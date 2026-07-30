@@ -13,6 +13,12 @@ let repositoryRoot = (0..<5).reduce(sourceFile) { url, _ in
 }
 let fixtureURL = repositoryRoot
     .appendingPathComponent("packages/contracts/fixtures/bridge-request.valid.json")
+let runtimeStatusFixtureURL = repositoryRoot
+    .appendingPathComponent("packages/contracts/fixtures/runtime-status.local-healthy.json")
+let handshakeChallengeFixtureURL = repositoryRoot
+    .appendingPathComponent("packages/contracts/fixtures/bridge-handshake.challenge.json")
+let handshakeResponseFixtureURL = repositoryRoot
+    .appendingPathComponent("packages/contracts/fixtures/bridge-handshake.response.json")
 
 do {
     let fixtureData = try Data(contentsOf: fixtureURL)
@@ -46,6 +52,49 @@ do {
     }
     guard encodedObject["payload"] is [String: Any] else {
         fail("encoded payload is not a JSON object")
+    }
+
+    let runtimeStatusData = try Data(contentsOf: runtimeStatusFixtureURL)
+    let runtimeStatus = try JSONDecoder().decode(RuntimeStatusEnvelope.self, from: runtimeStatusData)
+    guard runtimeStatus.agentStatus == .unpaired,
+          runtimeStatus.bridgeStatus == .ready,
+          runtimeStatus.localHealthy,
+          runtimeStatus.heartbeatAt == "2026-07-31T00:00:00Z",
+          runtimeStatus.processID == 4242,
+          runtimeStatus.appVersion == "0.0.0-s1a",
+          runtimeStatus.schemaVersion == 1 else {
+        fail("runtime status fixture does not match the canonical fields")
+    }
+
+    let challengeData = try Data(contentsOf: handshakeChallengeFixtureURL)
+    let challengeEnvelope = try JSONDecoder().decode(BridgeEnvelope.self, from: challengeData)
+    let challengePayload = try JSONEncoder().encode(challengeEnvelope.payload)
+    let challenge = try JSONDecoder().decode(HandshakeChallenge.self, from: challengePayload)
+    guard challengeEnvelope.protocolVersion == 1,
+          challengeEnvelope.messageKind == .request,
+          challengeEnvelope.capability == "bridge.handshake",
+          challengeEnvelope.deadlineMilliseconds == 1_000,
+          challengeEnvelope.error == nil,
+          challenge.phase == "challenge",
+          challenge.nonce == "c2VjcmV0LWZyZWUtbm9uY2UtMDE=",
+          challenge.agentVersion == "0.0.0-s1a" else {
+        fail("handshake challenge fixture does not match the canonical fields")
+    }
+
+    let responseData = try Data(contentsOf: handshakeResponseFixtureURL)
+    let responseEnvelope = try JSONDecoder().decode(BridgeEnvelope.self, from: responseData)
+    let responsePayload = try JSONEncoder().encode(responseEnvelope.payload)
+    let response = try JSONDecoder().decode(HandshakeResponse.self, from: responsePayload)
+    guard responseEnvelope.protocolVersion == 1,
+          responseEnvelope.messageKind == .response,
+          responseEnvelope.capability == "bridge.handshake",
+          responseEnvelope.deadlineMilliseconds == 1_000,
+          responseEnvelope.error == nil,
+          response.phase == "response",
+          response.nonce == challenge.nonce,
+          response.proof == "c3ludGhldGljLWhtYWMtc2hhMjU2LXByb29m",
+          response.bridgeVersion == "0.0.0-s1a" else {
+        fail("handshake response fixture does not match the canonical fields")
     }
 
     print("Swift Bridge contract fixture passed")

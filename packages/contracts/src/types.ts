@@ -24,6 +24,48 @@ export interface BridgeEnvelope {
   error?: ErrorEnvelope | null;
 }
 
+export type AgentStatus =
+  | "unpaired"
+  | "initializing"
+  | "waiting_permission"
+  | "running"
+  | "degraded"
+  | "sleeping"
+  | "updating"
+  | "repair"
+  | "stopped";
+
+export type BridgeStatus =
+  | "disconnected"
+  | "handshaking"
+  | "ready"
+  | "degraded"
+  | "incompatible"
+  | "stopped";
+
+export interface RuntimeStatusEnvelope {
+  agent_status: AgentStatus;
+  bridge_status: BridgeStatus;
+  local_healthy: boolean;
+  heartbeat_at: string;
+  process_id: number;
+  app_version: string;
+  schema_version: number;
+}
+
+export interface HandshakeChallenge {
+  phase: "challenge";
+  nonce: string;
+  agent_version: string;
+}
+
+export interface HandshakeResponse {
+  phase: "response";
+  nonce: string;
+  proof: string;
+  bridge_version: string;
+}
+
 export type Sensitivity = "public" | "normal" | "medium" | "high" | "secret";
 
 export interface EventEnvelope {

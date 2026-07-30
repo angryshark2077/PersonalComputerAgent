@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/runtime-status.schema.json",
+  "title": "RuntimeStatusEnvelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "agent_status",
+    "bridge_status",
+    "local_healthy",
+    "heartbeat_at",
+    "process_id",
+    "app_version",
+    "schema_version"
+  ],
+  "properties": {
+    "agent_status": {
+      "enum": [
+        "unpaired",
+        "initializing",
+        "waiting_permission",
+        "running",
+        "degraded",
+        "sleeping",
+        "updating",
+        "repair",
+        "stopped"
+      ]
+    },
+    "bridge_status": {
+      "enum": [
+        "disconnected",
+        "handshaking",
+        "ready",
+        "degraded",
+        "incompatible",
+        "stopped"
+      ]
+    },
+    "local_healthy": {
+      "type": "boolean"
+    },
+    "heartbeat_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "process_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "app_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

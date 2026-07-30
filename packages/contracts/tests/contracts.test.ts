@@ -60,3 +60,21 @@ test("registry contains the complete Appendix D error-code baseline", () => {
   assert.ok(registry.error_codes.includes("AUTH_REQUIRED"));
   assert.ok(registry.error_codes.includes("DISK_SPACE_LOW"));
 });
+
+test("local runtime status uses the canonical health fields", () => {
+  const value = fixture("runtime-status.local-healthy.json") as Record<string, unknown>;
+  assert.equal(value.agent_status, "unpaired");
+  assert.equal(value.bridge_status, "ready");
+  assert.equal(value.local_healthy, true);
+  assert.equal(typeof value.heartbeat_at, "string");
+});
+
+test("handshake fixtures never carry the shared secret", () => {
+  for (const name of [
+    "bridge-handshake.challenge.json",
+    "bridge-handshake.response.json",
+  ]) {
+    const value = JSON.stringify(fixture(name));
+    assert.equal(value.includes("shared_secret"), false);
+  }
+});

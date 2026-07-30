@@ -1,4 +1,7 @@
-use pca_domain::{BridgeEnvelope, EventEnvelope};
+use pca_domain::{
+    AgentStatus, BridgeEnvelope, BridgeMessageKind, BridgeStatus, EventEnvelope,
+    HandshakeChallenge, HandshakeResponse, RuntimeStatusEnvelope,
+};
 
 #[test]
 fn bridge_fixture_decodes_snake_case_and_object_payload() {
@@ -18,4 +21,67 @@ fn event_fixture_round_trips_without_field_loss() {
 
     assert_eq!(encoded["payload"]["state"], "running");
     assert_eq!(encoded["attachment_refs"][0], "attachment-001");
+}
+
+#[test]
+fn runtime_status_fixture_decodes_every_canonical_field() {
+    let raw =
+        include_str!("../../../packages/contracts/fixtures/runtime-status.local-healthy.json");
+    let status: RuntimeStatusEnvelope =
+        serde_json::from_str(raw).expect("valid runtime status fixture");
+
+    assert_eq!(status.agent_status, AgentStatus::Unpaired);
+    assert_eq!(status.bridge_status, BridgeStatus::Ready);
+    assert!(status.local_healthy);
+    assert_eq!(status.heartbeat_at, "2026-07-31T00:00:00Z");
+    assert_eq!(status.process_id, 4242);
+    assert_eq!(status.app_version, "0.0.0-s1a");
+    assert_eq!(status.schema_version, 1);
+}
+
+#[test]
+fn handshake_fixtures_decode_every_canonical_field() {
+    let challenge_raw =
+        include_str!("../../../packages/contracts/fixtures/bridge-handshake.challenge.json");
+    let challenge_envelope: BridgeEnvelope =
+        serde_json::from_str(challenge_raw).expect("valid handshake challenge fixture");
+    let challenge: HandshakeChallenge = serde_json::from_value(serde_json::Value::Object(
+        challenge_envelope.payload.clone(),
+    ))
+    .expect("valid handshake challenge payload");
+
+    assert_eq!(challenge_envelope.protocol_version, 1);
+    assert_eq!(
+        challenge_envelope.request_id.to_string(),
+        "018f3f4a-2d9b-7d21-a310-2c49d9b43c12"
+    );
+    assert_eq!(challenge_envelope.message_kind, BridgeMessageKind::Request);
+    assert_eq!(challenge_envelope.capability, "bridge.handshake");
+    assert_eq!(challenge_envelope.deadline_ms, 1_000);
+    assert!(challenge_envelope.error.is_none());
+    assert_eq!(challenge.phase, "challenge");
+    assert_eq!(challenge.nonce, "c2VjcmV0LWZyZWUtbm9uY2UtMDE=");
+    assert_eq!(challenge.agent_version, "0.0.0-s1a");
+
+    let response_raw =
+        include_str!("../../../packages/contracts/fixtures/bridge-handshake.response.json");
+    let response_envelope: BridgeEnvelope =
+        serde_json::from_str(response_raw).expect("valid handshake response fixture");
+    let response: HandshakeResponse =
+        serde_json::from_value(serde_json::Value::Object(response_envelope.payload.clone()))
+            .expect("valid handshake response payload");
+
+    assert_eq!(response_envelope.protocol_version, 1);
+    assert_eq!(
+        response_envelope.request_id.to_string(),
+        "018f3f4a-2d9b-7d21-a310-2c49d9b43c12"
+    );
+    assert_eq!(response_envelope.message_kind, BridgeMessageKind::Response);
+    assert_eq!(response_envelope.capability, "bridge.handshake");
+    assert_eq!(response_envelope.deadline_ms, 1_000);
+    assert!(response_envelope.error.is_none());
+    assert_eq!(response.phase, "response");
+    assert_eq!(response.nonce, "c2VjcmV0LWZyZWUtbm9uY2UtMDE=");
+    assert_eq!(response.proof, "c3ludGhldGljLWhtYWMtc2hhMjU2LXByb29m");
+    assert_eq!(response.bridge_version, "0.0.0-s1a");
 }

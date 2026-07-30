@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "request_id": "018f3f4a-2d9b-7d21-a310-2c49d9b43c12",
+  "message_kind": "response",
+  "capability": "bridge.handshake",
+  "deadline_ms": 1000,
+  "payload": {
+    "phase": "response",
+    "nonce": "c2VjcmV0LWZyZWUtbm9uY2UtMDE=",
+    "proof": "c3ludGhldGljLWhtYWMtc2hhMjU2LXByb29m",
+    "bridge_version": "0.0.0-s1a"
+  },
+  "error": null
+}

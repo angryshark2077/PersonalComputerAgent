@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Unpaired,
     Initializing,
@@ -63,6 +64,43 @@ pub enum BridgeMessageKind {
     Request,
     Response,
     Event,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeStatus {
+    Disconnected,
+    Handshaking,
+    Ready,
+    Degraded,
+    Incompatible,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeStatusEnvelope {
+    pub agent_status: AgentStatus,
+    pub bridge_status: BridgeStatus,
+    pub local_healthy: bool,
+    pub heartbeat_at: String,
+    pub process_id: u32,
+    pub app_version: String,
+    pub schema_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandshakeChallenge {
+    pub phase: String,
+    pub nonce: String,
+    pub agent_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandshakeResponse {
+    pub phase: String,
+    pub nonce: String,
+    pub proof: String,
+    pub bridge_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
