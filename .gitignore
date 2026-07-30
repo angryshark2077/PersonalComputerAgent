@@ -14,3 +14,4 @@ DerivedData/
 *.log
 .DS_Store
 .superpowers/
+.worktrees/
