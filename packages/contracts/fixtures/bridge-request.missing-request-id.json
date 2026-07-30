@@ -1,0 +1,7 @@
+{
+  "protocol_version": 1,
+  "message_kind": "request",
+  "capability": "system.capabilities",
+  "deadline_ms": 1000,
+  "payload": {}
+}

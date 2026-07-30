@@ -1,0 +1,14 @@
+{
+  "event_id": "018f3f4a-2d9b-7d21-a310-2c49d9b43c12",
+  "workspace_id": "018f3f4a-2d9b-7d21-a310-2c49d9b43c13",
+  "device_id": "018f3f4a-2d9b-7d21-a310-2c49d9b43c14",
+  "event_type": "agent.status_changed",
+  "source": "agent.core",
+  "schema_version": 1,
+  "occurred_at": "2026-07-30T12:00:00Z",
+  "created_at": "2026-07-30T12:00:00Z",
+  "sensitivity": "normal",
+  "payload": {"state": "running"},
+  "attachment_refs": ["attachment-001"],
+  "idempotency_key": "event-018f3f4a-2d9b-7d21-a310-2c49d9b43c12"
+}
