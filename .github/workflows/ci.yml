@@ -38,13 +38,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
       - run: swift build --package-path platform/macos
-      - name: Swift package tests
-        run: |
-          signal_tests='HandshakeTests.test(PostStartSignalsCleanlyStopRealServerProcess|ProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts|SignalDuringDelayedStartIsConsumedAfterRealServerStarts)'
-          swift test --package-path platform/macos --skip "$signal_tests"
-          swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
-          swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
-          swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
+      - name: Swift package tests except process-signal cases
+        run: >-
+          swift test --package-path platform/macos
+          --skip 'HandshakeTests.test(PostStartSignalsCleanlyStopRealServerProcess|ProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts|SignalDuringDelayedStartIsConsumedAfterRealServerStarts)'
+      - name: Swift post-start signal test in an isolated runner
+        run: swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
+      - name: Swift startup signal test in an isolated runner
+        run: swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
+      - name: Swift delayed-start signal test in an isolated runner
+        run: swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
       - run: swift run --package-path platform/macos BridgeContractVerifier
 
   s1a-macos:
@@ -53,13 +56,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
-      - name: Swift package tests
-        run: |
-          signal_tests='HandshakeTests.test(PostStartSignalsCleanlyStopRealServerProcess|ProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts|SignalDuringDelayedStartIsConsumedAfterRealServerStarts)'
-          swift test --package-path platform/macos --skip "$signal_tests"
-          swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
-          swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
-          swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
+      - name: Swift package tests except process-signal cases
+        run: >-
+          swift test --package-path platform/macos
+          --skip 'HandshakeTests.test(PostStartSignalsCleanlyStopRealServerProcess|ProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts|SignalDuringDelayedStartIsConsumedAfterRealServerStarts)'
+      - name: Swift post-start signal test in an isolated runner
+        run: swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
+      - name: Swift startup signal test in an isolated runner
+        run: swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
+      - name: Swift delayed-start signal test in an isolated runner
+        run: swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
       - run: swift run --package-path platform/macos BridgeContractVerifier
       - run: >-
           xcodebuild test
