@@ -37,7 +37,7 @@
 - Consumes: one absolute target path passed to `scripts/bootstrap-repo.sh`.
 - Produces: a self-contained generated repository with `DEV_PACKAGE_MANIFEST.md`, valid root-relative onboarding links, specifications, contracts, tasks, prompts, and template source files.
 
-- [ ] **Step 1: Write the failing bootstrap behavior tests**
+- [x] **Step 1: Write the failing bootstrap behavior tests**
 
 ```python
 import subprocess
@@ -82,7 +82,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 2: Run the tests and verify the first test fails for the current missing manifest and bad paths**
+- [x] **Step 2: Run the tests and verify the first test fails for the current missing manifest and bad paths**
 
 Run:
 
@@ -92,7 +92,7 @@ python3 -m unittest scripts.tests.test_bootstrap -v
 
 Expected: `test_generated_repository_is_self_contained` fails because `DEV_PACKAGE_MANIFEST.md` is absent and generated onboarding still contains invalid paths; the non-empty-target test passes.
 
-- [ ] **Step 3: Implement the minimum bootstrap and onboarding repair**
+- [x] **Step 3: Implement the minimum bootstrap and onboarding repair**
 
 Add `DEV_PACKAGE_MANIFEST.md` to the explicit bootstrap copy list. Replace the generated-repository portion of `00_START_HERE.md` with root-valid commands and remove the instruction to bootstrap again. Change `repo-template/README.md` to:
 
@@ -109,7 +109,7 @@ Start with:
 The scaffold is intentionally minimal and does not represent completed product functionality.
 ```
 
-- [ ] **Step 4: Run the bootstrap tests and shell syntax checks**
+- [x] **Step 4: Run the bootstrap tests and shell syntax checks**
 
 Run:
 
@@ -120,7 +120,7 @@ bash -n scripts/bootstrap-repo.sh scripts/verify-pack.sh
 
 Expected: two tests pass and Bash exits 0.
 
-- [ ] **Step 5: Generate the product repository and initialize Git**
+- [x] **Step 5: Generate the product repository and initialize Git**
 
 Run only after confirming `/Users/jacob/Projects/PersonalComputerAgent` does not exist or is empty:
 
@@ -160,7 +160,7 @@ Expected: bootstrap exits 0; Git reports a new repository and the initial commit
 - Consumes: `packages/contracts/*.schema.json` and Appendix C/D values.
 - Produces: `validateContract(schemaName, value): { valid: boolean; errors: string[] }`, shared fixture files, `BridgeEnvelope`, `EventEnvelope`, and the single enum/error registry.
 
-- [ ] **Step 1: Add synthetic fixtures and write failing Ajv behavior tests**
+- [x] **Step 1: Add synthetic fixtures and write failing Ajv behavior tests**
 
 Use literal UUIDs and UTC timestamps. The valid Bridge request must contain:
 
@@ -212,7 +212,7 @@ test("fixture payload is an object rather than encoded bytes", () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run:
 
@@ -224,7 +224,7 @@ pnpm --filter @pca/contracts test
 
 Expected: fail because `src/validate.ts`, scripts, and Ajv integration do not yet exist.
 
-- [ ] **Step 3: Implement the minimum TypeScript contract validator and explicit types**
+- [x] **Step 3: Implement the minimum TypeScript contract validator and explicit types**
 
 Implement `validate.ts` with one Ajv 2020 instance, schema registration by `$id`, and formatted `instancePath + message` errors. Use:
 
@@ -256,7 +256,7 @@ export interface BridgeEnvelope {
 
 Create `registry.json` with all 16 Appendix C enum groups and all Appendix D error codes. Tests must assert the literal group count of 16 and reject duplicate values within a group.
 
-- [ ] **Step 4: Add the minimal pnpm workspace projects**
+- [x] **Step 4: Add the minimal pnpm workspace projects**
 
 Set the root scripts to:
 
@@ -286,7 +286,7 @@ Use the shared `tsconfig.base.json`:
 
 Web Dashboard and domain-ts remain importable empty packages; they expose only a package identifier and no feature UI.
 
-- [ ] **Step 5: Run TypeScript verification**
+- [x] **Step 5: Run TypeScript verification**
 
 Run:
 
@@ -297,7 +297,7 @@ pnpm test
 
 Expected: all workspace typechecks and contract tests pass with zero failures.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add package.json pnpm-lock.yaml tsconfig.base.json apps packages
@@ -320,7 +320,7 @@ git commit -m "feat: freeze TypeScript contract baseline"
 - Consumes: shared JSON fixtures under `packages/contracts/fixtures`.
 - Produces: Serde-compatible `EventEnvelope`, `BridgeEnvelope`, `ErrorEnvelope`, and fixture round-trip tests.
 
-- [ ] **Step 1: Write failing Rust fixture tests**
+- [x] **Step 1: Write failing Rust fixture tests**
 
 ```rust
 use pca_domain::{BridgeEnvelope, EventEnvelope};
@@ -346,7 +346,7 @@ fn event_fixture_round_trips_without_field_loss() {
 }
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run:
 
@@ -356,7 +356,7 @@ cargo test -p pca-test-contracts --test fixtures
 
 Expected: compilation fails because the current domain model lacks Serde mappings, `BridgeEnvelope`, object payloads, and optional contract fields.
 
-- [ ] **Step 3: Implement the minimum Rust mappings**
+- [x] **Step 3: Implement the minimum Rust mappings**
 
 Add workspace dependencies for `serde`, `serde_json`, and `uuid`. Replace `payload_json: String` with `payload: serde_json::Map<String, serde_json::Value>`, add optional `attachment_refs` and `idempotency_key`, and derive `Serialize`/`Deserialize` using `#[serde(rename_all = "snake_case")]` for string enums.
 
@@ -378,7 +378,7 @@ pub struct BridgeEnvelope {
 
 Do not add runtime sockets, Tokio, SQLite, or Collector implementations in S0.
 
-- [ ] **Step 4: Run Rust gates**
+- [x] **Step 4: Run Rust gates**
 
 ```bash
 cargo fmt --all --check
@@ -388,7 +388,7 @@ cargo test --workspace
 
 Expected: all commands exit 0 with no warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates agent
@@ -409,7 +409,7 @@ git commit -m "feat: map canonical contracts in Rust"
 - Consumes: the shared `packages/contracts/fixtures/bridge-request.valid.json` directly through a path derived from `#filePath`; no duplicate Swift fixture is created.
 - Produces: a Swift `BridgeEnvelope` that decodes and re-encodes the canonical snake_case wire contract without field loss.
 
-- [ ] **Step 1: Write the failing Swift fixture test**
+- [x] **Step 1: Write the failing Swift fixture test**
 
 ```swift
 import Foundation
@@ -439,7 +439,7 @@ import Testing
 }
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -449,7 +449,7 @@ swift test --package-path platform/macos
 
 Expected: fail because the current Swift model expects camelCase wire keys and encodes `payload` as Base64 `Data`.
 
-- [ ] **Step 3: Implement the minimum Sendable JSON contract mapping**
+- [x] **Step 3: Implement the minimum Sendable JSON contract mapping**
 
 Implement a recursive `JSONValue: Codable, Sendable, Equatable` enum for null, bool, number, string, array, and object. Change payload to `[String: JSONValue]`. Add explicit `CodingKeys`:
 
@@ -467,7 +467,7 @@ private enum CodingKeys: String, CodingKey {
 
 Add the `BridgeProtocolTests` test target in `Package.swift`. Keep Setup/Repair as a placeholder and read the single shared fixture from its canonical repository path.
 
-- [ ] **Step 4: Run Swift gates**
+- [x] **Step 4: Run Swift gates**
 
 ```bash
 swift build --package-path platform/macos
@@ -476,7 +476,7 @@ swift test --package-path platform/macos
 
 Expected: both commands exit 0 and the shared fixture test passes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add platform/macos
@@ -502,7 +502,7 @@ git commit -m "feat: map canonical Bridge contract in Swift"
 - Consumes: immutable `0000_baseline.sql` files and workspace manifests/source imports.
 - Produces: deterministic migration checksum verification and non-zero boundary failures identifying the forbidden edge.
 
-- [ ] **Step 1: Write failing gate tests against controlled temporary fixtures**
+- [x] **Step 1: Write failing gate tests against controlled temporary fixtures**
 
 ```python
 def test_duplicate_migration_id_is_rejected(self) -> None:
@@ -523,7 +523,7 @@ def test_domain_to_platform_import_is_rejected(self) -> None:
 
 The test helper creates only the directories and files needed for each real script invocation; expected strings are literals, not derived from the gate implementation.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 ```bash
 python3 -m unittest scripts.tests.test_engineering_gates -v
@@ -531,7 +531,7 @@ python3 -m unittest scripts.tests.test_engineering_gates -v
 
 Expected: tests fail because both gate scripts are absent.
 
-- [ ] **Step 3: Implement minimal baseline migrations and gates**
+- [x] **Step 3: Implement minimal baseline migrations and gates**
 
 Local baseline creates only `schema_migrations` with immutable identifiers/checksums; cloud baseline creates only a `_pca_migrations` metadata table. `verify_migrations.py` must:
 
@@ -543,7 +543,7 @@ Local baseline creates only `schema_migrations` with immutable identifiers/check
 
 `verify_boundaries.py` must inspect Cargo path dependencies and TypeScript imports, not merely grep documentation. It rejects domain-to-platform/infrastructure, collector-to-cloud-client, and web-to-db-cloud edges.
 
-- [ ] **Step 4: Run the gate tests and real repository checks**
+- [x] **Step 4: Run the gate tests and real repository checks**
 
 ```bash
 python3 -m unittest scripts.tests.test_engineering_gates -v
@@ -554,7 +554,7 @@ cargo test -p pca-db-local
 
 Expected: all commands exit 0.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/db-local packages/db-cloud scripts
@@ -577,7 +577,7 @@ git commit -m "feat: add S0 migration and boundary gates"
 - Consumes: repository gates from Tasks 2-5 and available toolchains.
 - Produces: `STRUCTURAL VERIFICATION PASSED` only for structural mode, `FULL VERIFICATION PASSED` only after every required engineering gate succeeds.
 
-- [ ] **Step 1: Write failing verification-mode tests**
+- [x] **Step 1: Write failing verification-mode tests**
 
 ```python
 def test_structural_mode_never_claims_full_pass(self) -> None:
@@ -593,7 +593,7 @@ def test_full_mode_fails_when_cargo_is_hidden(self) -> None:
     self.assertNotIn("FULL VERIFICATION PASSED", result.stdout)
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 ```bash
 python3 -m unittest scripts.tests.test_verification_modes -v
@@ -601,7 +601,7 @@ python3 -m unittest scripts.tests.test_verification_modes -v
 
 Expected: fail because the scripts do not exist.
 
-- [ ] **Step 3: Implement structural and full verification scripts**
+- [x] **Step 3: Implement structural and full verification scripts**
 
 Both scripts use `set -euo pipefail`. Structural mode runs file, JSON/ref, shell, migration-metadata, boundary, and bootstrap-consistency checks that do not require compilation. Full mode first checks exact required tools, then runs:
 
@@ -620,11 +620,11 @@ python3 scripts/verify_boundaries.py .
 
 Print the full-pass marker only after the last command exits 0.
 
-- [ ] **Step 4: Add CI with explicit stages**
+- [x] **Step 4: Add CI with explicit stages**
 
 The GitHub Actions workflow uses macOS for Swift and Rust/Node compatibility. Jobs are named `format-lint`, `build-unit`, `contract`, `migration`, and `boundary`; each invokes the same repository commands rather than duplicating validation logic.
 
-- [ ] **Step 5: Run verification-mode tests and available gates**
+- [x] **Step 5: Run verification-mode tests and available gates**
 
 ```bash
 python3 -m unittest scripts.tests.test_verification_modes -v
@@ -634,7 +634,7 @@ python3 -m unittest scripts.tests.test_verification_modes -v
 
 Expected: mode tests and structural verification pass. Full verification must exit non-zero with `missing required tool: cargo` until Cargo is installed; it must not print the full-pass marker.
 
-- [ ] **Step 6: Install Rust through Homebrew rustup when Cargo is absent, then rerun full verification**
+- [x] **Step 6: Install Rust through Homebrew rustup when Cargo is absent, then rerun full verification**
 
 Do not edit `.env` or application secrets. If `command -v cargo` fails, run:
 
@@ -654,7 +654,7 @@ cargo --version
 
 Expected: versions are printed and full verification exits 0 with exactly one `FULL VERIFICATION PASSED` marker.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add .github scripts justfile README.md
@@ -677,7 +677,7 @@ git commit -m "ci: enforce complete S0 verification"
 - Consumes: the verified product-repository S0 skeleton.
 - Produces: a pack template that regenerates an equivalent clean S0 repository and a final evidence record.
 
-- [ ] **Step 1: Write the failing pack-regeneration test**
+- [x] **Step 1: Write the failing pack-regeneration test**
 
 The test bootstraps into a temporary directory, compares the canonical contract/fixture/tooling subset with the product repository, and runs structural verification in the generated target:
 
@@ -700,7 +700,7 @@ def test_pack_regenerates_verified_s0_baseline(self) -> None:
         )
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 ```bash
 cd /Users/jacob/Projects/PCA
@@ -709,7 +709,7 @@ python3 -m unittest scripts.tests.test_pack_verification -v
 
 Expected: fail because the pack template does not yet contain the completed S0 baseline.
 
-- [ ] **Step 3: Synchronize only S0 scaffold files back into the pack**
+- [x] **Step 3: Synchronize only S0 scaffold files back into the pack**
 
 Copy the verified repository skeleton into `repo-template` while excluding:
 
@@ -725,7 +725,7 @@ node_modules/
 
 Keep the pack's authoritative docs/tasks/contracts/prompts at their existing roots. Update `verify-pack.sh` so structural mode prints only `STRUCTURAL VERIFICATION PASSED`; full pack validation delegates to a clean bootstrapped target and its `verify-full.sh`.
 
-- [ ] **Step 4: Run the complete pack and clean-generation evidence suite**
+- [x] **Step 4: Run the complete pack and clean-generation evidence suite**
 
 ```bash
 cd /Users/jacob/Projects/PCA
@@ -738,7 +738,7 @@ tmp_target=$(mktemp -d /tmp/pca-final.XXXXXX)/PersonalComputerAgent
 
 Expected: every test passes; structural marker appears only in structural mode; the generated clean repository prints `FULL VERIFICATION PASSED` after all compilers/tests/gates pass.
 
-- [ ] **Step 5: Run final product-repository verification and record exact evidence**
+- [x] **Step 5: Run final product-repository verification and record exact evidence**
 
 ```bash
 cd /Users/jacob/Projects/PersonalComputerAgent
@@ -749,7 +749,7 @@ git log --oneline --decorate -8
 
 Expected: worktree is clean; full verification exits 0; Git history contains the S0 commits from Tasks 1-6.
 
-- [ ] **Step 6: Commit the final evidence document in the product repository**
+- [x] **Step 6: Commit the final evidence document in the product repository**
 
 Update the copied plan checkboxes and append the exact command exit codes under `## Verification Evidence`, then run:
 
@@ -759,6 +759,47 @@ git commit -m "docs: record S0 verification evidence"
 ```
 
 The development pack remains uncommitted because it is not a Git repository; report its changed-file list and hashes explicitly in the final handoff.
+
+---
+
+## Verification Evidence
+
+Recorded on 2026-07-31 on macOS.
+
+### Approved Swift verification deviation
+
+The installed Command Line Tools expose Swift Testing binaries but `swift test` only built the target and returned success without executing its assertions. A mutation from expected `protocol_version == 1` to `== 2` still returned zero, proving the apparent pass was false. The approved option was therefore implemented as the framework-free `BridgeContractVerifier` executable. With the same mutation, `swift run --package-path platform/macos BridgeContractVerifier` exited 1 and printed `expected protocol_version 2`; after restoration it exited 0 and printed `Swift Bridge contract fixture passed`. The full gate and CI invoke this executable directly.
+
+### Toolchains
+
+```text
+rustc 1.97.1
+cargo 1.97.1
+Apple Swift 6.3.3
+pnpm 9.15.0
+Node v24.18.0
+Python 3.9.6
+```
+
+### Product repository
+
+- `python3 -m unittest scripts.tests.test_verification_modes -v`: exit 0, 2 tests passed; structural mode never printed the full marker and hidden Cargo failed explicitly.
+- `./scripts/verify-structural.sh`: exit 0, 8 schemas validated, migration replay/boundary/failure-path tests passed, one `STRUCTURAL VERIFICATION PASSED` marker.
+- `./scripts/verify-full.sh`: exit 0; Rust fmt/clippy/tests, Swift build and executable fixture verifier, pnpm frozen install/typecheck/tests, migration replay, and dependency boundaries passed; one `FULL VERIFICATION PASSED` marker.
+- Contract evidence: TypeScript 6 tests passed; Rust shared-fixture integration 2 tests passed; Swift shared-fixture verifier passed; registry covers 16 Appendix C enum groups and 57 Appendix D error codes.
+- Migration evidence: local and cloud `0000_baseline.sql` checksums were recorded; the SQLite baseline replayed twice with stable schema plus successful `integrity_check` and `foreign_key_check`.
+- Git commits: `022aa25`, `3cec5c3`, `1347cb0`, `6f8d5e2`, `68b1b52`, and `70086cb`.
+
+### Development pack and clean regeneration
+
+- `python3 -m unittest scripts.tests.test_pack_verification -v`: exit 0; regenerated `packages/contracts` matched the product repository after generated dependency folders were excluded.
+- `/Users/jacob/Projects/PCA/scripts/verify-pack.sh`: exit 0; 8 schemas and all 3 pack/bootstrap tests passed.
+- A clean bootstrap at `/tmp/pca-s0-generated.RmxFTN/PersonalComputerAgent` ran `./scripts/verify-full.sh`: exit 0 with `FULL VERIFICATION PASSED` after fresh Rust, Swift, and pnpm builds.
+- Sync exclusions were enforced for `.git`, `target`, `.build`, `node_modules`, `.next`, `.db`, `.log`, and `.DS_Store` artifacts.
+
+### Scope and security review
+
+S0 adds contracts, language mappings, migration metadata, dependency gates, verification, and CI only. It adds no Collector behavior, WeChat access, cloud deployment, resident S1 runtime, secret handling, `.env` changes, or user-data access.
 
 ---
 
