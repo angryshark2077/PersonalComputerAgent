@@ -4,6 +4,8 @@ node_modules/
 dist/
 .build/
 DerivedData/
+platform/macos/.build-inputs/
+*.xcarchive
 *.xcuserstate
 .env
 .env.*

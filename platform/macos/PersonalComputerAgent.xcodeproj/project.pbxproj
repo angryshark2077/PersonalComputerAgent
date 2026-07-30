@@ -1,0 +1,105 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* PersonalComputerAgentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* PersonalComputerAgentApp.swift */; };
+		A10000000000000000000002 /* InstallerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* InstallerView.swift */; };
+		A10000000000000000000003 /* InstallerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* InstallerViewModel.swift */; };
+		A10000000000000000000004 /* InstallCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* InstallCoordinator.swift */; };
+		A10000000000000000000005 /* BundleValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* BundleValidator.swift */; };
+		A10000000000000000000006 /* ServiceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* ServiceController.swift */; };
+		A10000000000000000000007 /* UninstallCommand.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* UninstallCommand.swift */; };
+		A10000000000000000000008 /* InstallCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* InstallCoordinatorTests.swift */; };
+		A10000000000000000000009 /* BridgeProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = A90000000000000000000002 /* BridgeProtocol */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A30000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A70000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A60000000000000000000001;
+			remoteInfo = PersonalComputerAgent;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A20000000000000000000001 /* PersonalComputerAgentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersonalComputerAgentApp.swift; sourceTree = "<group>"; };
+		A20000000000000000000002 /* InstallerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallerView.swift; sourceTree = "<group>"; };
+		A20000000000000000000003 /* InstallerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallerViewModel.swift; sourceTree = "<group>"; };
+		A20000000000000000000004 /* InstallCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallCoordinator.swift; sourceTree = "<group>"; };
+		A20000000000000000000005 /* BundleValidator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BundleValidator.swift; sourceTree = "<group>"; };
+		A20000000000000000000006 /* ServiceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServiceController.swift; sourceTree = "<group>"; };
+		A20000000000000000000007 /* UninstallCommand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UninstallCommand.swift; sourceTree = "<group>"; };
+		A20000000000000000000008 /* InstallCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallCoordinatorTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A2000000000000000000000A /* PersonalComputerAgent.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PersonalComputerAgent.entitlements; sourceTree = "<group>"; };
+		A2000000000000000000000B /* com.pca.agentd.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = com.pca.agentd.plist; sourceTree = "<group>"; };
+		A2000000000000000000000C /* PersonalComputerAgent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PersonalComputerAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A2000000000000000000000D /* PersonalComputerAgentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PersonalComputerAgentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A40000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000009 /* BridgeProtocol in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A50000000000000000000001 = {isa = PBXGroup; children = (A50000000000000000000002 /* PersonalComputerAgent */, A50000000000000000000004 /* PersonalComputerAgentTests */, A50000000000000000000005 /* Products */); sourceTree = "<group>"; };
+		A50000000000000000000002 /* PersonalComputerAgent */ = {isa = PBXGroup; children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000004, A20000000000000000000005, A20000000000000000000006, A20000000000000000000007, A20000000000000000000009, A2000000000000000000000A, A50000000000000000000003 /* Resources */); path = PersonalComputerAgent; sourceTree = "<group>"; };
+		A50000000000000000000003 /* Resources */ = {isa = PBXGroup; children = (A2000000000000000000000B /* com.pca.agentd.plist */); path = Resources; sourceTree = "<group>"; };
+		A50000000000000000000004 /* PersonalComputerAgentTests */ = {isa = PBXGroup; children = (A20000000000000000000008); path = PersonalComputerAgentTests; sourceTree = "<group>"; };
+		A50000000000000000000005 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000C, A2000000000000000000000D); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A60000000000000000000001 /* PersonalComputerAgent */ = {isa = PBXNativeTarget; buildConfigurationList = A80000000000000000000002; buildPhases = (A40000000000000000000003 /* Sources */, A40000000000000000000001 /* Frameworks */, A40000000000000000000005 /* Embed Runtime Artifacts */); buildRules = (); dependencies = (); name = PersonalComputerAgent; packageProductDependencies = (A90000000000000000000002 /* BridgeProtocol */); productName = PersonalComputerAgent; productReference = A2000000000000000000000C; productType = "com.apple.product-type.application"; };
+		A60000000000000000000002 /* PersonalComputerAgentTests */ = {isa = PBXNativeTarget; buildConfigurationList = A80000000000000000000003; buildPhases = (A40000000000000000000004 /* Sources */, A40000000000000000000002 /* Frameworks */); buildRules = (); dependencies = (A60000000000000000000003 /* PBXTargetDependency */); name = PersonalComputerAgentTests; productName = PersonalComputerAgentTests; productReference = A2000000000000000000000D; productType = "com.apple.product-type.bundle.unit-test"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A70000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {A60000000000000000000001 = {CreatedOnToolsVersion = 26.6; }; A60000000000000000000002 = {CreatedOnToolsVersion = 26.6; TestTargetID = A60000000000000000000001; };};}; buildConfigurationList = A80000000000000000000001; compatibilityVersion = "Xcode 16.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A50000000000000000000001; minimizedProjectReferenceProxies = 1; packageReferences = (A90000000000000000000001 /* XCLocalSwiftPackageReference "." */); preferredProjectObjectVersion = 77; productRefGroup = A50000000000000000000005; projectDirPath = ""; projectRoot = ""; targets = (A60000000000000000000001, A60000000000000000000002); };
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A40000000000000000000005 /* Embed Runtime Artifacts */ = {isa = PBXShellScriptBuildPhase; alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = (); name = "Embed Runtime Artifacts"; outputPaths = (); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/bash; shellScript = "set -euo pipefail\ninput_dir=\"${PROJECT_DIR}/.build-inputs/s1a\"\nif [[ ! -d \"$input_dir\" ]]; then\n  if [[ \"${CONFIGURATION}\" == \"Debug\" ]]; then exit 0; fi\n  echo \"missing staged S1A runtime build inputs\" >&2\n  exit 1\nfi\ninstall -d -m 0755 \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/bin\"\ninstall -d -m 0755 \"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents\"\ninstall -m 0755 \"$input_dir/pca-agentd\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/bin/pca-agentd\"\ninstall -m 0755 \"$input_dir/PCAPlatformBridge\" \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/bin/PCAPlatformBridge\"\ninstall -m 0644 \"$input_dir/com.pca.agentd.plist\" \"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents/com.pca.agentd.plist\"\n"; };
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A40000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000004, A10000000000000000000005, A10000000000000000000006, A10000000000000000000007); runOnlyForDeploymentPostprocessing = 0; };
+		A40000000000000000000004 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000008); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A60000000000000000000003 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = A60000000000000000000001; targetProxy = A30000000000000000000001; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		B10000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx;}; name = Debug; };
+		B10000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx;}; name = Release; };
+		B10000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; CODE_SIGN_ENTITLEMENTS = PersonalComputerAgent/PersonalComputerAgent.entitlements; COMBINE_HIDPI_IMAGES = YES; CURRENT_PROJECT_VERSION = 1; ENABLE_HARDENED_RUNTIME = YES; ENABLE_TESTABILITY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = PersonalComputerAgent/Info.plist; MACOSX_DEPLOYMENT_TARGET = 13.0; MARKETING_VERSION = 0.1.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = com.pca.PersonalComputerAgent; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_VERSION = 6.0;}; name = Debug; };
+		B10000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; CODE_SIGN_ENTITLEMENTS = PersonalComputerAgent/PersonalComputerAgent.entitlements; COMBINE_HIDPI_IMAGES = YES; CURRENT_PROJECT_VERSION = 1; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = PersonalComputerAgent/Info.plist; MACOSX_DEPLOYMENT_TARGET = 13.0; MARKETING_VERSION = 0.1.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = com.pca.PersonalComputerAgent; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_VERSION = 6.0;}; name = Release; };
+		B10000000000000000000005 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 13.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = com.pca.PersonalComputerAgentTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/PersonalComputerAgent.app/Contents/MacOS/PersonalComputerAgent";}; name = Debug; };
+		B10000000000000000000006 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ARCHS = arm64; BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 13.0; ONLY_ACTIVE_ARCH = NO; PRODUCT_BUNDLE_IDENTIFIER = com.pca.PersonalComputerAgentTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/PersonalComputerAgent.app/Contents/MacOS/PersonalComputerAgent";}; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A80000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000001, B10000000000000000000002); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A80000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000003, B10000000000000000000004); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A80000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (B10000000000000000000005, B10000000000000000000006); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A90000000000000000000001 /* XCLocalSwiftPackageReference "." */ = {isa = XCLocalSwiftPackageReference; relativePath = .; };
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A90000000000000000000002 /* BridgeProtocol */ = {isa = XCSwiftPackageProductDependency; package = A90000000000000000000001; productName = BridgeProtocol; };
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A70000000000000000000001 /* Project object */;
+}

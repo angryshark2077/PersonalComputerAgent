@@ -1,0 +1,65 @@
+import SwiftUI
+
+struct InstallerView: View {
+    @ObservedObject var model: InstallerViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Personal Computer Agent")
+                .font(.largeTitle.bold())
+            Text("Installs a user-level background runtime. Program files go in Application Support; persistent local data stays separate across updates.")
+                .foregroundStyle(.secondary)
+
+            stateContent
+            Spacer(minLength: 8)
+
+            if canInstall {
+                Button("Install and Start") { model.installAndStart() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+            }
+        }
+        .padding(28)
+        .frame(width: 520, height: 310)
+    }
+
+    @ViewBuilder
+    private var stateContent: some View {
+        switch model.state {
+        case .ready:
+            Label("Ready to install without administrator access", systemImage: "checkmark.shield")
+        case .copying:
+            progress("Copying the signed app…")
+        case .validating:
+            progress("Validating bundle, architecture, and signatures…")
+        case .waitingApproval:
+            progress("Approve Personal Computer Agent in System Settings > General > Login Items.")
+        case .starting:
+            progress("Starting the local runtime…")
+        case .success:
+            Label("Installed and running", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case let .failed(message, recoveryAction):
+            VStack(alignment: .leading, spacing: 8) {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                Text(recoveryAction).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var canInstall: Bool {
+        guard model.installationAvailable else { return false }
+        return switch model.state {
+        case .ready, .failed: true
+        default: false
+        }
+    }
+
+    private func progress(_ text: String) -> some View {
+        HStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text(text)
+        }
+    }
+}
