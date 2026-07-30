@@ -2,6 +2,7 @@
 members = [
   "agent/core",
   "crates/agent-runtime",
+  "crates/bridge-client",
   "crates/db-local",
   "crates/domain",
   "crates/keychain",

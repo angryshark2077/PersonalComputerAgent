@@ -1,0 +1,24 @@
+[package]
+name = "pca-bridge-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64 = "0.22"
+hmac = "0.12"
+pca-domain = { path = "../domain" }
+pca-keychain = { path = "../keychain" }
+rand = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
