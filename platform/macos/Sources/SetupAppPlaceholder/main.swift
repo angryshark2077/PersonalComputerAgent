@@ -7,6 +7,6 @@ let envelope = BridgeEnvelope(
     messageKind: .event,
     capability: "scaffold.ready",
     deadlineMilliseconds: 1_000,
-    payload: Data()
+    payload: [:]
 )
 print("SetupApp placeholder: \(envelope.capability)")
