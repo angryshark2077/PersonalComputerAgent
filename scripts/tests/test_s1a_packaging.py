@@ -36,6 +36,7 @@ class S1APackagingTests(unittest.TestCase):
         unexpected_dmg_payload: bool = False,
         detach_failure: bool = False,
         traversal_failure: bool = False,
+        attach_parse_failure: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = f"{self.tools}:{env['PATH']}"
@@ -45,6 +46,7 @@ class S1APackagingTests(unittest.TestCase):
         env["PCA_SYNTHETIC_UNEXPECTED_PAYLOAD"] = "1" if unexpected_dmg_payload else "0"
         env["PCA_SYNTHETIC_DETACH_FAILURE"] = "1" if detach_failure else "0"
         env["PCA_SYNTHETIC_TRAVERSAL_FAILURE"] = "1" if traversal_failure else "0"
+        env["PCA_SYNTHETIC_ATTACH_PARSE_FAILURE"] = "1" if attach_parse_failure else "0"
         env["PCA_SYNTHETIC_TEAM_ID"] = "ABCDEFGHIJ"
         env["PCA_SYNTHETIC_TOOL_LOG"] = str(self.temp / "tools.log")
         return subprocess.run(
@@ -99,7 +101,7 @@ class S1APackagingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected payload", result.stdout)
         self.assertIn("-readonly", (self.temp / "hdiutil.log").read_text())
-        self.assertIn("detach /dev/disk99", (self.temp / "hdiutil.log").read_text())
+        self.assertIn("detach /dev/disk99s1", (self.temp / "hdiutil.log").read_text())
 
     def test_successful_dmg_verification_detaches_exact_attached_device(self) -> None:
         dmg = self.temp / "fixture.dmg"
@@ -108,7 +110,15 @@ class S1APackagingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         log = (self.temp / "hdiutil.log").read_text()
         self.assertIn("attach -readonly -nobrowse", log)
-        self.assertIn("detach /dev/disk99", log)
+        self.assertIn("detach /dev/disk99s1", log)
+
+    def test_attach_parse_failure_still_detaches_requested_mountpoint(self) -> None:
+        dmg = self.temp / "fixture.dmg"
+        dmg.write_bytes(b"synthetic image")
+        result = self.run_verify(dmg, attach_parse_failure=True)
+        self.assertNotEqual(result.returncode, 0)
+        log = (self.temp / "hdiutil.log").read_text()
+        self.assertRegex(log, r"detach .*/mount")
 
     def test_explicit_detach_failure_fails_verification(self) -> None:
         dmg = self.temp / "fixture.dmg"
@@ -317,10 +327,17 @@ if [[ "$1" == "attach" ]]; then
   fi
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict><key>system-entities</key><array><dict><key>dev-entry</key><string>/dev/disk99</string><key>mount-point</key><string>$mountpoint</string></dict></array></dict></plist>
+<plist version="1.0"><dict><key>system-entities</key><array>
+<dict><key>dev-entry</key><string>/dev/disk99</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
+<dict><key>dev-entry</key><string>/dev/disk99s1</string><key>mount-point</key><string>$([[ "${PCA_SYNTHETIC_ATTACH_PARSE_FAILURE:-0}" == "1" ]] && echo /wrong/mount || echo "$mountpoint")</string></dict>
+</array></dict></plist>
 PLIST
 elif [[ "$1" == "detach" ]]; then
-  [[ "$2" == "/dev/disk99" ]]
+  if [[ "${PCA_SYNTHETIC_ATTACH_PARSE_FAILURE:-0}" == "1" ]]; then
+    [[ "$2" == */mount ]]
+  else
+    [[ "$2" == "/dev/disk99s1" ]]
+  fi
   [[ "${PCA_SYNTHETIC_DETACH_FAILURE:-0}" != "1" ]]
 fi
 """,

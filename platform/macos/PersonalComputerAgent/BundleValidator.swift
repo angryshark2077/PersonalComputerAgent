@@ -74,7 +74,6 @@ struct BundleValidator: BundleValidating {
         self.architectureChecker = architectureChecker
         self.fileManager = fileManager
         self.expectedTeamIdentifier = expectedTeamIdentifier
-            ?? ProcessInfo.processInfo.environment["PCA_EXPECTED_TEAM_ID"]
             ?? (try? signatureChecker.verifyAndReadTeamIdentifier(of: Bundle.main.bundleURL))
     }
 

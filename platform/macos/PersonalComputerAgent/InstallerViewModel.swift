@@ -27,9 +27,10 @@ final class InstallerViewModel: ObservableObject {
     private let coordinator: (any InstallCoordinating)?
     private let sourceBundle: URL
     private let terminator: any ApplicationTerminating
-    private var installTask: Task<Void, Never>?
+    private var activeInstall: (generation: UUID, task: Task<Void, Never>)?
 
     var installationAvailable: Bool { coordinator != nil }
+    var isInstalling: Bool { activeInstall != nil }
 
     init(
         coordinator: any InstallCoordinating,
@@ -49,15 +50,30 @@ final class InstallerViewModel: ObservableObject {
     }
 
     func installAndStart() {
-        guard installTask == nil, coordinator != nil else { return }
-        installTask = Task { [weak self] in
-            await self?.performInstall()
+        guard activeInstall == nil, coordinator != nil else { return }
+        let generation = UUID()
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.performInstall(generation: generation)
         }
+        activeInstall = (generation, task)
     }
 
     func performInstall() async {
+        await runInstall()
+    }
+
+    private func performInstall(generation: UUID) async {
+        defer {
+            if activeInstall?.generation == generation {
+                activeInstall = nil
+            }
+        }
+        await runInstall()
+    }
+
+    private func runInstall() async {
         guard let coordinator else { return }
-        defer { installTask = nil }
         do {
             let result = try await coordinator.installOrFinish(from: sourceBundle) { [weak self] state in
                 self?.state = state
@@ -83,7 +99,6 @@ final class InstallerViewModel: ObservableObject {
     }
 
     func cancel() {
-        installTask?.cancel()
-        installTask = nil
+        activeInstall?.task.cancel()
     }
 }

@@ -35,11 +35,6 @@ struct UninstallCommand {
     }
 
     func execute(deleteData: Bool) async throws {
-        try await service.stopAndUnregister()
-        guard InstallPaths.entryExists(paths.rootURL) else { return }
-        let capturedIdentity = try rootIdentity ?? InstallPaths.identity(of: paths.rootURL)
-        try paths.revalidateRoot(capturedIdentity)
-
         if deleteData {
             writeLine("Persistent data to delete: \(paths.dataURL.path)")
             for scope in Self.credentialScopes {
@@ -50,6 +45,11 @@ struct UninstallCommand {
                 throw InstallError.uninstallConfirmationRequired
             }
         }
+
+        try await service.stopAndUnregister()
+        guard InstallPaths.entryExists(paths.rootURL) else { return }
+        let capturedIdentity = try rootIdentity ?? InstallPaths.identity(of: paths.rootURL)
+        try paths.revalidateRoot(capturedIdentity)
 
         try removeIfPresent(paths.appDirectoryURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
         try removeIfPresent(paths.runURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
@@ -63,11 +63,13 @@ struct UninstallCommand {
 
     private func removeIfPresent(_ target: URL, directChildOf parent: URL, rootIdentity: FileIdentity) throws {
         guard fileSystem.exists(target) else { return }
-        try fileSystem.quarantineAndDelete(
+        let targetIdentity = try fileSystem.identity(of: target)
+        try fileSystem.quarantineRootChild(
             target,
             parent: parent,
             paths: paths,
-            rootIdentity: rootIdentity
+            rootIdentity: rootIdentity,
+            expectedIdentity: targetIdentity
         )
     }
 

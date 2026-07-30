@@ -58,7 +58,7 @@ if ! command -v cargo >/dev/null 2>&1 && [[ -d "/opt/homebrew/opt/rustup/bin" ]]
   PATH="/opt/homebrew/opt/rustup/bin:$PATH"
   export PATH
 fi
-for tool in cargo swift xcodebuild codesign lipo hdiutil plutil; do
+for tool in cargo swift xcodebuild codesign lipo hdiutil plutil python3; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing required build tool: $tool" >&2; exit 1; }
 done
 

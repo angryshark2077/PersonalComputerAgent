@@ -96,19 +96,54 @@ final class ServiceController: ServiceControlling {
 }
 
 @MainActor
+protocol ProcessInspecting: AnyObject {
+    func inspect(processID: Int32) -> ProcessIdentity?
+}
+
+struct ProcessIdentity: Equatable, Sendable {
+    let userID: UInt32
+    let executableURL: URL
+    let startedAt: Date
+}
+
+@MainActor
+private final class DarwinProcessInspector: ProcessInspecting {
+    func inspect(processID: Int32) -> ProcessIdentity? {
+        var info = proc_bsdinfo()
+        let infoSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(processID, PROC_PIDTBSDINFO, 0, &info, infoSize) == infoSize else {
+            return nil
+        }
+
+        var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(processID, &path, UInt32(path.count)) > 0 else { return nil }
+        let start = TimeInterval(info.pbi_start_tvsec)
+            + TimeInterval(info.pbi_start_tvusec) / 1_000_000
+        return ProcessIdentity(
+            userID: info.pbi_uid,
+            executableURL: URL(fileURLWithPath: String(cString: path)).standardizedFileURL,
+            startedAt: Date(timeIntervalSince1970: start)
+        )
+    }
+}
+
+@MainActor
 final class RuntimeHealthChecker: HealthChecking {
     private let pollInterval: Duration
-    private let clockTolerance: TimeInterval
-    private let processValidator: @MainActor (Int32) -> Bool
+    private let processInspector: any ProcessInspecting
+
+    convenience init(
+        pollInterval: Duration = .milliseconds(250)
+    ) {
+        self.init(pollInterval: pollInterval, processInspector: DarwinProcessInspector())
+    }
 
     init(
         pollInterval: Duration = .milliseconds(250),
-        clockTolerance: TimeInterval = 1,
-        processValidator: @escaping @MainActor (Int32) -> Bool = RuntimeHealthChecker.isLiveOwnedProcess
+        processInspector: any ProcessInspecting
     ) {
         self.pollInterval = pollInterval
-        self.clockTolerance = clockTolerance
-        self.processValidator = processValidator
+        self.processInspector = processInspector
     }
 
     func waitForHealthy(
@@ -138,25 +173,28 @@ final class RuntimeHealthChecker: HealthChecking {
         }
 
         let statusURL = paths.runURL.appendingPathComponent("runtime-status.json")
-        let freshnessFloor = notBefore.addingTimeInterval(-clockTolerance)
+        let expectedExecutable = paths.installedAgentExecutableURL.standardizedFileURL.path
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         while clock.now < deadline {
             try Task.checkCancellation()
             if let attributes = try? FileManager.default.attributesOfItem(atPath: statusURL.path),
                let modifiedAt = attributes[.modificationDate] as? Date,
-               modifiedAt >= freshnessFloor,
+               modifiedAt >= notBefore,
                let data = try? Data(contentsOf: statusURL),
                let status = try? JSONDecoder().decode(RuntimeStatus.self, from: data),
                let heartbeat = ISO8601DateFormatter().date(from: status.heartbeatAt),
-               heartbeat >= freshnessFloor,
+               heartbeat >= notBefore,
                status.schemaVersion == 1,
                status.appVersion == expectedVersion,
                status.localHealthy,
                ["unpaired", "running", "degraded"].contains(status.agentStatus),
                !status.bridgeStatus.isEmpty,
                status.processID > 0,
-               processValidator(status.processID) {
+               let process = processInspector.inspect(processID: status.processID),
+               process.userID == geteuid(),
+               process.executableURL.standardizedFileURL.path == expectedExecutable,
+               process.startedAt >= notBefore {
                 return true
             }
             try await Task.sleep(for: pollInterval)
@@ -164,21 +202,6 @@ final class RuntimeHealthChecker: HealthChecking {
         return false
     }
 
-    private static func isLiveOwnedProcess(_ processID: Int32) -> Bool {
-        guard kill(processID, 0) == 0 || errno == EPERM else { return false }
-        let output = Pipe()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-o", "uid=", "-p", String(processID)]
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return false }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return false }
-        let raw = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return UInt32(raw) == geteuid()
-    }
 }
 
 @MainActor

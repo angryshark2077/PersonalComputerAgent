@@ -6,12 +6,16 @@ enum InstallFailure: String, Equatable, Sendable {
     case relaunch
     case registration
     case health
+    case recovery
 }
 
 enum RollbackRecovery: String, Equatable, Sendable {
     case restoredAndRelaunched
+    case restoredAndRelaunchedCleanupPending
     case restoredInactive
+    case restoredInactiveCleanupPending
     case firstInstallRemoved
+    case firstInstallRemovedCleanupPending
     case failed
 }
 
@@ -27,6 +31,9 @@ enum InstallError: Error, Equatable {
     case healthCheckFailed
     case uninstallConfirmationRequired
     case keychainDeletionFailed
+    case committedCleanupFailed
+    case rollbackCleanupFailed
+    case preparedCleanupFailed
     case transactionFailed(primary: InstallFailure, recovery: RollbackRecovery)
 }
 
@@ -45,6 +52,9 @@ extension InstallError: LocalizedError {
         case .healthCheckFailed: "The local runtime did not become healthy."
         case .uninstallConfirmationRequired: "Complete uninstall cancelled because the confirmation token did not match."
         case .keychainDeletionFailed: "The app files were removed, but a Keychain credential could not be deleted."
+        case .committedCleanupFailed: "The update is committed, but old update artifacts could not be removed."
+        case .rollbackCleanupFailed: "The previous version was restored, but recovery artifacts could not be removed."
+        case .preparedCleanupFailed: "The old version was not replaced, but prepared update artifacts could not be removed."
         case let .transactionFailed(primary, recovery):
             "Installation failed during \(primary.rawValue); recovery result: \(recovery.rawValue)."
         }
@@ -56,11 +66,21 @@ extension InstallError: LocalizedError {
             "Open System Settings > General > Login Items and allow Personal Computer Agent, then retry."
         case .keychainDeletionFailed:
             "Open Keychain Access and remove the Personal Computer Agent credential, then retry complete uninstall."
+        case .committedCleanupFailed:
+            "The new version remains active. Reopen it to retry safe cleanup; do not manually delete the install directory."
+        case .rollbackCleanupFailed, .preparedCleanupFailed:
+            "Reopen the signed installer to retry safe recovery cleanup. Persistent data was preserved."
         case let .transactionFailed(_, recovery):
             switch recovery {
             case .restoredAndRelaunched: "The previous version was restored and restarted; this installer will close."
-            case .restoredInactive: "The previous version was restored without changing its prior disabled service state."
+            case .restoredAndRelaunchedCleanupPending:
+                "The previous version was restored and restarted; cleanup will retry on its next launch."
+            case .restoredInactive: "The previous version was restored without changing its prior inactive service state."
+            case .restoredInactiveCleanupPending:
+                "The inactive previous version was restored; cleanup will retry on its next launch."
             case .firstInstallRemoved: "The incomplete first install was removed. Persistent data was preserved."
+            case .firstInstallRemovedCleanupPending:
+                "The incomplete first install was removed; recovery cleanup will retry safely."
             case .failed: "Recovery did not finish. Reopen a fresh signed installer; persistent data was preserved."
             }
         case .uninstallConfirmationRequired:
@@ -71,7 +91,10 @@ extension InstallError: LocalizedError {
     }
 
     var shouldTerminateCurrentProcess: Bool {
-        if case .transactionFailed(_, .restoredAndRelaunched) = self { return true }
+        if case .transactionFailed(_, let recovery) = self {
+            return recovery == .restoredAndRelaunched
+                || recovery == .restoredAndRelaunchedCleanupPending
+        }
         return false
     }
 }
@@ -80,6 +103,11 @@ struct FileIdentity: Codable, Equatable, Sendable {
     let device: UInt64
     let inode: UInt64
     let owner: UInt32
+}
+
+struct InstallLayoutIdentity: Codable, Equatable, Sendable {
+    let root: FileIdentity
+    let app: FileIdentity
 }
 
 struct InstallPaths: Equatable, Sendable {
@@ -93,6 +121,10 @@ struct InstallPaths: Equatable, Sendable {
 
     var installedExecutableURL: URL {
         installedBundleURL.appendingPathComponent("Contents/MacOS/PersonalComputerAgent")
+    }
+
+    var installedAgentExecutableURL: URL {
+        installedBundleURL.appendingPathComponent("Contents/Resources/bin/pca-agentd")
     }
 
     static func production(fileManager: FileManager = .default) throws -> InstallPaths {
@@ -111,9 +143,7 @@ struct InstallPaths: Equatable, Sendable {
         else { throw InstallError.unsafePath }
 
         let root = rootURL.standardizedFileURL
-        guard rawPath == root.path,
-              root.path != "/"
-        else { throw InstallError.unsafePath }
+        guard rawPath == root.path, root.path != "/" else { throw InstallError.unsafePath }
         self.rootURL = root
         appDirectoryURL = root.appendingPathComponent("App", isDirectory: true)
         dataURL = root.appendingPathComponent("Data", isDirectory: true)
@@ -129,18 +159,19 @@ struct InstallPaths: Equatable, Sendable {
         }
     }
 
-    /// The parent of `rootURL` is a trusted, user-owned Application Support boundary.
-    /// Within the managed root, every mutation is lexical, direct-child-only, and
-    /// revalidates the captured root identity immediately before the operation.
-    func prepareInstallLayout(fileManager: FileManager = .default) throws -> FileIdentity {
+    /// The parent of `rootURL` is a trusted, same-UID Application Support boundary.
+    /// Every managed mutation uses lexical direct children and revalidates the exact
+    /// root and App directory dev/inode/owner identities immediately beforehand.
+    func prepareInstallLayout(fileManager: FileManager = .default) throws -> InstallLayoutIdentity {
         try createOrValidateDirectory(rootURL, fileManager: fileManager)
-        let identity = try Self.identity(of: rootURL)
-        guard identity.owner == geteuid() else { throw InstallError.unsafePath }
-        for directory in [appDirectoryURL, runURL] {
-            try revalidateRoot(identity)
-            try createOrValidateDirectory(directory, fileManager: fileManager)
-        }
-        return identity
+        let rootIdentity = try Self.identity(of: rootURL)
+        guard rootIdentity.owner == geteuid() else { throw InstallError.unsafePath }
+        try createOrValidateDirectory(appDirectoryURL, fileManager: fileManager)
+        let appIdentity = try Self.identity(of: appDirectoryURL)
+        guard appIdentity.owner == geteuid() else { throw InstallError.unsafePath }
+        try revalidateLayout(InstallLayoutIdentity(root: rootIdentity, app: appIdentity))
+        try createOrValidateDirectory(runURL, fileManager: fileManager)
+        return InstallLayoutIdentity(root: rootIdentity, app: appIdentity)
     }
 
     func stagingBundleURL(identifier: UUID = UUID()) throws -> URL {
@@ -149,8 +180,20 @@ struct InstallPaths: Equatable, Sendable {
         return url
     }
 
+    func stagingBundleURL(name: String) throws -> URL {
+        guard name.hasPrefix(".staging-"), !name.contains("/") else { throw InstallError.unsafePath }
+        let url = appDirectoryURL.appendingPathComponent(name, isDirectory: true)
+        try Self.requireDirectChild(url, of: appDirectoryURL)
+        return url
+    }
+
     func revalidateRoot(_ expected: FileIdentity) throws {
         guard try Self.identity(of: rootURL) == expected else { throw InstallError.unsafePath }
+    }
+
+    func revalidateLayout(_ expected: InstallLayoutIdentity) throws {
+        try revalidateRoot(expected.root)
+        guard try Self.identity(of: appDirectoryURL) == expected.app else { throw InstallError.unsafePath }
     }
 
     func verifyDirectTarget(_ target: URL, parent: URL) throws {
@@ -165,7 +208,7 @@ struct InstallPaths: Equatable, Sendable {
 
     static func identity(of url: URL) throws -> FileIdentity {
         var info = stat()
-        guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else {
+        guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) != S_IFLNK else {
             throw InstallError.unsafePath
         }
         return FileIdentity(device: UInt64(info.st_dev), inode: UInt64(info.st_ino), owner: info.st_uid)
@@ -232,19 +275,60 @@ protocol Relaunching: AnyObject {
     func relaunch(executable: URL, arguments: [String]) throws
 }
 
+enum InstallPhase: String, Codable, Equatable, Sendable {
+    case prepared
+    case oldMoved
+    case newActivated
+    case committed
+    case rolledBack
+}
+
 struct InstallTransaction: Codable, Equatable, Sendable {
+    var phase: InstallPhase
     let previousVersion: String?
     let candidateVersion: String
     let priorServiceState: ServiceState
+    let stagingName: String
+    let expectedLayoutIdentity: InstallLayoutIdentity
+
+    init(
+        phase: InstallPhase,
+        previousVersion: String?,
+        candidateVersion: String,
+        priorServiceState: ServiceState,
+        stagingName: String,
+        expectedLayoutIdentity: InstallLayoutIdentity
+    ) {
+        self.phase = phase
+        self.previousVersion = previousVersion
+        self.candidateVersion = candidateVersion
+        self.priorServiceState = priorServiceState
+        self.stagingName = stagingName
+        self.expectedLayoutIdentity = expectedLayoutIdentity
+    }
+
+    func advancing(to phase: InstallPhase) -> InstallTransaction {
+        var copy = self
+        copy.phase = phase
+        return copy
+    }
 }
 
 protocol InstallFileOperating: AnyObject {
     func exists(_ url: URL) -> Bool
-    func copyItem(at source: URL, to destination: URL) throws
-    func moveItem(at source: URL, to destination: URL, paths: InstallPaths, rootIdentity: FileIdentity) throws
-    func quarantineAndDelete(_ target: URL, parent: URL, paths: InstallPaths, rootIdentity: FileIdentity) throws
-    func writeTransaction(_ transaction: InstallTransaction, paths: InstallPaths, rootIdentity: FileIdentity) throws
-    func readTransaction(paths: InstallPaths, rootIdentity: FileIdentity) throws -> InstallTransaction?
+    func identity(of url: URL) throws -> FileIdentity
+    func copyItem(at source: URL, to destination: URL, paths: InstallPaths, layoutIdentity: InstallLayoutIdentity) throws
+    func moveItem(at source: URL, to destination: URL, paths: InstallPaths, layoutIdentity: InstallLayoutIdentity) throws
+    func quarantineAndDelete(_ target: URL, parent: URL, paths: InstallPaths, layoutIdentity: InstallLayoutIdentity) throws
+    func quarantineRootChild(
+        _ target: URL,
+        parent: URL,
+        paths: InstallPaths,
+        rootIdentity: FileIdentity,
+        expectedIdentity: FileIdentity
+    ) throws
+    func writeTransaction(_ transaction: InstallTransaction, paths: InstallPaths, layoutIdentity: InstallLayoutIdentity) throws
+    func readTransaction(paths: InstallPaths, layoutIdentity: InstallLayoutIdentity) throws -> InstallTransaction?
 }
 
 final class LocalInstallFileSystem: InstallFileOperating {
@@ -253,52 +337,126 @@ final class LocalInstallFileSystem: InstallFileOperating {
     init(fileManager: FileManager = .default) { self.fileManager = fileManager }
 
     func exists(_ url: URL) -> Bool { InstallPaths.entryExists(url) }
+    func identity(of url: URL) throws -> FileIdentity { try InstallPaths.identity(of: url) }
 
-    func copyItem(at source: URL, to destination: URL) throws {
+    func copyItem(
+        at source: URL,
+        to destination: URL,
+        paths: InstallPaths,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        try paths.revalidateLayout(layoutIdentity)
+        try paths.verifyDirectTarget(destination, parent: paths.appDirectoryURL)
         guard !exists(destination) else { throw InstallError.unsafePath }
         try fileManager.copyItem(at: source, to: destination)
     }
 
-    func moveItem(at source: URL, to destination: URL, paths: InstallPaths, rootIdentity: FileIdentity) throws {
-        try paths.revalidateRoot(rootIdentity)
+    func moveItem(
+        at source: URL,
+        to destination: URL,
+        paths: InstallPaths,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        try paths.revalidateLayout(layoutIdentity)
         try paths.verifyDirectTarget(source, parent: paths.appDirectoryURL)
         try paths.verifyDirectTarget(destination, parent: paths.appDirectoryURL)
         guard exists(source), !exists(destination) else { throw InstallError.unsafePath }
         try fileManager.moveItem(at: source, to: destination)
     }
 
-    func quarantineAndDelete(_ target: URL, parent: URL, paths: InstallPaths, rootIdentity: FileIdentity) throws {
+    func quarantineAndDelete(
+        _ target: URL,
+        parent: URL,
+        paths: InstallPaths,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        guard exists(target) else { return }
+        try paths.revalidateLayout(layoutIdentity)
+        try quarantineAndDelete(
+            target,
+            parent: parent,
+            expectedIdentity: try identity(of: target),
+            revalidate: { try paths.revalidateLayout(layoutIdentity) }
+        )
+    }
+
+    func quarantineRootChild(
+        _ target: URL,
+        parent: URL,
+        paths: InstallPaths,
+        rootIdentity: FileIdentity,
+        expectedIdentity: FileIdentity
+    ) throws {
         guard exists(target) else { return }
         try paths.revalidateRoot(rootIdentity)
-        try paths.verifyDirectTarget(target, parent: parent)
-        let original = try entryIdentity(target)
-        let quarantine = parent.appendingPathComponent(".delete-\(UUID().uuidString)")
-        try paths.verifyDirectTarget(quarantine, parent: parent)
-        try fileManager.moveItem(at: target, to: quarantine)
-        guard try entryIdentity(quarantine) == original else { throw InstallError.unsafePath }
-        try paths.revalidateRoot(rootIdentity)
-        guard try entryIdentity(quarantine) == original else { throw InstallError.unsafePath }
-        try fileManager.removeItem(at: quarantine)
+        try quarantineAndDelete(
+            target,
+            parent: parent,
+            expectedIdentity: expectedIdentity,
+            revalidate: { try paths.revalidateRoot(rootIdentity) }
+        )
     }
 
-    func writeTransaction(_ transaction: InstallTransaction, paths: InstallPaths, rootIdentity: FileIdentity) throws {
-        try paths.revalidateRoot(rootIdentity)
+    func writeTransaction(
+        _ transaction: InstallTransaction,
+        paths: InstallPaths,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        try paths.revalidateLayout(layoutIdentity)
         try paths.verifyDirectTarget(paths.transactionURL, parent: paths.appDirectoryURL)
+        let temporary = paths.appDirectoryURL.appendingPathComponent(".transaction-\(UUID().uuidString).tmp")
+        try paths.verifyDirectTarget(temporary, parent: paths.appDirectoryURL)
         let data = try JSONEncoder().encode(transaction)
-        try data.write(to: paths.transactionURL, options: [.atomic])
+        try data.write(to: temporary, options: .withoutOverwriting)
+        let handle = try FileHandle(forWritingTo: temporary)
+        try handle.synchronize()
+        try handle.close()
+        try paths.revalidateLayout(layoutIdentity)
+        guard rename(temporary.path, paths.transactionURL.path) == 0 else {
+            throw InstallError.unsafePath
+        }
+        try paths.revalidateLayout(layoutIdentity)
+        let directoryDescriptor = open(paths.appDirectoryURL.path, O_RDONLY)
+        guard directoryDescriptor >= 0 else { throw InstallError.unsafePath }
+        defer { close(directoryDescriptor) }
+        guard fsync(directoryDescriptor) == 0 else { throw InstallError.unsafePath }
     }
 
-    func readTransaction(paths: InstallPaths, rootIdentity: FileIdentity) throws -> InstallTransaction? {
-        try paths.revalidateRoot(rootIdentity)
+    func readTransaction(
+        paths: InstallPaths,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws -> InstallTransaction? {
+        try paths.revalidateLayout(layoutIdentity)
         guard exists(paths.transactionURL) else { return nil }
         try paths.verifyDirectTarget(paths.transactionURL, parent: paths.appDirectoryURL)
         return try JSONDecoder().decode(InstallTransaction.self, from: Data(contentsOf: paths.transactionURL))
     }
 
-    private func entryIdentity(_ url: URL) throws -> FileIdentity {
-        var info = stat()
-        guard lstat(url.path, &info) == 0 else { throw InstallError.unsafePath }
-        return FileIdentity(device: UInt64(info.st_dev), inode: UInt64(info.st_ino), owner: info.st_uid)
+    private func quarantineAndDelete(
+        _ target: URL,
+        parent: URL,
+        expectedIdentity: FileIdentity,
+        revalidate: () throws -> Void
+    ) throws {
+        try revalidate()
+        try requireDirectChild(target, parent: parent)
+        guard try identity(of: target) == expectedIdentity else { throw InstallError.unsafePath }
+        let quarantine = parent.appendingPathComponent(".delete-\(UUID().uuidString)")
+        try requireDirectChild(quarantine, parent: parent)
+        try fileManager.moveItem(at: target, to: quarantine)
+        guard try identity(of: quarantine) == expectedIdentity else { throw InstallError.unsafePath }
+        try revalidate()
+        guard try identity(of: quarantine) == expectedIdentity else { throw InstallError.unsafePath }
+        try fileManager.removeItem(at: quarantine)
+    }
+
+    private func requireDirectChild(_ child: URL, parent: URL) throws {
+        guard child.standardizedFileURL.deletingLastPathComponent().path == parent.standardizedFileURL.path,
+              child.standardizedFileURL.path != parent.standardizedFileURL.path
+        else { throw InstallError.unsafePath }
+        if exists(child), try child.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true {
+            throw InstallError.unsafePath
+        }
     }
 }
 
@@ -351,55 +509,108 @@ final class InstallCoordinator: InstallCoordinating {
         from sourceBundle: URL,
         onState: @escaping @MainActor (InstallerState) -> Void = { _ in }
     ) async throws -> InstallResult {
-        let rootIdentity = try paths.prepareInstallLayout()
+        let layoutIdentity = try paths.prepareInstallLayout()
+        var inheritedPriorServiceState: ServiceState?
+        if let pending = try checkedTransaction(layoutIdentity: layoutIdentity) {
+            if pending.phase == .prepared,
+               try preparedOldBundleIsUntouched(pending) {
+                do { try cleanupPrepared(pending, layoutIdentity: layoutIdentity) }
+                catch { throw InstallError.preparedCleanupFailed }
+                inheritedPriorServiceState = pending.priorServiceState
+            } else if let recovery = try await recoverPendingInstallation(layoutIdentity: layoutIdentity) {
+                throw InstallError.transactionFailed(primary: .recovery, recovery: recovery)
+            }
+        }
         let staging = try paths.stagingBundleURL()
         let installedExists = fileSystem.exists(paths.installedBundleURL)
-        guard !fileSystem.exists(staging) else { throw InstallError.unsafePath }
+
+        if fileSystem.exists(paths.rollbackBundleURL) {
+            try fileSystem.quarantineAndDelete(
+                paths.rollbackBundleURL,
+                parent: paths.appDirectoryURL,
+                paths: paths,
+                layoutIdentity: layoutIdentity
+            )
+        }
 
         onState(.copying)
-        do { try fileSystem.copyItem(at: sourceBundle, to: staging) }
-        catch { throw InstallError.copyFailed }
-        defer {
-            if fileSystem.exists(staging) {
-                try? fileSystem.quarantineAndDelete(staging, parent: paths.appDirectoryURL, paths: paths, rootIdentity: rootIdentity)
-            }
+        do {
+            try fileSystem.copyItem(
+                at: sourceBundle,
+                to: staging,
+                paths: paths,
+                layoutIdentity: layoutIdentity
+            )
+        } catch let error as InstallError { throw error }
+        catch {
+            do { try cleanupUnjournaledStaging(staging, layoutIdentity: layoutIdentity) }
+            catch { throw InstallError.preparedCleanupFailed }
+            throw InstallError.copyFailed
         }
 
         onState(.validating)
-        let validated = try validator.validate(candidate: staging, replacing: installedExists ? paths.installedBundleURL : nil)
-        let transaction = InstallTransaction(
+        let validated: ValidatedBundle
+        do {
+            validated = try validator.validate(candidate: staging, replacing: installedExists ? paths.installedBundleURL : nil)
+        } catch {
+            do { try cleanupUnjournaledStaging(staging, layoutIdentity: layoutIdentity) }
+            catch { throw InstallError.preparedCleanupFailed }
+            throw error
+        }
+
+        var transaction = InstallTransaction(
+            phase: .prepared,
             previousVersion: validated.previousVersion,
             candidateVersion: validated.version,
-            priorServiceState: service.status()
+            priorServiceState: inheritedPriorServiceState ?? service.status(),
+            stagingName: staging.lastPathComponent,
+            expectedLayoutIdentity: layoutIdentity
         )
-        try fileSystem.writeTransaction(transaction, paths: paths, rootIdentity: rootIdentity)
-
-        do { try await service.stopAndUnregister() }
-        catch { throw InstallError.serviceRegistrationFailed }
-
-        var previousBundleMovedToRollback = false
         do {
-            if fileSystem.exists(paths.rollbackBundleURL) {
-                try fileSystem.quarantineAndDelete(paths.rollbackBundleURL, parent: paths.appDirectoryURL, paths: paths, rootIdentity: rootIdentity)
-            }
-            if installedExists {
-                try fileSystem.moveItem(at: paths.installedBundleURL, to: paths.rollbackBundleURL, paths: paths, rootIdentity: rootIdentity)
-                previousBundleMovedToRollback = true
-            }
-            try fileSystem.moveItem(at: staging, to: paths.installedBundleURL, paths: paths, rootIdentity: rootIdentity)
+            try fileSystem.writeTransaction(transaction, paths: paths, layoutIdentity: layoutIdentity)
         } catch {
-            throw await recover(
-                primary: .activation,
-                transaction: transaction,
-                rootIdentity: rootIdentity,
-                previousBundleMovedToRollback: previousBundleMovedToRollback
+            do { try cleanupUnjournaledStaging(staging, layoutIdentity: layoutIdentity) }
+            catch { throw InstallError.preparedCleanupFailed }
+            throw error
+        }
+
+        do {
+            try await service.stopAndUnregister()
+        } catch {
+            do { try cleanupPrepared(transaction, layoutIdentity: layoutIdentity) }
+            catch { throw InstallError.preparedCleanupFailed }
+            throw InstallError.serviceRegistrationFailed
+        }
+
+        do {
+            if installedExists {
+                try fileSystem.moveItem(
+                    at: paths.installedBundleURL,
+                    to: paths.rollbackBundleURL,
+                    paths: paths,
+                    layoutIdentity: layoutIdentity
+                )
+            }
+            transaction = transaction.advancing(to: .oldMoved)
+            try fileSystem.writeTransaction(transaction, paths: paths, layoutIdentity: layoutIdentity)
+            try fileSystem.moveItem(
+                at: staging,
+                to: paths.installedBundleURL,
+                paths: paths,
+                layoutIdentity: layoutIdentity
             )
+            transaction = transaction.advancing(to: .newActivated)
+            try fileSystem.writeTransaction(transaction, paths: paths, layoutIdentity: layoutIdentity)
+        } catch {
+            let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
+            throw InstallError.transactionFailed(primary: .activation, recovery: recovery)
         }
 
         do {
             try relauncher.relaunch(executable: paths.installedExecutableURL, arguments: ["--setup-installed"])
         } catch {
-            throw await recover(primary: .relaunch, transaction: transaction, rootIdentity: rootIdentity)
+            let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
+            throw InstallError.transactionFailed(primary: .relaunch, recovery: recovery)
         }
         return .relaunchRequired(previousVersion: validated.previousVersion, installedVersion: validated.version)
     }
@@ -407,8 +618,24 @@ final class InstallCoordinator: InstallCoordinating {
     func finishInstalledSetup(
         onState: @escaping @MainActor (InstallerState) -> Void = { _ in }
     ) async throws -> InstallResult {
-        let rootIdentity = try paths.prepareInstallLayout()
-        let transaction = try fileSystem.readTransaction(paths: paths, rootIdentity: rootIdentity)
+        let layoutIdentity = try paths.prepareInstallLayout()
+        let transaction = try checkedTransaction(layoutIdentity: layoutIdentity)
+        if let existing = transaction {
+            switch existing.phase {
+            case .committed:
+                try cleanupCommitted(existing, layoutIdentity: layoutIdentity)
+                return .success(version: existing.candidateVersion)
+            case .rolledBack:
+                try cleanupRolledBack(existing, layoutIdentity: layoutIdentity)
+                return .success(version: existing.previousVersion ?? existing.candidateVersion)
+            case .prepared, .oldMoved:
+                let recovery = try await recoverPendingInstallation(layoutIdentity: layoutIdentity) ?? .failed
+                throw InstallError.transactionFailed(primary: .recovery, recovery: recovery)
+            case .newActivated:
+                break
+            }
+        }
+
         let installedVersion = try validator.version(at: paths.installedBundleURL)
         let attemptStartedAt = Date()
         onState(.starting)
@@ -416,7 +643,8 @@ final class InstallCoordinator: InstallCoordinating {
             try await service.registerAndWaitForApproval { onState(.waitingApproval) }
         } catch {
             if let transaction {
-                throw await recover(primary: .registration, transaction: transaction, rootIdentity: rootIdentity)
+                let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
+                throw InstallError.transactionFailed(primary: .registration, recovery: recovery)
             }
             throw (error as? InstallError) ?? InstallError.serviceRegistrationFailed
         }
@@ -431,76 +659,242 @@ final class InstallCoordinator: InstallCoordinating {
             )
         } catch {
             if let transaction {
-                throw await recover(primary: .health, transaction: transaction, rootIdentity: rootIdentity)
+                let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
+                throw InstallError.transactionFailed(primary: .health, recovery: recovery)
             }
             throw error
         }
         guard healthy else {
             if let transaction {
-                throw await recover(primary: .health, transaction: transaction, rootIdentity: rootIdentity)
+                let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
+                throw InstallError.transactionFailed(primary: .health, recovery: recovery)
             }
             throw InstallError.healthCheckFailed
         }
 
-        if fileSystem.exists(paths.rollbackBundleURL) {
-            try? fileSystem.quarantineAndDelete(paths.rollbackBundleURL, parent: paths.appDirectoryURL, paths: paths, rootIdentity: rootIdentity)
-        }
-        if fileSystem.exists(paths.transactionURL) {
-            try? fileSystem.quarantineAndDelete(paths.transactionURL, parent: paths.appDirectoryURL, paths: paths, rootIdentity: rootIdentity)
+        if let existing = transaction {
+            let committed = existing.advancing(to: .committed)
+            do { try fileSystem.writeTransaction(committed, paths: paths, layoutIdentity: layoutIdentity) }
+            catch {
+                let recovery = await recoverFailure(existing, layoutIdentity: layoutIdentity)
+                throw InstallError.transactionFailed(primary: .health, recovery: recovery)
+            }
+            try cleanupCommitted(committed, layoutIdentity: layoutIdentity)
         }
         onState(.success)
         return .success(version: installedVersion)
     }
 
-    private func recover(
-        primary: InstallFailure,
-        transaction: InstallTransaction,
-        rootIdentity: FileIdentity,
-        previousBundleMovedToRollback: Bool = true
-    ) async -> InstallError {
+    func recoverPendingInstallation() async throws -> RollbackRecovery? {
+        let layoutIdentity = try paths.prepareInstallLayout()
+        return try await recoverPendingInstallation(layoutIdentity: layoutIdentity)
+    }
+
+    private func recoverPendingInstallation(
+        layoutIdentity: InstallLayoutIdentity
+    ) async throws -> RollbackRecovery? {
+        guard let transaction = try checkedTransaction(layoutIdentity: layoutIdentity) else { return nil }
+        switch transaction.phase {
+        case .prepared:
+            if transaction.previousVersion != nil,
+               !fileSystem.exists(paths.installedBundleURL),
+               fileSystem.exists(paths.rollbackBundleURL) {
+                return await recoverFailure(transaction.advancing(to: .oldMoved), layoutIdentity: layoutIdentity)
+            }
+            do { try cleanupPrepared(transaction, layoutIdentity: layoutIdentity) }
+            catch { throw InstallError.preparedCleanupFailed }
+            return nil
+        case .oldMoved, .newActivated:
+            return await recoverFailure(transaction, layoutIdentity: layoutIdentity)
+        case .committed:
+            try cleanupCommitted(transaction, layoutIdentity: layoutIdentity)
+            return nil
+        case .rolledBack:
+            try cleanupRolledBack(transaction, layoutIdentity: layoutIdentity)
+            return nil
+        }
+    }
+
+    private func recoverFailure(
+        _ transaction: InstallTransaction,
+        layoutIdentity: InstallLayoutIdentity
+    ) async -> RollbackRecovery {
         do {
             try await service.stopAndUnregister()
+            let recovery: RollbackRecovery
             if let previousVersion = transaction.previousVersion {
-                if previousBundleMovedToRollback {
-                    guard fileSystem.exists(paths.rollbackBundleURL) else {
-                        return .transactionFailed(primary: primary, recovery: .failed)
-                    }
-                    if fileSystem.exists(paths.installedBundleURL) {
-                        try fileSystem.quarantineAndDelete(paths.installedBundleURL, parent: paths.appDirectoryURL, paths: paths, rootIdentity: rootIdentity)
-                    }
-                    try fileSystem.moveItem(at: paths.rollbackBundleURL, to: paths.installedBundleURL, paths: paths, rootIdentity: rootIdentity)
-                } else {
-                    guard fileSystem.exists(paths.installedBundleURL),
-                          (try? validator.version(at: paths.installedBundleURL)) == previousVersion
-                    else { return .transactionFailed(primary: primary, recovery: .failed) }
-                }
-                if transaction.priorServiceState == .enabled || transaction.priorServiceState == .requiresApproval {
+                try restorePreviousBundle(previousVersion, layoutIdentity: layoutIdentity)
+                if transaction.priorServiceState == .enabled {
                     let attempt = Date()
+                    try await service.registerAndWaitForApproval {}
                     try relauncher.relaunch(
                         executable: paths.installedExecutableURL,
                         arguments: ["--setup-installed", "--rollback-recovered"]
                     )
-                    let healthy = try await health.waitForHealthy(
+                    guard try await health.waitForHealthy(
                         paths: paths,
                         expectedVersion: previousVersion,
                         notBefore: attempt,
                         timeout: .seconds(5)
-                    )
-                    guard healthy else { return .transactionFailed(primary: primary, recovery: .failed) }
-                    return .transactionFailed(primary: primary, recovery: .restoredAndRelaunched)
+                    ) else { return .failed }
+                    recovery = .restoredAndRelaunched
+                } else {
+                    recovery = .restoredInactive
                 }
-                return .transactionFailed(primary: primary, recovery: .restoredInactive)
+            } else {
+                if fileSystem.exists(paths.installedBundleURL) {
+                    try fileSystem.quarantineAndDelete(
+                        paths.installedBundleURL,
+                        parent: paths.appDirectoryURL,
+                        paths: paths,
+                        layoutIdentity: layoutIdentity
+                    )
+                }
+                if fileSystem.exists(paths.runURL) {
+                    try fileSystem.quarantineAndDelete(
+                        paths.runURL,
+                        parent: paths.rootURL,
+                        paths: paths,
+                        layoutIdentity: layoutIdentity
+                    )
+                }
+                recovery = .firstInstallRemoved
             }
 
-            if fileSystem.exists(paths.installedBundleURL) {
-                try fileSystem.quarantineAndDelete(paths.installedBundleURL, parent: paths.appDirectoryURL, paths: paths, rootIdentity: rootIdentity)
+            let rolledBack = transaction.advancing(to: .rolledBack)
+            try fileSystem.writeTransaction(rolledBack, paths: paths, layoutIdentity: layoutIdentity)
+            do { try cleanupRolledBack(rolledBack, layoutIdentity: layoutIdentity) }
+            catch {
+                switch recovery {
+                case .restoredAndRelaunched: return .restoredAndRelaunchedCleanupPending
+                case .restoredInactive: return .restoredInactiveCleanupPending
+                case .firstInstallRemoved: return .firstInstallRemovedCleanupPending
+                default: return .failed
+                }
             }
-            if fileSystem.exists(paths.runURL) {
-                try fileSystem.quarantineAndDelete(paths.runURL, parent: paths.rootURL, paths: paths, rootIdentity: rootIdentity)
-            }
-            return .transactionFailed(primary: primary, recovery: .firstInstallRemoved)
+            return recovery
         } catch {
-            return .transactionFailed(primary: primary, recovery: .failed)
+            return .failed
+        }
+    }
+
+    private func restorePreviousBundle(
+        _ previousVersion: String,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        if fileSystem.exists(paths.rollbackBundleURL) {
+            if fileSystem.exists(paths.installedBundleURL) {
+                try fileSystem.quarantineAndDelete(
+                    paths.installedBundleURL,
+                    parent: paths.appDirectoryURL,
+                    paths: paths,
+                    layoutIdentity: layoutIdentity
+                )
+            }
+            try fileSystem.moveItem(
+                at: paths.rollbackBundleURL,
+                to: paths.installedBundleURL,
+                paths: paths,
+                layoutIdentity: layoutIdentity
+            )
+        }
+        guard fileSystem.exists(paths.installedBundleURL),
+              try validator.version(at: paths.installedBundleURL) == previousVersion
+        else { throw InstallError.activationFailed }
+    }
+
+    private func checkedTransaction(
+        layoutIdentity: InstallLayoutIdentity
+    ) throws -> InstallTransaction? {
+        let transaction = try fileSystem.readTransaction(paths: paths, layoutIdentity: layoutIdentity)
+        if let transaction {
+            guard transaction.expectedLayoutIdentity == layoutIdentity else { throw InstallError.unsafePath }
+        }
+        return transaction
+    }
+
+    private func preparedOldBundleIsUntouched(_ transaction: InstallTransaction) throws -> Bool {
+        guard !fileSystem.exists(paths.rollbackBundleURL) else { return false }
+        if let previousVersion = transaction.previousVersion {
+            return try fileSystem.exists(paths.installedBundleURL)
+                && (try validator.version(at: paths.installedBundleURL)) == previousVersion
+        }
+        return !fileSystem.exists(paths.installedBundleURL)
+    }
+
+    private func cleanupUnjournaledStaging(
+        _ staging: URL,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        if fileSystem.exists(staging) {
+            try fileSystem.quarantineAndDelete(
+                staging,
+                parent: paths.appDirectoryURL,
+                paths: paths,
+                layoutIdentity: layoutIdentity
+            )
+        }
+    }
+
+    private func cleanupPrepared(
+        _ transaction: InstallTransaction,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        let staging = try paths.stagingBundleURL(name: transaction.stagingName)
+        try cleanupUnjournaledStaging(staging, layoutIdentity: layoutIdentity)
+        try removeTransaction(layoutIdentity: layoutIdentity)
+    }
+
+    private func cleanupCommitted(
+        _ transaction: InstallTransaction,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        do {
+            let staging = try paths.stagingBundleURL(name: transaction.stagingName)
+            try cleanupUnjournaledStaging(staging, layoutIdentity: layoutIdentity)
+            if fileSystem.exists(paths.rollbackBundleURL) {
+                try fileSystem.quarantineAndDelete(
+                    paths.rollbackBundleURL,
+                    parent: paths.appDirectoryURL,
+                    paths: paths,
+                    layoutIdentity: layoutIdentity
+                )
+            }
+            try removeTransaction(layoutIdentity: layoutIdentity)
+        } catch {
+            throw InstallError.committedCleanupFailed
+        }
+    }
+
+    private func cleanupRolledBack(
+        _ transaction: InstallTransaction,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        do {
+            let staging = try paths.stagingBundleURL(name: transaction.stagingName)
+            try cleanupUnjournaledStaging(staging, layoutIdentity: layoutIdentity)
+            if fileSystem.exists(paths.rollbackBundleURL) {
+                try fileSystem.quarantineAndDelete(
+                    paths.rollbackBundleURL,
+                    parent: paths.appDirectoryURL,
+                    paths: paths,
+                    layoutIdentity: layoutIdentity
+                )
+            }
+            try removeTransaction(layoutIdentity: layoutIdentity)
+        } catch {
+            throw InstallError.rollbackCleanupFailed
+        }
+    }
+
+    private func removeTransaction(layoutIdentity: InstallLayoutIdentity) throws {
+        if fileSystem.exists(paths.transactionURL) {
+            try fileSystem.quarantineAndDelete(
+                paths.transactionURL,
+                parent: paths.appDirectoryURL,
+                paths: paths,
+                layoutIdentity: layoutIdentity
+            )
         }
     }
 }

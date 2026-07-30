@@ -19,7 +19,8 @@ attached_device=""
 mounted=0
 cleanup() {
   if [[ "$mounted" -eq 1 ]]; then
-    hdiutil detach "$attached_device" >/dev/null 2>&1 || true
+    detach_target=${attached_device:-$mount_point}
+    hdiutil detach "$detach_target" >/dev/null 2>&1 || true
   fi
   if [[ -n "$temporary_directory" && -d "$temporary_directory" ]]; then
     rm -rf "$temporary_directory"
@@ -39,13 +40,21 @@ case "$input" in
     mkdir -m 0700 "$mount_point"
     attach_plist=$(hdiutil attach -readonly -nobrowse -plist -mountpoint "$mount_point" "$input") \
       || fail "could not attach DMG read-only"
-    attached_device=$(plutil -extract system-entities.0.dev-entry raw -o - - <<<"$attach_plist") \
-      || fail "could not read attached DMG device"
-    attached_mount=$(plutil -extract system-entities.0.mount-point raw -o - - <<<"$attach_plist") \
-      || fail "could not read attached DMG mount point"
-    [[ "$attached_device" == /dev/disk* && "$attached_mount" == "$mount_point" ]] \
-      || fail "attached DMG identity did not match requested mount"
     mounted=1
+    command -v python3 >/dev/null 2>&1 || fail "python3 is required to parse hdiutil output"
+    attached_device=$(python3 -c '
+import plistlib, sys
+requested = sys.argv[1]
+document = plistlib.load(sys.stdin.buffer)
+matches = [
+    item.get("dev-entry")
+    for item in document.get("system-entities", [])
+    if item.get("mount-point") == requested and isinstance(item.get("dev-entry"), str)
+]
+if len(matches) != 1 or not matches[0].startswith("/dev/disk"):
+    raise SystemExit(1)
+print(matches[0])
+' "$mount_point" <<<"$attach_plist") || fail "could not identify the exact mounted DMG device"
     shopt -s nullglob dotglob
     payload=("$mount_point"/*)
     [[ ${#payload[@]} -eq 1 ]] || fail "DMG must contain a single app and no unexpected payload"
