@@ -1,63 +1,19 @@
-# S1 · Rust Core + Swift Bridge
+# S1 · Rust Core + Swift Bridge (split)
 
-## Must read
+> Superseded as an executable task card by
+> `tasks/S1A_LOCAL_RUNTIME_INSTALLER.md` and
+> `tasks/S1B_CLOUD_CONTROL_PLANE.md`. This file preserves the original S1
+> scope as a cross-reference only; it has no independent deliverables or exit
+> gate.
 
-Spec §6, §11, §12, §13, §18, §20.3, §24-25.
+## Approved order
 
-## Objective
+1. S1A · Local Runtime and Self-Install DMG
+2. S1B · Cloud Control Plane
+3. S2 · Core Collectors
+4. S3 · Complete Sync
 
-Build a durable resident Rust `agentd` and a minimal Swift PlatformBridge without business Collector scope creep.
-
-## Deliverables
-
-### Rust
-
-- single-instance lock
-- structured tracing and crash marker
-- Agent state machine
-- Keychain Port
-- SQLite DbActor
-- WAL, foreign keys, busy timeout
-- immutable migration runner
-- integrity and smoke checks
-- Event Bus
-- local Event Store and Outbox transaction
-- Heartbeat worker
-- Bridge client/supervisor
-- graceful shutdown and sleep hooks
-
-### Swift
-
-- Bridge server
-- protocol handshake
-- capability probe
-- TCC status read
-- Power sleep/wake events
-- SMAppService registration
-- minimal Setup/Repair placeholder
-
-## Non-goals
-
-- No Screenshot/Activity implementation beyond fixture capability.
-- No WeChat.
-- No cloud sync beyond heartbeat interface fixture.
-- No local daily UI.
-
-## Failure paths
-
-- Bridge missing
-- Bridge crashes after handshake
-- incompatible protocol
-- SQLite locked/corrupt
-- migration failure
-- Keychain unavailable
-- duplicate agent instance
-- sleep during queued write
-
-## Exit gate
-
-- Login LaunchAgent starts Rust agentd.
-- Heartbeat starts in <5s without waiting for providers.
-- Bridge crash degrades only bridge-dependent capabilities and reconnects.
-- SQLite Event + Outbox commit survives process kill.
-- Migration failure enters repair and restores backup.
+S2 remains before S3. S1A is the only active self-use installation channel:
+`$HOME/Library/Application Support/PersonalComputerAgent/App/PersonalComputerAgent.app`.
+It uses a user LaunchAgent and never root or a LaunchDaemon. The future public
+channel may use `/Applications` only through a separate decision.

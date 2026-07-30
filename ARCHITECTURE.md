@@ -39,6 +39,23 @@ Swift PlatformBridge
 
 ## 2. Process boundaries
 
+### 2.1 S1A installation channel
+
+The S1A self-use channel installs only to
+`$HOME/Library/Application Support/PersonalComputerAgent/App/PersonalComputerAgent.app`.
+Its persistent `Data/` and ephemeral `Run/` directories are siblings under the
+same root; bundle replacement changes only `App/`.
+
+`agentd` runs through a user-level `SMAppService` LaunchAgent in the logged-in
+user session. S1A never uses root, a LaunchDaemon, or a privileged helper. The
+`/Applications/PersonalComputerAgent.app` location in the product specification
+is reserved for a separately approved future public channel, not an S1A
+fallback or simultaneous target. See `docs/INSTALLATION_CHANNELS.md` and
+`docs/adr/ADR-0005-user-level-self-install-channel.md`.
+
+The topology's Sparkle coordination is a later release capability and is not
+part of S1A.
+
 ### Rust `agentd`
 
 负责：
