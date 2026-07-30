@@ -12,47 +12,73 @@ enum InstallerState: Equatable, Sendable {
 }
 
 @MainActor
+protocol ApplicationTerminating: AnyObject {
+    func terminate()
+}
+
+@MainActor
+final class NSApplicationTerminator: ApplicationTerminating {
+    func terminate() { NSApplication.shared.terminate(nil) }
+}
+
+@MainActor
 final class InstallerViewModel: ObservableObject {
     @Published private(set) var state: InstallerState = .ready
-    private let coordinator: InstallCoordinator?
+    private let coordinator: (any InstallCoordinating)?
     private let sourceBundle: URL
+    private let terminator: any ApplicationTerminating
     private var installTask: Task<Void, Never>?
 
     var installationAvailable: Bool { coordinator != nil }
 
-    init(coordinator: InstallCoordinator, sourceBundle: URL) {
+    init(
+        coordinator: any InstallCoordinating,
+        sourceBundle: URL,
+        terminator: any ApplicationTerminating = NSApplicationTerminator()
+    ) {
         self.coordinator = coordinator
         self.sourceBundle = sourceBundle
+        self.terminator = terminator
     }
 
     init(failureMessage: String, recoveryAction: String) {
         coordinator = nil
         sourceBundle = Bundle.main.bundleURL
+        terminator = NSApplicationTerminator()
         state = .failed(message: failureMessage, recoveryAction: recoveryAction)
     }
 
     func installAndStart() {
-        guard installTask == nil, let coordinator else { return }
-        installTask = Task {
-            defer { installTask = nil }
-            do {
-                let result = try await coordinator.installOrFinish(from: sourceBundle) { [weak self] state in
-                    self?.state = state
-                }
-                if case .relaunchRequired = result {
-                    NSApplication.shared.terminate(nil)
-                }
-            } catch let error as InstallError {
-                state = .failed(
-                    message: error.localizedDescription,
-                    recoveryAction: error.recoveryAction
-                )
-            } catch {
-                state = .failed(
-                    message: "Installation failed without changing persistent data.",
-                    recoveryAction: "Retry with a fresh signed installer."
-                )
+        guard installTask == nil, coordinator != nil else { return }
+        installTask = Task { [weak self] in
+            await self?.performInstall()
+        }
+    }
+
+    func performInstall() async {
+        guard let coordinator else { return }
+        defer { installTask = nil }
+        do {
+            let result = try await coordinator.installOrFinish(from: sourceBundle) { [weak self] state in
+                self?.state = state
             }
+            if case .relaunchRequired = result {
+                terminator.terminate()
+            }
+        } catch let error as InstallError {
+            if error.shouldTerminateCurrentProcess {
+                terminator.terminate()
+                return
+            }
+            state = .failed(
+                message: error.localizedDescription,
+                recoveryAction: error.recoveryAction
+            )
+        } catch {
+            state = .failed(
+                message: "Installation failed without changing persistent data.",
+                recoveryAction: "Retry with a fresh signed installer."
+            )
         }
     }
 

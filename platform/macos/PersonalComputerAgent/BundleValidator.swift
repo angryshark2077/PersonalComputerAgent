@@ -1,7 +1,7 @@
 import Foundation
 
 protocol SignatureChecking: Sendable {
-    func verify(bundle: URL, nestedExecutables: [URL]) throws
+    func verifyAndReadTeamIdentifier(of target: URL) throws -> String
 }
 
 protocol ArchitectureChecking: Sendable {
@@ -9,17 +9,32 @@ protocol ArchitectureChecking: Sendable {
 }
 
 struct ProductionSignatureChecker: SignatureChecking {
-    func verify(bundle: URL, nestedExecutables: [URL]) throws {
-        for target in nestedExecutables + [bundle] {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-            process.arguments = ["--verify", "--strict", "--verbose=2", target.path]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { throw InstallError.invalidBundle }
-        }
+    func verifyAndReadTeamIdentifier(of target: URL) throws -> String {
+        let verify = Process()
+        verify.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        verify.arguments = ["--verify", "--strict", "--verbose=2", target.path]
+        verify.standardOutput = FileHandle.nullDevice
+        verify.standardError = FileHandle.nullDevice
+        try verify.run()
+        verify.waitUntilExit()
+        guard verify.terminationStatus == 0 else { throw InstallError.invalidBundle }
+
+        let details = Pipe()
+        let inspect = Process()
+        inspect.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        inspect.arguments = ["-d", "--verbose=4", target.path]
+        inspect.standardOutput = FileHandle.nullDevice
+        inspect.standardError = details
+        try inspect.run()
+        inspect.waitUntilExit()
+        guard inspect.terminationStatus == 0 else { throw InstallError.invalidBundle }
+        let output = String(decoding: details.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        guard let line = output.split(whereSeparator: \ .isNewline)
+            .first(where: { $0.hasPrefix("TeamIdentifier=") })
+        else { throw InstallError.invalidBundle }
+        let team = line.dropFirst("TeamIdentifier=".count)
+        guard !team.isEmpty, team != "not set" else { throw InstallError.invalidBundle }
+        return String(team)
     }
 }
 
@@ -47,8 +62,10 @@ struct BundleValidator: BundleValidating {
     private let signatureChecker: any SignatureChecking
     private let architectureChecker: any ArchitectureChecking
     private let fileManager: FileManager
+    private let expectedTeamIdentifier: String?
 
     init(
+        expectedTeamIdentifier: String? = nil,
         signatureChecker: any SignatureChecking = ProductionSignatureChecker(),
         architectureChecker: any ArchitectureChecking = ProductionArchitectureChecker(),
         fileManager: FileManager = .default
@@ -56,6 +73,9 @@ struct BundleValidator: BundleValidating {
         self.signatureChecker = signatureChecker
         self.architectureChecker = architectureChecker
         self.fileManager = fileManager
+        self.expectedTeamIdentifier = expectedTeamIdentifier
+            ?? ProcessInfo.processInfo.environment["PCA_EXPECTED_TEAM_ID"]
+            ?? (try? signatureChecker.verifyAndReadTeamIdentifier(of: Bundle.main.bundleURL))
     }
 
     func validate(candidate: URL, replacing installed: URL?) throws -> ValidatedBundle {
@@ -93,7 +113,14 @@ struct BundleValidator: BundleValidating {
            Version(candidateVersion).compare(to: Version(previousVersion)) == .orderedAscending {
             throw InstallError.downgradeRejected(installed: previousVersion, candidate: candidateVersion)
         }
-        try signatureChecker.verify(bundle: candidate, nestedExecutables: [agent, bridge])
+        guard let expectedTeamIdentifier, !expectedTeamIdentifier.isEmpty else {
+            throw InstallError.invalidBundle
+        }
+        for signedTarget in [candidate, agent, bridge] {
+            guard try signatureChecker.verifyAndReadTeamIdentifier(of: signedTarget) == expectedTeamIdentifier else {
+                throw InstallError.invalidBundle
+            }
+        }
         return ValidatedBundle(version: candidateVersion, previousVersion: previousVersion)
     }
 

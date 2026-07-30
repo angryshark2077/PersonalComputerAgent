@@ -25,6 +25,17 @@ done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
 [[ "$output" == *.dmg ]] || usage
 
+repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ "$output" = /* ]]; then
+  final_output=$output
+else
+  final_output="$repository_root/$output"
+fi
+[[ ! -e "$final_output" && ! -L "$final_output" ]] || {
+  echo "output already exists; refusing to overwrite it" >&2
+  exit 1
+}
+
 for preflight_tool in security openssl; do
   command -v "$preflight_tool" >/dev/null 2>&1 || {
     echo "missing required build tool: $preflight_tool" >&2
@@ -43,7 +54,7 @@ if ! grep -Eq "(^|,)OU=$team_id(,|$)" <<<"${certificate_subject#subject=}"; then
   exit 1
 fi
 
-if [[ -d "/opt/homebrew/opt/rustup/bin" ]]; then
+if ! command -v cargo >/dev/null 2>&1 && [[ -d "/opt/homebrew/opt/rustup/bin" ]]; then
   PATH="/opt/homebrew/opt/rustup/bin:$PATH"
   export PATH
 fi
@@ -51,25 +62,23 @@ for tool in cargo swift xcodebuild codesign lipo hdiutil plutil; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing required build tool: $tool" >&2; exit 1; }
 done
 
-repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 project_dir="$repository_root/platform/macos"
-build_inputs="$project_dir/.build-inputs/s1a"
 temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/pca-s1a-build.XXXXXX")
+build_inputs="$temporary_directory/build-inputs"
 cleanup() {
-  rm -rf "$build_inputs"
   rm -rf "$temporary_directory"
 }
 trap cleanup EXIT INT TERM
 
 mkdir -m 0700 -p "$build_inputs"
 
-cargo build \
+PCA_APP_VERSION="$version" cargo build \
   --manifest-path "$repository_root/Cargo.toml" \
   --release \
-  --target arm64-apple-darwin \
+  --target aarch64-apple-darwin \
   -p pca-agentd
 install -m 0755 \
-  "$repository_root/target/arm64-apple-darwin/release/pca-agentd" \
+  "$repository_root/target/aarch64-apple-darwin/release/pca-agentd" \
   "$build_inputs/pca-agentd"
 
 swift build \
@@ -88,7 +97,7 @@ install -m 0644 \
   "$build_inputs/com.pca.agentd.plist"
 
 archive="$temporary_directory/PersonalComputerAgent.xcarchive"
-xcodebuild archive \
+PCA_PREBUILT_DIR="$build_inputs" xcodebuild archive \
   -project "$project_dir/PersonalComputerAgent.xcodeproj" \
   -scheme PersonalComputerAgent \
   -configuration Release \
@@ -99,6 +108,7 @@ xcodebuild archive \
   DEVELOPMENT_TEAM="$team_id" \
   CODE_SIGN_IDENTITY="$identity" \
   CODE_SIGN_STYLE=Manual \
+  PCA_PREBUILT_DIR="$build_inputs" \
   MARKETING_VERSION="$version" \
   CURRENT_PROJECT_VERSION=1
 
@@ -131,7 +141,7 @@ grep -Fq "TeamIdentifier=$team_id" <<<"$signature_details" || {
   echo "signed app TeamIdentifier does not match --team-id" >&2
   exit 1
 }
-"$repository_root/scripts/verify-s1a-bundle.sh" "$app"
+"$repository_root/scripts/verify-s1a-bundle.sh" --team-id "$team_id" "$app"
 
 temporary_dmg="$temporary_directory/PersonalComputerAgent-S1A-arm64.dmg"
 hdiutil create \
@@ -140,13 +150,12 @@ hdiutil create \
   -volname "Personal Computer Agent" \
   -srcfolder "$dmg_root" \
   "$temporary_dmg" >/dev/null
-"$repository_root/scripts/verify-s1a-bundle.sh" "$temporary_dmg"
+"$repository_root/scripts/verify-s1a-bundle.sh" --team-id "$team_id" "$temporary_dmg"
 
-if [[ "$output" = /* ]]; then
-  final_output=$output
-else
-  final_output="$repository_root/$output"
-fi
 mkdir -p "$(dirname "$final_output")"
-mv -f "$temporary_dmg" "$final_output"
+[[ ! -e "$final_output" && ! -L "$final_output" ]] || {
+  echo "output appeared during build; refusing to overwrite it" >&2
+  exit 1
+}
+mv "$temporary_dmg" "$final_output"
 echo "S1A DMG CREATED: $final_output"

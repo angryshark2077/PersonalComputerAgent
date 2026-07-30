@@ -9,14 +9,36 @@ struct UninstallCommand {
     ]
 
     let paths: InstallPaths
+    let rootIdentity: FileIdentity?
     let service: any ServiceControlling
-    var fileManager: FileManager = .default
-    var readConfirmation: () -> String? = { readLine() }
-    var writeLine: (String) -> Void = { print($0) }
-    var deleteCredential: @MainActor (KeychainScope) throws -> Void = Self.deleteCredential
+    let fileSystem: any InstallFileOperating
+    var readConfirmation: () -> String?
+    var writeLine: (String) -> Void
+    var deleteCredential: @MainActor (KeychainScope) throws -> Void
+
+    init(
+        paths: InstallPaths,
+        rootIdentity: FileIdentity? = nil,
+        service: any ServiceControlling,
+        fileSystem: any InstallFileOperating = LocalInstallFileSystem(),
+        readConfirmation: @escaping () -> String? = { readLine() },
+        writeLine: @escaping (String) -> Void = { print($0) },
+        deleteCredential: @escaping @MainActor (KeychainScope) throws -> Void = Self.deleteCredential
+    ) {
+        self.paths = paths
+        self.rootIdentity = rootIdentity
+        self.service = service
+        self.fileSystem = fileSystem
+        self.readConfirmation = readConfirmation
+        self.writeLine = writeLine
+        self.deleteCredential = deleteCredential
+    }
 
     func execute(deleteData: Bool) async throws {
         try await service.stopAndUnregister()
+        guard InstallPaths.entryExists(paths.rootURL) else { return }
+        let capturedIdentity = try rootIdentity ?? InstallPaths.identity(of: paths.rootURL)
+        try paths.revalidateRoot(capturedIdentity)
 
         if deleteData {
             writeLine("Persistent data to delete: \(paths.dataURL.path)")
@@ -29,20 +51,24 @@ struct UninstallCommand {
             }
         }
 
-        try removeIfPresent(paths.appDirectoryURL, directChildOf: paths.rootURL)
-        try removeIfPresent(paths.runURL, directChildOf: paths.rootURL)
+        try removeIfPresent(paths.appDirectoryURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
+        try removeIfPresent(paths.runURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
         if deleteData {
-            try removeIfPresent(paths.dataURL, directChildOf: paths.rootURL)
+            try removeIfPresent(paths.dataURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
             for scope in Self.credentialScopes {
                 try deleteCredential(scope)
             }
         }
     }
 
-    private func removeIfPresent(_ target: URL, directChildOf parent: URL) throws {
-        guard fileManager.fileExists(atPath: target.path) else { return }
-        try paths.verifyDeletionTarget(target, directChildOf: parent)
-        try fileManager.removeItem(at: target)
+    private func removeIfPresent(_ target: URL, directChildOf parent: URL, rootIdentity: FileIdentity) throws {
+        guard fileSystem.exists(target) else { return }
+        try fileSystem.quarantineAndDelete(
+            target,
+            parent: parent,
+            paths: paths,
+            rootIdentity: rootIdentity
+        )
     }
 
     private static func deleteCredential(_ scope: KeychainScope) throws {
@@ -53,7 +79,7 @@ struct UninstallCommand {
         ]
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw InstallError.serviceRegistrationFailed
+            throw InstallError.keychainDeletionFailed
         }
     }
 }

@@ -418,13 +418,13 @@ async fn open_database(config: &RunConfig) -> Result<DbActorHandle, FailureStage
             .map_err(|_| FailureStage::DatabaseOpen)?;
         return DbActorHandle::open_with_process_test_hooks(
             &config.paths.database_file,
-            env!("CARGO_PKG_VERSION"),
+            app_version(),
             hooks,
         )
         .await
         .map_err(|_| FailureStage::DatabaseOpen);
     }
-    DbActorHandle::open(&config.paths.database_file, env!("CARGO_PKG_VERSION"))
+    DbActorHandle::open(&config.paths.database_file, app_version())
         .await
         .map_err(|_| FailureStage::DatabaseOpen)
 }
@@ -438,7 +438,7 @@ fn start_bridge(
     let bridge_config = BridgeSupervisorConfig::new(
         &config.bridge_executable,
         &config.paths.socket_file,
-        env!("CARGO_PKG_VERSION"),
+        app_version(),
     )
     .map_err(|_| ())?;
     #[cfg(feature = "process-test-hooks")]
@@ -510,10 +510,14 @@ async fn persist_runtime_status(
             local_healthy: true,
             heartbeat_at,
             process_id: std::process::id(),
-            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            app_version: app_version().to_owned(),
             schema_version,
         })
         .map_err(|_| FailureStage::Heartbeat)
+}
+
+fn app_version() -> &'static str {
+    option_env!("PCA_APP_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 fn set_bridge_status(

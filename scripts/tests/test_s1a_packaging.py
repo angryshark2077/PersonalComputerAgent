@@ -34,6 +34,8 @@ class S1APackagingTests(unittest.TestCase):
         *,
         signature_failure: str = "",
         unexpected_dmg_payload: bool = False,
+        detach_failure: bool = False,
+        traversal_failure: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = f"{self.tools}:{env['PATH']}"
@@ -41,8 +43,12 @@ class S1APackagingTests(unittest.TestCase):
         env["PCA_SYNTHETIC_DMG_APP"] = str(self.app)
         env["PCA_SYNTHETIC_HDIUTIL_LOG"] = str(self.temp / "hdiutil.log")
         env["PCA_SYNTHETIC_UNEXPECTED_PAYLOAD"] = "1" if unexpected_dmg_payload else "0"
+        env["PCA_SYNTHETIC_DETACH_FAILURE"] = "1" if detach_failure else "0"
+        env["PCA_SYNTHETIC_TRAVERSAL_FAILURE"] = "1" if traversal_failure else "0"
+        env["PCA_SYNTHETIC_TEAM_ID"] = "ABCDEFGHIJ"
+        env["PCA_SYNTHETIC_TOOL_LOG"] = str(self.temp / "tools.log")
         return subprocess.run(
-            [str(VERIFY), str(input_path or self.app)],
+            [str(VERIFY), "--team-id", "ABCDEFGHIJ", str(input_path or self.app)],
             cwd=ROOT,
             env=env,
             text=True,
@@ -93,6 +99,53 @@ class S1APackagingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected payload", result.stdout)
         self.assertIn("-readonly", (self.temp / "hdiutil.log").read_text())
+        self.assertIn("detach /dev/disk99", (self.temp / "hdiutil.log").read_text())
+
+    def test_successful_dmg_verification_detaches_exact_attached_device(self) -> None:
+        dmg = self.temp / "fixture.dmg"
+        dmg.write_bytes(b"synthetic image")
+        result = self.run_verify(dmg)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        log = (self.temp / "hdiutil.log").read_text()
+        self.assertIn("attach -readonly -nobrowse", log)
+        self.assertIn("detach /dev/disk99", log)
+
+    def test_explicit_detach_failure_fails_verification(self) -> None:
+        dmg = self.temp / "fixture.dmg"
+        dmg.write_bytes(b"synthetic image")
+        result = self.run_verify(dmg, detach_failure=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("detach", result.stdout.lower())
+
+    def test_bundle_traversal_error_is_fatal(self) -> None:
+        result = self.run_verify(traversal_failure=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("enumerate", result.stdout.lower())
+
+    def test_non_numeric_three_component_version_is_rejected(self) -> None:
+        info = self.app / "Contents/Info.plist"
+        with info.open("rb") as source:
+            value = plistlib.load(source)
+        value["CFBundleShortVersionString"] = "1.0-beta"
+        with info.open("wb") as output:
+            plistlib.dump(value, output)
+        result = self.run_verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("version", result.stdout.lower())
+
+    def test_mismatched_nested_team_identifier_is_rejected(self) -> None:
+        env_name = "PCA_SYNTHETIC_WRONG_TEAM_TARGET"
+        previous = os.environ.get(env_name)
+        os.environ[env_name] = "PCAPlatformBridge"
+        try:
+            result = self.run_verify()
+        finally:
+            if previous is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = previous
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TeamIdentifier", result.stdout)
 
     def test_build_fails_before_creating_output_when_identity_is_missing(self) -> None:
         output = self.temp / "must-not-exist.dmg"
@@ -120,6 +173,37 @@ class S1APackagingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("identity is not available", result.stdout)
         self.assertFalse(output.exists())
+
+    def test_build_rejects_existing_output_without_overwriting_it(self) -> None:
+        output = self.temp / "existing.dmg"
+        output.write_bytes(b"keep")
+        env = os.environ.copy()
+        env["PATH"] = f"{self.tools}:{env['PATH']}"
+        result = subprocess.run(
+            [str(BUILD), "--team-id", "ABCDEFGHIJ", "--identity", "Apple Development: Missing (ABCDEFGHIJ)", "--version", "0.1.0", "--output", str(output)],
+            cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("output already exists", result.stdout)
+        self.assertEqual(output.read_bytes(), b"keep")
+
+    def test_build_never_deletes_preexisting_fixed_prebuilt_directory(self) -> None:
+        fixed = ROOT / "platform/macos/.build-inputs/s1a"
+        fixed.mkdir(parents=True, exist_ok=True)
+        marker = fixed / "user-marker"
+        marker.write_text("keep")
+        self.addCleanup(lambda: shutil.rmtree(ROOT / "platform/macos/.build-inputs", ignore_errors=True))
+        output = self.temp / "blocked.dmg"
+        env = os.environ.copy()
+        env["PATH"] = f"{self.tools}:{env['PATH']}"
+        env["PCA_SYNTHETIC_VALID_IDENTITY"] = "1"
+        env["PCA_SYNTHETIC_FAIL_CARGO"] = "1"
+        result = subprocess.run(
+            [str(BUILD), "--team-id", "ABCDEFGHIJ", "--identity", "Apple Development: Test (ABCDEFGHIJ)", "--version", "0.1.0", "--output", str(output)],
+            cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(marker.exists(), result.stdout)
 
     def _make_app(self) -> None:
         executable = self.app / "Contents/MacOS/PersonalComputerAgent"
@@ -162,10 +246,18 @@ class S1APackagingTests(unittest.TestCase):
             "codesign",
             """#!/usr/bin/env bash
 set -euo pipefail
+echo "codesign $*" >> "${PCA_SYNTHETIC_TOOL_LOG:?}"
 target="${!#}"
 if [[ "$(basename "$target")" == "${PCA_SYNTHETIC_SIGNATURE_FAILURE:-}" ]]; then
   echo "synthetic signature failure" >&2
   exit 1
+fi
+if [[ "$1" == "--verify" ]]; then
+  [[ " $* " == *" --strict "* && " $* " == *" --verbose=2 "* ]]
+elif [[ "$1" == "-d" ]]; then
+  team="${PCA_SYNTHETIC_TEAM_ID:-ABCDEFGHIJ}"
+  if [[ "$(basename "$target")" == "${PCA_SYNTHETIC_WRONG_TEAM_TARGET:-}" ]]; then team="ZZZZZZZZZZ"; fi
+  echo "TeamIdentifier=$team" >&2
 fi
 """,
         )
@@ -173,6 +265,8 @@ fi
             "lipo",
             """#!/usr/bin/env bash
 set -euo pipefail
+echo "lipo $*" >> "${PCA_SYNTHETIC_TOOL_LOG:?}"
+[[ "$1" == "-archs" && $# -eq 2 ]]
 target="${!#}"
 arch_file="${target}.arch"
 [[ -f "$arch_file" ]] || exit 1
@@ -183,7 +277,26 @@ cat "$arch_file"
             "security",
             """#!/usr/bin/env bash
 set -euo pipefail
-echo "  0 valid identities found"
+if [[ "${PCA_SYNTHETIC_VALID_IDENTITY:-0}" == "1" ]]; then
+  if [[ "$1" == "find-identity" ]]; then echo '  1) ABCDEF "Apple Development: Test (ABCDEFGHIJ)"'; else echo 'synthetic certificate'; fi
+else
+  echo "  0 valid identities found"
+fi
+""",
+        )
+        self._write_tool(
+            "openssl",
+            """#!/usr/bin/env bash
+set -euo pipefail
+echo 'subject=OU=ABCDEFGHIJ,CN=Apple Development Test'
+""",
+        )
+        self._write_tool(
+            "cargo",
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PCA_SYNTHETIC_FAIL_CARGO:-0}" == "1" ]]; then exit 77; fi
+exit 77
 """,
         )
         self._write_tool(
@@ -202,7 +315,22 @@ if [[ "$1" == "attach" ]]; then
   if [[ "${PCA_SYNTHETIC_UNEXPECTED_PAYLOAD:-0}" == "1" ]]; then
     touch "$mountpoint/unexpected.txt"
   fi
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>system-entities</key><array><dict><key>dev-entry</key><string>/dev/disk99</string><key>mount-point</key><string>$mountpoint</string></dict></array></dict></plist>
+PLIST
+elif [[ "$1" == "detach" ]]; then
+  [[ "$2" == "/dev/disk99" ]]
+  [[ "${PCA_SYNTHETIC_DETACH_FAILURE:-0}" != "1" ]]
 fi
+""",
+        )
+        self._write_tool(
+            "find",
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PCA_SYNTHETIC_TRAVERSAL_FAILURE:-0}" == "1" ]]; then exit 2; fi
+exec /usr/bin/find "$@"
 """,
         )
 

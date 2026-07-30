@@ -6,17 +6,20 @@ fail() {
   exit 1
 }
 
-[[ $# -eq 1 ]] || fail "usage: verify-s1a-bundle.sh <app-or-dmg>"
-input=$1
+[[ $# -eq 3 && "$1" == "--team-id" && "$2" =~ ^[A-Z0-9]{10}$ ]] \
+  || fail "usage: verify-s1a-bundle.sh --team-id TEAMID <app-or-dmg>"
+team_id=$2
+input=$3
 [[ -e "$input" ]] || fail "input does not exist"
 [[ ! -L "$input" ]] || fail "input must not be a symbolic link"
 
 temporary_directory=""
 mount_point=""
+attached_device=""
 mounted=0
 cleanup() {
   if [[ "$mounted" -eq 1 ]]; then
-    hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+    hdiutil detach "$attached_device" >/dev/null 2>&1 || true
   fi
   if [[ -n "$temporary_directory" && -d "$temporary_directory" ]]; then
     rm -rf "$temporary_directory"
@@ -34,7 +37,14 @@ case "$input" in
     temporary_directory=$(mktemp -d "${TMPDIR:-/tmp}/pca-s1a-verify.XXXXXX")
     mount_point="$temporary_directory/mount"
     mkdir -m 0700 "$mount_point"
-    hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$input" >/dev/null
+    attach_plist=$(hdiutil attach -readonly -nobrowse -plist -mountpoint "$mount_point" "$input") \
+      || fail "could not attach DMG read-only"
+    attached_device=$(plutil -extract system-entities.0.dev-entry raw -o - - <<<"$attach_plist") \
+      || fail "could not read attached DMG device"
+    attached_mount=$(plutil -extract system-entities.0.mount-point raw -o - - <<<"$attach_plist") \
+      || fail "could not read attached DMG mount point"
+    [[ "$attached_device" == /dev/disk* && "$attached_mount" == "$mount_point" ]] \
+      || fail "attached DMG identity did not match requested mount"
     mounted=1
     shopt -s nullglob dotglob
     payload=("$mount_point"/*)
@@ -71,7 +81,7 @@ plist_mode=$(stat -f '%Lp' "$launch_agent")
 [[ "$(plutil -extract CFBundleExecutable raw -o - "$info")" == "PersonalComputerAgent" ]] || fail "wrong bundle executable"
 [[ "$(plutil -extract LSUIElement raw -o - "$info")" == "true" ]] || fail "LSUIElement must be true"
 version=$(plutil -extract CFBundleShortVersionString raw -o - "$info")
-[[ -n "$version" ]] || fail "missing bundle version"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "bundle version must be three numeric components"
 
 [[ "$(plutil -extract Label raw -o - "$launch_agent")" == "com.pca.agentd" ]] || fail "wrong LaunchAgent label"
 [[ "$(plutil -extract BundleProgram raw -o - "$launch_agent")" == "Contents/Resources/bin/pca-agentd" ]] || fail "wrong BundleProgram"
@@ -80,16 +90,24 @@ arguments=$(plutil -extract ProgramArguments json -o - "$launch_agent" | tr -d '
 [[ "$(plutil -extract RunAtLoad raw -o - "$launch_agent")" == "true" ]] || fail "RunAtLoad must be true"
 [[ "$(plutil -extract KeepAlive raw -o - "$launch_agent")" == "true" ]] || fail "KeepAlive must be true"
 
-if find "$app" -type l -print -quit | grep -q .; then
-  fail "symbolic links are not allowed in the S1A bundle"
-fi
-if find "$app" -type d \( -name Data -o -name Run \) -print -quit | grep -q .; then
-  fail "writable Data or Run directories must not exist inside the bundle"
-fi
+links=$(find "$app" -type l -print -quit) || fail "could not enumerate bundle for symbolic links"
+[[ -z "$links" ]] || fail "symbolic links are not allowed in the S1A bundle"
+runtime_directories=$(find "$app" -type d \( -name Data -o -name Run \) -print -quit) \
+  || fail "could not enumerate bundle for writable runtime directories"
+[[ -z "$runtime_directories" ]] || fail "writable Data or Run directories must not exist inside the bundle"
 
-for nested in "$agent" "$bridge"; do
-  codesign --verify --strict --verbose=2 "$nested" >/dev/null 2>&1 || fail "nested signature verification failed for $(basename "$nested")"
+for signed_target in "$app" "$agent" "$bridge"; do
+  codesign --verify --strict --verbose=2 "$signed_target" >/dev/null 2>&1 \
+    || fail "signature verification failed for $(basename "$signed_target")"
+  signature_details=$(codesign -d --verbose=4 "$signed_target" 2>&1) \
+    || fail "could not inspect TeamIdentifier for $(basename "$signed_target")"
+  grep -Fxq "TeamIdentifier=$team_id" <<<"$signature_details" \
+    || fail "TeamIdentifier mismatch for $(basename "$signed_target")"
 done
-codesign --verify --deep --strict --verbose=2 "$app" >/dev/null 2>&1 || fail "app signature verification failed"
+
+if [[ "$mounted" -eq 1 ]]; then
+  hdiutil detach "$attached_device" >/dev/null 2>&1 || fail "could not detach attached DMG device"
+  mounted=0
+fi
 
 echo "S1A BUNDLE VERIFIED: $version arm64"
