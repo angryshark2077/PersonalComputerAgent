@@ -1,0 +1,11 @@
+[package]
+name = "pca-keychain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+security-framework = "=3.6.0"
+
+[lints]
+workspace = true

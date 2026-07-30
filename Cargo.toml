@@ -4,6 +4,7 @@ members = [
   "crates/agent-runtime",
   "crates/db-local",
   "crates/domain",
+  "crates/keychain",
   "crates/provider-contracts",
   "crates/test-contracts",
 ]
