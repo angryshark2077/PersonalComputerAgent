@@ -28,52 +28,80 @@ public enum PlatformBridgeExecutable {
         arguments commandLineArguments: [String],
         signalRuntime: TerminationSignalRuntime
     ) async -> Int32 {
-        if signalRuntime.terminationAcceptedOrPending() { return 0 }
+        let server: BridgeServer
         do {
             let arguments = try BridgeArguments.parse(commandLineArguments)
             let validator = SocketPathValidator()
             try validator.validate(socketURL: arguments.socketURL)
-            let server = BridgeServer(
+            server = BridgeServer(
                 socketURL: arguments.socketURL,
                 pathValidator: validator,
                 handshakeHandler: HandshakeHandler(bridgeVersion: "0.0.0-s1a"),
                 credentialProvider: KeychainBridgeCredentialProvider()
             )
+        } catch {
+            return startupFailureCode(signalRuntime: signalRuntime)
+        }
+        return await run(server: server, signalRuntime: signalRuntime)
+    }
+
+    static func run(
+        server: BridgeServer,
+        signalRuntime: TerminationSignalRuntime
+    ) async -> Int32 {
+        if let failureCode = await start(server: server, signalRuntime: signalRuntime) {
+            return failureCode
+        }
+        signalRuntime.startReader()
+        return await serveStarted(server: server)
+    }
+
+    static func start(
+        server: BridgeServer,
+        signalRuntime: TerminationSignalRuntime
+    ) async -> Int32? {
+        do {
             guard try await signalRuntime.coordinator.register(server: server) else { return 0 }
+            try await server.start()
+            return nil
+        } catch BridgeServerError.shutdownRequested {
+            return 0
+        } catch {
+            return startupFailureCode(signalRuntime: signalRuntime)
+        }
+    }
 
-            do {
-                try await server.start()
-            } catch BridgeServerError.shutdownRequested {
-                return 0
+    static func serveStarted(server: BridgeServer) async -> Int32 {
+        let powerMonitor = await MainActor.run {
+            let monitor = PowerMonitor { _ in
+                // The typed callback is intentionally not serialized until the lifecycle wire schema is frozen.
             }
-
-            let powerMonitor = await MainActor.run {
-                let monitor = PowerMonitor { _ in
-                    // The typed callback is intentionally not serialized until the lifecycle wire schema is frozen.
-                }
-                monitor.start()
-                return monitor
-            }
-            do {
-                try await server.serve()
-            } catch let serveError {
-                do {
-                    try await server.shutdown()
-                } catch {
-                    await MainActor.run { powerMonitor.stop() }
-                    throw error
-                }
-                await MainActor.run { powerMonitor.stop() }
-                throw serveError
-            }
+            monitor.start()
+            return monitor
+        }
+        do {
+            try await server.serve()
             try await server.shutdown()
             await MainActor.run { powerMonitor.stop() }
             return 0
         } catch {
-            if signalRuntime.terminationAcceptedOrPending() { return 0 }
-            safeFailure("startup or server failure")
+            do {
+                try await server.shutdown()
+            } catch {
+                // The original runtime failure remains the selected result.
+            }
+            await MainActor.run { powerMonitor.stop() }
+            safeFailure("server runtime failure")
             return 1
         }
+    }
+
+    private static func startupFailureCode(
+        signalRuntime: TerminationSignalRuntime
+    ) -> Int32 {
+        if signalRuntime.terminationAccepted() { return 0 }
+        safeFailure("startup failure")
+        return 1
     }
 
     public static func main() -> Never {

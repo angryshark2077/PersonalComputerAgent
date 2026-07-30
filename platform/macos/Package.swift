@@ -11,6 +11,11 @@ let package = Package(
         .executable(name: "PCAPlatformBridge", targets: ["PCAPlatformBridge"])
     ],
     targets: [
+        .target(
+            name: "CSignalRelay",
+            path: "Sources/CSignalRelay",
+            publicHeadersPath: "include"
+        ),
         .target(name: "BridgeProtocol"),
         .executableTarget(
             name: "SetupAppPlaceholder",
@@ -22,7 +27,7 @@ let package = Package(
         ),
         .target(
             name: "PlatformBridge",
-            dependencies: ["BridgeProtocol"]
+            dependencies: ["BridgeProtocol", "CSignalRelay"]
         ),
         .executableTarget(
             name: "PCAPlatformBridge",

@@ -250,7 +250,7 @@ final class HandshakeTests: XCTestCase {
             guard FileManager.default.fileExists(atPath: readyHook.path) else {
                 if process.isRunning { kill(process.processIdentifier, SIGKILL) }
                 process.waitUntilExit()
-                XCTFail("signal harness never reached the masked startup hook")
+                XCTFail("signal harness never reached the installed-relay startup hook")
                 continue
             }
 
@@ -302,6 +302,101 @@ final class HandshakeTests: XCTestCase {
             invalidProcess.waitUntilExit()
             XCTAssertEqual(invalidProcess.terminationReason, .exit)
             XCTAssertEqual(invalidProcess.terminationStatus, 1)
+        }
+    }
+
+    func testSignalDuringDelayedStartIsConsumedAfterRealServerStarts() async throws {
+        let harnessURL = Bundle(for: Self.self).bundleURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("PlatformBridgeSignalHarness")
+        let parent = URL(
+            fileURLWithPath: "/tmp/pca-signal-delayed-\(UUID().uuidString.prefix(8))",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let runRoot = parent.appendingPathComponent("Run", isDirectory: true)
+        let socket = runRoot.appendingPathComponent("bridge.sock")
+        let readyHook = parent.appendingPathComponent("startup-ready")
+        let process = Process()
+        process.executableURL = harnessURL
+        process.arguments = [
+            "--socket", socket.path,
+            "--run-root", runRoot.path,
+            "--ready-hook", readyHook.path,
+            "--await-signal-before-start",
+        ]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+
+        guard try await waitForFile(
+            readyHook,
+            process: process,
+            failure: "delayed-start harness was not ready"
+        ) else { return }
+        XCTAssertEqual(kill(process.processIdentifier, SIGTERM), 0)
+        guard try await waitForExit(
+            process,
+            expectedStatus: 0,
+            failure: "delayed-start harness did not exit"
+        ) else { return }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: socket.path))
+        XCTAssertTrue(try quarantineArtifacts(in: runRoot).isEmpty)
+    }
+
+    func testPostStartSignalsCleanlyStopRealServerProcess() async throws {
+        let harnessURL = Bundle(for: Self.self).bundleURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("PlatformBridgeSignalHarness")
+        let signalCases: [(label: String, signals: [Int32], delayMilliseconds: UInt64)] = [
+            ("immediate-sigterm", [SIGTERM], 0),
+            ("serving-sigint", [SIGINT], 50),
+            ("repeated", [SIGTERM, SIGINT], 0),
+        ]
+        for iteration in 0..<3 {
+            for signalCase in signalCases {
+                let parent = URL(
+                    fileURLWithPath: "/tmp/pca-signal-post-\(iteration)-\(signalCase.label)-\(UUID().uuidString.prefix(8))",
+                    isDirectory: true
+                )
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+                defer { try? FileManager.default.removeItem(at: parent) }
+                let runRoot = parent.appendingPathComponent("Run", isDirectory: true)
+                let socket = runRoot.appendingPathComponent("bridge.sock")
+                let readyHook = parent.appendingPathComponent("server-ready")
+                let process = Process()
+                process.executableURL = harnessURL
+                process.arguments = [
+                    "--socket", socket.path,
+                    "--run-root", runRoot.path,
+                    "--ready-hook", readyHook.path,
+                    "--ready-after-start",
+                ]
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+
+                guard try await waitForFile(
+                    readyHook,
+                    process: process,
+                    failure: "post-start harness was not ready"
+                ) else { return }
+                XCTAssertTrue(FileManager.default.fileExists(atPath: socket.path))
+                if signalCase.delayMilliseconds > 0 {
+                    try await Task.sleep(for: .milliseconds(signalCase.delayMilliseconds))
+                }
+                for terminationSignal in signalCase.signals {
+                    XCTAssertEqual(kill(process.processIdentifier, terminationSignal), 0)
+                }
+                guard try await waitForExit(
+                    process,
+                    expectedStatus: 0,
+                    failure: "post-start harness did not exit"
+                ) else { return }
+                XCTAssertFalse(FileManager.default.fileExists(atPath: socket.path))
+                XCTAssertTrue(try quarantineArtifacts(in: runRoot).isEmpty)
+            }
         }
     }
 
@@ -521,6 +616,47 @@ final class HandshakeTests: XCTestCase {
         try await server.shutdown()
         try await serveTask.value
         XCTAssertFalse(FileManager.default.fileExists(atPath: socket.path))
+    }
+
+    private func waitForFile(
+        _ file: URL,
+        process: Process,
+        failure: String
+    ) async throws -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !FileManager.default.fileExists(atPath: file.path),
+              process.isRunning,
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        guard FileManager.default.fileExists(atPath: file.path) else {
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            process.waitUntilExit()
+            XCTFail(failure)
+            return false
+        }
+        return true
+    }
+
+    private func waitForExit(
+        _ process: Process,
+        expectedStatus: Int32,
+        failure: String
+    ) async throws -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while process.isRunning, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+            process.waitUntilExit()
+            XCTFail(failure)
+            return false
+        }
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationReason, .exit, failure)
+        XCTAssertEqual(process.terminationStatus, expectedStatus, failure)
+        return true
     }
 
     private func challengeData(protocolVersion: Int, requestID: UUID) throws -> Data {
