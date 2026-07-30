@@ -4,9 +4,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+process-test-hooks = ["pca-db-local/process-test-hooks"]
+
 [dependencies]
+pca-agent-runtime = { path = "../../crates/agent-runtime" }
+pca-bridge-client = { path = "../../crates/bridge-client" }
+pca-db-local = { path = "../../crates/db-local" }
 pca-domain = { path = "../../crates/domain" }
-pca-provider-contracts = { path = "../../crates/provider-contracts" }
+pca-keychain = { path = "../../crates/keychain" }
+serde_json.workspace = true
+time = { version = "=0.3.36", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"

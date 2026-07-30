@@ -2,12 +2,17 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "process-test-hooks", not(debug_assertions)))]
+compile_error!("process-test-hooks cannot be compiled into a release build");
+
 mod actor;
 mod error;
 mod migrations;
 mod repository;
 
 pub use actor::DbActorHandle;
+#[cfg(feature = "process-test-hooks")]
+pub use actor::ProcessTestHooks;
 pub use error::DbError;
 
 /// The initial local database migration.

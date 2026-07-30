@@ -1,8 +1,15 @@
-use pca_domain::AgentStatus;
-use pca_provider_contracts::ProviderStatus;
+mod app;
+mod config;
+mod lifecycle;
 
-fn main() {
-    let agent = AgentStatus::Initializing;
-    let wechat = ProviderStatus::WaitingSource;
-    println!("pca-agentd scaffold: agent={agent:?}, wechat={wechat:?}");
+#[tokio::main]
+async fn main() {
+    let exit_code = match config::CommandConfig::parse(std::env::args_os()) {
+        Ok(command) => app::execute(command).await,
+        Err(message) => {
+            eprintln!("pca-agentd: {message}");
+            app::EXIT_USAGE
+        }
+    };
+    std::process::exit(exit_code);
 }

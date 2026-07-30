@@ -1,5 +1,8 @@
 use std::{path::Path, thread, time::Duration};
 
+#[cfg(feature = "process-test-hooks")]
+use std::path::PathBuf;
+
 use pca_domain::{AgentStatus, BridgeStatus, EventEnvelope};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -7,6 +10,46 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{migrations, repository, DbError, DbHealth};
 
 const REQUEST_CAPACITY: usize = 64;
+
+#[cfg(feature = "process-test-hooks")]
+#[derive(Clone, Debug)]
+pub struct ProcessTestHooks {
+    pub(crate) event_inserted_ready: PathBuf,
+    pub(crate) event_inserted_release: PathBuf,
+}
+
+#[cfg(feature = "process-test-hooks")]
+impl ProcessTestHooks {
+    /// Configures a deterministic, test-only rendezvous inside an Event/Outbox transaction.
+    ///
+    /// This API does not exist unless the `process-test-hooks` Cargo feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless both paths are absolute, distinct, and share one parent.
+    pub fn new(ready: PathBuf, release: PathBuf) -> Result<Self, DbError> {
+        if !ready.is_absolute()
+            || !release.is_absolute()
+            || ready == release
+            || ready.parent() != release.parent()
+        {
+            return Err(DbError::sqlite(
+                "configure process test barrier",
+                "barrier paths must be distinct absolute siblings",
+            ));
+        }
+        Ok(Self {
+            event_inserted_ready: ready,
+            event_inserted_release: release,
+        })
+    }
+}
+
+#[derive(Default)]
+struct ActorOptions {
+    #[cfg(feature = "process-test-hooks")]
+    process_test_hooks: Option<ProcessTestHooks>,
+}
 
 enum Request {
     AppendEvent {
@@ -63,6 +106,35 @@ impl DbActorHandle {
     ///
     /// Returns a migration, integrity, configuration, or actor startup error.
     pub async fn open(path: &Path, app_version: &str) -> Result<Self, DbError> {
+        Self::open_with_options(path, app_version, ActorOptions::default()).await
+    }
+
+    /// Opens a database with a feature-gated deterministic process-test barrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same startup errors as [`Self::open`].
+    #[cfg(feature = "process-test-hooks")]
+    pub async fn open_with_process_test_hooks(
+        path: &Path,
+        app_version: &str,
+        hooks: ProcessTestHooks,
+    ) -> Result<Self, DbError> {
+        Self::open_with_options(
+            path,
+            app_version,
+            ActorOptions {
+                process_test_hooks: Some(hooks),
+            },
+        )
+        .await
+    }
+
+    async fn open_with_options(
+        path: &Path,
+        app_version: &str,
+        options: ActorOptions,
+    ) -> Result<Self, DbError> {
         let (request_sender, request_receiver) = mpsc::channel(REQUEST_CAPACITY);
         let (startup_sender, startup_receiver) = oneshot::channel();
         let (owner_stopped_sender, owner_stopped_receiver) = oneshot::channel();
@@ -75,7 +147,7 @@ impl DbActorHandle {
                 match result {
                     Ok(connection) => {
                         let _ = startup_sender.send(Ok(()));
-                        run(connection, request_receiver);
+                        run(connection, request_receiver, &options);
                     }
                     Err(error) => {
                         let _ = startup_sender.send(Err(error));
@@ -261,7 +333,8 @@ fn open_connection(path: &Path, app_version: &str) -> Result<Connection, DbError
     Ok(connection)
 }
 
-fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>) {
+#[cfg_attr(not(feature = "process-test-hooks"), allow(unused_variables))]
+fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, options: &ActorOptions) {
     while let Some(request) = requests.blocking_recv() {
         if request.is_cancelled() {
             continue;
@@ -271,6 +344,8 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>) {
                 let _ = response.send(repository::append_event_with_outbox(
                     &mut connection,
                     &event,
+                    #[cfg(feature = "process-test-hooks")]
+                    options.process_test_hooks.as_ref(),
                 ));
             }
             Request::SetAgentState {

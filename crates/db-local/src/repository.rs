@@ -1,11 +1,22 @@
 use pca_domain::{AgentStatus, BridgeStatus, EventEnvelope, Sensitivity};
 use rusqlite::{params, Connection};
 
+#[cfg(feature = "process-test-hooks")]
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    thread,
+    time::{Duration, Instant},
+};
+
+#[cfg(feature = "process-test-hooks")]
+use crate::actor::ProcessTestHooks;
 use crate::{migrations::MAX_SUPPORTED_SCHEMA_VERSION, DbError, DbHealth};
 
 pub(crate) fn append_event_with_outbox(
     connection: &mut Connection,
     event: &EventEnvelope,
+    #[cfg(feature = "process-test-hooks")] process_test_hooks: Option<&ProcessTestHooks>,
 ) -> Result<(), DbError> {
     let payload_json = serde_json::to_string(&event.payload)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -43,6 +54,10 @@ pub(crate) fn append_event_with_outbox(
             ],
         )
         .map_err(|error| DbError::sqlite("insert local event", error))?;
+    #[cfg(feature = "process-test-hooks")]
+    if let Some(hooks) = process_test_hooks {
+        wait_at_process_test_barrier(hooks)?;
+    }
     transaction
         .execute(
             "INSERT INTO sync_outbox (outbox_id, event_id, state, created_at_ms)
@@ -56,6 +71,45 @@ pub(crate) fn append_event_with_outbox(
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit event transaction", error))
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn wait_at_process_test_barrier(hooks: &ProcessTestHooks) -> Result<(), DbError> {
+    let mut ready = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&hooks.event_inserted_ready)
+        .map_err(|error| DbError::sqlite("create process test barrier", error))?;
+    ready
+        .write_all(b"event-inserted\n")
+        .and_then(|()| ready.sync_all())
+        .map_err(|error| DbError::sqlite("publish process test barrier", error))?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match fs::symlink_metadata(&hooks.event_inserted_release) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                return Ok(())
+            }
+            Ok(_) => {
+                return Err(DbError::sqlite(
+                    "wait at process test barrier",
+                    "release must be a regular file",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DbError::sqlite("wait at process test barrier", error));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(DbError::sqlite(
+                "wait at process test barrier",
+                "release was not observed within ten seconds",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 pub(crate) fn set_agent_state(
