@@ -1,6 +1,9 @@
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -134,6 +137,44 @@ async fn duplicate_event_is_idempotent_for_event_and_outbox() {
             .expect("count durable rows"),
         (1, 1)
     );
+}
+
+#[tokio::test]
+async fn duplicate_append_repairs_missing_outbox_with_stable_id() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let event = event("event-repair-outbox");
+    db.append_event_with_outbox(&event)
+        .await
+        .expect("initial append");
+    let connection = Connection::open(&path).expect("open repair setup connection");
+    connection
+        .execute(
+            "DELETE FROM sync_outbox WHERE event_id = ?1",
+            [&event.event_id],
+        )
+        .expect("delete only Outbox row");
+
+    db.append_event_with_outbox(&event)
+        .await
+        .expect("repair missing Outbox row");
+
+    assert_eq!(
+        db.count_event_and_outbox(&event.event_id)
+            .await
+            .expect("count repaired rows"),
+        (1, 1)
+    );
+    let outbox_id = connection
+        .query_row(
+            "SELECT outbox_id FROM sync_outbox WHERE event_id = ?1",
+            [&event.event_id],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read stable Outbox identifier");
+    assert_eq!(outbox_id, "event:event-repair-outbox");
 }
 
 #[tokio::test]
@@ -294,5 +335,81 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
             1,
             1_754_000_000_000
         )
+    );
+}
+
+#[tokio::test]
+async fn drop_does_not_block_on_a_cancelled_locked_request() {
+    let (_directory, path) = database_path();
+    let db = Arc::new(
+        DbActorHandle::open(&path, "0.1.0")
+            .await
+            .expect("open database"),
+    );
+    let lock = Connection::open(&path).expect("open locking connection");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold SQLite write lock");
+    let request_db = Arc::clone(&db);
+    let request = tokio::spawn(async move {
+        request_db
+            .append_event_with_outbox(&event("event-cancel-drop"))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    request.abort();
+    let _ = request.await;
+    let started = Instant::now();
+
+    drop(db);
+
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_millis(250), "elapsed: {elapsed:?}");
+    lock.execute_batch("ROLLBACK").expect("release write lock");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn async_shutdown_skips_cancelled_queued_requests_and_joins_owner() {
+    let (_directory, path) = database_path();
+    let db = Arc::new(
+        DbActorHandle::open(&path, "0.1.0")
+            .await
+            .expect("open database"),
+    );
+    let lock = Connection::open(&path).expect("open locking connection");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold SQLite write lock");
+    let mut requests = Vec::new();
+    for index in 0..16 {
+        let request_db = Arc::clone(&db);
+        requests.push(tokio::spawn(async move {
+            request_db
+                .append_event_with_outbox(&event(&format!("event-cancel-{index}")))
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for request in &requests {
+        request.abort();
+    }
+    for request in requests {
+        let _ = request.await;
+    }
+    lock.execute_batch("ROLLBACK").expect("release write lock");
+    let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("request handles released"));
+
+    db.shutdown().await.expect("join database owner thread");
+
+    let connection = Connection::open(&path).expect("inspect canceled requests");
+    let event_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events_local WHERE event_id LIKE 'event-cancel-%'",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .expect("count canceled events");
+    assert!(
+        event_count <= 1,
+        "canceled requests wrote {event_count} events"
     );
 }

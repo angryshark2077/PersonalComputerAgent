@@ -32,9 +32,27 @@ enum Request {
     },
 }
 
+impl Request {
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::AppendEvent { response, .. }
+            | Self::SetAgentState { response, .. }
+            | Self::Checkpoint { response } => response.is_closed(),
+            Self::Health { response } => response.is_closed(),
+            Self::CountEventAndOutbox { response, .. } => response.is_closed(),
+        }
+    }
+}
+
 /// Async handle to the single thread that owns the local `SQLite` connection.
+///
+/// Dropping the handle never waits for the owner thread: it closes the bounded request queue and
+/// detaches the thread, which skips canceled queued requests and exits after any request already in
+/// progress returns. Call [`Self::shutdown`] when the caller must wait for connection close and a
+/// deterministic thread join.
 pub struct DbActorHandle {
     requests: Option<mpsc::Sender<Request>>,
+    owner_stopped: Option<oneshot::Receiver<()>>,
     owner_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -47,6 +65,7 @@ impl DbActorHandle {
     pub async fn open(path: &Path, app_version: &str) -> Result<Self, DbError> {
         let (request_sender, request_receiver) = mpsc::channel(REQUEST_CAPACITY);
         let (startup_sender, startup_receiver) = oneshot::channel();
+        let (owner_stopped_sender, owner_stopped_receiver) = oneshot::channel();
         let path = path.to_owned();
         let app_version = app_version.to_owned();
         let owner_thread = thread::Builder::new()
@@ -62,12 +81,14 @@ impl DbActorHandle {
                         let _ = startup_sender.send(Err(error));
                     }
                 }
+                let _ = owner_stopped_sender.send(());
             })
             .map_err(|error| DbError::sqlite("spawn database owner thread", error))?;
 
         match startup_receiver.await {
             Ok(Ok(())) => Ok(Self {
                 requests: Some(request_sender),
+                owner_stopped: Some(owner_stopped_receiver),
                 owner_thread: Some(owner_thread),
             }),
             Ok(Err(error)) => {
@@ -165,6 +186,27 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Closes the request queue, waits without blocking the async executor, and joins the owner.
+    ///
+    /// Requests whose response futures were canceled are skipped before they touch `SQLite`.
+    /// When this method returns, the connection has been dropped and the owner thread has exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor error if the owner exits without signaling, or a panic error if joining
+    /// the owner thread reports a panic.
+    pub async fn shutdown(mut self) -> Result<(), DbError> {
+        self.requests.take();
+        let owner_stopped = self.owner_stopped.take().ok_or(DbError::ActorUnavailable)?;
+        let owner_thread = self.owner_thread.take().ok_or(DbError::ActorUnavailable)?;
+        let stopped_result = owner_stopped.await;
+        while !owner_thread.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        owner_thread.join().map_err(|_| DbError::ActorThreadPanic)?;
+        stopped_result.map_err(|_| DbError::ActorUnavailable)
+    }
+
     async fn send(&self, request: Request) -> Result<(), DbError> {
         self.requests
             .as_ref()
@@ -179,7 +221,9 @@ impl Drop for DbActorHandle {
     fn drop(&mut self) {
         self.requests.take();
         if let Some(owner_thread) = self.owner_thread.take() {
-            let _ = owner_thread.join();
+            if owner_thread.is_finished() {
+                let _ = owner_thread.join();
+            }
         }
     }
 }
@@ -219,6 +263,9 @@ fn open_connection(path: &Path, app_version: &str) -> Result<Connection, DbError
 
 fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>) {
     while let Some(request) = requests.blocking_recv() {
+        if request.is_cancelled() {
+            continue;
+        }
         match request {
             Request::AppendEvent { event, response } => {
                 let _ = response.send(repository::append_event_with_outbox(

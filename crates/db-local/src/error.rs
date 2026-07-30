@@ -24,7 +24,7 @@ pub enum DbError {
     ForeignKeyCheck { details: Vec<String> },
     /// The database owner thread is no longer accepting work.
     ActorUnavailable,
-    /// The database owner thread panicked during initialization.
+    /// The database owner thread panicked during initialization or shutdown.
     ActorThreadPanic,
 }
 
@@ -37,6 +37,10 @@ impl DbError {
     }
 
     pub(crate) fn startup_sqlite(operation: &'static str, error: rusqlite::Error) -> Self {
+        Self::integrity_sqlite(operation, error)
+    }
+
+    pub(crate) fn integrity_sqlite(operation: &'static str, error: rusqlite::Error) -> Self {
         if matches!(
             error.sqlite_error_code(),
             Some(
@@ -90,3 +94,26 @@ impl fmt::Display for DbError {
 }
 
 impl std::error::Error for DbError {}
+
+#[cfg(test)]
+mod tests {
+    use super::DbError;
+
+    #[test]
+    fn ordinary_integrity_path_sqlite_error_stays_sqlite() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is busy".to_owned()),
+        );
+
+        let mapped = DbError::integrity_sqlite("run integrity check", error);
+
+        assert!(matches!(
+            mapped,
+            DbError::Sqlite {
+                operation: "run integrity check",
+                ..
+            }
+        ));
+    }
+}

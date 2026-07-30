@@ -178,18 +178,12 @@ pub(crate) fn checkpoint(connection: &Connection) -> Result<(), DbError> {
 fn integrity_check(connection: &Connection) -> Result<Vec<String>, DbError> {
     let mut statement = connection
         .prepare("PRAGMA integrity_check")
-        .map_err(|error| DbError::IntegrityCheck {
-            details: vec![error.to_string()],
-        })?;
+        .map_err(|error| DbError::integrity_sqlite("prepare integrity check", error))?;
     let rows = statement
         .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| DbError::IntegrityCheck {
-            details: vec![error.to_string()],
-        })?;
+        .map_err(|error| DbError::integrity_sqlite("query integrity check", error))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| DbError::IntegrityCheck {
-            details: vec![error.to_string()],
-        })
+        .map_err(|error| DbError::integrity_sqlite("read integrity check row", error))
 }
 
 fn foreign_key_check(connection: &Connection) -> Result<Vec<String>, DbError> {
