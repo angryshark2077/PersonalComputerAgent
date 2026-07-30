@@ -1,6 +1,8 @@
 use std::{error::Error, fmt};
 
 mod macos;
+#[cfg(test)]
+mod macos_tests;
 
 pub use macos::MacOSKeychainStore;
 
@@ -14,6 +16,7 @@ pub enum CredentialError {
     InvalidSecretLength,
     CorruptSecret,
     OperationFailed,
+    UnsupportedIdentity,
 }
 
 impl fmt::Display for CredentialError {
@@ -23,6 +26,7 @@ impl fmt::Display for CredentialError {
             Self::InvalidSecretLength => "invalid credential length",
             Self::CorruptSecret => "stored credential is corrupt",
             Self::OperationFailed => "credential operation failed",
+            Self::UnsupportedIdentity => "credential identity unsupported",
         };
         formatter.write_str(message)
     }
@@ -65,6 +69,7 @@ pub fn load_bridge_shared_secret(
     store
         .load(BRIDGE_CREDENTIAL_SERVICE, BRIDGE_CREDENTIAL_ACCOUNT)?
         .map(|secret| {
+            validate_loaded_bridge_secret(&secret)?;
             secret
                 .try_into()
                 .map_err(|_| CredentialError::CorruptSecret)
@@ -82,10 +87,7 @@ pub fn store_bridge_shared_secret(
     store: &dyn CredentialStore,
     secret: &[u8],
 ) -> Result<(), CredentialError> {
-    if secret.len() != BRIDGE_SHARED_SECRET_LENGTH {
-        return Err(CredentialError::InvalidSecretLength);
-    }
-
+    validate_bridge_secret_for_store(secret)?;
     store.store(BRIDGE_CREDENTIAL_SERVICE, BRIDGE_CREDENTIAL_ACCOUNT, secret)
 }
 
@@ -96,4 +98,31 @@ pub fn store_bridge_shared_secret(
 /// Returns a safe [`CredentialError`] when the backing store cannot complete the operation.
 pub fn delete_bridge_shared_secret(store: &dyn CredentialStore) -> Result<(), CredentialError> {
     store.delete(BRIDGE_CREDENTIAL_SERVICE, BRIDGE_CREDENTIAL_ACCOUNT)
+}
+
+pub(crate) fn validate_bridge_identity(
+    service: &str,
+    account: &str,
+) -> Result<(), CredentialError> {
+    if service == BRIDGE_CREDENTIAL_SERVICE && account == BRIDGE_CREDENTIAL_ACCOUNT {
+        Ok(())
+    } else {
+        Err(CredentialError::UnsupportedIdentity)
+    }
+}
+
+pub(crate) fn validate_bridge_secret_for_store(secret: &[u8]) -> Result<(), CredentialError> {
+    if secret.len() == BRIDGE_SHARED_SECRET_LENGTH {
+        Ok(())
+    } else {
+        Err(CredentialError::InvalidSecretLength)
+    }
+}
+
+pub(crate) fn validate_loaded_bridge_secret(secret: &[u8]) -> Result<(), CredentialError> {
+    if secret.len() == BRIDGE_SHARED_SECRET_LENGTH {
+        Ok(())
+    } else {
+        Err(CredentialError::CorruptSecret)
+    }
 }

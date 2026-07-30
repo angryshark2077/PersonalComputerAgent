@@ -169,6 +169,7 @@ fn credential_errors_never_embed_secret_or_query_values() {
         CredentialError::InvalidSecretLength,
         CredentialError::CorruptSecret,
         CredentialError::OperationFailed,
+        CredentialError::UnsupportedIdentity,
     ] {
         let display = error.to_string();
         let debug = format!("{error:?}");
@@ -195,6 +196,11 @@ fn production_credential_adapters_have_no_plaintext_fallback_channel() {
         ("File::create", "Rust file creation"),
         ("Command::new", "Rust command arguments"),
         ("std::env", "Rust environment fallback"),
+        ("println!", "Rust stdout logging"),
+        ("eprintln!", "Rust stderr logging"),
+        ("dbg!", "Rust debug logging"),
+        ("log::", "Rust log facade"),
+        ("tracing::", "Rust tracing logging"),
         ("FileManager", "Swift filesystem access"),
         (".write(to:", "Swift file write"),
         ("UserDefaults", "Swift defaults fallback"),
@@ -203,6 +209,10 @@ fn production_credential_adapters_have_no_plaintext_fallback_channel() {
             "Swift environment fallback",
         ),
         ("Process()", "Swift command arguments"),
+        ("print(", "Swift stdout logging"),
+        ("NSLog(", "Swift system logging"),
+        ("os_log", "Swift unified logging"),
+        ("Logger(", "Swift Logger construction"),
         ("\"Data\"", "persistent Data directory reference"),
         ("\"Run\"", "ephemeral Run directory reference"),
     ];
