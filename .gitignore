@@ -13,3 +13,4 @@ DerivedData/
 *.db-shm
 *.log
 .DS_Store
+.superpowers/
