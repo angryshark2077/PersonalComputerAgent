@@ -16,7 +16,85 @@ pub(crate) struct ProcessTestBarrierConfig {
 #[derive(Debug)]
 pub(crate) struct ProcessTestFatalCleanupConfig {
     pub(crate) bridge_pid_ready: PathBuf,
+    pub(crate) armed: PathBuf,
+    pub(crate) release: PathBuf,
     pub(crate) cleanup_complete: PathBuf,
+}
+
+#[cfg(feature = "process-test-hooks")]
+#[derive(Default)]
+struct ProcessTestOptions {
+    barrier_ready: Option<PathBuf>,
+    barrier_release: Option<PathBuf>,
+    fail_after_bridge_pid: Option<PathBuf>,
+    fatal_armed: Option<PathBuf>,
+    fatal_release: Option<PathBuf>,
+    cleanup_complete: Option<PathBuf>,
+}
+
+#[cfg(feature = "process-test-hooks")]
+impl ProcessTestOptions {
+    fn parse_argument(
+        &mut self,
+        argument: &str,
+        remaining: &mut impl Iterator<Item = OsString>,
+    ) -> Result<bool, String> {
+        let target = match argument {
+            "--process-test-event-barrier-ready" if self.barrier_ready.is_none() => {
+                &mut self.barrier_ready
+            }
+            "--process-test-event-barrier-release" if self.barrier_release.is_none() => {
+                &mut self.barrier_release
+            }
+            "--process-test-fail-heartbeat-after-bridge-pid"
+                if self.fail_after_bridge_pid.is_none() =>
+            {
+                &mut self.fail_after_bridge_pid
+            }
+            "--process-test-fatal-armed" if self.fatal_armed.is_none() => &mut self.fatal_armed,
+            "--process-test-fatal-release" if self.fatal_release.is_none() => {
+                &mut self.fatal_release
+            }
+            "--process-test-cleanup-complete" if self.cleanup_complete.is_none() => {
+                &mut self.cleanup_complete
+            }
+            _ => return Ok(false),
+        };
+        *target = Some(PathBuf::from(remaining.next().ok_or_else(usage)?));
+        Ok(true)
+    }
+
+    fn rebase(&mut self, original_root: &Path, canonical_root: &Path) -> Result<(), String> {
+        for path in [
+            &mut self.barrier_ready,
+            &mut self.barrier_release,
+            &mut self.fail_after_bridge_pid,
+            &mut self.fatal_armed,
+            &mut self.fatal_release,
+            &mut self.cleanup_complete,
+        ] {
+            rebase_process_test_path(path, original_root, canonical_root)?;
+        }
+        Ok(())
+    }
+
+    fn reject_if_present(&self) -> Result<(), String> {
+        if [
+            &self.barrier_ready,
+            &self.barrier_release,
+            &self.fail_after_bridge_pid,
+            &self.fatal_armed,
+            &self.fatal_release,
+            &self.cleanup_complete,
+        ]
+        .iter()
+        .all(|path| path.is_none())
+        {
+            Ok(())
+        } else {
+            Err("process test options are valid only for run".to_owned())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -47,37 +125,18 @@ impl CommandConfig {
 
         let mut runtime_root = None;
         #[cfg(feature = "process-test-hooks")]
-        let mut barrier_ready = None;
-        #[cfg(feature = "process-test-hooks")]
-        let mut barrier_release = None;
-        #[cfg(feature = "process-test-hooks")]
-        let mut fail_after_bridge_pid = None;
-        #[cfg(feature = "process-test-hooks")]
-        let mut cleanup_complete = None;
+        let mut process_test = ProcessTestOptions::default();
 
         while let Some(argument) = arguments.next() {
+            #[cfg(feature = "process-test-hooks")]
+            if let Some(argument) = argument.to_str() {
+                if process_test.parse_argument(argument, &mut arguments)? {
+                    continue;
+                }
+            }
             match argument.to_str() {
                 Some("--runtime-root") if runtime_root.is_none() => {
                     runtime_root = Some(PathBuf::from(arguments.next().ok_or_else(usage)?));
-                }
-                #[cfg(feature = "process-test-hooks")]
-                Some("--process-test-event-barrier-ready") if barrier_ready.is_none() => {
-                    barrier_ready = Some(PathBuf::from(arguments.next().ok_or_else(usage)?));
-                }
-                #[cfg(feature = "process-test-hooks")]
-                Some("--process-test-event-barrier-release") if barrier_release.is_none() => {
-                    barrier_release = Some(PathBuf::from(arguments.next().ok_or_else(usage)?));
-                }
-                #[cfg(feature = "process-test-hooks")]
-                Some("--process-test-fail-heartbeat-after-bridge-pid")
-                    if fail_after_bridge_pid.is_none() =>
-                {
-                    fail_after_bridge_pid =
-                        Some(PathBuf::from(arguments.next().ok_or_else(usage)?));
-                }
-                #[cfg(feature = "process-test-hooks")]
-                Some("--process-test-cleanup-complete") if cleanup_complete.is_none() => {
-                    cleanup_complete = Some(PathBuf::from(arguments.next().ok_or_else(usage)?));
                 }
                 _ => return Err(usage()),
             }
@@ -91,23 +150,26 @@ impl CommandConfig {
         };
         #[cfg(feature = "process-test-hooks")]
         if let Some(original_root) = explicit_root_path.as_deref() {
-            rebase_process_test_path(&mut barrier_ready, original_root, &paths.root)?;
-            rebase_process_test_path(&mut barrier_release, original_root, &paths.root)?;
-            rebase_process_test_path(&mut fail_after_bridge_pid, original_root, &paths.root)?;
-            rebase_process_test_path(&mut cleanup_complete, original_root, &paths.root)?;
+            process_test.rebase(original_root, &paths.root)?;
         }
 
         match command.as_str() {
             "run" => {
                 #[cfg(feature = "process-test-hooks")]
-                let process_test_barrier =
-                    barrier_config(explicit_root, &paths, barrier_ready, barrier_release)?;
+                let process_test_barrier = barrier_config(
+                    explicit_root,
+                    &paths,
+                    process_test.barrier_ready,
+                    process_test.barrier_release,
+                )?;
                 #[cfg(feature = "process-test-hooks")]
                 let process_test_fatal_cleanup = fatal_cleanup_config(
                     explicit_root,
                     &paths,
-                    fail_after_bridge_pid,
-                    cleanup_complete,
+                    process_test.fail_after_bridge_pid,
+                    process_test.fatal_armed,
+                    process_test.fatal_release,
+                    process_test.cleanup_complete,
                 )?;
                 let bridge_executable = bridge_executable(&paths, explicit_root)?;
                 Ok(Self::Run(RunConfig {
@@ -121,22 +183,12 @@ impl CommandConfig {
             }
             "health" => {
                 #[cfg(feature = "process-test-hooks")]
-                reject_process_test_options(
-                    barrier_ready.as_ref(),
-                    barrier_release.as_ref(),
-                    fail_after_bridge_pid.as_ref(),
-                    cleanup_complete.as_ref(),
-                )?;
+                process_test.reject_if_present()?;
                 Ok(Self::Health(paths))
             }
             "prepare-sleep" => {
                 #[cfg(feature = "process-test-hooks")]
-                reject_process_test_options(
-                    barrier_ready.as_ref(),
-                    barrier_release.as_ref(),
-                    fail_after_bridge_pid.as_ref(),
-                    cleanup_complete.as_ref(),
-                )?;
+                process_test.reject_if_present()?;
                 let _ = paths;
                 Ok(Self::PrepareSleep)
             }
@@ -241,18 +293,29 @@ fn fatal_cleanup_config(
     explicit_root: bool,
     paths: &RuntimePaths,
     bridge_pid_ready: Option<PathBuf>,
+    armed: Option<PathBuf>,
+    release: Option<PathBuf>,
     cleanup_complete: Option<PathBuf>,
 ) -> Result<Option<ProcessTestFatalCleanupConfig>, String> {
-    match (bridge_pid_ready, cleanup_complete) {
-        (None, None) => Ok(None),
-        (Some(bridge_pid_ready), Some(cleanup_complete))
+    match (bridge_pid_ready, armed, release, cleanup_complete) {
+        (None, None, None, None) => Ok(None),
+        (Some(bridge_pid_ready), Some(armed), Some(release), Some(cleanup_complete))
             if explicit_root
                 && bridge_pid_ready.parent() == Some(paths.run_dir.as_path())
+                && armed.parent() == Some(paths.run_dir.as_path())
+                && release.parent() == Some(paths.run_dir.as_path())
                 && cleanup_complete.parent() == Some(paths.run_dir.as_path())
-                && bridge_pid_ready != cleanup_complete =>
+                && all_paths_are_distinct(&[
+                    &bridge_pid_ready,
+                    &armed,
+                    &release,
+                    &cleanup_complete,
+                ]) =>
         {
             Ok(Some(ProcessTestFatalCleanupConfig {
                 bridge_pid_ready,
+                armed,
+                release,
                 cleanup_complete,
             }))
         }
@@ -261,21 +324,11 @@ fn fatal_cleanup_config(
 }
 
 #[cfg(feature = "process-test-hooks")]
-fn reject_process_test_options(
-    barrier_ready: Option<&PathBuf>,
-    barrier_release: Option<&PathBuf>,
-    bridge_pid_ready: Option<&PathBuf>,
-    cleanup_complete: Option<&PathBuf>,
-) -> Result<(), String> {
-    if barrier_ready.is_none()
-        && barrier_release.is_none()
-        && bridge_pid_ready.is_none()
-        && cleanup_complete.is_none()
-    {
-        Ok(())
-    } else {
-        Err("process test options are valid only for run".to_owned())
-    }
+fn all_paths_are_distinct(paths: &[&Path]) -> bool {
+    paths
+        .iter()
+        .enumerate()
+        .all(|(index, path)| paths[index + 1..].iter().all(|other| path != other))
 }
 
 fn usage() -> String {

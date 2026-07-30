@@ -14,10 +14,17 @@ use pca_db_local::DbActorHandle;
 #[cfg(feature = "process-test-hooks")]
 use pca_db_local::ProcessTestHooks;
 use pca_domain::{AgentStatus, BridgeStatus, RuntimeStatusEnvelope};
-use pca_keychain::MacOSKeychainStore;
+#[cfg(feature = "process-test-hooks")]
+use pca_keychain::{
+    CredentialError, BRIDGE_CREDENTIAL_ACCOUNT, BRIDGE_CREDENTIAL_SERVICE,
+    BRIDGE_SHARED_SECRET_LENGTH,
+};
+use pca_keychain::{CredentialStore, MacOSKeychainStore};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::{sync::watch, task::JoinHandle};
 
+#[cfg(feature = "process-test-hooks")]
+use crate::config::ProcessTestFatalCleanupConfig;
 use crate::{
     config::{CommandConfig, RunConfig},
     lifecycle::{LifecycleRuntime, NoopCapabilityRefresher, RuntimeIdentity},
@@ -186,7 +193,13 @@ impl RuntimeResources {
             .map_err(|_| FailureStage::DatabaseHealth)?;
         self.schema_version = Some(health.schema_version);
 
-        let credential_store = Arc::new(MacOSKeychainStore);
+        let credential_store: Arc<dyn CredentialStore> = Arc::new(MacOSKeychainStore);
+        #[cfg(feature = "process-test-hooks")]
+        let credential_store = if config.process_test_fatal_cleanup.is_some() {
+            Arc::new(ProcessTestCredentialStore) as Arc<dyn CredentialStore>
+        } else {
+            credential_store
+        };
         let (bridge_status_sender, mut bridge_status_receiver) =
             watch::channel(BridgeStatus::Disconnected);
         let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
@@ -239,12 +252,7 @@ impl RuntimeResources {
 
         #[cfg(feature = "process-test-hooks")]
         if let Some(hook) = &config.process_test_fatal_cleanup {
-            wait_for_bridge_spawn(&mut bridge_status_receiver)
-                .await
-                .map_err(|()| FailureStage::InjectedHeartbeat)?;
-            wait_for_process_test_file(&hook.bridge_pid_ready)
-                .await
-                .map_err(|()| FailureStage::InjectedHeartbeat)?;
+            await_fatal_cleanup_release(hook, &mut bridge_status_receiver).await?;
             return Err(FailureStage::InjectedHeartbeat);
         }
 
@@ -423,7 +431,7 @@ async fn open_database(config: &RunConfig) -> Result<DbActorHandle, FailureStage
 
 fn start_bridge(
     config: &RunConfig,
-    credential_store: Arc<MacOSKeychainStore>,
+    credential_store: Arc<dyn CredentialStore>,
     statuses: watch::Sender<BridgeStatus>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), BridgeSupervisorError>>, ()> {
@@ -433,23 +441,45 @@ fn start_bridge(
         env!("CARGO_PKG_VERSION"),
     )
     .map_err(|_| ())?;
+    #[cfg(feature = "process-test-hooks")]
+    let bridge_config = if config.process_test_fatal_cleanup.is_some() {
+        bridge_config.with_operation_timeout(Duration::from_secs(10))
+    } else {
+        bridge_config
+    };
     let supervisor = BridgeSupervisor::new(bridge_config, credential_store, statuses);
     Ok(tokio::spawn(supervisor.run(shutdown)))
+}
+
+#[cfg(feature = "process-test-hooks")]
+struct ProcessTestCredentialStore;
+
+#[cfg(feature = "process-test-hooks")]
+impl CredentialStore for ProcessTestCredentialStore {
+    fn load(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+        if service != BRIDGE_CREDENTIAL_SERVICE || account != BRIDGE_CREDENTIAL_ACCOUNT {
+            return Err(CredentialError::UnsupportedIdentity);
+        }
+        Ok(Some(vec![0x5a; BRIDGE_SHARED_SECRET_LENGTH]))
+    }
+
+    fn store(&self, _: &str, _: &str, _: &[u8]) -> Result<(), CredentialError> {
+        Err(CredentialError::OperationFailed)
+    }
+
+    fn delete(&self, _: &str, _: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::OperationFailed)
+    }
 }
 
 async fn stop_bridge(
     bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
 ) -> Result<(), FailureStage> {
-    if let Some(mut task) = bridge_task {
-        if let Ok(result) = tokio::time::timeout(Duration::from_secs(3), &mut task).await {
-            result
-                .map_err(|_| FailureStage::BridgeCleanup)?
-                .map_err(|_| FailureStage::BridgeCleanup)?;
-        } else {
-            task.abort();
-            let _ = task.await;
-            return Err(FailureStage::BridgeCleanup);
-        }
+    if let Some(task) = bridge_task {
+        // Never abort a supervisor that owns a child: it must finish its kill-and-wait reap path.
+        task.await
+            .map_err(|_| FailureStage::BridgeCleanup)?
+            .map_err(|_| FailureStage::BridgeCleanup)?;
     }
     Ok(())
 }
@@ -556,6 +586,24 @@ fn health(paths: &RuntimePaths) -> u8 {
 }
 
 #[cfg(feature = "process-test-hooks")]
+async fn await_fatal_cleanup_release(
+    hook: &ProcessTestFatalCleanupConfig,
+    statuses: &mut watch::Receiver<BridgeStatus>,
+) -> Result<(), FailureStage> {
+    wait_for_bridge_spawn(statuses)
+        .await
+        .map_err(|()| FailureStage::InjectedHeartbeat)?;
+    wait_for_process_test_file(&hook.bridge_pid_ready)
+        .await
+        .map_err(|()| FailureStage::InjectedHeartbeat)?;
+    write_process_test_file(&hook.armed, b"armed\n")
+        .map_err(|()| FailureStage::InjectedHeartbeat)?;
+    wait_for_process_test_file(&hook.release)
+        .await
+        .map_err(|()| FailureStage::InjectedHeartbeat)
+}
+
+#[cfg(feature = "process-test-hooks")]
 async fn wait_for_bridge_spawn(statuses: &mut watch::Receiver<BridgeStatus>) -> Result<(), ()> {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -589,13 +637,18 @@ async fn wait_for_process_test_file(path: &Path) -> Result<(), ()> {
 
 #[cfg(feature = "process-test-hooks")]
 fn write_process_test_cleanup_complete(path: &Path) -> Result<(), ()> {
+    write_process_test_file(path, b"bridge-reaped-db-shutdown\n")
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn write_process_test_file(path: &Path, contents: &[u8]) -> Result<(), ()> {
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(path)
         .map_err(|_| ())?;
-    file.write_all(b"bridge-reaped-db-shutdown\n")
+    file.write_all(contents)
         .and_then(|()| file.sync_all())
         .map_err(|_| ())
 }

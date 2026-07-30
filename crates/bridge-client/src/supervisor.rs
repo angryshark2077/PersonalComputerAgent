@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::{
     process::{Child, Command},
     sync::watch,
-    time::{sleep, timeout, Instant},
+    time::{sleep, Instant},
 };
 
 use crate::{BridgeClient, BridgeClientConfig, BridgeClientError};
@@ -24,7 +24,6 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_STABLE_READY: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STABLE_READY: Duration = Duration::from_secs(30);
 
@@ -148,6 +147,8 @@ impl BridgeSupervisor {
     /// # Errors
     ///
     /// Returns only when cancellation cannot cleanly reap the supervised child.
+    /// Child termination deliberately has no wall-clock deadline: after sending SIGKILL, the
+    /// supervisor retains ownership until `wait` confirms reap, even if kernel waitpid is delayed.
     pub async fn run(
         self,
         mut shutdown: watch::Receiver<bool>,
@@ -312,28 +313,35 @@ fn spawn_bridge(config: &BridgeSupervisorConfig) -> Result<Child, ()> {
 }
 
 async fn cleanup_child(child: &mut Child, socket_path: &Path) -> Result<(), BridgeSupervisorError> {
-    let cleanup = async {
-        match child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => {
-                if child.start_kill().is_err() {
-                    return match child.try_wait() {
-                        Ok(Some(_)) => Ok(()),
-                        Ok(None) | Err(_) => Err(BridgeSupervisorError::ProcessCleanup),
-                    };
+    // Once this supervisor owns a child, cleanup favors a confirmed waitpid over a time bound.
+    // `kill_on_drop` remains a last-resort process fallback, not evidence that the child was reaped.
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if child.start_kill().is_err() {
+                match child.try_wait() {
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => {
+                        child
+                            .wait()
+                            .await
+                            .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
+                    }
                 }
+            } else {
                 child
                     .wait()
                     .await
                     .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
-                Ok(())
             }
-            Err(_) => Err(BridgeSupervisorError::ProcessCleanup),
         }
-    };
-    timeout(CHILD_CLEANUP_TIMEOUT, cleanup)
-        .await
-        .map_err(|_| BridgeSupervisorError::ProcessCleanup)??;
+        Err(_) => {
+            child
+                .wait()
+                .await
+                .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
+        }
+    }
     remove_confirmed_socket(socket_path)
 }
 

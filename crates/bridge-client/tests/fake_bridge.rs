@@ -490,6 +490,16 @@ async fn supervisor_restarts_a_crashed_child_reconnects_and_cancels_without_leak
             .expect("status channel");
         statuses.push(*status_rx.borrow_and_update());
     }
+    let pid = fs::read_to_string(directory.path().join("pid")).expect("live child pid");
+    assert!(
+        StdCommand::new("kill")
+            .args(["-0", pid.trim()])
+            .output()
+            .expect("probe live child pid")
+            .status
+            .success(),
+        "supervisor child must be live when shutdown begins"
+    );
     shutdown_tx.send(true).expect("request shutdown");
     task.await
         .expect("supervisor task")
@@ -508,7 +518,6 @@ async fn supervisor_restarts_a_crashed_child_reconnects_and_cancels_without_leak
     ));
     let runs = fs::read_to_string(directory.path().join("runs")).expect("run count");
     assert_eq!(runs.trim(), "2");
-    let pid = fs::read_to_string(directory.path().join("pid")).expect("child pid");
     assert!(!StdCommand::new("kill")
         .args(["-0", pid.trim()])
         .output()

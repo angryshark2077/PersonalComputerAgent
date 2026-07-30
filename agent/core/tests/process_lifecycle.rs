@@ -17,18 +17,37 @@ use rusqlite::Connection;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 
-struct ChildGuard(Child);
+struct ChildGuard {
+    child: Child,
+    fatal_release: Option<PathBuf>,
+    bridge_pid_file: Option<PathBuf>,
+}
 
 impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            fatal_release: None,
+            bridge_pid_file: None,
+        }
+    }
+
+    #[cfg(feature = "process-test-hooks")]
+    fn with_fatal_cleanup(mut self, release: PathBuf, bridge_pid_file: PathBuf) -> Self {
+        self.fatal_release = Some(release);
+        self.bridge_pid_file = Some(bridge_pid_file);
+        self
+    }
+
     fn wait_bounded(&mut self) -> ExitStatus {
         let deadline = Instant::now() + PROCESS_TIMEOUT;
         loop {
-            if let Some(status) = self.0.try_wait().expect("poll child") {
+            if let Some(status) = self.child.try_wait().expect("poll child") {
                 return status;
             }
             if Instant::now() >= deadline {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+                let _ = self.child.kill();
+                let _ = self.child.wait();
                 panic!("child process exceeded five-second bound");
             }
             thread::sleep(Duration::from_millis(10));
@@ -38,9 +57,30 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        let mut forced_agent_kill = false;
+        if self.child.try_wait().ok().flatten().is_none() {
+            if let Some(release) = &self.fatal_release {
+                let _ = fs::write(release, b"release-on-drop\n");
+                let deadline = Instant::now() + PROCESS_TIMEOUT;
+                while Instant::now() < deadline && self.child.try_wait().ok().flatten().is_none() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                forced_agent_kill = true;
+            }
+        }
+        if forced_agent_kill {
+            let Some(pid_file) = &self.bridge_pid_file else {
+                return;
+            };
+            if let Ok(pid) = fs::read_to_string(pid_file) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", pid.trim()])
+                    .status();
+            }
         }
     }
 }
@@ -50,7 +90,7 @@ fn binary() -> &'static str {
 }
 
 fn spawn_run(root: &Path) -> ChildGuard {
-    ChildGuard(
+    ChildGuard::new(
         Command::new(binary())
             .arg("run")
             .arg("--runtime-root")
@@ -95,9 +135,9 @@ fn wait_for_file(path: &Path) {
 fn wait_for_file_while_running(child: &mut ChildGuard, path: &Path) {
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     while !path.exists() {
-        if let Some(status) = child.0.try_wait().expect("poll rendezvous child") {
+        if let Some(status) = child.child.try_wait().expect("poll rendezvous child") {
             let mut stderr = String::new();
-            if let Some(mut pipe) = child.0.stderr.take() {
+            if let Some(mut pipe) = child.child.stderr.take() {
                 pipe.read_to_string(&mut stderr).expect("read child stderr");
             }
             panic!("child exited before rendezvous: {status}; stderr={stderr}");
@@ -142,7 +182,7 @@ fn install_fake_bridge(paths: &RuntimePaths) -> String {
 fn signal(child: &ChildGuard, name: &str) {
     let result = Command::new("/bin/kill")
         .arg(format!("-{name}"))
-        .arg(child.0.id().to_string())
+        .arg(child.child.id().to_string())
         .status()
         .expect("send signal");
     assert!(result.success(), "signal command failed");
@@ -309,13 +349,19 @@ fn fatal_failure_after_bridge_start_reaps_child_and_shuts_down_database_owner() 
     )
     .expect("fake Bridge satisfies production supervisor validation");
     let bridge_pid_file = paths.run_dir.join("fake-bridge.pid");
+    let fatal_armed = paths.run_dir.join("fatal-cleanup.armed");
+    let fatal_release = paths.run_dir.join("fatal-cleanup.release");
     let cleanup_complete = paths.run_dir.join("fatal-cleanup.complete");
-    let mut child = ChildGuard(
+    let mut child = ChildGuard::new(
         Command::new(binary())
             .args(["run", "--runtime-root"])
             .arg(root.path())
             .arg("--process-test-fail-heartbeat-after-bridge-pid")
             .arg(&bridge_pid_file)
+            .arg("--process-test-fatal-armed")
+            .arg(&fatal_armed)
+            .arg("--process-test-fatal-release")
+            .arg(&fatal_release)
             .arg("--process-test-cleanup-complete")
             .arg(&cleanup_complete)
             .stdin(Stdio::null())
@@ -323,19 +369,29 @@ fn fatal_failure_after_bridge_start_reaps_child_and_shuts_down_database_owner() 
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn failure-injected agentd"),
-    );
+    )
+    .with_fatal_cleanup(fatal_release.clone(), bridge_pid_file.clone());
 
-    wait_for_file_while_running(&mut child, &bridge_pid_file);
+    wait_for_file_while_running(&mut child, &fatal_armed);
     let bridge_pid = fs::read_to_string(&bridge_pid_file).expect("read fake Bridge pid");
     assert_ne!(
         bridge_pid.trim(),
         executable_probe_pid.trim(),
         "supervisor must spawn a new fake Bridge child"
     );
+    let live_probe = Command::new("/bin/kill")
+        .args(["-0", bridge_pid.trim()])
+        .output()
+        .expect("probe live fake Bridge pid");
+    assert!(
+        live_probe.status.success(),
+        "fake Bridge must be live immediately before fatal cleanup"
+    );
+    fs::write(&fatal_release, b"release\n").expect("release fatal cleanup injection");
     assert_eq!(child.wait_bounded().code(), Some(5));
     let mut stderr = String::new();
     child
-        .0
+        .child
         .stderr
         .take()
         .expect("fatal agent stderr")
@@ -445,6 +501,8 @@ fn default_binary_does_not_recognize_process_test_hook_flags() {
         "--process-test-event-barrier-ready",
         "--process-test-event-barrier-release",
         "--process-test-fail-heartbeat-after-bridge-pid",
+        "--process-test-fatal-armed",
+        "--process-test-fatal-release",
         "--process-test-cleanup-complete",
     ] {
         let output = Command::new(binary())
