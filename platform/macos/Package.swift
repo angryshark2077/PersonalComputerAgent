@@ -7,7 +7,8 @@ let package = Package(
     products: [
         .library(name: "BridgeProtocol", targets: ["BridgeProtocol"]),
         .executable(name: "SetupAppPlaceholder", targets: ["SetupAppPlaceholder"]),
-        .executable(name: "BridgeContractVerifier", targets: ["BridgeContractVerifier"])
+        .executable(name: "BridgeContractVerifier", targets: ["BridgeContractVerifier"]),
+        .executable(name: "PCAPlatformBridge", targets: ["PlatformBridge"])
     ],
     targets: [
         .target(name: "BridgeProtocol"),
@@ -18,6 +19,14 @@ let package = Package(
         .executableTarget(
             name: "BridgeContractVerifier",
             dependencies: ["BridgeProtocol"]
+        ),
+        .executableTarget(
+            name: "PlatformBridge",
+            dependencies: ["BridgeProtocol"]
+        ),
+        .testTarget(
+            name: "PlatformBridgeTests",
+            dependencies: ["PlatformBridge", "BridgeProtocol"]
         ),
     ]
 )
