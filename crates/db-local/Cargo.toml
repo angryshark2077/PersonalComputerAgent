@@ -4,5 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+pca-domain = { path = "../domain" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync"] }
+
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync"] }

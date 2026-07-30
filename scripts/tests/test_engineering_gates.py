@@ -40,6 +40,32 @@ class EngineeringGateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("duplicate migration id: 0000", result.stderr)
 
+    def test_non_contiguous_migration_ids_are_rejected(self) -> None:
+        root = self.make_repo()
+        self.write(root / "crates/db-local/migrations/0000_baseline.sql", "SELECT 1;")
+        self.write(root / "crates/db-local/migrations/0002_gap.sql", "SELECT 2;")
+
+        result = self.run_gate("verify_migrations.py", root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-monotonic migration ids", result.stderr)
+
+    def test_complete_local_migration_chain_replays_and_prints_checksums(self) -> None:
+        root = self.make_repo()
+        for relative_path in (
+            "crates/db-local/migrations/0000_baseline.sql",
+            "crates/db-local/migrations/0001_s1a_runtime.sql",
+            "packages/db-cloud/migrations/0000_baseline.sql",
+        ):
+            source = REPOSITORY_ROOT / relative_path
+            self.write(root / relative_path, source.read_text(encoding="utf-8"))
+
+        result = self.run_gate("verify_migrations.py", root)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("0000_baseline.sql sha256=", result.stdout)
+        self.assertIn("0001_s1a_runtime.sql sha256=", result.stdout)
+
     def test_domain_to_platform_import_is_rejected(self) -> None:
         root = self.make_repo()
         self.write(root / "crates/domain/src/lib.rs", "use pca_platform::Bridge;")
