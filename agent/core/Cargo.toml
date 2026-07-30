@@ -8,6 +8,11 @@ license.workspace = true
 default = []
 process-test-hooks = ["pca-db-local/process-test-hooks"]
 
+[[bin]]
+name = "pca-test-bridge"
+path = "tests/support/fake_bridge.rs"
+required-features = ["process-test-hooks"]
+
 [dependencies]
 pca-agent-runtime = { path = "../../crates/agent-runtime" }
 pca-bridge-client = { path = "../../crates/bridge-client" }

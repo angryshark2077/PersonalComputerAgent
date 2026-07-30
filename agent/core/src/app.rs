@@ -1,10 +1,15 @@
 use std::{fs, sync::Arc, time::Duration};
 
+#[cfg(feature = "process-test-hooks")]
+use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
+
 use pca_agent_runtime::{
     CrashMarkerGuard, LocalHeartbeatWriter, RuntimeError, RuntimePaths, RuntimeStateMachine,
     SingleInstanceGuard,
 };
-use pca_bridge_client::supervisor::{BridgeSupervisor, BridgeSupervisorConfig};
+use pca_bridge_client::supervisor::{
+    BridgeSupervisor, BridgeSupervisorConfig, BridgeSupervisorError,
+};
 use pca_db_local::DbActorHandle;
 #[cfg(feature = "process-test-hooks")]
 use pca_db_local::ProcessTestHooks;
@@ -15,28 +20,28 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
     config::{CommandConfig, RunConfig},
-    lifecycle::{LifecycleRuntime, RuntimeIdentity},
+    lifecycle::{LifecycleRuntime, NoopCapabilityRefresher, RuntimeIdentity},
 };
 
-pub(crate) const EXIT_USAGE: i32 = 2;
-const EXIT_UNHEALTHY: i32 = 1;
-const EXIT_UNSUPPORTED: i32 = 3;
-const EXIT_ALREADY_RUNNING: i32 = 4;
-const EXIT_RUNTIME_FAILURE: i32 = 5;
+pub(crate) const EXIT_USAGE: u8 = 2;
+const EXIT_UNHEALTHY: u8 = 1;
+const EXIT_UNSUPPORTED: u8 = 3;
+const EXIT_ALREADY_RUNNING: u8 = 4;
+const EXIT_RUNTIME_FAILURE: u8 = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEALTH_FRESHNESS: TimeDuration = TimeDuration::seconds(5);
 const LIFECYCLE_CAPACITY: usize = 32;
 
-pub(crate) async fn execute(command: CommandConfig) -> i32 {
+pub(crate) async fn execute(command: CommandConfig) -> u8 {
     match command {
-        CommandConfig::Run(config) => match run(config).await {
+        CommandConfig::Run(config) => match run(&config).await {
             Ok(()) => 0,
             Err(AppError::AlreadyRunning) => {
                 eprintln!("pca-agentd: already running");
                 EXIT_ALREADY_RUNNING
             }
-            Err(_) => {
-                eprintln!("pca-agentd: runtime failure");
+            Err(AppError::Failure(report)) => {
+                report.log();
                 EXIT_RUNTIME_FAILURE
             }
         },
@@ -50,142 +55,370 @@ pub(crate) async fn execute(command: CommandConfig) -> i32 {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FailureStage {
+    Paths,
+    CrashMarker,
+    DatabaseOpen,
+    DatabaseHealth,
+    State,
+    Lifecycle,
+    Heartbeat,
+    Signal,
+    #[cfg(feature = "process-test-hooks")]
+    BridgeConfiguration,
+    #[cfg(feature = "process-test-hooks")]
+    InjectedHeartbeat,
+    LifecycleCleanup,
+    BridgeCleanup,
+    Checkpoint,
+    FinalStatus,
+    DatabaseOwnership,
+    DatabaseShutdown,
+    #[cfg(feature = "process-test-hooks")]
+    CleanupEvidence,
+}
+
+impl FailureStage {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Paths => "paths",
+            Self::CrashMarker => "crash_marker",
+            Self::DatabaseOpen => "database_open",
+            Self::DatabaseHealth => "database_health",
+            Self::State => "state",
+            Self::Lifecycle => "lifecycle",
+            Self::Heartbeat => "heartbeat",
+            Self::Signal => "signal",
+            #[cfg(feature = "process-test-hooks")]
+            Self::BridgeConfiguration => "bridge_configuration",
+            #[cfg(feature = "process-test-hooks")]
+            Self::InjectedHeartbeat => "injected_heartbeat",
+            Self::LifecycleCleanup => "lifecycle_cleanup",
+            Self::BridgeCleanup => "bridge_cleanup",
+            Self::Checkpoint => "checkpoint",
+            Self::FinalStatus => "final_status",
+            Self::DatabaseOwnership => "database_ownership",
+            Self::DatabaseShutdown => "database_shutdown",
+            #[cfg(feature = "process-test-hooks")]
+            Self::CleanupEvidence => "cleanup_evidence",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FailureReport {
+    primary: FailureStage,
+    cleanup: Vec<FailureStage>,
+}
+
+impl FailureReport {
+    fn log(&self) {
+        eprint!("pca-agentd: runtime failure stage={}", self.primary.code());
+        if self.cleanup.is_empty() {
+            eprintln!(" cleanup=none");
+        } else {
+            eprint!(" cleanup=");
+            for (index, stage) in self.cleanup.iter().enumerate() {
+                if index > 0 {
+                    eprint!(",");
+                }
+                eprint!("{}", stage.code());
+            }
+            eprintln!();
+        }
+    }
+}
+
 #[derive(Debug)]
 enum AppError {
     AlreadyRunning,
-    Runtime,
+    Failure(FailureReport),
 }
 
-impl<T> From<T> for AppError
-where
-    T: std::error::Error,
-{
-    fn from(_: T) -> Self {
-        Self::Runtime
+impl AppError {
+    fn primary(stage: FailureStage) -> Self {
+        Self::Failure(FailureReport {
+            primary: stage,
+            cleanup: Vec::new(),
+        })
     }
 }
 
-async fn run(config: RunConfig) -> Result<(), AppError> {
-    config.paths.create_securely()?;
-    let _instance = match SingleInstanceGuard::acquire(&config.paths.lock_file) {
-        Ok(guard) => guard,
-        Err(RuntimeError::AlreadyRunning) => return Err(AppError::AlreadyRunning),
-        Err(error) => return Err(error.into()),
-    };
+struct RuntimeResources {
+    database: Option<Arc<DbActorHandle>>,
+    lifecycle: Option<LifecycleRuntime>,
+    bridge_shutdown: Option<watch::Sender<bool>>,
+    bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
+    heartbeat: Option<LocalHeartbeatWriter>,
+    state: RuntimeStateMachine,
+    schema_version: Option<u32>,
+}
 
-    eprintln!("pca-agentd: starting local runtime");
-    let crash_marker = CrashMarkerGuard::activate(&config.paths.crash_marker_file)?;
-    let recovered_from_crash = crash_marker.previous_exit_was_unclean();
-
-    let active_result = run_active(&config, recovered_from_crash).await;
-    let database = match active_result {
-        Ok(database) => database,
-        Err(error) => {
-            std::mem::forget(crash_marker);
-            return Err(error);
+impl RuntimeResources {
+    fn new(database: DbActorHandle) -> Self {
+        Self {
+            database: Some(Arc::new(database)),
+            lifecycle: None,
+            bridge_shutdown: None,
+            bridge_task: None,
+            heartbeat: None,
+            state: RuntimeStateMachine::starting(),
+            schema_version: None,
         }
-    };
-    crash_marker.complete_cleanly()?;
-    database.shutdown().await?;
-    eprintln!("pca-agentd: stopped local runtime");
-    Ok(())
-}
-
-async fn run_active(
-    config: &RunConfig,
-    recovered_from_crash: bool,
-) -> Result<DbActorHandle, AppError> {
-    #[cfg(feature = "process-test-hooks")]
-    let database = if let Some(ref barrier) = config.process_test_barrier {
-        let hooks = ProcessTestHooks::new(barrier.ready.clone(), barrier.release.clone())?;
-        DbActorHandle::open_with_process_test_hooks(
-            &config.paths.database_file,
-            env!("CARGO_PKG_VERSION"),
-            hooks,
-        )
-        .await?
-    } else {
-        DbActorHandle::open(&config.paths.database_file, env!("CARGO_PKG_VERSION")).await?
-    };
-    #[cfg(not(feature = "process-test-hooks"))]
-    let database =
-        DbActorHandle::open(&config.paths.database_file, env!("CARGO_PKG_VERSION")).await?;
-    let database_health = database.health().await?;
-    let database = Arc::new(database);
-
-    let credential_store = Arc::new(MacOSKeychainStore);
-    let (bridge_status_sender, mut bridge_status_receiver) =
-        watch::channel(BridgeStatus::Disconnected);
-    let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
-    let bridge_task = start_bridge(
-        config,
-        credential_store,
-        bridge_status_sender.clone(),
-        bridge_shutdown_receiver,
-    );
-
-    let mut state = RuntimeStateMachine::starting();
-    state.transition_agent(AgentStatus::Unpaired)?;
-    if bridge_task.is_none() {
-        set_bridge_status(&mut state, BridgeStatus::Degraded)?;
-        bridge_status_sender.send_replace(BridgeStatus::Degraded);
     }
 
-    let lifecycle = LifecycleRuntime::start(
-        Arc::clone(&database),
-        RuntimeIdentity::new("local-unpaired", "local-device"),
-        LIFECYCLE_CAPACITY,
-    );
-    if recovered_from_crash {
-        lifecycle.record_crash_recovery().await?;
+    fn database(&self) -> &DbActorHandle {
+        self.database
+            .as_deref()
+            .expect("database exists until cleanup")
     }
-    lifecycle.record_startup().await?;
 
-    let heartbeat = LocalHeartbeatWriter::new(&config.paths.status_file);
-    persist_runtime_status(&database, &heartbeat, state, database_health.schema_version).await?;
+    async fn run_until_signal(
+        &mut self,
+        config: &RunConfig,
+        recovered_from_crash: bool,
+    ) -> Result<(), FailureStage> {
+        let health = self
+            .database()
+            .health()
+            .await
+            .map_err(|_| FailureStage::DatabaseHealth)?;
+        self.schema_version = Some(health.schema_version);
 
-    let mut heartbeat_timer = tokio::time::interval(HEARTBEAT_INTERVAL);
-    heartbeat_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    heartbeat_timer.tick().await;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let credential_store = Arc::new(MacOSKeychainStore);
+        let (bridge_status_sender, mut bridge_status_receiver) =
+            watch::channel(BridgeStatus::Disconnected);
+        let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
+        let bridge_task = start_bridge(
+            config,
+            credential_store,
+            bridge_status_sender.clone(),
+            bridge_shutdown_receiver,
+        );
+        #[cfg(feature = "process-test-hooks")]
+        if bridge_task.is_err() && config.process_test_fatal_cleanup.is_some() {
+            return Err(FailureStage::BridgeConfiguration);
+        }
+        self.bridge_task = bridge_task.ok();
+        self.bridge_shutdown = Some(bridge_shutdown_sender);
 
-    loop {
-        tokio::select! {
-            _ = interrupt.recv() => break,
-            _ = terminate.recv() => break,
-            _ = heartbeat_timer.tick() => {
-                persist_runtime_status(
-                    &database,
-                    &heartbeat,
-                    state,
-                    database_health.schema_version,
-                ).await?;
-            }
-            changed = bridge_status_receiver.changed() => {
-                if changed.is_ok() {
-                    let next = *bridge_status_receiver.borrow_and_update();
-                    set_bridge_status(&mut state, next)?;
-                    persist_runtime_status(
-                        &database,
-                        &heartbeat,
-                        state,
-                        database_health.schema_version,
-                    ).await?;
+        self.state
+            .transition_agent(AgentStatus::Unpaired)
+            .map_err(|_| FailureStage::State)?;
+        if self.bridge_task.is_none() {
+            set_bridge_status(&mut self.state, BridgeStatus::Degraded)
+                .map_err(|_| FailureStage::State)?;
+            bridge_status_sender.send_replace(BridgeStatus::Degraded);
+        }
+
+        self.lifecycle = Some(LifecycleRuntime::start(
+            Arc::clone(
+                self.database
+                    .as_ref()
+                    .expect("database exists until cleanup"),
+            ),
+            RuntimeIdentity::new("local-unpaired", "local-device"),
+            LIFECYCLE_CAPACITY,
+            Arc::new(NoopCapabilityRefresher),
+        ));
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .expect("lifecycle was just installed");
+        if recovered_from_crash {
+            lifecycle
+                .record_crash_recovery()
+                .await
+                .map_err(|_| FailureStage::Lifecycle)?;
+        }
+        lifecycle
+            .record_startup()
+            .await
+            .map_err(|_| FailureStage::Lifecycle)?;
+
+        #[cfg(feature = "process-test-hooks")]
+        if let Some(hook) = &config.process_test_fatal_cleanup {
+            wait_for_bridge_spawn(&mut bridge_status_receiver)
+                .await
+                .map_err(|()| FailureStage::InjectedHeartbeat)?;
+            wait_for_process_test_file(&hook.bridge_pid_ready)
+                .await
+                .map_err(|()| FailureStage::InjectedHeartbeat)?;
+            return Err(FailureStage::InjectedHeartbeat);
+        }
+
+        self.heartbeat = Some(LocalHeartbeatWriter::new(&config.paths.status_file));
+        self.persist_status()
+            .await
+            .map_err(|_| FailureStage::Heartbeat)?;
+
+        let mut heartbeat_timer = tokio::time::interval(HEARTBEAT_INTERVAL);
+        heartbeat_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat_timer.tick().await;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(|_| FailureStage::Signal)?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|_| FailureStage::Signal)?;
+
+        loop {
+            tokio::select! {
+                _ = interrupt.recv() => return Ok(()),
+                _ = terminate.recv() => return Ok(()),
+                _ = heartbeat_timer.tick() => {
+                    self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
+                }
+                changed = bridge_status_receiver.changed() => {
+                    if changed.is_ok() {
+                        let next = *bridge_status_receiver.borrow_and_update();
+                        set_bridge_status(&mut self.state, next)
+                            .map_err(|_| FailureStage::State)?;
+                        self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
+                    }
                 }
             }
         }
     }
 
-    lifecycle.stop_and_drain().await?;
-    bridge_shutdown_sender.send_replace(true);
-    stop_bridge(bridge_task).await?;
-    database.checkpoint().await?;
-    state.transition_agent(AgentStatus::Stopped)?;
-    set_bridge_status(&mut state, BridgeStatus::Stopped)?;
-    persist_runtime_status(&database, &heartbeat, state, database_health.schema_version).await?;
-    let database = Arc::try_unwrap(database).map_err(|_| AppError::Runtime)?;
-    Ok(database)
+    async fn persist_status(&self) -> Result<(), FailureStage> {
+        let heartbeat = self.heartbeat.as_ref().ok_or(FailureStage::Heartbeat)?;
+        let schema_version = self.schema_version.ok_or(FailureStage::Heartbeat)?;
+        persist_runtime_status(self.database(), heartbeat, self.state, schema_version)
+            .await
+            .map_err(|_| FailureStage::Heartbeat)
+    }
+
+    async fn cleanup(mut self, clean_shutdown: bool) -> Vec<FailureStage> {
+        let mut failures = Vec::new();
+
+        if let Some(lifecycle) = self.lifecycle.take() {
+            let result = if clean_shutdown {
+                lifecycle.stop_and_drain().await.map(|_| ())
+            } else {
+                lifecycle.abort_and_drain().await
+            };
+            if result.is_err() {
+                failures.push(FailureStage::LifecycleCleanup);
+            }
+        }
+
+        if let Some(shutdown) = self.bridge_shutdown.take() {
+            shutdown.send_replace(true);
+        }
+        if stop_bridge(self.bridge_task.take()).await.is_err() {
+            failures.push(FailureStage::BridgeCleanup);
+        }
+
+        if self.database().checkpoint().await.is_err() {
+            failures.push(FailureStage::Checkpoint);
+        }
+
+        if clean_shutdown {
+            let state_result = self
+                .state
+                .transition_agent(AgentStatus::Stopped)
+                .and_then(|()| set_bridge_status(&mut self.state, BridgeStatus::Stopped));
+            if state_result.is_err() {
+                failures.push(FailureStage::State);
+            } else if self.persist_status().await.is_err() {
+                failures.push(FailureStage::FinalStatus);
+            }
+        }
+
+        // The heartbeat interval is local to `run_until_signal`; it has already been dropped, so
+        // no writer can race this final status. Dropping the writer releases the remaining handle.
+        self.heartbeat.take();
+        let database = self.database.take().expect("database exists until cleanup");
+        match Arc::try_unwrap(database) {
+            Ok(database) => {
+                if database.shutdown().await.is_err() {
+                    failures.push(FailureStage::DatabaseShutdown);
+                }
+            }
+            Err(_) => failures.push(FailureStage::DatabaseOwnership),
+        }
+        failures
+    }
+}
+
+async fn run(config: &RunConfig) -> Result<(), AppError> {
+    config
+        .paths
+        .create_securely()
+        .map_err(|_| AppError::primary(FailureStage::Paths))?;
+    let _instance = match SingleInstanceGuard::acquire(&config.paths.lock_file) {
+        Ok(guard) => guard,
+        Err(RuntimeError::AlreadyRunning) => return Err(AppError::AlreadyRunning),
+        Err(_) => return Err(AppError::primary(FailureStage::Paths)),
+    };
+
+    eprintln!("pca-agentd: starting local runtime");
+    let crash_marker = CrashMarkerGuard::activate(&config.paths.crash_marker_file)
+        .map_err(|_| AppError::primary(FailureStage::CrashMarker))?;
+    let recovered_from_crash = crash_marker.previous_exit_was_unclean();
+    let database = match open_database(config).await {
+        Ok(database) => database,
+        Err(stage) => {
+            std::mem::forget(crash_marker);
+            return Err(AppError::primary(stage));
+        }
+    };
+
+    let mut resources = RuntimeResources::new(database);
+    let primary_result = resources
+        .run_until_signal(config, recovered_from_crash)
+        .await;
+    let clean_shutdown = primary_result.is_ok();
+    let cleanup = resources.cleanup(clean_shutdown).await;
+
+    #[cfg(feature = "process-test-hooks")]
+    let cleanup = {
+        let mut cleanup = cleanup;
+        if cleanup.is_empty() {
+            if let Some(hook) = &config.process_test_fatal_cleanup {
+                if write_process_test_cleanup_complete(&hook.cleanup_complete).is_err() {
+                    cleanup.push(FailureStage::CleanupEvidence);
+                }
+            }
+        }
+        cleanup
+    };
+
+    if clean_shutdown && cleanup.is_empty() {
+        crash_marker
+            .complete_cleanly()
+            .map_err(|_| AppError::primary(FailureStage::CrashMarker))?;
+        eprintln!("pca-agentd: stopped local runtime");
+        Ok(())
+    } else {
+        std::mem::forget(crash_marker);
+        Err(AppError::Failure(FailureReport {
+            primary: primary_result
+                .err()
+                .unwrap_or(FailureStage::LifecycleCleanup),
+            cleanup,
+        }))
+    }
+}
+
+async fn open_database(config: &RunConfig) -> Result<DbActorHandle, FailureStage> {
+    #[cfg(feature = "process-test-hooks")]
+    if let Some(ref barrier) = config.process_test_barrier {
+        let hooks = ProcessTestHooks::new(barrier.ready.clone(), barrier.release.clone())
+            .map_err(|_| FailureStage::DatabaseOpen)?;
+        return DbActorHandle::open_with_process_test_hooks(
+            &config.paths.database_file,
+            env!("CARGO_PKG_VERSION"),
+            hooks,
+        )
+        .await
+        .map_err(|_| FailureStage::DatabaseOpen);
+    }
+    DbActorHandle::open(&config.paths.database_file, env!("CARGO_PKG_VERSION"))
+        .await
+        .map_err(|_| FailureStage::DatabaseOpen)
 }
 
 fn start_bridge(
@@ -193,29 +426,29 @@ fn start_bridge(
     credential_store: Arc<MacOSKeychainStore>,
     statuses: watch::Sender<BridgeStatus>,
     shutdown: watch::Receiver<bool>,
-) -> Option<JoinHandle<Result<(), pca_bridge_client::supervisor::BridgeSupervisorError>>> {
+) -> Result<JoinHandle<Result<(), BridgeSupervisorError>>, ()> {
     let bridge_config = BridgeSupervisorConfig::new(
         &config.bridge_executable,
         &config.paths.socket_file,
         env!("CARGO_PKG_VERSION"),
     )
-    .ok()?;
+    .map_err(|_| ())?;
     let supervisor = BridgeSupervisor::new(bridge_config, credential_store, statuses);
-    Some(tokio::spawn(supervisor.run(shutdown)))
+    Ok(tokio::spawn(supervisor.run(shutdown)))
 }
 
 async fn stop_bridge(
-    bridge_task: Option<
-        JoinHandle<Result<(), pca_bridge_client::supervisor::BridgeSupervisorError>>,
-    >,
-) -> Result<(), AppError> {
+    bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
+) -> Result<(), FailureStage> {
     if let Some(mut task) = bridge_task {
         if let Ok(result) = tokio::time::timeout(Duration::from_secs(3), &mut task).await {
-            result.map_err(|_| AppError::Runtime)??;
+            result
+                .map_err(|_| FailureStage::BridgeCleanup)?
+                .map_err(|_| FailureStage::BridgeCleanup)?;
         } else {
             task.abort();
             let _ = task.await;
-            return Err(AppError::Runtime);
+            return Err(FailureStage::BridgeCleanup);
         }
     }
     Ok(())
@@ -226,11 +459,11 @@ async fn persist_runtime_status(
     heartbeat: &LocalHeartbeatWriter,
     state: RuntimeStateMachine,
     schema_version: u32,
-) -> Result<(), AppError> {
+) -> Result<(), FailureStage> {
     let now = OffsetDateTime::now_utc();
-    let heartbeat_at = now.format(&Rfc3339).map_err(|_| AppError::Runtime)?;
-    let updated_at_ms =
-        i64::try_from(now.unix_timestamp_nanos() / 1_000_000).map_err(|_| AppError::Runtime)?;
+    let heartbeat_at = now.format(&Rfc3339).map_err(|_| FailureStage::Heartbeat)?;
+    let updated_at_ms = i64::try_from(now.unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| FailureStage::Heartbeat)?;
     database
         .set_agent_state(
             state.agent_status(),
@@ -238,17 +471,19 @@ async fn persist_runtime_status(
             true,
             updated_at_ms,
         )
-        .await?;
-    heartbeat.write(&RuntimeStatusEnvelope {
-        agent_status: state.agent_status(),
-        bridge_status: state.bridge_status(),
-        local_healthy: true,
-        heartbeat_at,
-        process_id: std::process::id(),
-        app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        schema_version,
-    })?;
-    Ok(())
+        .await
+        .map_err(|_| FailureStage::Heartbeat)?;
+    heartbeat
+        .write(&RuntimeStatusEnvelope {
+            agent_status: state.agent_status(),
+            bridge_status: state.bridge_status(),
+            local_healthy: true,
+            heartbeat_at,
+            process_id: std::process::id(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            schema_version,
+        })
+        .map_err(|_| FailureStage::Heartbeat)
 }
 
 fn set_bridge_status(
@@ -286,7 +521,7 @@ fn set_bridge_status(
     }
 }
 
-fn health(paths: &RuntimePaths) -> i32 {
+fn health(paths: &RuntimePaths) -> u8 {
     let Ok(bytes) = fs::read(&paths.status_file) else {
         eprintln!("pca-agentd: local health unavailable");
         return EXIT_UNHEALTHY;
@@ -318,4 +553,49 @@ fn health(paths: &RuntimePaths) -> i32 {
         }
         Err(_) => EXIT_UNHEALTHY,
     }
+}
+
+#[cfg(feature = "process-test-hooks")]
+async fn wait_for_bridge_spawn(statuses: &mut watch::Receiver<BridgeStatus>) -> Result<(), ()> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if *statuses.borrow_and_update() == BridgeStatus::Handshaking {
+                return Ok(());
+            }
+            statuses.changed().await.map_err(|_| ())?;
+        }
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+#[cfg(feature = "process-test-hooks")]
+async fn wait_for_process_test_file(path: &Path) -> Result<(), ()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                return Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn write_process_test_cleanup_complete(path: &Path) -> Result<(), ()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| ())?;
+    file.write_all(b"bridge-reaped-db-shutdown\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|_| ())
 }

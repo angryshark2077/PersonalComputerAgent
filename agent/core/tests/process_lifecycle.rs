@@ -6,7 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "process-test-hooks")]
+use std::{io::Read, os::unix::fs::PermissionsExt};
+
 use pca_agent_runtime::{RuntimePaths, SingleInstanceGuard};
+#[cfg(feature = "process-test-hooks")]
+use pca_bridge_client::supervisor::BridgeSupervisorConfig;
 use pca_domain::{AgentStatus, BridgeStatus, RuntimeStatusEnvelope};
 use rusqlite::Connection;
 
@@ -72,6 +77,66 @@ fn wait_for_status(path: &Path) -> RuntimeStatusEnvelope {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "expected process rendezvous file within five seconds"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn wait_for_file_while_running(child: &mut ChildGuard, path: &Path) {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while !path.exists() {
+        if let Some(status) = child.0.try_wait().expect("poll rendezvous child") {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.0.stderr.take() {
+                pipe.read_to_string(&mut stderr).expect("read child stderr");
+            }
+            panic!("child exited before rendezvous: {status}; stderr={stderr}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected process rendezvous file within five seconds"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn install_fake_bridge(paths: &RuntimePaths) -> String {
+    let executable = paths
+        .app_dir
+        .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge");
+    fs::create_dir_all(executable.parent().expect("Bridge executable parent"))
+        .expect("create fake Bridge bundle path");
+    fs::copy(env!("CARGO_BIN_EXE_pca-test-bridge"), &executable)
+        .expect("install native fake Bridge");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+        .expect("make fake Bridge executable");
+
+    let pid_file = paths.run_dir.join("fake-bridge.pid");
+    let mut probe = Command::new(&executable)
+        .arg("--socket")
+        .arg(&paths.socket_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("execute fake Bridge with production argv");
+    wait_for_file(&pid_file);
+    let probe_pid = fs::read_to_string(&pid_file).expect("read fake Bridge executable probe pid");
+    probe.kill().expect("stop fake Bridge executable probe");
+    probe.wait().expect("reap fake Bridge executable probe");
+    fs::remove_file(pid_file).expect("remove fake Bridge executable probe pid");
+    probe_pid
 }
 
 fn signal(child: &ChildGuard, name: &str) {
@@ -161,6 +226,28 @@ fn run_writes_fresh_local_health_when_bridge_is_missing_and_stops_cleanly() {
 }
 
 #[test]
+fn final_heartbeat_cannot_be_overwritten_by_the_periodic_timer() {
+    let root = tempfile::tempdir().expect("temporary runtime root");
+    let paths = RuntimePaths::under(root.path());
+    let mut child = spawn_run(root.path());
+    wait_for_status(&paths.status_file);
+
+    signal(&child, "TERM");
+    assert!(child.wait_bounded().success());
+    let final_bytes = fs::read(&paths.status_file).expect("read final heartbeat");
+    let final_status: RuntimeStatusEnvelope =
+        serde_json::from_slice(&final_bytes).expect("decode final heartbeat");
+    assert_eq!(final_status.agent_status, AgentStatus::Stopped);
+
+    thread::sleep(Duration::from_millis(2_100));
+    assert_eq!(
+        fs::read(&paths.status_file).expect("reread final heartbeat"),
+        final_bytes,
+        "no periodic writer may survive final heartbeat"
+    );
+}
+
+#[test]
 fn second_instance_is_rejected_before_an_otherwise_fatal_database_open() {
     let root = tempfile::tempdir().expect("temporary runtime root");
     let paths = RuntimePaths::under(root.path());
@@ -202,6 +289,80 @@ fn fatal_startup_retains_crash_marker_for_next_recovery() {
         1,
         "abnormal startup must remain visible to crash recovery"
     );
+}
+
+#[cfg(feature = "process-test-hooks")]
+#[test]
+fn fatal_failure_after_bridge_start_reaps_child_and_shuts_down_database_owner() {
+    let root = tempfile::tempdir().expect("temporary runtime root");
+    let paths = RuntimePaths::under(root.path());
+    paths.create_securely().expect("secure runtime paths");
+    let executable_probe_pid = install_fake_bridge(&paths);
+    let canonical_paths = RuntimePaths::under(root.path().canonicalize().expect("canonical root"));
+    let bridge_executable = canonical_paths
+        .app_dir
+        .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge");
+    BridgeSupervisorConfig::new(
+        &bridge_executable,
+        &canonical_paths.socket_file,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .expect("fake Bridge satisfies production supervisor validation");
+    let bridge_pid_file = paths.run_dir.join("fake-bridge.pid");
+    let cleanup_complete = paths.run_dir.join("fatal-cleanup.complete");
+    let mut child = ChildGuard(
+        Command::new(binary())
+            .args(["run", "--runtime-root"])
+            .arg(root.path())
+            .arg("--process-test-fail-heartbeat-after-bridge-pid")
+            .arg(&bridge_pid_file)
+            .arg("--process-test-cleanup-complete")
+            .arg(&cleanup_complete)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn failure-injected agentd"),
+    );
+
+    wait_for_file_while_running(&mut child, &bridge_pid_file);
+    let bridge_pid = fs::read_to_string(&bridge_pid_file).expect("read fake Bridge pid");
+    assert_ne!(
+        bridge_pid.trim(),
+        executable_probe_pid.trim(),
+        "supervisor must spawn a new fake Bridge child"
+    );
+    assert_eq!(child.wait_bounded().code(), Some(5));
+    let mut stderr = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .expect("fatal agent stderr")
+        .read_to_string(&mut stderr)
+        .expect("read fatal agent stderr");
+    assert!(
+        stderr.contains("stage=injected_heartbeat cleanup=none"),
+        "fatal report must preserve static primary and cleanup context: {stderr}"
+    );
+    wait_for_file(&cleanup_complete);
+
+    let bridge_probe = Command::new("/bin/kill")
+        .args(["-0", bridge_pid.trim()])
+        .output()
+        .expect("probe fake Bridge pid");
+    assert!(!bridge_probe.status.success(), "fake Bridge child leaked");
+    assert!(!paths.socket_file.exists(), "Bridge socket leaked");
+    assert_eq!(
+        marker_members(&paths).len(),
+        1,
+        "fatal cleanup must retain crash marker"
+    );
+    let _lock = SingleInstanceGuard::acquire(&paths.lock_file).expect("agent lock was released");
+    let connection = Connection::open(&paths.database_file).expect("reopen database after cleanup");
+    connection
+        .execute_batch("BEGIN EXCLUSIVE; ROLLBACK;")
+        .expect("database owner and transaction were shut down");
 }
 
 #[test]
@@ -280,15 +441,20 @@ fn stale_health_and_unavailable_prepare_sleep_have_meaningful_exit_codes() {
 #[test]
 fn default_binary_does_not_recognize_process_test_hook_flags() {
     let root = tempfile::tempdir().expect("temporary runtime root");
-    let output = Command::new(binary())
-        .args(["run", "--runtime-root"])
-        .arg(root.path())
-        .arg("--process-test-event-barrier-ready")
-        .arg(root.path().join("ready"))
-        .arg("--process-test-event-barrier-release")
-        .arg(root.path().join("release"))
-        .output()
-        .expect("run default binary with hidden flags");
+    for flag in [
+        "--process-test-event-barrier-ready",
+        "--process-test-event-barrier-release",
+        "--process-test-fail-heartbeat-after-bridge-pid",
+        "--process-test-cleanup-complete",
+    ] {
+        let output = Command::new(binary())
+            .args(["run", "--runtime-root"])
+            .arg(root.path())
+            .arg(flag)
+            .arg(root.path().join("hidden-hook-value"))
+            .output()
+            .expect("run default binary with hidden flag");
 
-    assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.status.code(), Some(2), "default accepted {flag}");
+    }
 }

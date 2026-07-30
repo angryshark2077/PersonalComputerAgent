@@ -12,12 +12,21 @@ pub(crate) struct ProcessTestBarrierConfig {
     pub(crate) release: PathBuf,
 }
 
+#[cfg(feature = "process-test-hooks")]
+#[derive(Debug)]
+pub(crate) struct ProcessTestFatalCleanupConfig {
+    pub(crate) bridge_pid_ready: PathBuf,
+    pub(crate) cleanup_complete: PathBuf,
+}
+
 #[derive(Debug)]
 pub(crate) struct RunConfig {
     pub(crate) paths: RuntimePaths,
     pub(crate) bridge_executable: PathBuf,
     #[cfg(feature = "process-test-hooks")]
     pub(crate) process_test_barrier: Option<ProcessTestBarrierConfig>,
+    #[cfg(feature = "process-test-hooks")]
+    pub(crate) process_test_fatal_cleanup: Option<ProcessTestFatalCleanupConfig>,
 }
 
 #[derive(Debug)]
@@ -41,6 +50,10 @@ impl CommandConfig {
         let mut barrier_ready = None;
         #[cfg(feature = "process-test-hooks")]
         let mut barrier_release = None;
+        #[cfg(feature = "process-test-hooks")]
+        let mut fail_after_bridge_pid = None;
+        #[cfg(feature = "process-test-hooks")]
+        let mut cleanup_complete = None;
 
         while let Some(argument) = arguments.next() {
             match argument.to_str() {
@@ -55,43 +68,75 @@ impl CommandConfig {
                 Some("--process-test-event-barrier-release") if barrier_release.is_none() => {
                     barrier_release = Some(PathBuf::from(arguments.next().ok_or_else(usage)?));
                 }
+                #[cfg(feature = "process-test-hooks")]
+                Some("--process-test-fail-heartbeat-after-bridge-pid")
+                    if fail_after_bridge_pid.is_none() =>
+                {
+                    fail_after_bridge_pid =
+                        Some(PathBuf::from(arguments.next().ok_or_else(usage)?));
+                }
+                #[cfg(feature = "process-test-hooks")]
+                Some("--process-test-cleanup-complete") if cleanup_complete.is_none() => {
+                    cleanup_complete = Some(PathBuf::from(arguments.next().ok_or_else(usage)?));
+                }
                 _ => return Err(usage()),
             }
         }
 
-        let explicit_root = runtime_root.is_some();
+        let explicit_root_path = runtime_root.clone();
+        let explicit_root = explicit_root_path.is_some();
         let paths = match runtime_root {
-            Some(root) => test_paths(root)?,
+            Some(root) => test_paths(&root)?,
             None => RuntimePaths::for_current_user().map_err(|_| "production root unavailable")?,
         };
+        #[cfg(feature = "process-test-hooks")]
+        if let Some(original_root) = explicit_root_path.as_deref() {
+            rebase_process_test_path(&mut barrier_ready, original_root, &paths.root)?;
+            rebase_process_test_path(&mut barrier_release, original_root, &paths.root)?;
+            rebase_process_test_path(&mut fail_after_bridge_pid, original_root, &paths.root)?;
+            rebase_process_test_path(&mut cleanup_complete, original_root, &paths.root)?;
+        }
 
         match command.as_str() {
             "run" => {
                 #[cfg(feature = "process-test-hooks")]
                 let process_test_barrier =
                     barrier_config(explicit_root, &paths, barrier_ready, barrier_release)?;
-                let bridge_executable = if explicit_root {
-                    paths
-                        .app_dir
-                        .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge")
-                } else {
-                    production_bridge_executable()?
-                };
+                #[cfg(feature = "process-test-hooks")]
+                let process_test_fatal_cleanup = fatal_cleanup_config(
+                    explicit_root,
+                    &paths,
+                    fail_after_bridge_pid,
+                    cleanup_complete,
+                )?;
+                let bridge_executable = bridge_executable(&paths, explicit_root)?;
                 Ok(Self::Run(RunConfig {
                     paths,
                     bridge_executable,
                     #[cfg(feature = "process-test-hooks")]
                     process_test_barrier,
+                    #[cfg(feature = "process-test-hooks")]
+                    process_test_fatal_cleanup,
                 }))
             }
             "health" => {
                 #[cfg(feature = "process-test-hooks")]
-                reject_barrier_options(barrier_ready.as_ref(), barrier_release.as_ref())?;
+                reject_process_test_options(
+                    barrier_ready.as_ref(),
+                    barrier_release.as_ref(),
+                    fail_after_bridge_pid.as_ref(),
+                    cleanup_complete.as_ref(),
+                )?;
                 Ok(Self::Health(paths))
             }
             "prepare-sleep" => {
                 #[cfg(feature = "process-test-hooks")]
-                reject_barrier_options(barrier_ready.as_ref(), barrier_release.as_ref())?;
+                reject_process_test_options(
+                    barrier_ready.as_ref(),
+                    barrier_release.as_ref(),
+                    fail_after_bridge_pid.as_ref(),
+                    cleanup_complete.as_ref(),
+                )?;
                 let _ = paths;
                 Ok(Self::PrepareSleep)
             }
@@ -100,7 +145,7 @@ impl CommandConfig {
     }
 }
 
-fn test_paths(root: PathBuf) -> Result<RuntimePaths, String> {
+fn test_paths(root: &Path) -> Result<RuntimePaths, String> {
     if !root.is_absolute()
         || root.as_os_str().is_empty()
         || root == Path::new("/")
@@ -113,16 +158,53 @@ fn test_paths(root: PathBuf) -> Result<RuntimePaths, String> {
     {
         return Err("--runtime-root must be a safe absolute non-production path".to_owned());
     }
-    let canonical_root = std::fs::canonicalize(&root)
-        .map_err(|_| "--runtime-root must name an existing non-production directory")?;
-    let resolves_to_production = RuntimePaths::for_current_user()
-        .ok()
-        .and_then(|production| std::fs::canonicalize(production.root).ok())
-        .is_some_and(|production| production == canonical_root);
-    if resolves_to_production {
-        return Err("--runtime-root cannot override the production root".to_owned());
+    let production = RuntimePaths::for_current_user()
+        .map_err(|_| "production root unavailable")?
+        .root;
+    canonical_test_root(root, &production).map(RuntimePaths::under)
+}
+
+fn bridge_executable(paths: &RuntimePaths, explicit_root: bool) -> Result<PathBuf, String> {
+    if explicit_root {
+        Ok(paths
+            .app_dir
+            .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge"))
+    } else {
+        production_bridge_executable()
     }
-    Ok(RuntimePaths::under(root))
+}
+
+fn canonical_test_root(root: &Path, production_root: &Path) -> Result<PathBuf, String> {
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|_| "--runtime-root must name an existing non-production directory")?;
+    if !canonical_root.is_dir() {
+        return Err("--runtime-root must name an existing non-production directory".to_owned());
+    }
+    if let Ok(canonical_production) = std::fs::canonicalize(production_root) {
+        if canonical_root == canonical_production
+            || canonical_root.starts_with(canonical_production)
+        {
+            return Err(
+                "--runtime-root cannot equal or descend from the production root".to_owned(),
+            );
+        }
+    }
+    Ok(canonical_root)
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn rebase_process_test_path(
+    path: &mut Option<PathBuf>,
+    original_root: &Path,
+    canonical_root: &Path,
+) -> Result<(), String> {
+    if let Some(current) = path {
+        let relative = current
+            .strip_prefix(original_root)
+            .map_err(|_| "process test paths must be below --runtime-root")?;
+        *current = canonical_root.join(relative);
+    }
+    Ok(())
 }
 
 fn production_bridge_executable() -> Result<PathBuf, String> {
@@ -155,14 +237,44 @@ fn barrier_config(
 }
 
 #[cfg(feature = "process-test-hooks")]
-fn reject_barrier_options(
-    ready: Option<&PathBuf>,
-    release: Option<&PathBuf>,
+fn fatal_cleanup_config(
+    explicit_root: bool,
+    paths: &RuntimePaths,
+    bridge_pid_ready: Option<PathBuf>,
+    cleanup_complete: Option<PathBuf>,
+) -> Result<Option<ProcessTestFatalCleanupConfig>, String> {
+    match (bridge_pid_ready, cleanup_complete) {
+        (None, None) => Ok(None),
+        (Some(bridge_pid_ready), Some(cleanup_complete))
+            if explicit_root
+                && bridge_pid_ready.parent() == Some(paths.run_dir.as_path())
+                && cleanup_complete.parent() == Some(paths.run_dir.as_path())
+                && bridge_pid_ready != cleanup_complete =>
+        {
+            Ok(Some(ProcessTestFatalCleanupConfig {
+                bridge_pid_ready,
+                cleanup_complete,
+            }))
+        }
+        _ => Err("fatal cleanup test requires distinct runtime-root Run siblings".to_owned()),
+    }
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn reject_process_test_options(
+    barrier_ready: Option<&PathBuf>,
+    barrier_release: Option<&PathBuf>,
+    bridge_pid_ready: Option<&PathBuf>,
+    cleanup_complete: Option<&PathBuf>,
 ) -> Result<(), String> {
-    if ready.is_none() && release.is_none() {
+    if barrier_ready.is_none()
+        && barrier_release.is_none()
+        && bridge_pid_ready.is_none()
+        && cleanup_complete.is_none()
+    {
         Ok(())
     } else {
-        Err("process test barrier is valid only for run".to_owned())
+        Err("process test options are valid only for run".to_owned())
     }
 }
 
@@ -172,9 +284,9 @@ fn usage() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{ffi::OsString, os::unix::fs::symlink};
 
-    use super::CommandConfig;
+    use super::{canonical_test_root, CommandConfig};
 
     #[test]
     fn production_command_surface_is_exact() {
@@ -184,5 +296,34 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn explicit_root_uses_its_canonical_spelling() {
+        let directory = tempfile::tempdir().expect("temporary root parent");
+        let production = directory.path().join("production");
+        let actual = directory.path().join("actual-test-root");
+        let alias = directory.path().join("test-root-alias");
+        std::fs::create_dir(&production).expect("create synthetic production root");
+        std::fs::create_dir(&actual).expect("create actual test root");
+        symlink(&actual, &alias).expect("create test-root alias");
+
+        assert_eq!(
+            canonical_test_root(&alias, &production).expect("canonical non-production root"),
+            actual.canonicalize().expect("canonical expected root")
+        );
+    }
+
+    #[test]
+    fn explicit_root_rejects_production_descendants_and_their_aliases() {
+        let directory = tempfile::tempdir().expect("temporary root parent");
+        let production = directory.path().join("production");
+        let descendant = production.join("nested-test-root");
+        let alias = directory.path().join("descendant-alias");
+        std::fs::create_dir_all(&descendant).expect("create production descendant");
+        symlink(&descendant, &alias).expect("create descendant alias");
+
+        assert!(canonical_test_root(&descendant, &production).is_err());
+        assert!(canonical_test_root(&alias, &production).is_err());
     }
 }

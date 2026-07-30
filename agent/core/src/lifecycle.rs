@@ -12,6 +12,21 @@ use uuid::Uuid;
 
 const EVENT_SOURCE: &str = "runtime.lifecycle";
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CapabilityRefreshError;
+
+pub(crate) trait CapabilityRefresher: Send + Sync {
+    fn refresh(&self) -> Result<(), CapabilityRefreshError>;
+}
+
+pub(crate) struct NoopCapabilityRefresher;
+
+impl CapabilityRefresher for NoopCapabilityRefresher {
+    fn refresh(&self) -> Result<(), CapabilityRefreshError> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeIdentity {
     workspace_id: String,
@@ -33,6 +48,7 @@ pub(crate) enum LifecycleError {
     NotAccepting,
     QueueClosed,
     WorkerStopped,
+    CapabilityRefresh,
     Clock,
 }
 
@@ -43,6 +59,7 @@ impl fmt::Display for LifecycleError {
             Self::NotAccepting => formatter.write_str("lifecycle side effects are paused"),
             Self::QueueClosed => formatter.write_str("lifecycle queue is closed"),
             Self::WorkerStopped => formatter.write_str("lifecycle worker stopped"),
+            Self::CapabilityRefresh => formatter.write_str("capability refresh failed"),
             Self::Clock => formatter.write_str("system time cannot be formatted"),
         }
     }
@@ -63,8 +80,8 @@ enum Command {
         response: oneshot::Sender<Result<String, LifecycleError>>,
     },
     Stop {
-        event: EventEnvelope,
-        response: oneshot::Sender<Result<String, LifecycleError>>,
+        event: Option<EventEnvelope>,
+        response: oneshot::Sender<Result<Option<String>, LifecycleError>>,
     },
 }
 
@@ -72,6 +89,7 @@ pub(crate) struct LifecycleRuntime {
     sender: mpsc::Sender<Command>,
     accepting: Arc<Mutex<bool>>,
     identity: RuntimeIdentity,
+    capability_refresher: Arc<dyn CapabilityRefresher>,
     worker: JoinHandle<()>,
 }
 
@@ -80,6 +98,7 @@ impl LifecycleRuntime {
         database: Arc<DbActorHandle>,
         identity: RuntimeIdentity,
         capacity: usize,
+        capability_refresher: Arc<dyn CapabilityRefresher>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(capacity.max(1));
         let worker = tokio::spawn(run_worker(database, receiver));
@@ -87,6 +106,7 @@ impl LifecycleRuntime {
             sender,
             accepting: Arc::new(Mutex::new(true)),
             identity,
+            capability_refresher,
             worker,
         }
     }
@@ -128,34 +148,75 @@ impl LifecycleRuntime {
         }
         let event = lifecycle_event(&self.identity, "SYSTEM_WAKE")?;
         let result = send_persist(&self.sender, event, false).await;
-        if result.is_ok() {
-            *accepting = true;
-        }
-        result
+        let event_id = result?;
+        self.capability_refresher
+            .refresh()
+            .map_err(|_| LifecycleError::CapabilityRefresh)?;
+        *accepting = true;
+        Ok(event_id)
     }
 
     /// Rejects new producers, drains queued work, records clean stop, and joins the worker.
     pub(crate) async fn stop_and_drain(self) -> Result<String, LifecycleError> {
-        let mut accepting = self.accepting.lock().await;
-        *accepting = false;
-        let event = lifecycle_event(&self.identity, "AGENT_STOPPED")?;
+        self.finish(Some("AGENT_STOPPED"))
+            .await?
+            .ok_or(LifecycleError::WorkerStopped)
+    }
+
+    pub(crate) async fn abort_and_drain(self) -> Result<(), LifecycleError> {
+        self.finish(None).await.map(|_| ())
+    }
+
+    async fn finish(
+        self,
+        event_type: Option<&'static str>,
+    ) -> Result<Option<String>, LifecycleError> {
+        {
+            let mut accepting = self.accepting.lock().await;
+            *accepting = false;
+        }
+        let mut first_error = None;
+        let event = match event_type.map(|kind| lifecycle_event(&self.identity, kind)) {
+            Some(Ok(event)) => Some(event),
+            Some(Err(error)) => {
+                first_error = Some(error);
+                None
+            }
+            None => None,
+        };
         let (response_sender, response_receiver) = oneshot::channel();
-        self.sender
+        let send_result = self
+            .sender
             .send(Command::Stop {
                 event,
                 response: response_sender,
             })
-            .await
-            .map_err(|_| LifecycleError::QueueClosed)?;
-        drop(accepting);
-        let result = response_receiver
-            .await
-            .map_err(|_| LifecycleError::WorkerStopped)?;
+            .await;
+        let result = if send_result.is_ok() {
+            match response_receiver.await {
+                Ok(result) => result,
+                Err(_) => Err(LifecycleError::WorkerStopped),
+            }
+        } else {
+            Err(LifecycleError::QueueClosed)
+        };
         drop(self.sender);
-        self.worker
-            .await
-            .map_err(|_| LifecycleError::WorkerStopped)?;
-        result
+        let worker_result = self.worker.await;
+
+        let event_id = match result {
+            Ok(event_id) => event_id,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                None
+            }
+        };
+        if worker_result.is_err() {
+            first_error.get_or_insert(LifecycleError::WorkerStopped);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(event_id),
+        }
     }
 
     async fn persist(
@@ -207,18 +268,27 @@ async fn run_worker(database: Arc<DbActorHandle>, mut receiver: mpsc::Receiver<C
             Command::Stop { event, response } => {
                 receiver.close();
                 while let Some(queued) = receiver.recv().await {
-                    if let Command::Persist {
-                        event,
-                        checkpoint,
-                        response,
-                    } = queued
-                    {
-                        let result = persist(&database, &event, checkpoint).await;
-                        let _ = response.send(result.map(|()| event.event_id));
+                    match queued {
+                        Command::Persist {
+                            event,
+                            checkpoint,
+                            response,
+                        } => {
+                            let result = persist(&database, &event, checkpoint).await;
+                            let _ = response.send(result.map(|()| event.event_id));
+                        }
+                        Command::Stop { response, .. } => {
+                            let _ = response.send(Err(LifecycleError::QueueClosed));
+                        }
                     }
                 }
-                let result = persist(&database, &event, false).await;
-                let _ = response.send(result.map(|()| event.event_id));
+                let result = match event {
+                    Some(event) => persist(&database, &event, false)
+                        .await
+                        .map(|()| Some(event.event_id)),
+                    None => Ok(None),
+                };
+                let _ = response.send(result);
                 break;
             }
         }
@@ -263,11 +333,45 @@ fn lifecycle_event(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use pca_db_local::DbActorHandle;
 
-    use super::{LifecycleError, LifecycleRuntime, RuntimeIdentity};
+    use super::{
+        CapabilityRefreshError, CapabilityRefresher, LifecycleError, LifecycleRuntime,
+        RuntimeIdentity,
+    };
+
+    struct RecordingRefresher {
+        calls: Arc<StdMutex<Vec<&'static str>>>,
+        database_path: Option<std::path::PathBuf>,
+        fail: bool,
+    }
+
+    impl CapabilityRefresher for RecordingRefresher {
+        fn refresh(&self) -> Result<(), CapabilityRefreshError> {
+            let call = if let Some(path) = &self.database_path {
+                let connection = rusqlite::Connection::open(path).expect("inspect refresh order");
+                let wake_pairs: u64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM events_local e JOIN sync_outbox o ON o.event_id = e.event_id WHERE e.event_type = 'SYSTEM_WAKE'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("count wake pair during refresh");
+                assert_eq!(wake_pairs, 1, "wake Event+Outbox must precede refresh");
+                "refresh_after_wake_pair"
+            } else {
+                "refresh"
+            };
+            self.calls.lock().expect("refresh calls").push(call);
+            if self.fail {
+                Err(CapabilityRefreshError)
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     #[tokio::test]
     async fn typed_prepare_sleep_and_wake_persist_atomic_lifecycle_pairs() {
@@ -281,6 +385,11 @@ mod tests {
             Arc::clone(&database),
             RuntimeIdentity::new("local-workspace", "local-device"),
             2,
+            Arc::new(RecordingRefresher {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                database_path: None,
+                fail: false,
+            }),
         );
 
         runtime.record_startup().await.expect("record startup");
@@ -306,5 +415,53 @@ mod tests {
                 .expect("count wake pair"),
             (1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn wake_refreshes_capabilities_after_event_and_stays_paused_on_refresh_error() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("agent.sqlite3");
+        let database = Arc::new(
+            DbActorHandle::open(&path, "0.0.0")
+                .await
+                .expect("open database"),
+        );
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = LifecycleRuntime::start(
+            Arc::clone(&database),
+            RuntimeIdentity::new("local-workspace", "local-device"),
+            2,
+            Arc::new(RecordingRefresher {
+                calls: Arc::clone(&calls),
+                database_path: Some(path.clone()),
+                fail: true,
+            }),
+        );
+
+        runtime.prepare_sleep().await.expect("prepare sleep");
+        let wake = runtime.wake().await;
+
+        assert!(matches!(wake, Err(LifecycleError::CapabilityRefresh)));
+        assert_eq!(
+            *calls.lock().expect("refresh calls"),
+            vec!["refresh_after_wake_pair"]
+        );
+        assert!(matches!(
+            runtime.record_startup().await,
+            Err(LifecycleError::NotAccepting)
+        ));
+        let connection = rusqlite::Connection::open(&path).expect("inspect wake event ordering");
+        let wake_pairs: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events_local e JOIN sync_outbox o ON o.event_id = e.event_id WHERE e.event_type = 'SYSTEM_WAKE'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count wake pair before refresh error");
+        assert_eq!(
+            wake_pairs, 1,
+            "wake Event+Outbox precedes capability refresh"
+        );
+        runtime.abort_and_drain().await.expect("abort lifecycle");
     }
 }

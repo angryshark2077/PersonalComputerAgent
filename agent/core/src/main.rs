@@ -3,7 +3,7 @@ mod config;
 mod lifecycle;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     let exit_code = match config::CommandConfig::parse(std::env::args_os()) {
         Ok(command) => app::execute(command).await,
         Err(message) => {
@@ -11,5 +11,5 @@ async fn main() {
             app::EXIT_USAGE
         }
     };
-    std::process::exit(exit_code);
+    std::process::ExitCode::from(exit_code)
 }
