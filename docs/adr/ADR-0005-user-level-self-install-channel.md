@@ -46,6 +46,9 @@ channel selection are required before that channel is implemented.
 - S1A target Macs do not need Xcode, Rust, Node, or source code. Full Xcode is
   a development-machine prerequisite only.
 - Local uninstall is initiated by the installed executable and preserves data
-  by default; complete data removal remains an explicit later operation.
+  by default. S1A also supports complete uninstall through `--delete-data`:
+  it displays the exact `Data/` and PCA-owned Keychain credential scope,
+  requires an explicit confirmation token, and then deletes only those
+  PCA-owned targets.
 - S1B adds the cloud control plane after S1A. S2 and S3 retain their approved
   order after S1B.
