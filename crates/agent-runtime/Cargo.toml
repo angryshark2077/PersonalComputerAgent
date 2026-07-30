@@ -1,0 +1,16 @@
+[package]
+name = "pca-agent-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fs2 = "0.4"
+pca-domain = { path = "../domain" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
