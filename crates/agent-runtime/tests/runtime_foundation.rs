@@ -82,6 +82,25 @@ fn instance_lock_rejects_a_second_owner_until_the_first_is_dropped() {
 }
 
 #[test]
+fn instance_lock_rejects_a_symlink_instead_of_following_it() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    let paths = RuntimePaths::under(temporary_root.path());
+    paths.create_securely().expect("secure layout");
+    let target = temporary_root.path().join("lock-target");
+    fs::write(&target, b"not a lock").expect("target file");
+    std::os::unix::fs::symlink(&target, &paths.lock_file).expect("lock symlink");
+
+    assert!(matches!(
+        SingleInstanceGuard::acquire(&paths.lock_file),
+        Err(RuntimeError::UnsafePath { .. })
+    ));
+    assert_eq!(
+        fs::read(&target).expect("target remains readable"),
+        b"not a lock"
+    );
+}
+
+#[test]
 fn state_machine_allows_only_explicit_agent_lifecycle_edges() {
     let mut state = RuntimeStateMachine::starting();
 
@@ -170,20 +189,30 @@ fn state_machine_allows_only_explicit_bridge_lifecycle_edges() {
 }
 
 #[test]
-fn crash_marker_reports_an_unclean_previous_process_exit() {
-    if let Some(marker_path) = env::var_os("PCA_CRASH_MARKER_CHILD") {
-        let _guard = CrashMarkerGuard::activate(Path::new(&marker_path)).expect("child marker");
-        std::process::exit(0);
-    }
+fn crash_marker_child_process() {
+    let Some(marker_path) = env::var_os("PCA_CRASH_MARKER_CHILD") else {
+        return;
+    };
+    let _guard = CrashMarkerGuard::activate(Path::new(&marker_path)).expect("child marker");
 
+    match env::var("PCA_CRASH_MARKER_CHILD_MODE").as_deref() {
+        Ok("exit") => std::process::exit(0),
+        Ok("panic") => panic!("intentional child panic"),
+        _ => panic!("unexpected crash-marker child mode"),
+    }
+}
+
+#[test]
+fn crash_marker_reports_an_unclean_previous_process_exit() {
     let temporary_root = tempfile::tempdir().expect("temporary root");
     let paths = RuntimePaths::under(temporary_root.path());
     paths.create_securely().expect("secure layout");
 
     let result = Command::new(env::current_exe().expect("test executable"))
-        .arg("crash_marker_reports_an_unclean_previous_process_exit")
+        .arg("crash_marker_child_process")
         .arg("--exact")
         .env("PCA_CRASH_MARKER_CHILD", &paths.crash_marker_file)
+        .env("PCA_CRASH_MARKER_CHILD_MODE", "exit")
         .status()
         .expect("child test process");
     assert!(result.success(), "child process should exit cleanly");
@@ -191,10 +220,84 @@ fn crash_marker_reports_an_unclean_previous_process_exit() {
 
     let guard = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("recovery marker");
     assert!(guard.previous_exit_was_unclean());
+    guard.complete_cleanly().expect("clean completion");
+    assert!(
+        !paths.crash_marker_file.exists(),
+        "clean completion removes marker"
+    );
+}
+
+#[test]
+fn crash_marker_is_retained_when_a_child_panics_while_unwinding() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    let paths = RuntimePaths::under(temporary_root.path());
+    paths.create_securely().expect("secure layout");
+
+    let result = Command::new(env::current_exe().expect("test executable"))
+        .arg("crash_marker_child_process")
+        .arg("--exact")
+        .env("PCA_CRASH_MARKER_CHILD", &paths.crash_marker_file)
+        .env("PCA_CRASH_MARKER_CHILD_MODE", "panic")
+        .status()
+        .expect("child test process");
+    assert!(!result.success(), "panicking child must fail");
+    assert!(paths.crash_marker_file.exists(), "panic marker remains");
+
+    let guard = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("recovery marker");
+    assert!(guard.previous_exit_was_unclean());
+    guard
+        .complete_cleanly()
+        .expect("recovered clean completion");
+    assert!(!paths.crash_marker_file.exists(), "recovery removes marker");
+}
+
+#[test]
+fn stale_crash_marker_guard_cannot_remove_a_newer_activation_marker() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    let paths = RuntimePaths::under(temporary_root.path());
+    paths.create_securely().expect("secure layout");
+
+    let stale = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("first marker");
+    let current = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("newer marker");
+
+    assert!(matches!(
+        stale.complete_cleanly(),
+        Err(RuntimeError::CrashMarkerOwnershipLost { .. })
+    ));
+    assert!(paths.crash_marker_file.exists(), "newer marker remains");
+    current
+        .complete_cleanly()
+        .expect("current clean completion");
+    assert!(!paths.crash_marker_file.exists(), "current marker removed");
+}
+
+#[test]
+fn stale_crash_marker_drop_cannot_remove_a_newer_activation_marker() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    let paths = RuntimePaths::under(temporary_root.path());
+    paths.create_securely().expect("secure layout");
+
+    let stale = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("first marker");
+    let current = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("newer marker");
+    drop(stale);
+
+    assert!(paths.crash_marker_file.exists(), "newer marker remains");
+    current
+        .complete_cleanly()
+        .expect("current clean completion");
+}
+
+#[test]
+fn crash_marker_drop_removes_its_marker_without_a_panic() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    let paths = RuntimePaths::under(temporary_root.path());
+    paths.create_securely().expect("secure layout");
+
+    let guard = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("marker");
     drop(guard);
     assert!(
         !paths.crash_marker_file.exists(),
-        "clean drop removes marker"
+        "best-effort drop removed marker"
     );
 }
 

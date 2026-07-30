@@ -69,6 +69,8 @@ impl RuntimePaths {
     ///
     /// Existing symlinks are rejected so sensitive local artifacts are never deliberately
     /// placed through a redirect at one of these ownership boundaries.
+    /// Existing ancestors of `root` remain a caller trust boundary; after this method returns,
+    /// `root` and its direct children are restricted to the current user with mode `0700`.
     ///
     /// # Errors
     ///
@@ -122,6 +124,8 @@ pub(crate) fn reject_symlink(path: &Path) -> Result<(), RuntimeError> {
             path: path.to_path_buf(),
             reason: "must not be a symlink",
         }),
-        Ok(_) | Err(_) => Ok(()),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RuntimeError::io("inspect runtime path", error)),
     }
 }

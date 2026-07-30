@@ -32,6 +32,8 @@ pub enum RuntimeError {
     },
     /// A runtime path is unsafe to use for a sensitive local artifact.
     UnsafePath { path: PathBuf, reason: &'static str },
+    /// A crash-marker guard no longer owns the marker it was asked to remove.
+    CrashMarkerOwnershipLost { path: PathBuf },
     /// A filesystem operation failed.
     Io {
         operation: &'static str,
@@ -64,6 +66,11 @@ impl fmt::Display for RuntimeError {
                     path.display()
                 )
             }
+            Self::CrashMarkerOwnershipLost { path } => write!(
+                formatter,
+                "crash marker ownership was lost before cleanup: {}",
+                path.display()
+            ),
             Self::Io { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Serialization(error) => write!(formatter, "serialize runtime status: {error}"),
         }

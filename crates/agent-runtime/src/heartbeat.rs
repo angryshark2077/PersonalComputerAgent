@@ -89,13 +89,14 @@ fn write_and_replace(
     serialized: &[u8],
 ) -> Result<(), RuntimeError> {
     temporary_file
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| RuntimeError::io("secure heartbeat temporary file", error))?;
+    temporary_file
         .write_all(serialized)
         .map_err(|error| RuntimeError::io("write heartbeat temporary file", error))?;
     temporary_file
         .sync_all()
         .map_err(|error| RuntimeError::io("sync heartbeat temporary file", error))?;
     fs::rename(temporary_path, status_file)
-        .map_err(|error| RuntimeError::io("replace heartbeat status", error))?;
-    fs::set_permissions(status_file, fs::Permissions::from_mode(0o600))
-        .map_err(|error| RuntimeError::io("secure heartbeat status", error))
+        .map_err(|error| RuntimeError::io("replace heartbeat status", error))
 }
