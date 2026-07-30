@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/command-envelope.schema.json",
+  "title": "AgentCommand",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "command_id",
+    "workspace_id",
+    "device_id",
+    "command_type",
+    "status",
+    "created_at",
+    "expires_at",
+    "idempotency_key",
+    "payload"
+  ],
+  "properties": {
+    "command_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "workspace_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "device_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "command_type": {
+      "enum": [
+        "capture_screenshot",
+        "pause_collection",
+        "resume_collection",
+        "refresh_health",
+        "check_update",
+        "export_diagnostics"
+      ]
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "dispatched",
+        "running",
+        "waiting_permission",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "expired"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}

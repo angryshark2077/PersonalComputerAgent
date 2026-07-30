@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/sync-batch-request.schema.json",
+  "title": "SyncBatchRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "batch_id",
+    "device_id",
+    "protocol_version",
+    "events"
+  ],
+  "properties": {
+    "batch_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "device_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "protocol_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "events": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "$ref": "event-envelope.schema.json"
+      }
+    },
+    "compressed": {
+      "type": "boolean",
+      "default": false
+    }
+  }
+}

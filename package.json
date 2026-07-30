@@ -1,0 +1,10 @@
+{
+  "name": "personal-computer-agent",
+  "private": true,
+  "version": "0.0.0",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "verify:contracts": "python3 scripts/verify_contracts.py",
+    "test": "echo \"Install workspace dependencies before TS tests\""
+  }
+}

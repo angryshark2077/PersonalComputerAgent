@@ -1,0 +1,5 @@
+verify:
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo test --workspace
+    python3 scripts/verify_contracts.py

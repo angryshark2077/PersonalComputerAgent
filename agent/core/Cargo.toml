@@ -1,0 +1,12 @@
+[package]
+name = "pca-agentd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pca-domain = { path = "../../crates/domain" }
+pca-provider-contracts = { path = "../../crates/provider-contracts" }
+
+[lints]
+workspace = true

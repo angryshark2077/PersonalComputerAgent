@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/sync-batch-response.schema.json",
+  "title": "SyncBatchResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "batch_id",
+    "accepted",
+    "duplicates",
+    "rejected",
+    "server_time"
+  ],
+  "properties": {
+    "batch_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "accepted": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      }
+    },
+    "duplicates": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      }
+    },
+    "rejected": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "error_code",
+          "retryable"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "server_time": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

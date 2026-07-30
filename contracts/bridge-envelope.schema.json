@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/bridge-envelope.schema.json",
+  "title": "BridgeEnvelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "message_kind",
+    "capability",
+    "deadline_ms",
+    "payload"
+  ],
+  "properties": {
+    "protocol_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "request_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "message_kind": {
+      "enum": [
+        "request",
+        "response",
+        "event"
+      ]
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 1
+    },
+    "deadline_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "payload": {
+      "type": "object"
+    },
+    "error": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "error-envelope.schema.json"
+        }
+      ]
+    }
+  }
+}

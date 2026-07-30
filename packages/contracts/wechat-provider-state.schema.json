@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/wechat-provider-state.schema.json",
+  "title": "WechatProviderState",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "provider_key",
+    "status",
+    "capabilities",
+    "updated_at"
+  ],
+  "properties": {
+    "provider_key": {
+      "const": "wechat"
+    },
+    "status": {
+      "enum": [
+        "disabled",
+        "waiting_source",
+        "checking_stored_key",
+        "passive_scanning",
+        "verifying_database",
+        "active",
+        "degraded",
+        "capability_unavailable",
+        "unsupported",
+        "error"
+      ]
+    },
+    "key_type": {
+      "oneOf": [
+        {
+          "enum": [
+            "raw_key",
+            "enc_key_pair_set"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "wechat_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "account_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "last_error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

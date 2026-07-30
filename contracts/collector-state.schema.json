@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/collector-state.schema.json",
+  "title": "CollectorState",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "collector_key",
+    "collector_version",
+    "status",
+    "desired_config_revision",
+    "applied_config_revision"
+  ],
+  "properties": {
+    "collector_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "collector_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "disabled",
+        "permission_required",
+        "initializing",
+        "running",
+        "paused",
+        "degraded",
+        "unsupported",
+        "error"
+      ]
+    },
+    "desired_config_revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "applied_config_revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "last_event_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_health_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

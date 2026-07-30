@@ -1,0 +1,15 @@
+target/
+node_modules/
+.next/
+dist/
+.build/
+DerivedData/
+*.xcuserstate
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.log
+.DS_Store
