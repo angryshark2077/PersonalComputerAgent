@@ -1,13 +1,12 @@
 [package]
-name = "pca-domain"
+name = "pca-test-contracts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-serde.workspace = true
+pca-domain = { path = "../domain" }
 serde_json.workspace = true
-uuid.workspace = true
 
 [lints]
 workspace = true
