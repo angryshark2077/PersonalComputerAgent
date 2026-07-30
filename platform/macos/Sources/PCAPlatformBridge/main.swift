@@ -1,0 +1,3 @@
+import PlatformBridge
+
+PlatformBridgeExecutable.main()

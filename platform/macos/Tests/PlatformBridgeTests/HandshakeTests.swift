@@ -209,6 +209,76 @@ final class HandshakeTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: socket.path))
     }
 
+    func testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts() async throws {
+        let harnessURL = Bundle(for: Self.self).bundleURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("PlatformBridgeSignalHarness")
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: harnessURL.path))
+
+        let signalCases: [(label: String, signals: [Int32])] = [
+            ("sigterm", [SIGTERM]),
+            ("sigint", [SIGINT]),
+            ("repeated", [SIGTERM, SIGINT]),
+        ]
+        for signalCase in signalCases {
+            let parent = URL(
+                fileURLWithPath: "/tmp/pca-signal-\(signalCase.label)-\(UUID().uuidString.prefix(8))",
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+            defer { try? FileManager.default.removeItem(at: parent) }
+            let runRoot = parent.appendingPathComponent("Run", isDirectory: true)
+            let socket = runRoot.appendingPathComponent("bridge.sock")
+            let readyHook = parent.appendingPathComponent("startup-ready")
+            let process = Process()
+            process.executableURL = harnessURL
+            process.arguments = [
+                "--socket", socket.path,
+                "--run-root", runRoot.path,
+                "--ready-hook", readyHook.path,
+            ]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+
+            let readyDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while !FileManager.default.fileExists(atPath: readyHook.path),
+                  process.isRunning,
+                  ContinuousClock.now < readyDeadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            guard FileManager.default.fileExists(atPath: readyHook.path) else {
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+                process.waitUntilExit()
+                XCTFail("signal harness never reached the masked startup hook")
+                continue
+            }
+
+            for terminationSignal in signalCase.signals {
+                XCTAssertEqual(kill(process.processIdentifier, terminationSignal), 0)
+            }
+            let exitDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while process.isRunning, ContinuousClock.now < exitDeadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                process.waitUntilExit()
+                XCTFail("signal harness exceeded its hard exit deadline")
+                continue
+            }
+            process.waitUntilExit()
+
+            XCTAssertEqual(process.terminationReason, .exit)
+            XCTAssertEqual(process.terminationStatus, 0)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: socket.path))
+            if FileManager.default.fileExists(atPath: runRoot.path) {
+                let entries = try FileManager.default.contentsOfDirectory(atPath: runRoot.path)
+                XCTAssertFalse(entries.contains { $0.hasPrefix(".pca-quarantine-") })
+            }
+        }
+    }
+
     func testCapabilityRequestRejectsIntMaxPlusOneAndUInt64MaxWithoutTrap() throws {
         let tooLarge = UInt64(Int.max) + 1
         for deadline in [BridgeWireLimits.maximumDeadlineMilliseconds + 1, tooLarge, UInt64.max] {

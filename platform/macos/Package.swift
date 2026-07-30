@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "BridgeProtocol", targets: ["BridgeProtocol"]),
         .executable(name: "SetupAppPlaceholder", targets: ["SetupAppPlaceholder"]),
         .executable(name: "BridgeContractVerifier", targets: ["BridgeContractVerifier"]),
-        .executable(name: "PCAPlatformBridge", targets: ["PlatformBridge"])
+        .executable(name: "PCAPlatformBridge", targets: ["PCAPlatformBridge"])
     ],
     targets: [
         .target(name: "BridgeProtocol"),
@@ -20,13 +20,22 @@ let package = Package(
             name: "BridgeContractVerifier",
             dependencies: ["BridgeProtocol"]
         ),
-        .executableTarget(
+        .target(
             name: "PlatformBridge",
             dependencies: ["BridgeProtocol"]
         ),
+        .executableTarget(
+            name: "PCAPlatformBridge",
+            dependencies: ["PlatformBridge"]
+        ),
+        .executableTarget(
+            name: "PlatformBridgeSignalHarness",
+            dependencies: ["PlatformBridge"],
+            path: "Tests/PlatformBridgeSignalHarness"
+        ),
         .testTarget(
             name: "PlatformBridgeTests",
-            dependencies: ["PlatformBridge", "BridgeProtocol"]
+            dependencies: ["PlatformBridge", "PlatformBridgeSignalHarness", "BridgeProtocol"]
         ),
     ]
 )
