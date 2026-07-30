@@ -273,6 +273,7 @@ protocol HealthChecking: AnyObject {
 @MainActor
 protocol Relaunching: AnyObject {
     func relaunch(executable: URL, arguments: [String]) throws
+    func isRunning(executable: URL, startedAtOrAfter: Date) -> Bool
 }
 
 enum InstallPhase: String, Codable, Equatable, Sendable {
@@ -283,8 +284,16 @@ enum InstallPhase: String, Codable, Equatable, Sendable {
     case rolledBack
 }
 
+enum RollbackPhase: String, Codable, Equatable, Sendable {
+    case oldBundleRestored
+    case oldServiceRegistered
+    case oldAppRelaunched
+}
+
 struct InstallTransaction: Codable, Equatable, Sendable {
     var phase: InstallPhase
+    var rollbackPhase: RollbackPhase?
+    var rollbackAttemptStartedAt: Date?
     let previousVersion: String?
     let candidateVersion: String
     let priorServiceState: ServiceState
@@ -297,9 +306,13 @@ struct InstallTransaction: Codable, Equatable, Sendable {
         candidateVersion: String,
         priorServiceState: ServiceState,
         stagingName: String,
-        expectedLayoutIdentity: InstallLayoutIdentity
+        expectedLayoutIdentity: InstallLayoutIdentity,
+        rollbackPhase: RollbackPhase? = nil,
+        rollbackAttemptStartedAt: Date? = nil
     ) {
         self.phase = phase
+        self.rollbackPhase = rollbackPhase
+        self.rollbackAttemptStartedAt = rollbackAttemptStartedAt
         self.previousVersion = previousVersion
         self.candidateVersion = candidateVersion
         self.priorServiceState = priorServiceState
@@ -310,6 +323,18 @@ struct InstallTransaction: Codable, Equatable, Sendable {
     func advancing(to phase: InstallPhase) -> InstallTransaction {
         var copy = self
         copy.phase = phase
+        return copy
+    }
+
+    func advancingRollback(to rollbackPhase: RollbackPhase) -> InstallTransaction {
+        var copy = self
+        copy.rollbackPhase = rollbackPhase
+        return copy
+    }
+
+    func startingRollbackAttempt(at date: Date) -> InstallTransaction {
+        var copy = self
+        copy.rollbackAttemptStartedAt = date
         return copy
     }
 }
@@ -720,17 +745,60 @@ final class InstallCoordinator: InstallCoordinating {
         layoutIdentity: InstallLayoutIdentity
     ) async -> RollbackRecovery {
         do {
-            try await service.stopAndUnregister()
+            var transaction = transaction
             let recovery: RollbackRecovery
             if let previousVersion = transaction.previousVersion {
-                try restorePreviousBundle(previousVersion, layoutIdentity: layoutIdentity)
-                if transaction.priorServiceState == .enabled {
-                    let attempt = Date()
-                    try await service.registerAndWaitForApproval {}
-                    try relauncher.relaunch(
-                        executable: paths.installedExecutableURL,
-                        arguments: ["--setup-installed", "--rollback-recovered"]
+                if transaction.rollbackPhase == nil {
+                    try await service.stopAndUnregister()
+                    try restorePreviousBundle(previousVersion, layoutIdentity: layoutIdentity)
+                    transaction = transaction.advancingRollback(to: .oldBundleRestored)
+                    try fileSystem.writeTransaction(
+                        transaction,
+                        paths: paths,
+                        layoutIdentity: layoutIdentity
                     )
+                } else {
+                    try restorePreviousBundle(previousVersion, layoutIdentity: layoutIdentity)
+                }
+                if transaction.priorServiceState == .enabled {
+                    if transaction.rollbackAttemptStartedAt == nil {
+                        transaction = transaction.startingRollbackAttempt(at: Date())
+                        try fileSystem.writeTransaction(
+                            transaction,
+                            paths: paths,
+                            layoutIdentity: layoutIdentity
+                        )
+                    }
+                    guard let attempt = transaction.rollbackAttemptStartedAt else { return .failed }
+                    if transaction.rollbackPhase == .oldBundleRestored {
+                        if service.status() != .enabled {
+                            try await service.registerAndWaitForApproval {}
+                        }
+                        transaction = transaction.advancingRollback(to: .oldServiceRegistered)
+                        try fileSystem.writeTransaction(
+                            transaction,
+                            paths: paths,
+                            layoutIdentity: layoutIdentity
+                        )
+                    }
+                    if transaction.rollbackPhase == .oldServiceRegistered {
+                        if !relauncher.isRunning(
+                            executable: paths.installedExecutableURL,
+                            startedAtOrAfter: attempt
+                        ) {
+                            try relauncher.relaunch(
+                                executable: paths.installedExecutableURL,
+                                arguments: ["--setup-installed", "--rollback-recovered"]
+                            )
+                        }
+                        transaction = transaction.advancingRollback(to: .oldAppRelaunched)
+                        try fileSystem.writeTransaction(
+                            transaction,
+                            paths: paths,
+                            layoutIdentity: layoutIdentity
+                        )
+                    }
+                    guard transaction.rollbackPhase == .oldAppRelaunched else { return .failed }
                     guard try await health.waitForHealthy(
                         paths: paths,
                         expectedVersion: previousVersion,
@@ -742,6 +810,7 @@ final class InstallCoordinator: InstallCoordinating {
                     recovery = .restoredInactive
                 }
             } else {
+                try await service.stopAndUnregister()
                 if fileSystem.exists(paths.installedBundleURL) {
                     try fileSystem.quarantineAndDelete(
                         paths.installedBundleURL,

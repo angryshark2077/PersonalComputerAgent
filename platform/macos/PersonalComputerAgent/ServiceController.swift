@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 import ServiceManagement
@@ -131,6 +132,8 @@ private final class DarwinProcessInspector: ProcessInspecting {
 final class RuntimeHealthChecker: HealthChecking {
     private let pollInterval: Duration
     private let processInspector: any ProcessInspecting
+    private static let fractionalRFC3339 = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+    private static let wholeSecondRFC3339 = Date.ISO8601FormatStyle(includingFractionalSeconds: false)
 
     convenience init(
         pollInterval: Duration = .milliseconds(250)
@@ -183,7 +186,7 @@ final class RuntimeHealthChecker: HealthChecking {
                modifiedAt >= notBefore,
                let data = try? Data(contentsOf: statusURL),
                let status = try? JSONDecoder().decode(RuntimeStatus.self, from: data),
-               let heartbeat = ISO8601DateFormatter().date(from: status.heartbeatAt),
+               let heartbeat = Self.parseRFC3339(status.heartbeatAt),
                heartbeat >= notBefore,
                status.schemaVersion == 1,
                status.appVersion == expectedVersion,
@@ -202,6 +205,10 @@ final class RuntimeHealthChecker: HealthChecking {
         return false
     }
 
+    private static func parseRFC3339(_ value: String) -> Date? {
+        if let date = try? fractionalRFC3339.parse(value) { return date }
+        return try? wholeSecondRFC3339.parse(value)
+    }
 }
 
 @MainActor
@@ -212,5 +219,15 @@ final class ProcessRelauncher: Relaunching {
         process.arguments = arguments
         do { try process.run() }
         catch { throw InstallError.relaunchFailed }
+    }
+
+    func isRunning(executable: URL, startedAtOrAfter: Date) -> Bool {
+        let expectedPath = executable.standardizedFileURL.path
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        return NSWorkspace.shared.runningApplications.contains { application in
+            application.processIdentifier != currentProcessID
+                && application.executableURL?.standardizedFileURL.path == expectedPath
+                && (application.launchDate ?? .distantPast) >= startedAtOrAfter
+        }
     }
 }

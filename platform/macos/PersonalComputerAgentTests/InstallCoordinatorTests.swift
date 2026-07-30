@@ -325,6 +325,54 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertFalse(fixture.fileSystem.exists(fixture.paths.transactionURL))
     }
 
+    func testCrashAfterOldServiceRegistrationDoesNotRegisterOrRestoreTwice() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
+        try fixture.simulateCrash(phase: .newActivated, priorServiceState: .enabled)
+        fixture.fileSystem.crashBeforePersistingRollbackPhase = .oldServiceRegistered
+
+        let firstRecovery = try await fixture.coordinator.recoverPendingInstallation()
+        XCTAssertEqual(firstRecovery, .failed)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.relauncher.urls.count, 0)
+        XCTAssertEqual(
+            try fixture.fileSystem.readTransaction(
+                paths: fixture.paths,
+                layoutIdentity: fixture.layoutIdentity
+            )?.rollbackPhase,
+            .oldBundleRestored
+        )
+
+        let retriedRecovery = try await fixture.coordinator.recoverPendingInstallation()
+        XCTAssertEqual(retriedRecovery, .restoredAndRelaunched)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.relauncher.urls.count, 1)
+        XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
+    }
+
+    func testCrashAfterOldAppRelaunchDoesNotRegisterOrRelaunchTwice() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
+        try fixture.simulateCrash(phase: .newActivated, priorServiceState: .enabled)
+        fixture.fileSystem.crashBeforePersistingRollbackPhase = .oldAppRelaunched
+
+        let firstRecovery = try await fixture.coordinator.recoverPendingInstallation()
+        XCTAssertEqual(firstRecovery, .failed)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.relauncher.urls.count, 1)
+        XCTAssertEqual(
+            try fixture.fileSystem.readTransaction(
+                paths: fixture.paths,
+                layoutIdentity: fixture.layoutIdentity
+            )?.rollbackPhase,
+            .oldServiceRegistered
+        )
+
+        let retriedRecovery = try await fixture.coordinator.recoverPendingInstallation()
+        XCTAssertEqual(retriedRecovery, .restoredAndRelaunched)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.relauncher.urls.count, 1)
+        XCTAssertEqual(fixture.health.expectedVersions, ["1.0.0"])
+    }
+
     func testAppDirectoryReplacementBeforeStagingCopyFailsClosed() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
         fixture.fileSystem.replaceAppBeforeCopy = true
@@ -491,6 +539,7 @@ private final class FakeRelauncher: Relaunching {
     var urls: [URL] = []
     var arguments: [[String]] = []
     var failuresRemaining = 0
+    private var runningExecutables: [String: Date] = [:]
     func relaunch(executable: URL, arguments: [String]) throws {
         urls.append(executable)
         self.arguments.append(arguments)
@@ -498,6 +547,11 @@ private final class FakeRelauncher: Relaunching {
             failuresRemaining -= 1
             throw InstallError.relaunchFailed
         }
+        runningExecutables[executable.standardizedFileURL.path] = Date()
+    }
+    func isRunning(executable: URL, startedAtOrAfter: Date) -> Bool {
+        guard let startedAt = runningExecutables[executable.standardizedFileURL.path] else { return false }
+        return startedAt >= startedAtOrAfter
     }
 }
 
@@ -507,6 +561,7 @@ private final class FaultingInstallFileSystem: InstallFileOperating {
     var recordedPhases: [InstallPhase] = []
     var failNextCleanup = false
     var failDeletionTarget: String?
+    var crashBeforePersistingRollbackPhase: RollbackPhase?
     var replaceAppBeforeCopy = false
     var replaceAppBeforeActivation = false
     var replaceRootChildBeforeQuarantine = false
@@ -565,6 +620,11 @@ private final class FaultingInstallFileSystem: InstallFileOperating {
     }
     func writeTransaction(_ transaction: InstallTransaction, paths: InstallPaths, layoutIdentity: InstallLayoutIdentity) throws {
         recordedPhases.append(transaction.phase)
+        if let expectedCrashPhase = crashBeforePersistingRollbackPhase,
+           transaction.rollbackPhase == expectedCrashPhase {
+            self.crashBeforePersistingRollbackPhase = nil
+            throw InstallError.unsafePath
+        }
         try base.writeTransaction(transaction, paths: paths, layoutIdentity: layoutIdentity)
     }
     func readTransaction(paths: InstallPaths, layoutIdentity: InstallLayoutIdentity) throws -> InstallTransaction? {
@@ -645,6 +705,40 @@ final class RuntimeHealthCheckerTests: XCTestCase {
 
         XCTAssertTrue(healthy)
     }
+
+    func testRustMicrosecondHeartbeatWireValueIsParsedAndComparedForFreshness() async throws {
+        let fixture = try HealthFixture()
+        let heartbeat = "2026-07-30T22:26:16.944668Z"
+        let justBeforeHeartbeat = Date(timeIntervalSince1970: 1_785_450_376.944_667)
+        fixture.processInspector.identity = fixture.validIdentity(startedAt: justBeforeHeartbeat)
+        try fixture.writeStatus(version: "2.0.0", pid: 321, heartbeatWire: heartbeat)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_785_450_377)],
+            ofItemAtPath: fixture.statusURL.path
+        )
+
+        let freshResult = try await fixture.checker.waitForHealthy(
+            paths: fixture.paths,
+            expectedVersion: "2.0.0",
+            notBefore: justBeforeHeartbeat,
+            timeout: .milliseconds(20)
+        )
+        XCTAssertTrue(freshResult)
+
+        let justAfterHeartbeat = Date(timeIntervalSince1970: 1_785_450_376.944_669)
+        fixture.processInspector.identity = fixture.validIdentity(startedAt: justAfterHeartbeat)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_785_450_377)],
+            ofItemAtPath: fixture.statusURL.path
+        )
+        let staleResult = try await fixture.checker.waitForHealthy(
+            paths: fixture.paths,
+            expectedVersion: "2.0.0",
+            notBefore: justAfterHeartbeat,
+            timeout: .milliseconds(15)
+        )
+        XCTAssertFalse(staleResult)
+    }
 }
 
 @MainActor
@@ -671,11 +765,20 @@ private final class HealthFixture {
 
     func writeStatus(version: String, pid: Int32, heartbeat: Date, schema: Int = 1) throws {
         let formatter = ISO8601DateFormatter()
+        try writeStatus(
+            version: version,
+            pid: pid,
+            heartbeatWire: formatter.string(from: heartbeat),
+            schema: schema
+        )
+    }
+
+    func writeStatus(version: String, pid: Int32, heartbeatWire: String, schema: Int = 1) throws {
         let object: [String: Any] = [
             "agent_status": "unpaired",
             "bridge_status": "degraded",
             "local_healthy": true,
-            "heartbeat_at": formatter.string(from: heartbeat),
+            "heartbeat_at": heartbeatWire,
             "process_id": pid,
             "app_version": version,
             "schema_version": schema,
