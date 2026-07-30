@@ -21,6 +21,7 @@ struct ChildGuard {
     child: Child,
     fatal_release: Option<PathBuf>,
     bridge_pid_file: Option<PathBuf>,
+    bridge_executable: Option<PathBuf>,
 }
 
 impl ChildGuard {
@@ -29,13 +30,20 @@ impl ChildGuard {
             child,
             fatal_release: None,
             bridge_pid_file: None,
+            bridge_executable: None,
         }
     }
 
     #[cfg(feature = "process-test-hooks")]
-    fn with_fatal_cleanup(mut self, release: PathBuf, bridge_pid_file: PathBuf) -> Self {
+    fn with_fatal_cleanup(
+        mut self,
+        release: PathBuf,
+        bridge_pid_file: PathBuf,
+        bridge_executable: PathBuf,
+    ) -> Self {
         self.fatal_release = Some(release);
         self.bridge_pid_file = Some(bridge_pid_file);
+        self.bridge_executable = Some(bridge_executable);
         self
     }
 
@@ -57,7 +65,6 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let mut forced_agent_kill = false;
         if self.child.try_wait().ok().flatten().is_none() {
             if let Some(release) = &self.fatal_release {
                 let _ = fs::write(release, b"release-on-drop\n");
@@ -69,20 +76,63 @@ impl Drop for ChildGuard {
             if self.child.try_wait().ok().flatten().is_none() {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                forced_agent_kill = true;
             }
         }
-        if forced_agent_kill {
-            let Some(pid_file) = &self.bridge_pid_file else {
-                return;
-            };
-            if let Ok(pid) = fs::read_to_string(pid_file) {
-                let _ = Command::new("/bin/kill")
-                    .args(["-KILL", pid.trim()])
-                    .status();
-            }
+        if let (Some(pid_file), Some(executable)) = (&self.bridge_pid_file, &self.bridge_executable)
+        {
+            cleanup_recorded_bridge(pid_file, executable);
         }
     }
+}
+
+fn cleanup_recorded_bridge(pid_file: &Path, executable: &Path) {
+    let Ok(pid) = fs::read_to_string(pid_file) else {
+        return;
+    };
+    let pid = pid.trim();
+    if !process_is_running(pid) || !process_matches_executable(pid, executable) {
+        return;
+    }
+    let _ = Command::new("/bin/kill").args(["-KILL", pid]).status();
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while Instant::now() < deadline && process_is_running(pid) {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn process_is_running(pid: &str) -> bool {
+    let signallable = Command::new("/bin/kill")
+        .args(["-0", pid])
+        .status()
+        .is_ok_and(|status| status.success());
+    if !signallable {
+        return false;
+    }
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-p", pid, "-o", "state="])
+        .output()
+    else {
+        return false;
+    };
+    !String::from_utf8_lossy(&output.stdout)
+        .trim_start()
+        .starts_with('Z')
+}
+
+fn process_matches_executable(pid: &str, executable: &Path) -> bool {
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-ww", "-p", pid, "-o", "command="])
+        .output()
+    else {
+        return false;
+    };
+    let command = String::from_utf8_lossy(&output.stdout);
+    let command = command.trim();
+    let executable = executable.to_string_lossy();
+    command == executable
+        || command
+            .strip_prefix(executable.as_ref())
+            .is_some_and(|arguments| arguments.starts_with(' '))
 }
 
 fn binary() -> &'static str {
@@ -177,6 +227,53 @@ fn install_fake_bridge(paths: &RuntimePaths) -> String {
     probe.wait().expect("reap fake Bridge executable probe");
     fs::remove_file(pid_file).expect("remove fake Bridge executable probe pid");
     probe_pid
+}
+
+#[cfg(feature = "process-test-hooks")]
+#[test]
+fn child_guard_cleans_recorded_fixture_even_when_agent_already_exited() {
+    let root = tempfile::tempdir().expect("temporary runtime root");
+    let paths = RuntimePaths::under(root.path());
+    paths.create_securely().expect("secure runtime paths");
+    install_fake_bridge(&paths);
+    let executable = paths
+        .app_dir
+        .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge");
+    let mut fake = Command::new(&executable)
+        .arg("--socket")
+        .arg(&paths.socket_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn recorded fake Bridge");
+    let pid_file = paths.run_dir.join("fake-bridge.pid");
+    wait_for_file(&pid_file);
+
+    let mut exited_agent = Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn exited agent stand-in");
+    assert!(exited_agent.wait().expect("reap agent stand-in").success());
+    let guard = ChildGuard::new(exited_agent).with_fatal_cleanup(
+        paths.run_dir.join("guard.release"),
+        pid_file,
+        executable,
+    );
+    drop(guard);
+
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    loop {
+        if let Some(status) = fake.try_wait().expect("poll recorded fake Bridge") {
+            assert!(!status.success(), "guard must terminate the parked fixture");
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = fake.kill();
+            let _ = fake.wait();
+            panic!("guard left recorded fake Bridge alive");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn signal(child: &ChildGuard, name: &str) {
@@ -370,7 +467,11 @@ fn fatal_failure_after_bridge_start_reaps_child_and_shuts_down_database_owner() 
             .spawn()
             .expect("spawn failure-injected agentd"),
     )
-    .with_fatal_cleanup(fatal_release.clone(), bridge_pid_file.clone());
+    .with_fatal_cleanup(
+        fatal_release.clone(),
+        bridge_pid_file.clone(),
+        bridge_executable,
+    );
 
     wait_for_file_while_running(&mut child, &fatal_armed);
     let bridge_pid = fs::read_to_string(&bridge_pid_file).expect("read fake Bridge pid");

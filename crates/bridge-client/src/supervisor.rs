@@ -1,9 +1,11 @@
 use std::{
-    fs, io,
+    fs,
+    future::Future,
+    io,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::Component,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -24,6 +26,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_STABLE_READY: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const CHILD_REAP_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STABLE_READY: Duration = Duration::from_secs(30);
 
@@ -115,7 +118,7 @@ impl BridgeSupervisorConfig {
 
 #[derive(Debug, Error)]
 pub enum BridgeSupervisorError {
-    #[error("Bridge child process cleanup failed")]
+    #[error("Bridge process cleanup failed")]
     ProcessCleanup,
 }
 
@@ -146,9 +149,9 @@ impl BridgeSupervisor {
     ///
     /// # Errors
     ///
-    /// Returns only when cancellation cannot cleanly reap the supervised child.
-    /// Child termination deliberately has no wall-clock deadline: after sending SIGKILL, the
-    /// supervisor retains ownership until `wait` confirms reap, even if kernel waitpid is delayed.
+    /// Returns only when confirmed socket cleanup fails. Child termination deliberately has no
+    /// wall-clock deadline: the supervisor retries kill/wait observations and retains ownership
+    /// until `wait` or `try_wait` confirms reap, even if process APIs repeatedly fail.
     pub async fn run(
         self,
         mut shutdown: watch::Receiver<bool>,
@@ -210,7 +213,9 @@ impl BridgeSupervisor {
                     return Ok(());
                 }
                 result = child.wait() => {
-                    result.map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
+                    if result.is_err() {
+                        reap_child(&mut child).await;
+                    }
                     true
                 }
                 () = &mut stable => {
@@ -223,7 +228,9 @@ impl BridgeSupervisor {
                             return Ok(());
                         }
                         result = child.wait() => {
-                            result.map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
+                            if result.is_err() {
+                                reap_child(&mut child).await;
+                            }
                             true
                         }
                     }
@@ -313,36 +320,46 @@ fn spawn_bridge(config: &BridgeSupervisorConfig) -> Result<Child, ()> {
 }
 
 async fn cleanup_child(child: &mut Child, socket_path: &Path) -> Result<(), BridgeSupervisorError> {
-    // Once this supervisor owns a child, cleanup favors a confirmed waitpid over a time bound.
-    // `kill_on_drop` remains a last-resort process fallback, not evidence that the child was reaped.
-    match child.try_wait() {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            if child.start_kill().is_err() {
-                match child.try_wait() {
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => {
-                        child
-                            .wait()
-                            .await
-                            .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
-                    }
-                }
-            } else {
-                child
-                    .wait()
-                    .await
-                    .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
-            }
-        }
-        Err(_) => {
-            child
-                .wait()
-                .await
-                .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
-        }
-    }
+    reap_child(child).await;
     remove_confirmed_socket(socket_path)
+}
+
+trait ReapProcess {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+    fn start_kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>>;
+}
+
+impl ReapProcess for Child {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        Child::start_kill(self)
+    }
+
+    fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> {
+        Child::wait(self)
+    }
+}
+
+async fn reap_child(child: &mut impl ReapProcess) {
+    // `kill_on_drop` is a last-resort process fallback, never evidence of reap. Once Child is
+    // owned, even pathological start_kill/wait errors keep this loop pending until an explicit
+    // wait observation confirms the child has exited and been reaped.
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if child.start_kill().is_err() && matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if child.wait().await.is_ok() || matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        sleep(CHILD_REAP_RETRY_BACKOFF).await;
+    }
 }
 
 fn remove_confirmed_socket(socket_path: &Path) -> Result<(), BridgeSupervisorError> {
@@ -429,13 +446,18 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::{
-        remove_confirmed_socket, Backoff, BridgeSupervisorConfig, StatusEmitter, MAX_BACKOFF,
-        MAX_OPERATION_TIMEOUT, MAX_STABLE_READY,
+        reap_child, remove_confirmed_socket, Backoff, BridgeSupervisorConfig, ReapProcess,
+        StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT, MAX_STABLE_READY,
     };
     use pca_domain::BridgeStatus;
     use std::{
+        collections::VecDeque,
         fs,
+        future::{ready, Future},
+        io,
+        os::unix::process::ExitStatusExt,
         os::unix::{fs::symlink, fs::PermissionsExt, net::UnixListener},
+        process::ExitStatus,
         time::Duration,
     };
     use tokio::sync::watch;
@@ -520,5 +542,46 @@ mod tests {
         assert_eq!(config.backoff_base, MAX_BACKOFF);
         assert_eq!(config.backoff_cap, MAX_BACKOFF);
         assert_eq!(config.stable_ready, MAX_STABLE_READY);
+    }
+
+    struct ErrorThenExitProcess {
+        try_waits: VecDeque<io::Result<Option<ExitStatus>>>,
+        kills: VecDeque<io::Result<()>>,
+        waits: VecDeque<io::Result<ExitStatus>>,
+    }
+
+    impl ReapProcess for ErrorThenExitProcess {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            self.try_waits.pop_front().expect("scripted try_wait")
+        }
+
+        fn start_kill(&mut self) -> io::Result<()> {
+            self.kills.pop_front().expect("scripted start_kill")
+        }
+
+        fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> {
+            ready(self.waits.pop_front().expect("scripted wait"))
+        }
+    }
+
+    #[tokio::test]
+    async fn reap_retries_api_errors_until_exit_is_confirmed() {
+        let api_error = || io::Error::other("injected process API failure");
+        let mut child = ErrorThenExitProcess {
+            try_waits: VecDeque::from([
+                Err(api_error()),
+                Ok(None),
+                Ok(None),
+                Ok(Some(ExitStatus::from_raw(0))),
+            ]),
+            kills: VecDeque::from([Err(api_error())]),
+            waits: VecDeque::from([Err(api_error())]),
+        };
+
+        reap_child(&mut child).await;
+
+        assert!(child.try_waits.is_empty());
+        assert!(child.kills.is_empty());
+        assert!(child.waits.is_empty());
     }
 }
