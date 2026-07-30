@@ -1,4 +1,7 @@
 use std::{
+    fs, io,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
+    path::Component,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -11,8 +14,8 @@ use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use tokio::{
     process::{Child, Command},
-    sync::{mpsc, watch},
-    time::{sleep, Instant},
+    sync::watch,
+    time::{sleep, timeout, Instant},
 };
 
 use crate::{BridgeClient, BridgeClientConfig, BridgeClientError};
@@ -21,6 +24,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_STABLE_READY: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_STABLE_READY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct BridgeSupervisorConfig {
@@ -37,7 +43,10 @@ impl BridgeSupervisorConfig {
     ///
     /// # Errors
     ///
-    /// Rejects non-absolute paths, root paths, and invalid client settings.
+    /// Rejects non-absolute paths, parent traversal, a missing/non-executable regular executable,
+    /// an untrusted socket parent, and invalid client settings. The caller must ensure the socket
+    /// parent is the per-user runtime directory owned by the current user and that existing parent
+    /// path components are not replaced with symlinks after validation.
     pub fn new(
         executable_path: impl AsRef<Path>,
         socket_path: impl AsRef<Path>,
@@ -47,7 +56,27 @@ impl BridgeSupervisorConfig {
         if !executable_path.is_absolute()
             || executable_path.as_os_str().is_empty()
             || executable_path == Path::new("/")
+            || has_parent_traversal(executable_path)
         {
+            return Err(BridgeClientError::InvalidConfiguration);
+        }
+        let executable_metadata = fs::symlink_metadata(executable_path)
+            .map_err(|_| BridgeClientError::InvalidConfiguration)?;
+        if !executable_metadata.file_type().is_file()
+            || executable_metadata.permissions().mode() & 0o111 == 0
+        {
+            return Err(BridgeClientError::InvalidConfiguration);
+        }
+        let socket_path = socket_path.as_ref();
+        let socket_parent = socket_path
+            .parent()
+            .ok_or(BridgeClientError::InvalidConfiguration)?;
+        if socket_parent == Path::new("/") {
+            return Err(BridgeClientError::InvalidConfiguration);
+        }
+        let parent_metadata = fs::symlink_metadata(socket_parent)
+            .map_err(|_| BridgeClientError::InvalidConfiguration)?;
+        if !parent_metadata.file_type().is_dir() {
             return Err(BridgeClientError::InvalidConfiguration);
         }
         let client_config = BridgeClientConfig::new(socket_path, agent_version)?;
@@ -64,8 +93,8 @@ impl BridgeSupervisorConfig {
     #[must_use]
     pub fn with_operation_timeout(mut self, timeout: Duration) -> Self {
         if !timeout.is_zero() {
-            self.operation_timeout = timeout;
-            self.client_config = self.client_config.with_timeout(timeout);
+            self.operation_timeout = timeout.min(MAX_OPERATION_TIMEOUT);
+            self.client_config = self.client_config.with_timeout(self.operation_timeout);
         }
         self
     }
@@ -79,7 +108,7 @@ impl BridgeSupervisorConfig {
             self.backoff_cap = cap.min(MAX_BACKOFF).max(self.backoff_base);
         }
         if !stable_ready.is_zero() {
-            self.stable_ready = stable_ready;
+            self.stable_ready = stable_ready.min(MAX_STABLE_READY);
         }
         self
     }
@@ -94,7 +123,7 @@ pub enum BridgeSupervisorError {
 pub struct BridgeSupervisor {
     config: BridgeSupervisorConfig,
     credential_store: Arc<dyn CredentialStore>,
-    statuses: mpsc::UnboundedSender<BridgeStatus>,
+    statuses: watch::Sender<BridgeStatus>,
 }
 
 impl BridgeSupervisor {
@@ -102,7 +131,7 @@ impl BridgeSupervisor {
     pub fn new(
         config: BridgeSupervisorConfig,
         credential_store: Arc<dyn CredentialStore>,
-        statuses: mpsc::UnboundedSender<BridgeStatus>,
+        statuses: watch::Sender<BridgeStatus>,
     ) -> Self {
         Self {
             config,
@@ -150,16 +179,16 @@ impl BridgeSupervisor {
             let client = match connection {
                 ConnectOutcome::Ready(client) => client,
                 ConnectOutcome::Cancelled => {
-                    cleanup_child(&mut child).await?;
+                    cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
                     return Ok(());
                 }
                 ConnectOutcome::Incompatible => {
-                    cleanup_child(&mut child).await?;
+                    cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
                     status.emit(BridgeStatus::Incompatible);
                     return Ok(());
                 }
                 ConnectOutcome::Failed => {
-                    cleanup_child(&mut child).await?;
+                    cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
                     status.emit(BridgeStatus::Degraded);
                     if wait_or_cancel(backoff.next_delay(), &mut shutdown).await {
                         return Ok(());
@@ -176,7 +205,7 @@ impl BridgeSupervisor {
                 biased;
                 changed = shutdown.changed() => {
                     let _ = changed;
-                    cleanup_child(&mut child).await?;
+                    cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
                     return Ok(());
                 }
                 result = child.wait() => {
@@ -189,7 +218,7 @@ impl BridgeSupervisor {
                         biased;
                         changed = shutdown.changed() => {
                             let _ = changed;
-                            cleanup_child(&mut child).await?;
+                            cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
                             return Ok(());
                         }
                         result = child.wait() => {
@@ -201,6 +230,7 @@ impl BridgeSupervisor {
             };
             drop(client);
             if child_exited {
+                remove_confirmed_socket(self.config.client_config.socket_path())?;
                 if ready_at.elapsed() >= self.config.stable_ready {
                     backoff.reset();
                 }
@@ -226,7 +256,7 @@ async fn connect_until_ready(
     child: &mut Child,
     shutdown: &mut watch::Receiver<bool>,
 ) -> ConnectOutcome {
-    let deadline = Instant::now() + config.operation_timeout;
+    let started = Instant::now();
     loop {
         if *shutdown.borrow() {
             return ConnectOutcome::Cancelled;
@@ -235,11 +265,11 @@ async fn connect_until_ready(
             Ok(Some(_)) | Err(_) => return ConnectOutcome::Failed,
             Ok(None) => {}
         }
-        if Instant::now() >= deadline {
+        if started.elapsed() >= config.operation_timeout {
             return ConnectOutcome::Failed;
         }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = config.operation_timeout.saturating_sub(started.elapsed());
         let connect = BridgeClient::connect_and_handshake(
             config.client_config.clone().with_timeout(remaining),
             Arc::clone(&credential_store),
@@ -257,7 +287,9 @@ async fn connect_until_ready(
             Err(BridgeClientError::IncompatibleProtocol { .. }) => {
                 return ConnectOutcome::Incompatible;
             }
-            Err(BridgeClientError::ConnectionFailed) if Instant::now() < deadline => {
+            Err(BridgeClientError::ConnectionFailed)
+                if started.elapsed() < config.operation_timeout =>
+            {
                 if wait_or_cancel(CONNECT_RETRY_INTERVAL, shutdown).await {
                     return ConnectOutcome::Cancelled;
                 }
@@ -279,20 +311,39 @@ fn spawn_bridge(config: &BridgeSupervisorConfig) -> Result<Child, ()> {
         .map_err(|_| ())
 }
 
-async fn cleanup_child(child: &mut Child) -> Result<(), BridgeSupervisorError> {
-    match child.try_wait() {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
-            child
-                .kill()
-                .await
-                .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
-            child
-                .wait()
-                .await
-                .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
-            Ok(())
+async fn cleanup_child(child: &mut Child, socket_path: &Path) -> Result<(), BridgeSupervisorError> {
+    let cleanup = async {
+        match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                if child.start_kill().is_err() {
+                    return match child.try_wait() {
+                        Ok(Some(_)) => Ok(()),
+                        Ok(None) | Err(_) => Err(BridgeSupervisorError::ProcessCleanup),
+                    };
+                }
+                child
+                    .wait()
+                    .await
+                    .map_err(|_| BridgeSupervisorError::ProcessCleanup)?;
+                Ok(())
+            }
+            Err(_) => Err(BridgeSupervisorError::ProcessCleanup),
         }
+    };
+    timeout(CHILD_CLEANUP_TIMEOUT, cleanup)
+        .await
+        .map_err(|_| BridgeSupervisorError::ProcessCleanup)??;
+    remove_confirmed_socket(socket_path)
+}
+
+fn remove_confirmed_socket(socket_path: &Path) -> Result<(), BridgeSupervisorError> {
+    match fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            fs::remove_file(socket_path).map_err(|_| BridgeSupervisorError::ProcessCleanup)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(BridgeSupervisorError::ProcessCleanup),
     }
 }
@@ -312,21 +363,26 @@ async fn wait_or_cancel(duration: Duration, shutdown: &mut watch::Receiver<bool>
 }
 
 struct StatusEmitter {
-    sender: mpsc::UnboundedSender<BridgeStatus>,
+    sender: watch::Sender<BridgeStatus>,
     last: Option<BridgeStatus>,
 }
 
 impl StatusEmitter {
-    fn new(sender: mpsc::UnboundedSender<BridgeStatus>) -> Self {
+    fn new(sender: watch::Sender<BridgeStatus>) -> Self {
         Self { sender, last: None }
     }
 
     fn emit(&mut self, status: BridgeStatus) {
         if self.last != Some(status) {
-            let _ = self.sender.send(status);
+            self.sender.send_replace(status);
             self.last = Some(status);
         }
     }
+}
+
+fn has_parent_traversal(path: &Path) -> bool {
+    path.components()
+        .any(|component| component == Component::ParentDir)
 }
 
 struct Backoff {
@@ -364,8 +420,17 @@ impl Backoff {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backoff, MAX_BACKOFF};
-    use std::time::Duration;
+    use super::{
+        remove_confirmed_socket, Backoff, BridgeSupervisorConfig, StatusEmitter, MAX_BACKOFF,
+        MAX_OPERATION_TIMEOUT, MAX_STABLE_READY,
+    };
+    use pca_domain::BridgeStatus;
+    use std::{
+        fs,
+        os::unix::{fs::symlink, fs::PermissionsExt, net::UnixListener},
+        time::Duration,
+    };
+    use tokio::sync::watch;
 
     #[test]
     fn backoff_is_jittered_bounded_and_resettable() {
@@ -381,5 +446,71 @@ mod tests {
         backoff.reset();
         let after_reset = backoff.next_delay();
         assert!((Duration::from_secs(3)..=base).contains(&after_reset));
+    }
+
+    #[test]
+    fn status_updates_are_coalesced_and_survive_a_closed_consumer() {
+        let (sender, mut receiver) = watch::channel(BridgeStatus::Disconnected);
+        let mut emitter = StatusEmitter::new(sender);
+        for status in [
+            BridgeStatus::Handshaking,
+            BridgeStatus::Ready,
+            BridgeStatus::Degraded,
+            BridgeStatus::Ready,
+        ] {
+            emitter.emit(status);
+        }
+        assert_eq!(*receiver.borrow_and_update(), BridgeStatus::Ready);
+        assert!(!receiver.has_changed().expect("watch remains open"));
+
+        drop(receiver);
+        emitter.emit(BridgeStatus::Degraded);
+        assert_eq!(*emitter.sender.borrow(), BridgeStatus::Degraded);
+        assert_eq!(emitter.sender.receiver_count(), 0);
+    }
+
+    #[test]
+    fn confirmed_socket_cleanup_never_unlinks_regular_files_or_symlinks() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("bridge.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        drop(listener);
+        remove_confirmed_socket(&socket).expect("remove confirmed socket");
+        assert!(!socket.exists());
+
+        fs::write(&socket, "unrelated").expect("regular file");
+        remove_confirmed_socket(&socket).expect("preserve regular file");
+        assert!(socket.is_file());
+        fs::remove_file(&socket).expect("test cleanup");
+
+        let target = directory.path().join("target");
+        fs::write(&target, "unrelated").expect("symlink target");
+        symlink(&target, &socket).expect("socket-path symlink");
+        remove_confirmed_socket(&socket).expect("preserve symlink");
+        assert!(fs::symlink_metadata(&socket)
+            .expect("symlink metadata")
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn extreme_durations_are_clamped_without_instant_overflow() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let executable = directory.path().join("bridge");
+        fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("fake executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("executable mode");
+        let config = BridgeSupervisorConfig::new(
+            &executable,
+            directory.path().join("bridge.sock"),
+            "0.0.0-s1a",
+        )
+        .expect("valid config")
+        .with_operation_timeout(Duration::MAX)
+        .with_backoff(Duration::MAX, Duration::MAX, Duration::MAX);
+        assert_eq!(config.operation_timeout, MAX_OPERATION_TIMEOUT);
+        assert_eq!(config.backoff_base, MAX_BACKOFF);
+        assert_eq!(config.backoff_cap, MAX_BACKOFF);
+        assert_eq!(config.stable_ready, MAX_STABLE_READY);
     }
 }

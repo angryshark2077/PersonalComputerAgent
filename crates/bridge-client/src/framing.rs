@@ -62,6 +62,21 @@ pub async fn read_frame<R>(reader: &mut R) -> Result<Value, FrameError>
 where
     R: AsyncRead + Unpin,
 {
+    let payload = read_frame_bytes(reader).await?;
+    serde_json::from_slice(&payload).map_err(|_| FrameError::InvalidJson)
+}
+
+/// Reads one length-prefixed UTF-8 frame without normalizing the JSON representation.
+///
+/// This is used by strict typed decoders so Serde can detect duplicate struct fields directly.
+///
+/// # Errors
+///
+/// Rejects zero, oversized, truncated, and non-UTF-8 frames.
+pub async fn read_frame_bytes<R>(reader: &mut R) -> Result<Vec<u8>, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut prefix = [0_u8; 4];
     reader
         .read_exact(&mut prefix)
@@ -80,8 +95,8 @@ where
         .read_exact(&mut payload)
         .await
         .map_err(map_read_error)?;
-    let text = std::str::from_utf8(&payload).map_err(|_| FrameError::InvalidUtf8)?;
-    serde_json::from_str(text).map_err(|_| FrameError::InvalidJson)
+    std::str::from_utf8(&payload).map_err(|_| FrameError::InvalidUtf8)?;
+    Ok(payload)
 }
 
 /// Writes one length-prefixed JSON frame.

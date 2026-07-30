@@ -11,6 +11,8 @@ pub struct InvalidProof;
 ///
 /// The exact HMAC transcript is the 32 raw decoded nonce bytes, followed by the protocol version
 /// as four unsigned big-endian bytes, followed by the exact UTF-8 bytes of `agent_version`.
+/// A handshake responder signs the version it declares in its response envelope. The client must
+/// authenticate that declaration before deciding whether the declared version is compatible.
 ///
 /// # Panics
 ///

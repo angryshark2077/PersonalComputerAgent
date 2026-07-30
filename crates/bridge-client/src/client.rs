@@ -1,29 +1,31 @@
 use std::{
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use pca_domain::{
-    BridgeEnvelope, BridgeMessageKind, HandshakeChallenge, HandshakeChallengePhase,
-    HandshakeResponse,
+    BridgeEnvelope, BridgeMessageKind, ErrorEnvelope, HandshakeChallenge, HandshakeChallengePhase,
+    HandshakeResponsePhase,
 };
 use pca_keychain::{load_bridge_shared_secret, CredentialError, CredentialStore};
 use rand::{rngs::OsRng, RngCore};
-use serde_json::{Map, Value};
+use serde::Deserialize;
+use serde_json::{value::RawValue, Map, Value};
 use thiserror::Error;
 use tokio::{net::UnixStream, time::timeout};
 use uuid::Uuid;
 
 use crate::{
     auth::verify_proof,
-    framing::{read_frame, write_frame, FrameError},
+    framing::{read_frame_bytes, write_frame, FrameError},
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const HANDSHAKE_CAPABILITY: &str = "bridge.handshake";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct BridgeClientConfig {
@@ -47,6 +49,9 @@ impl BridgeClientConfig {
         if !socket_path.is_absolute()
             || socket_path.as_os_str().is_empty()
             || socket_path == Path::new("/")
+            || socket_path
+                .components()
+                .any(|component| component == Component::ParentDir)
         {
             return Err(BridgeClientError::InvalidConfiguration);
         }
@@ -62,7 +67,9 @@ impl BridgeClientConfig {
 
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout.max(Duration::from_millis(1));
+        self.timeout = timeout
+            .max(Duration::from_millis(1))
+            .min(MAX_CLIENT_TIMEOUT);
         self
     }
 
@@ -83,6 +90,8 @@ pub enum BridgeClientError {
     CredentialInvalid,
     #[error("Bridge connection failed")]
     ConnectionFailed,
+    #[error("Bridge connection is disconnected")]
+    Disconnected,
     #[error("Bridge operation timed out")]
     Timeout,
     #[error("Bridge frame failed")]
@@ -120,7 +129,7 @@ impl PartialEq for BridgeClientError {
 impl Eq for BridgeClientError {}
 
 pub struct BridgeClient {
-    stream: UnixStream,
+    stream: Option<UnixStream>,
     operation_timeout: Duration,
 }
 
@@ -128,6 +137,7 @@ impl std::fmt::Debug for BridgeClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BridgeClient")
+            .field("connected", &self.stream.is_some())
             .field("operation_timeout", &self.operation_timeout)
             .finish_non_exhaustive()
     }
@@ -172,16 +182,24 @@ impl BridgeClient {
 
         let response = timeout(config.timeout, async {
             write_envelope(&mut stream, &challenge).await?;
-            read_envelope(&mut stream).await
+            read_handshake_response(&mut stream).await
         })
         .await
         .map_err(|_| BridgeClientError::Timeout)??;
-        validate_response_envelope(&challenge, &response)?;
+        validate_response_correlators(
+            &challenge,
+            response.request_id,
+            response.message_kind,
+            &response.capability,
+            response.deadline_ms,
+        )?;
         if response.error.is_some() {
             return Err(BridgeClientError::InvalidHandshake);
         }
-        let handshake: HandshakeResponse = serde_json::from_value(Value::Object(response.payload))
-            .map_err(|_| BridgeClientError::InvalidHandshake)?;
+        let handshake = response.payload;
+        if handshake.phase != HandshakeResponsePhase::Response {
+            return Err(BridgeClientError::InvalidHandshake);
+        }
         if handshake.nonce != encoded_nonce {
             return Err(BridgeClientError::NonceMismatch);
         }
@@ -191,14 +209,20 @@ impl BridgeClient {
         verify_proof(
             &secret,
             &nonce,
-            PROTOCOL_VERSION,
+            response.protocol_version,
             &config.agent_version,
             &handshake.proof,
         )
         .map_err(|_| BridgeClientError::AuthenticationFailed)?;
+        if response.protocol_version != PROTOCOL_VERSION {
+            return Err(BridgeClientError::IncompatibleProtocol {
+                expected: PROTOCOL_VERSION,
+                actual: response.protocol_version,
+            });
+        }
 
         Ok(Self {
-            stream,
+            stream: Some(stream),
             operation_timeout: config.timeout,
         })
     }
@@ -214,15 +238,29 @@ impl BridgeClient {
         request: BridgeEnvelope,
     ) -> Result<BridgeEnvelope, BridgeClientError> {
         validate_request(&request)?;
+        let mut stream = self.stream.take().ok_or(BridgeClientError::Disconnected)?;
         let wire_deadline = Duration::from_millis(request.deadline_ms);
         let operation_timeout = self.operation_timeout.min(wire_deadline);
         let response = timeout(operation_timeout, async {
-            write_envelope(&mut self.stream, &request).await?;
-            read_envelope(&mut self.stream).await
+            write_envelope(&mut stream, &request).await?;
+            read_response_envelope(&mut stream).await
         })
         .await
         .map_err(|_| BridgeClientError::Timeout)??;
-        validate_response_envelope(&request, &response)?;
+        validate_response_correlators(
+            &request,
+            response.request_id,
+            response.message_kind,
+            &response.capability,
+            response.deadline_ms,
+        )?;
+        if response.protocol_version != PROTOCOL_VERSION {
+            return Err(BridgeClientError::IncompatibleProtocol {
+                expected: PROTOCOL_VERSION,
+                actual: response.protocol_version,
+            });
+        }
+        self.stream = Some(stream);
         Ok(response)
     }
 }
@@ -250,20 +288,17 @@ fn validate_request(request: &BridgeEnvelope) -> Result<(), BridgeClientError> {
     Ok(())
 }
 
-fn validate_response_envelope(
+fn validate_response_correlators(
     request: &BridgeEnvelope,
-    response: &BridgeEnvelope,
+    response_request_id: Uuid,
+    response_kind: BridgeMessageKind,
+    response_capability: &str,
+    response_deadline_ms: u64,
 ) -> Result<(), BridgeClientError> {
-    if response.protocol_version != PROTOCOL_VERSION {
-        return Err(BridgeClientError::IncompatibleProtocol {
-            expected: PROTOCOL_VERSION,
-            actual: response.protocol_version,
-        });
-    }
-    if response.message_kind != BridgeMessageKind::Response
-        || response.request_id != request.request_id
-        || response.capability != request.capability
-        || response.deadline_ms != request.deadline_ms
+    if response_kind != BridgeMessageKind::Response
+        || response_request_id != request.request_id
+        || response_capability != request.capability
+        || response_deadline_ms != request.deadline_ms
     {
         return Err(BridgeClientError::InvalidEnvelope);
     }
@@ -280,9 +315,30 @@ async fn write_envelope(
         .map_err(BridgeClientError::Frame)
 }
 
-async fn read_envelope(stream: &mut UnixStream) -> Result<BridgeEnvelope, BridgeClientError> {
-    let value = read_frame(stream).await.map_err(BridgeClientError::Frame)?;
-    serde_json::from_value(value).map_err(|_| BridgeClientError::InvalidEnvelope)
+async fn read_handshake_response(
+    stream: &mut UnixStream,
+) -> Result<StrictEnvelope<StrictHandshakeResponse>, BridgeClientError> {
+    let bytes = read_frame_bytes(stream)
+        .await
+        .map_err(BridgeClientError::Frame)?;
+    let envelope: StrictEnvelope<Box<RawValue>> =
+        serde_json::from_slice(&bytes).map_err(|_| BridgeClientError::InvalidEnvelope)?;
+    let payload = serde_json::from_str(envelope.payload.get())
+        .map_err(|_| BridgeClientError::InvalidHandshake)?;
+    Ok(envelope.map_payload(payload))
+}
+
+async fn read_response_envelope(
+    stream: &mut UnixStream,
+) -> Result<BridgeEnvelope, BridgeClientError> {
+    let bytes = read_frame_bytes(stream)
+        .await
+        .map_err(BridgeClientError::Frame)?;
+    let strict: StrictEnvelope<Box<RawValue>> =
+        serde_json::from_slice(&bytes).map_err(|_| BridgeClientError::InvalidEnvelope)?;
+    let payload = serde_json::from_str(strict.payload.get())
+        .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+    Ok(strict.map_payload(payload).into_domain())
 }
 
 fn object_payload<T: serde::Serialize>(
@@ -297,4 +353,78 @@ fn object_payload<T: serde::Serialize>(
 
 fn duration_millis(duration: Duration) -> Result<u64, BridgeClientError> {
     u64::try_from(duration.as_millis()).map_err(|_| BridgeClientError::InvalidConfiguration)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictEnvelope<T> {
+    protocol_version: u32,
+    request_id: Uuid,
+    message_kind: BridgeMessageKind,
+    capability: String,
+    deadline_ms: u64,
+    payload: T,
+    #[serde(default)]
+    error: Option<StrictErrorEnvelope>,
+}
+
+impl<T> StrictEnvelope<T> {
+    fn map_payload<U>(self, payload: U) -> StrictEnvelope<U> {
+        StrictEnvelope {
+            protocol_version: self.protocol_version,
+            request_id: self.request_id,
+            message_kind: self.message_kind,
+            capability: self.capability,
+            deadline_ms: self.deadline_ms,
+            payload,
+            error: self.error,
+        }
+    }
+}
+
+impl StrictEnvelope<Map<String, Value>> {
+    fn into_domain(self) -> BridgeEnvelope {
+        BridgeEnvelope {
+            protocol_version: self.protocol_version,
+            request_id: self.request_id,
+            message_kind: self.message_kind,
+            capability: self.capability,
+            deadline_ms: self.deadline_ms,
+            payload: self.payload,
+            error: self.error.map(StrictErrorEnvelope::into_domain),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictErrorEnvelope {
+    error_code: String,
+    message: String,
+    retryable: bool,
+    #[serde(default)]
+    request_id: Option<Uuid>,
+    #[serde(default)]
+    details: Option<Map<String, Value>>,
+}
+
+impl StrictErrorEnvelope {
+    fn into_domain(self) -> ErrorEnvelope {
+        ErrorEnvelope {
+            error_code: self.error_code,
+            message: self.message,
+            retryable: self.retryable,
+            request_id: self.request_id,
+            details: self.details,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictHandshakeResponse {
+    phase: HandshakeResponsePhase,
+    nonce: String,
+    proof: String,
+    bridge_version: String,
 }

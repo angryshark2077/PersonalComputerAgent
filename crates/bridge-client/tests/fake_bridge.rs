@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     fs,
     os::unix::fs::PermissionsExt,
+    process::Command as StdCommand,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -22,7 +23,7 @@ use serde_json::{json, Map, Value};
 use tokio::{
     io::{duplex, AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
-    sync::{mpsc, watch},
+    sync::watch,
 };
 use uuid::Uuid;
 
@@ -137,7 +138,6 @@ async fn handshake_rejects_deadline_nonce_hmac_and_protocol_failures() {
         ServerBehavior::Stall,
         ServerBehavior::WrongNonce,
         ServerBehavior::WrongProof,
-        ServerBehavior::Incompatible,
         ServerBehavior::WrongKind,
         ServerBehavior::WrongCapability,
         ServerBehavior::WrongRequestId,
@@ -156,12 +156,6 @@ async fn handshake_rejects_deadline_nonce_hmac_and_protocol_failures() {
                     Err(BridgeClientError::AuthenticationFailed)
                 ));
             }
-            ServerBehavior::Incompatible => {
-                assert!(matches!(
-                    result,
-                    Err(BridgeClientError::IncompatibleProtocol { .. })
-                ));
-            }
             ServerBehavior::WrongKind
             | ServerBehavior::WrongCapability
             | ServerBehavior::WrongRequestId => {
@@ -170,8 +164,61 @@ async fn handshake_rejects_deadline_nonce_hmac_and_protocol_failures() {
             ServerBehavior::WrongPhase | ServerBehavior::EmptyBridgeVersion => {
                 assert!(matches!(result, Err(BridgeClientError::InvalidHandshake)));
             }
-            ServerBehavior::Valid => unreachable!(),
+            ServerBehavior::Valid
+            | ServerBehavior::ForgedIncompatible
+            | ServerBehavior::AuthenticatedIncompatible
+            | ServerBehavior::UnknownEnvelopeField
+            | ServerBehavior::UnknownHandshakeField
+            | ServerBehavior::DuplicateEnvelopeField => unreachable!(),
         }
+    }
+}
+
+#[tokio::test]
+async fn version_mismatch_is_terminal_only_after_authenticating_the_declared_version() {
+    assert!(matches!(
+        connect_to_fake(
+            ServerBehavior::ForgedIncompatible,
+            Duration::from_millis(100)
+        )
+        .await,
+        Err(BridgeClientError::AuthenticationFailed)
+    ));
+    assert!(matches!(
+        connect_to_fake(
+            ServerBehavior::AuthenticatedIncompatible,
+            Duration::from_millis(100)
+        )
+        .await,
+        Err(BridgeClientError::IncompatibleProtocol {
+            expected: 1,
+            actual: 999
+        })
+    ));
+}
+
+#[tokio::test]
+async fn strict_wire_rejects_unknown_envelope_unknown_handshake_and_duplicate_keys() {
+    for (behavior, expected) in [
+        (
+            ServerBehavior::UnknownEnvelopeField,
+            BridgeClientError::InvalidEnvelope,
+        ),
+        (
+            ServerBehavior::UnknownHandshakeField,
+            BridgeClientError::InvalidHandshake,
+        ),
+        (
+            ServerBehavior::DuplicateEnvelopeField,
+            BridgeClientError::InvalidEnvelope,
+        ),
+    ] {
+        assert_eq!(
+            connect_to_fake(behavior, Duration::from_millis(100))
+                .await
+                .expect_err("strict wire rejection"),
+            expected
+        );
     }
 }
 
@@ -226,6 +273,39 @@ fn client_and_supervisor_reject_non_absolute_or_root_paths() {
             .expect_err("relative executable"),
         BridgeClientError::InvalidConfiguration
     );
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let executable = directory.path().join("bridge");
+    fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("fake executable");
+    assert_eq!(
+        BridgeSupervisorConfig::new(
+            &executable,
+            directory.path().join("bridge.sock"),
+            "0.0.0-s1a",
+        )
+        .expect_err("non-executable file"),
+        BridgeClientError::InvalidConfiguration
+    );
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).expect("make executable");
+    fs::create_dir(directory.path().join("run")).expect("runtime child");
+    assert_eq!(
+        BridgeSupervisorConfig::new(
+            &executable,
+            directory.path().join("run/../bridge.sock"),
+            "0.0.0-s1a",
+        )
+        .expect_err("socket traversal"),
+        BridgeClientError::InvalidConfiguration
+    );
+    assert_eq!(
+        BridgeSupervisorConfig::new(
+            directory.path().join("missing-bridge"),
+            directory.path().join("bridge.sock"),
+            "0.0.0-s1a",
+        )
+        .expect_err("missing executable"),
+        BridgeClientError::InvalidConfiguration
+    );
 }
 
 #[tokio::test]
@@ -264,6 +344,13 @@ async fn request_enforces_wire_deadline_and_correlates_every_response_field() {
             .await
             .expect_err("invalid response");
         assert_eq!(error, expected);
+        assert_eq!(
+            client
+                .request(request(Map::new()))
+                .await
+                .expect_err("failed exchange poisons stream"),
+            BridgeClientError::Disconnected
+        );
         server.abort();
     }
 
@@ -306,6 +393,65 @@ async fn request_rejects_invalid_outgoing_envelopes_before_io() {
 }
 
 #[tokio::test]
+async fn request_timeout_poisons_stream_reuse_and_a_new_connection_succeeds() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let socket = directory.path().join("timeout-reuse.sock");
+    let listener = UnixListener::bind(&socket).expect("bind timeout fake");
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.expect("first connection");
+        serve_valid_handshake(&mut first, 1).await;
+        let _: BridgeEnvelope =
+            serde_json::from_value(read_frame(&mut first).await.expect("first timed request"))
+                .expect("first request envelope");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(matches!(
+            read_frame(&mut first).await,
+            Err(FrameError::Truncated)
+        ));
+
+        let (mut second, _) = listener.accept().await.expect("replacement connection");
+        serve_valid_handshake(&mut second, 1).await;
+        let request: BridgeEnvelope =
+            serde_json::from_value(read_frame(&mut second).await.expect("replacement request"))
+                .expect("replacement request envelope");
+        send_valid_response(&mut second, &request).await;
+    });
+
+    let config = BridgeClientConfig::new(&socket, "0.0.0-s1a")
+        .expect("valid config")
+        .with_timeout(Duration::from_secs(1));
+    let store: Arc<dyn CredentialStore> = Arc::new(TestStore::with_secret(Some(SECRET.to_vec())));
+    let mut client = BridgeClient::connect_and_handshake(config.clone(), Arc::clone(&store))
+        .await
+        .expect("first handshake");
+    let mut timed_request = request(Map::new());
+    timed_request.deadline_ms = 20;
+    assert_eq!(
+        client
+            .request(timed_request)
+            .await
+            .expect_err("request timeout"),
+        BridgeClientError::Timeout
+    );
+    assert_eq!(
+        client
+            .request(request(Map::new()))
+            .await
+            .expect_err("poisoned connection"),
+        BridgeClientError::Disconnected
+    );
+
+    let mut replacement = BridgeClient::connect_and_handshake(config, store)
+        .await
+        .expect("replacement handshake");
+    replacement
+        .request(request(Map::new()))
+        .await
+        .expect("replacement request");
+    server.await.expect("timeout server");
+}
+
+#[tokio::test]
 async fn supervisor_restarts_a_crashed_child_reconnects_and_cancels_without_leaking() {
     let directory = tempfile::tempdir().expect("tempdir");
     let executable = directory.path().join("fake bridge;no-shell");
@@ -322,7 +468,7 @@ async fn supervisor_restarts_a_crashed_child_reconnects_and_cancels_without_leak
             Duration::from_millis(20),
             Duration::from_millis(50),
         );
-    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+    let (status_tx, mut status_rx) = watch::channel(BridgeStatus::Disconnected);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let supervisor = BridgeSupervisor::new(
         config,
@@ -331,19 +477,18 @@ async fn supervisor_restarts_a_crashed_child_reconnects_and_cancels_without_leak
     );
     let task = tokio::spawn(supervisor.run(shutdown_rx));
 
-    let mut statuses = Vec::new();
+    let mut statuses = vec![*status_rx.borrow_and_update()];
     while statuses
         .iter()
         .filter(|status| **status == BridgeStatus::Ready)
         .count()
         < 2
     {
-        statuses.push(
-            tokio::time::timeout(Duration::from_secs(3), status_rx.recv())
-                .await
-                .expect("status deadline")
-                .expect("status channel"),
-        );
+        tokio::time::timeout(Duration::from_secs(3), status_rx.changed())
+            .await
+            .expect("status deadline")
+            .expect("status channel");
+        statuses.push(*status_rx.borrow_and_update());
     }
     shutdown_tx.send(true).expect("request shutdown");
     task.await
@@ -363,6 +508,14 @@ async fn supervisor_restarts_a_crashed_child_reconnects_and_cancels_without_leak
     ));
     let runs = fs::read_to_string(directory.path().join("runs")).expect("run count");
     assert_eq!(runs.trim(), "2");
+    let pid = fs::read_to_string(directory.path().join("pid")).expect("child pid");
+    assert!(!StdCommand::new("kill")
+        .args(["-0", pid.trim()])
+        .output()
+        .expect("probe child pid")
+        .status
+        .success());
+    assert!(!socket.exists());
 }
 
 #[tokio::test]
@@ -376,7 +529,7 @@ async fn supervisor_emits_incompatible_once_and_does_not_restart() {
     let config = BridgeSupervisorConfig::new(&executable, &socket, "0.0.0-s1a")
         .expect("valid supervisor config")
         .with_operation_timeout(Duration::from_secs(1));
-    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+    let (status_tx, status_rx) = watch::channel(BridgeStatus::Disconnected);
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     BridgeSupervisor::new(
         config,
@@ -387,13 +540,10 @@ async fn supervisor_emits_incompatible_once_and_does_not_restart() {
     .await
     .expect("incompatible is a terminal supervised state");
 
-    let mut statuses = Vec::new();
-    while let Ok(status) = status_rx.try_recv() {
-        statuses.push(status);
-    }
-    assert_eq!(statuses.last(), Some(&BridgeStatus::Incompatible));
+    assert_eq!(*status_rx.borrow(), BridgeStatus::Incompatible);
     let runs = fs::read_to_string(directory.path().join("runs")).expect("run count");
     assert_eq!(runs.trim(), "1");
+    assert!(!socket.exists());
 }
 
 #[derive(Clone, Copy)]
@@ -402,12 +552,16 @@ enum ServerBehavior {
     Stall,
     WrongNonce,
     WrongProof,
-    Incompatible,
+    ForgedIncompatible,
+    AuthenticatedIncompatible,
     WrongKind,
     WrongCapability,
     WrongRequestId,
     WrongPhase,
     EmptyBridgeVersion,
+    UnknownEnvelopeField,
+    UnknownHandshakeField,
+    DuplicateEnvelopeField,
 }
 
 #[derive(Clone, Copy)]
@@ -428,6 +582,7 @@ async fn connect_to_fake(
     connect_to_fake_observing(behavior, timeout, Arc::new(Mutex::new(VecDeque::new()))).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn connect_to_fake_observing(
     behavior: ServerBehavior,
     timeout: Duration,
@@ -459,10 +614,27 @@ async fn connect_to_fake_observing(
         } else {
             nonce.to_owned()
         };
+        let response_version = if matches!(
+            behavior,
+            ServerBehavior::ForgedIncompatible | ServerBehavior::AuthenticatedIncompatible
+        ) {
+            999
+        } else {
+            1
+        };
         let proof = if matches!(behavior, ServerBehavior::WrongProof) {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32])
         } else {
-            create_proof(&SECRET, &nonce_bytes, 1, "0.0.0-s1a")
+            create_proof(
+                &SECRET,
+                &nonce_bytes,
+                if matches!(behavior, ServerBehavior::AuthenticatedIncompatible) {
+                    response_version
+                } else {
+                    1
+                },
+                "0.0.0-s1a",
+            )
         };
         let mut payload = serde_json::to_value(HandshakeResponse {
             phase: HandshakeResponsePhase::Response,
@@ -482,11 +654,7 @@ async fn connect_to_fake_observing(
             payload.insert("phase".to_owned(), Value::String("challenge".to_owned()));
         }
         let response = BridgeEnvelope {
-            protocol_version: if matches!(behavior, ServerBehavior::Incompatible) {
-                999
-            } else {
-                1
-            },
+            protocol_version: response_version,
             request_id: if matches!(behavior, ServerBehavior::WrongRequestId) {
                 Uuid::new_v4()
             } else {
@@ -506,12 +674,16 @@ async fn connect_to_fake_observing(
             payload,
             error: None,
         };
-        write_frame(
-            &mut stream,
-            &serde_json::to_value(response).expect("response envelope"),
-        )
-        .await
-        .expect("response frame");
+        let mut response_json = serde_json::to_string(&response).expect("response envelope");
+        if matches!(behavior, ServerBehavior::UnknownEnvelopeField) {
+            response_json = format!("{{\"unexpected\":true,{}", &response_json[1..]);
+        } else if matches!(behavior, ServerBehavior::UnknownHandshakeField) {
+            response_json =
+                response_json.replacen("\"payload\":{", "\"payload\":{\"unexpected\":true,", 1);
+        } else if matches!(behavior, ServerBehavior::DuplicateEnvelopeField) {
+            response_json = format!("{{\"protocol_version\":1,{}", &response_json[1..]);
+        }
+        write_raw_frame(&mut stream, response_json.as_bytes()).await;
     });
 
     let config = BridgeClientConfig::new(&socket, "0.0.0-s1a")
@@ -666,6 +838,72 @@ fn contains_ordered(actual: &[BridgeStatus], expected: &[BridgeStatus]) -> bool 
     next.is_none()
 }
 
+async fn serve_valid_handshake(stream: &mut tokio::net::UnixStream, response_version: u32) {
+    let challenge: BridgeEnvelope =
+        serde_json::from_value(read_frame(stream).await.expect("challenge frame"))
+            .expect("challenge envelope");
+    let nonce = challenge.payload["nonce"].as_str().expect("nonce string");
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, nonce)
+        .expect("base64 nonce");
+    let mut nonce_bytes = [0_u8; 32];
+    nonce_bytes.copy_from_slice(&decoded);
+    let payload = serde_json::to_value(HandshakeResponse {
+        phase: HandshakeResponsePhase::Response,
+        nonce: nonce.to_owned(),
+        proof: create_proof(&SECRET, &nonce_bytes, response_version, "0.0.0-s1a"),
+        bridge_version: "0.0.0-s1a".to_owned(),
+    })
+    .expect("response payload")
+    .as_object()
+    .expect("object payload")
+    .clone();
+    let response = BridgeEnvelope {
+        protocol_version: response_version,
+        request_id: challenge.request_id,
+        message_kind: BridgeMessageKind::Response,
+        capability: challenge.capability,
+        deadline_ms: challenge.deadline_ms,
+        payload,
+        error: None,
+    };
+    write_frame(
+        stream,
+        &serde_json::to_value(response).expect("response envelope"),
+    )
+    .await
+    .expect("response frame");
+}
+
+async fn send_valid_response(stream: &mut tokio::net::UnixStream, request: &BridgeEnvelope) {
+    let response = BridgeEnvelope {
+        protocol_version: request.protocol_version,
+        request_id: request.request_id,
+        message_kind: BridgeMessageKind::Response,
+        capability: request.capability.clone(),
+        deadline_ms: request.deadline_ms,
+        payload: json!({"screen_capture": "available"})
+            .as_object()
+            .expect("object response")
+            .clone(),
+        error: None,
+    };
+    write_frame(
+        stream,
+        &serde_json::to_value(response).expect("response envelope"),
+    )
+    .await
+    .expect("response frame");
+}
+
+async fn write_raw_frame(stream: &mut tokio::net::UnixStream, payload: &[u8]) {
+    let length = u32::try_from(payload.len()).expect("raw test frame fits u32");
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .expect("raw frame prefix");
+    stream.write_all(payload).await.expect("raw frame payload");
+}
+
 fn fake_bridge_script(incompatible: bool) -> String {
     let protocol_version = if incompatible { 999 } else { 1 };
     format!(
@@ -682,10 +920,8 @@ except FileNotFoundError:
     runs = 1
 with open(runs_path, 'w', encoding='ascii') as handle:
     handle.write(str(runs))
-try:
-    os.unlink(socket_path)
-except FileNotFoundError:
-    pass
+with open(os.path.join(os.path.dirname(__file__), 'pid'), 'w', encoding='ascii') as handle:
+    handle.write(str(os.getpid()))
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(socket_path)
 server.listen(1)
@@ -701,7 +937,7 @@ def exact(count):
 length = struct.unpack('>I', exact(4))[0]
 challenge = json.loads(exact(length).decode('utf-8'))
 nonce = base64.b64decode(challenge['payload']['nonce'])
-transcript = nonce + struct.pack('>I', 1) + challenge['payload']['agent_version'].encode('utf-8')
+transcript = nonce + struct.pack('>I', {protocol_version}) + challenge['payload']['agent_version'].encode('utf-8')
 proof = base64.b64encode(hmac.new(bytes([0x5a]) * 32, transcript, hashlib.sha256).digest()).decode('ascii')
 response = {{
     'protocol_version': {protocol_version},
