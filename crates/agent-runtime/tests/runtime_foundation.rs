@@ -1,5 +1,9 @@
 use std::{
-    collections::BTreeSet, env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command,
+    collections::BTreeSet,
+    env, fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Command,
 };
 
 use pca_agent_runtime::{
@@ -7,6 +11,7 @@ use pca_agent_runtime::{
     SingleInstanceGuard,
 };
 use pca_domain::{AgentStatus, BridgeStatus, RuntimeStatusEnvelope};
+use uuid::Uuid;
 
 fn mode(path: &Path) -> u32 {
     fs::metadata(path)
@@ -25,6 +30,31 @@ fn status(heartbeat_at: &str) -> RuntimeStatusEnvelope {
         app_version: "0.0.0-s1a".to_owned(),
         schema_version: 1,
     }
+}
+
+fn marker_paths(marker_base: &Path) -> Vec<PathBuf> {
+    let parent = marker_base.parent().expect("marker parent");
+    let base_name = marker_base
+        .file_name()
+        .expect("marker file name")
+        .to_str()
+        .expect("marker file name is UTF-8");
+    let prefix = format!("{base_name}.");
+
+    fs::read_dir(parent)
+        .expect("marker parent entries")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let candidate = name.to_str()?.strip_prefix(&prefix)?;
+            (Uuid::parse_str(candidate).ok()?.hyphenated().to_string() == candidate)
+                .then_some(entry.path())
+        })
+        .collect()
+}
+
+fn acquire_instance(paths: &RuntimePaths) -> SingleInstanceGuard {
+    SingleInstanceGuard::acquire(&paths.lock_file).expect("instance lock")
 }
 
 #[test]
@@ -193,6 +223,9 @@ fn crash_marker_child_process() {
     let Some(marker_path) = env::var_os("PCA_CRASH_MARKER_CHILD") else {
         return;
     };
+    let lock_path = env::var_os("PCA_CRASH_MARKER_CHILD_LOCK").expect("child instance lock");
+    let _instance =
+        SingleInstanceGuard::acquire(Path::new(&lock_path)).expect("child instance lock");
     let _guard = CrashMarkerGuard::activate(Path::new(&marker_path)).expect("child marker");
 
     match env::var("PCA_CRASH_MARKER_CHILD_MODE").as_deref() {
@@ -212,17 +245,19 @@ fn crash_marker_reports_an_unclean_previous_process_exit() {
         .arg("crash_marker_child_process")
         .arg("--exact")
         .env("PCA_CRASH_MARKER_CHILD", &paths.crash_marker_file)
+        .env("PCA_CRASH_MARKER_CHILD_LOCK", &paths.lock_file)
         .env("PCA_CRASH_MARKER_CHILD_MODE", "exit")
         .status()
         .expect("child test process");
     assert!(result.success(), "child process should exit cleanly");
-    assert!(paths.crash_marker_file.exists(), "child marker remains");
+    assert_eq!(marker_paths(&paths.crash_marker_file).len(), 1);
 
+    let _instance = acquire_instance(&paths);
     let guard = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("recovery marker");
     assert!(guard.previous_exit_was_unclean());
     guard.complete_cleanly().expect("clean completion");
     assert!(
-        !paths.crash_marker_file.exists(),
+        marker_paths(&paths.crash_marker_file).is_empty(),
         "clean completion removes marker"
     );
 }
@@ -237,18 +272,20 @@ fn crash_marker_is_retained_when_a_child_panics_while_unwinding() {
         .arg("crash_marker_child_process")
         .arg("--exact")
         .env("PCA_CRASH_MARKER_CHILD", &paths.crash_marker_file)
+        .env("PCA_CRASH_MARKER_CHILD_LOCK", &paths.lock_file)
         .env("PCA_CRASH_MARKER_CHILD_MODE", "panic")
         .status()
         .expect("child test process");
     assert!(!result.success(), "panicking child must fail");
-    assert!(paths.crash_marker_file.exists(), "panic marker remains");
+    assert_eq!(marker_paths(&paths.crash_marker_file).len(), 1);
 
+    let _instance = acquire_instance(&paths);
     let guard = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("recovery marker");
     assert!(guard.previous_exit_was_unclean());
     guard
         .complete_cleanly()
         .expect("recovered clean completion");
-    assert!(!paths.crash_marker_file.exists(), "recovery removes marker");
+    assert!(marker_paths(&paths.crash_marker_file).is_empty());
 }
 
 #[test]
@@ -256,6 +293,7 @@ fn stale_crash_marker_guard_cannot_remove_a_newer_activation_marker() {
     let temporary_root = tempfile::tempdir().expect("temporary root");
     let paths = RuntimePaths::under(temporary_root.path());
     paths.create_securely().expect("secure layout");
+    let _instance = acquire_instance(&paths);
 
     let stale = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("first marker");
     let current = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("newer marker");
@@ -264,11 +302,11 @@ fn stale_crash_marker_guard_cannot_remove_a_newer_activation_marker() {
         stale.complete_cleanly(),
         Err(RuntimeError::CrashMarkerOwnershipLost { .. })
     ));
-    assert!(paths.crash_marker_file.exists(), "newer marker remains");
+    assert_eq!(marker_paths(&paths.crash_marker_file).len(), 1);
     current
         .complete_cleanly()
         .expect("current clean completion");
-    assert!(!paths.crash_marker_file.exists(), "current marker removed");
+    assert!(marker_paths(&paths.crash_marker_file).is_empty());
 }
 
 #[test]
@@ -276,12 +314,13 @@ fn stale_crash_marker_drop_cannot_remove_a_newer_activation_marker() {
     let temporary_root = tempfile::tempdir().expect("temporary root");
     let paths = RuntimePaths::under(temporary_root.path());
     paths.create_securely().expect("secure layout");
+    let _instance = acquire_instance(&paths);
 
     let stale = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("first marker");
     let current = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("newer marker");
     drop(stale);
 
-    assert!(paths.crash_marker_file.exists(), "newer marker remains");
+    assert_eq!(marker_paths(&paths.crash_marker_file).len(), 1);
     current
         .complete_cleanly()
         .expect("current clean completion");
@@ -292,13 +331,50 @@ fn crash_marker_drop_removes_its_marker_without_a_panic() {
     let temporary_root = tempfile::tempdir().expect("temporary root");
     let paths = RuntimePaths::under(temporary_root.path());
     paths.create_securely().expect("secure layout");
+    let _instance = acquire_instance(&paths);
 
     let guard = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("marker");
     drop(guard);
     assert!(
-        !paths.crash_marker_file.exists(),
+        marker_paths(&paths.crash_marker_file).is_empty(),
         "best-effort drop removed marker"
     );
+}
+
+#[test]
+fn crash_marker_cleans_stale_family_members_without_touching_unrelated_files() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    let paths = RuntimePaths::under(temporary_root.path());
+    paths.create_securely().expect("secure layout");
+    let _instance = acquire_instance(&paths);
+    let base_name = paths
+        .crash_marker_file
+        .file_name()
+        .expect("marker file name")
+        .to_str()
+        .expect("marker file name is UTF-8");
+    let first_stale = paths
+        .data_dir
+        .join(format!("{base_name}.{}", Uuid::new_v4()));
+    let second_stale = paths
+        .data_dir
+        .join(format!("{base_name}.{}", Uuid::new_v4()));
+    let unrelated = paths.data_dir.join(format!("{base_name}.not-a-uuid"));
+    fs::write(&paths.crash_marker_file, b"legacy marker").expect("legacy marker");
+    fs::write(&first_stale, b"old marker").expect("first stale marker");
+    fs::write(&second_stale, b"old marker").expect("second stale marker");
+    fs::write(&unrelated, b"unrelated").expect("unrelated file");
+
+    let guard = CrashMarkerGuard::activate(&paths.crash_marker_file).expect("recovery marker");
+    assert!(guard.previous_exit_was_unclean());
+    assert!(!paths.crash_marker_file.exists(), "legacy marker cleaned");
+    assert!(!first_stale.exists());
+    assert!(!second_stale.exists());
+    assert!(unrelated.exists(), "unrelated file remains");
+    assert_eq!(marker_paths(&paths.crash_marker_file).len(), 1);
+    guard.complete_cleanly().expect("clean completion");
+    assert!(marker_paths(&paths.crash_marker_file).is_empty());
+    assert!(unrelated.exists(), "unrelated file remains after cleanup");
 }
 
 #[test]
