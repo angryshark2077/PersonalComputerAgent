@@ -210,10 +210,11 @@ final class HandshakeTests: XCTestCase {
     }
 
     func testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts() async throws {
-        let harnessURL = Bundle(for: Self.self).bundleURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("PlatformBridgeSignalHarness")
+        let productsURL = Bundle(for: Self.self).bundleURL.deletingLastPathComponent()
+        let harnessURL = productsURL.appendingPathComponent("PlatformBridgeSignalHarness")
+        let productURL = productsURL.appendingPathComponent("PCAPlatformBridge")
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: harnessURL.path))
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: productURL.path))
 
         let signalCases: [(label: String, signals: [Int32])] = [
             ("sigterm", [SIGTERM]),
@@ -227,15 +228,14 @@ final class HandshakeTests: XCTestCase {
             )
             try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
             defer { try? FileManager.default.removeItem(at: parent) }
-            let runRoot = parent.appendingPathComponent("Run", isDirectory: true)
-            let socket = runRoot.appendingPathComponent("bridge.sock")
+            let invalidSocket = parent.appendingPathComponent("invalid.sock")
             let readyHook = parent.appendingPathComponent("startup-ready")
             let process = Process()
             process.executableURL = harnessURL
             process.arguments = [
-                "--socket", socket.path,
-                "--run-root", runRoot.path,
+                "--invalid-socket", invalidSocket.path,
                 "--ready-hook", readyHook.path,
+                "--await-signal",
             ]
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
@@ -271,11 +271,37 @@ final class HandshakeTests: XCTestCase {
 
             XCTAssertEqual(process.terminationReason, .exit)
             XCTAssertEqual(process.terminationStatus, 0)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: socket.path))
-            if FileManager.default.fileExists(atPath: runRoot.path) {
-                let entries = try FileManager.default.contentsOfDirectory(atPath: runRoot.path)
-                XCTAssertFalse(entries.contains { $0.hasPrefix(".pca-quarantine-") })
-            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: invalidSocket.path))
+            let entries = try FileManager.default.contentsOfDirectory(atPath: parent.path)
+            XCTAssertFalse(entries.contains { $0.hasPrefix(".pca-quarantine-") })
+        }
+
+        let invalidParent = URL(
+            fileURLWithPath: "/tmp/pca-signal-invalid-\(UUID().uuidString.prefix(8))",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: invalidParent, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: invalidParent) }
+        let invalidProcess = Process()
+        invalidProcess.executableURL = harnessURL
+        invalidProcess.arguments = [
+            "--invalid-socket", invalidParent.appendingPathComponent("invalid.sock").path,
+        ]
+        invalidProcess.standardOutput = FileHandle.nullDevice
+        invalidProcess.standardError = FileHandle.nullDevice
+        try invalidProcess.run()
+        let invalidExitDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while invalidProcess.isRunning, ContinuousClock.now < invalidExitDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        if invalidProcess.isRunning {
+            kill(invalidProcess.processIdentifier, SIGKILL)
+            invalidProcess.waitUntilExit()
+            XCTFail("invalid invocation exceeded its hard exit deadline")
+        } else {
+            invalidProcess.waitUntilExit()
+            XCTAssertEqual(invalidProcess.terminationReason, .exit)
+            XCTAssertEqual(invalidProcess.terminationStatus, 1)
         }
     }
 
