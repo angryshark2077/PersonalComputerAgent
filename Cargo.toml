@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "agent/core",
+  "crates/db-local",
   "crates/domain",
   "crates/provider-contracts",
   "crates/test-contracts",

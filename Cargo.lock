@@ -76,6 +76,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pca-db-local"
+version = "0.0.0"
+
+[[package]]
 name = "pca-domain"
 version = "0.0.0"
 dependencies = [
