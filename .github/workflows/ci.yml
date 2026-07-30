@@ -1,4 +1,4 @@
-name: S0 Engineering Gates
+name: S0 and S1A Engineering Gates
 
 on:
   pull_request:
@@ -38,7 +38,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
       - run: swift build --package-path platform/macos
+      - name: Swift package tests
+        run: |
+          signal_tests='HandshakeTests.test(PostStartSignalsCleanlyStopRealServerProcess|ProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts|SignalDuringDelayedStartIsConsumedAfterRealServerStarts)'
+          swift test --package-path platform/macos --skip "$signal_tests"
+          swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
+          swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
+          swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
       - run: swift run --package-path platform/macos BridgeContractVerifier
+
+  s1a-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+      - name: Swift package tests
+        run: |
+          signal_tests='HandshakeTests.test(PostStartSignalsCleanlyStopRealServerProcess|ProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts|SignalDuringDelayedStartIsConsumedAfterRealServerStarts)'
+          swift test --package-path platform/macos --skip "$signal_tests"
+          swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
+          swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
+          swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
+      - run: swift run --package-path platform/macos BridgeContractVerifier
+      - run: >-
+          xcodebuild test
+          -project platform/macos/PersonalComputerAgent.xcodeproj
+          -scheme PersonalComputerAgent
+          -destination 'platform=macOS,arch=arm64'
+          CODE_SIGNING_ALLOWED=NO
+      - run: python3 scripts/verify_migrations.py .
+      - run: python3 scripts/verify_boundaries.py .
+      - run: python3 -m unittest scripts.tests.test_s1a_packaging scripts.tests.test_s1a_live_verification -v
 
   contract:
     runs-on: macos-15
