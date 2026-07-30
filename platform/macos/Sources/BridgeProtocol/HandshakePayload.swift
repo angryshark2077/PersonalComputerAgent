@@ -41,8 +41,12 @@ public struct RuntimeStatusEnvelope: Codable, Sendable, Equatable {
     }
 }
 
+public enum HandshakeChallengePhase: String, Codable, Sendable, Equatable {
+    case challenge
+}
+
 public struct HandshakeChallenge: Codable, Sendable, Equatable {
-    public let phase: String
+    public let phase: HandshakeChallengePhase
     public let nonce: String
     public let agentVersion: String
 
@@ -53,8 +57,12 @@ public struct HandshakeChallenge: Codable, Sendable, Equatable {
     }
 }
 
+public enum HandshakeResponsePhase: String, Codable, Sendable, Equatable {
+    case response
+}
+
 public struct HandshakeResponse: Codable, Sendable, Equatable {
-    public let phase: String
+    public let phase: HandshakeResponsePhase
     public let nonce: String
     public let proof: String
     public let bridgeVersion: String

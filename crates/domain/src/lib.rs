@@ -88,16 +88,28 @@ pub struct RuntimeStatusEnvelope {
     pub schema_version: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandshakeChallengePhase {
+    Challenge,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandshakeChallenge {
-    pub phase: String,
+    pub phase: HandshakeChallengePhase,
     pub nonce: String,
     pub agent_version: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandshakeResponsePhase {
+    Response,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandshakeResponse {
-    pub phase: String,
+    pub phase: HandshakeResponsePhase,
     pub nonce: String,
     pub proof: String,
     pub bridge_version: String,

@@ -1,6 +1,7 @@
 use pca_domain::{
     AgentStatus, BridgeEnvelope, BridgeMessageKind, BridgeStatus, EventEnvelope,
-    HandshakeChallenge, HandshakeResponse, RuntimeStatusEnvelope,
+    HandshakeChallenge, HandshakeChallengePhase, HandshakeResponse, HandshakeResponsePhase,
+    RuntimeStatusEnvelope,
 };
 
 #[test]
@@ -59,7 +60,7 @@ fn handshake_fixtures_decode_every_canonical_field() {
     assert_eq!(challenge_envelope.capability, "bridge.handshake");
     assert_eq!(challenge_envelope.deadline_ms, 1_000);
     assert!(challenge_envelope.error.is_none());
-    assert_eq!(challenge.phase, "challenge");
+    assert_eq!(challenge.phase, HandshakeChallengePhase::Challenge);
     assert_eq!(challenge.nonce, "c2VjcmV0LWZyZWUtbm9uY2UtMDE=");
     assert_eq!(challenge.agent_version, "0.0.0-s1a");
 
@@ -80,8 +81,25 @@ fn handshake_fixtures_decode_every_canonical_field() {
     assert_eq!(response_envelope.capability, "bridge.handshake");
     assert_eq!(response_envelope.deadline_ms, 1_000);
     assert!(response_envelope.error.is_none());
-    assert_eq!(response.phase, "response");
+    assert_eq!(response.phase, HandshakeResponsePhase::Response);
     assert_eq!(response.nonce, "c2VjcmV0LWZyZWUtbm9uY2UtMDE=");
     assert_eq!(response.proof, "c3ludGhldGljLWhtYWMtc2hhMjU2LXByb29m");
     assert_eq!(response.bridge_version, "0.0.0-s1a");
+}
+
+#[test]
+fn handshake_payloads_reject_mismatched_phases() {
+    let mut challenge: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../packages/contracts/fixtures/bridge-handshake.challenge.json"
+    ))
+    .expect("valid handshake challenge fixture");
+    challenge["payload"]["phase"] = serde_json::Value::String("response".to_owned());
+    assert!(serde_json::from_value::<HandshakeChallenge>(challenge["payload"].clone()).is_err());
+
+    let mut response: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../packages/contracts/fixtures/bridge-handshake.response.json"
+    ))
+    .expect("valid handshake response fixture");
+    response["payload"]["phase"] = serde_json::Value::String("challenge".to_owned());
+    assert!(serde_json::from_value::<HandshakeResponse>(response["payload"].clone()).is_err());
 }

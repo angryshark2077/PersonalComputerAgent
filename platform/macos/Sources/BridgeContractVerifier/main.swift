@@ -75,7 +75,7 @@ do {
           challengeEnvelope.capability == "bridge.handshake",
           challengeEnvelope.deadlineMilliseconds == 1_000,
           challengeEnvelope.error == nil,
-          challenge.phase == "challenge",
+          challenge.phase == .challenge,
           challenge.nonce == "c2VjcmV0LWZyZWUtbm9uY2UtMDE=",
           challenge.agentVersion == "0.0.0-s1a" else {
         fail("handshake challenge fixture does not match the canonical fields")
@@ -90,11 +90,25 @@ do {
           responseEnvelope.capability == "bridge.handshake",
           responseEnvelope.deadlineMilliseconds == 1_000,
           responseEnvelope.error == nil,
-          response.phase == "response",
+          response.phase == .response,
           response.nonce == challenge.nonce,
           response.proof == "c3ludGhldGljLWhtYWMtc2hhMjU2LXByb29m",
           response.bridgeVersion == "0.0.0-s1a" else {
         fail("handshake response fixture does not match the canonical fields")
+    }
+
+    let malformedChallengePayload = Data(
+        "{\"phase\":\"response\",\"nonce\":\"c2VjcmV0LWZyZWUtbm9uY2UtMDE=\",\"agent_version\":\"0.0.0-s1a\"}".utf8
+    )
+    guard (try? JSONDecoder().decode(HandshakeChallenge.self, from: malformedChallengePayload)) == nil else {
+        fail("handshake challenge accepted a mismatched phase")
+    }
+
+    let malformedResponsePayload = Data(
+        "{\"phase\":\"challenge\",\"nonce\":\"c2VjcmV0LWZyZWUtbm9uY2UtMDE=\",\"proof\":\"c3ludGhldGljLWhtYWMtc2hhMjU2LXByb29m\",\"bridge_version\":\"0.0.0-s1a\"}".utf8
+    )
+    guard (try? JSONDecoder().decode(HandshakeResponse.self, from: malformedResponsePayload)) == nil else {
+        fail("handshake response accepted a mismatched phase")
     }
 
     print("Swift Bridge contract fixture passed")
