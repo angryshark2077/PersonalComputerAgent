@@ -14,6 +14,50 @@ struct KeychainBridgeCredentialProvider: BridgeCredentialProviding {
     }
 }
 
+enum CredentialLoader {
+    static func load(
+        from provider: any BridgeCredentialProviding,
+        timeoutMilliseconds: UInt64
+    ) async throws -> Data {
+        let result: Result<Data, any Error> = await withCheckedContinuation { continuation in
+            let gate = CredentialLoadGate(continuation: continuation)
+            Task.detached {
+                let result: Result<Data, any Error>
+                do {
+                    guard let secret = try provider.loadSecret() else {
+                        throw BridgeHandshakeError.credentialMissing
+                    }
+                    guard secret.count == KeychainCredentialStore.sharedSecretLength else {
+                        throw BridgeHandshakeError.credentialInvalid
+                    }
+                    result = .success(secret)
+                } catch {
+                    result = .failure(error)
+                }
+                await gate.finish(result)
+            }
+            Task.detached {
+                try? await Task.sleep(for: .milliseconds(timeoutMilliseconds))
+                await gate.finish(.failure(BridgeHandshakeError.timedOut))
+            }
+        }
+        return try result.get()
+    }
+}
+
+private actor CredentialLoadGate {
+    private var continuation: CheckedContinuation<Result<Data, any Error>, Never>?
+
+    init(continuation: CheckedContinuation<Result<Data, any Error>, Never>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ result: Result<Data, any Error>) {
+        continuation?.resume(returning: result)
+        continuation = nil
+    }
+}
+
 enum BridgeHandshakeError: Error, Equatable, Sendable {
     case malformedJSON
     case duplicateField
@@ -23,6 +67,11 @@ enum BridgeHandshakeError: Error, Equatable, Sendable {
     case credentialMissing
     case credentialInvalid
     case proofFailure
+    case timedOut
+}
+
+enum BridgeWireLimits {
+    static let maximumDeadlineMilliseconds: UInt64 = 30_000
 }
 
 enum BridgeProof {
@@ -87,6 +136,16 @@ struct HandshakeResult: Sendable {
     let deadlineMilliseconds: UInt64
 }
 
+struct ValidatedHandshakeChallenge: Sendable {
+    let protocolVersion: UInt32
+    let requestID: UUID
+    let capability: String
+    let deadlineMilliseconds: UInt64
+    let nonce: Data
+    let encodedNonce: String
+    let agentVersion: String
+}
+
 struct HandshakeHandler: Sendable {
     static let protocolVersion: UInt32 = 1
     private static let envelopeKeys: Set<String> = [
@@ -94,10 +153,9 @@ struct HandshakeHandler: Sendable {
     ]
     private static let challengeKeys: Set<String> = ["phase", "nonce", "agent_version"]
 
-    let credentialProvider: any BridgeCredentialProviding
     let bridgeVersion: String
 
-    func respond(to challengeJSON: Data) throws -> HandshakeResult {
+    func validate(_ challengeJSON: Data) throws -> ValidatedHandshakeChallenge {
         guard !bridgeVersion.isEmpty else { throw BridgeHandshakeError.invalidEnvelope }
         let object = try StrictJSON.object(challengeJSON)
         try StrictJSON.requireOnlyKeys(object, allowed: Self.envelopeKeys)
@@ -116,6 +174,8 @@ struct HandshakeHandler: Sendable {
         guard challenge.messageKind == .request,
               challenge.capability == "bridge.handshake",
               challenge.deadlineMilliseconds > 0,
+              challenge.deadlineMilliseconds <= UInt64(Int.max),
+              challenge.deadlineMilliseconds <= BridgeWireLimits.maximumDeadlineMilliseconds,
               challenge.error == nil,
               challenge.payload.phase == .challenge,
               !challenge.payload.agentVersion.isEmpty else {
@@ -126,9 +186,22 @@ struct HandshakeHandler: Sendable {
               nonce.base64EncodedString() == challenge.payload.nonce else {
             throw BridgeHandshakeError.invalidNonce
         }
-        guard let secret = try credentialProvider.loadSecret() else {
-            throw BridgeHandshakeError.credentialMissing
-        }
+        return ValidatedHandshakeChallenge(
+            protocolVersion: challenge.protocolVersion,
+            requestID: challenge.requestID,
+            capability: challenge.capability,
+            deadlineMilliseconds: challenge.deadlineMilliseconds,
+            nonce: nonce,
+            encodedNonce: challenge.payload.nonce,
+            agentVersion: challenge.payload.agentVersion
+        )
+    }
+
+    func respond(to challengeJSON: Data, secret: Data) throws -> HandshakeResult {
+        try respond(to: validate(challengeJSON), secret: secret)
+    }
+
+    func respond(to challenge: ValidatedHandshakeChallenge, secret: Data) throws -> HandshakeResult {
         guard secret.count == KeychainCredentialStore.sharedSecretLength else {
             throw BridgeHandshakeError.credentialInvalid
         }
@@ -136,19 +209,19 @@ struct HandshakeHandler: Sendable {
         let responseVersion = Self.protocolVersion
         let proof = try BridgeProof.make(
             secret: secret,
-            nonce: nonce,
+            nonce: challenge.nonce,
             protocolVersion: responseVersion,
-            agentVersion: challenge.payload.agentVersion
+            agentVersion: challenge.agentVersion
         )
         let response = BridgeEnvelope(
             protocolVersion: Int(responseVersion),
             requestID: challenge.requestID,
             messageKind: .response,
             capability: challenge.capability,
-            deadlineMilliseconds: challenge.deadlineMilliseconds,
+            deadlineMilliseconds: Int(challenge.deadlineMilliseconds),
             payload: [
                 "phase": .string("response"),
-                "nonce": .string(challenge.payload.nonce),
+                "nonce": .string(challenge.encodedNonce),
                 "proof": .string(proof),
                 "bridge_version": .string(bridgeVersion),
             ]
@@ -156,7 +229,7 @@ struct HandshakeHandler: Sendable {
         return HandshakeResult(
             responseJSON: try JSONEncoder().encode(response),
             protocolCompatible: challenge.protocolVersion == Self.protocolVersion,
-            deadlineMilliseconds: UInt64(challenge.deadlineMilliseconds)
+            deadlineMilliseconds: challenge.deadlineMilliseconds
         )
     }
 }
@@ -166,7 +239,7 @@ private struct StrictHandshakeEnvelope: Decodable {
     let requestID: UUID
     let messageKind: BridgeMessageKind
     let capability: String
-    let deadlineMilliseconds: Int
+    let deadlineMilliseconds: UInt64
     let payload: StrictHandshakeChallenge
     let error: JSONValue?
 

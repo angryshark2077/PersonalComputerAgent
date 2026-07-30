@@ -1,3 +1,5 @@
+import ApplicationServices
+import AVFoundation
 import CoreGraphics
 import Foundation
 
@@ -9,7 +11,7 @@ enum PermissionStatus: String, Codable, CaseIterable, Sendable {
     case unavailable
 }
 
-enum RawPermissionStatus: Sendable {
+enum RawPermissionStatus: CaseIterable, Equatable, Sendable {
     case notDetermined
     case granted
     case denied
@@ -17,13 +19,39 @@ enum RawPermissionStatus: Sendable {
     case unavailable
 }
 
+enum PlatformCapability: CaseIterable, Hashable, Sendable {
+    case screenCapture
+    case accessibility
+    case camera
+    case microphone
+}
+
 protocol CapabilityStatusSource: Sendable {
-    func screenCaptureStatus() -> RawPermissionStatus
+    func status(for capability: PlatformCapability) -> RawPermissionStatus
 }
 
 struct SystemCapabilityStatusSource: CapabilityStatusSource {
-    func screenCaptureStatus() -> RawPermissionStatus {
-        CGPreflightScreenCaptureAccess() ? .granted : .denied
+    func status(for capability: PlatformCapability) -> RawPermissionStatus {
+        switch capability {
+        case .screenCapture:
+            CGPreflightScreenCaptureAccess() ? .granted : .denied
+        case .accessibility:
+            AXIsProcessTrusted() ? .granted : .denied
+        case .camera:
+            Self.map(AVCaptureDevice.authorizationStatus(for: .video))
+        case .microphone:
+            Self.map(AVCaptureDevice.authorizationStatus(for: .audio))
+        }
+    }
+
+    static func map(_ status: AVAuthorizationStatus) -> RawPermissionStatus {
+        switch status {
+        case .notDetermined: .notDetermined
+        case .authorized: .granted
+        case .denied: .denied
+        case .restricted: .restricted
+        @unknown default: .unavailable
+        }
     }
 }
 
@@ -35,7 +63,11 @@ struct CapabilityProbe: Sendable {
     }
 
     func screenCapturePermission() -> PermissionStatus {
-        Self.map(source.screenCaptureStatus())
+        permission(for: .screenCapture)
+    }
+
+    func permission(for capability: PlatformCapability) -> PermissionStatus {
+        Self.map(source.status(for: capability))
     }
 
     static func map(_ raw: RawPermissionStatus) -> PermissionStatus {

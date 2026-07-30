@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 @testable import PlatformBridge
 import XCTest
@@ -19,10 +20,31 @@ final class CapabilityProbeTests: XCTestCase {
     }
 
     func testProbeReadsInjectedStatusWithoutPrompting() {
-        let source = FixedCapabilityStatusSource(status: .restricted)
+        let source = FixedCapabilityStatusSource(statuses: [.screenCapture: .restricted])
         let probe = CapabilityProbe(source: source)
 
         XCTAssertEqual(probe.screenCapturePermission(), .restricted)
+    }
+
+    func testAVFoundationAuthorizationStatusesMapWithoutRequestingAccess() {
+        let cases: [(AVAuthorizationStatus, RawPermissionStatus)] = [
+            (.notDetermined, .notDetermined),
+            (.authorized, .granted),
+            (.denied, .denied),
+            (.restricted, .restricted),
+        ]
+
+        for (status, expected) in cases {
+            XCTAssertEqual(SystemCapabilityStatusSource.map(status), expected)
+        }
+    }
+
+    func testProductionReadOnlySourceReturnsCanonicalStatusForEverySupportedCapability() {
+        let source = SystemCapabilityStatusSource()
+
+        for capability in PlatformCapability.allCases {
+            XCTAssertTrue(RawPermissionStatus.allCases.contains(source.status(for: capability)))
+        }
     }
 
     func testSyntheticSleepAndWakeMapToCanonicalLifecycleEvents() {
@@ -34,10 +56,10 @@ final class CapabilityProbeTests: XCTestCase {
 }
 
 private struct FixedCapabilityStatusSource: CapabilityStatusSource {
-    let status: RawPermissionStatus
+    let statuses: [PlatformCapability: RawPermissionStatus]
 
-    func screenCaptureStatus() -> RawPermissionStatus {
-        status
+    func status(for capability: PlatformCapability) -> RawPermissionStatus {
+        statuses[capability] ?? .unavailable
     }
 }
 

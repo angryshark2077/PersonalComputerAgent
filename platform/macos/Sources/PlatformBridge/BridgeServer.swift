@@ -9,9 +9,18 @@ enum BridgeServerError: Error, Equatable, Sendable {
     case socketPathTooLong
     case socketOperationFailed
     case notStarted
+    case shutdownRequested
     case alreadyStarted
     case timedOut
     case invalidRequest
+    case socketIdentityMismatch
+    case cleanupFailed
+}
+
+struct SocketIdentity: Equatable, Sendable {
+    let device: dev_t
+    let inode: ino_t
+    let owner: uid_t
 }
 
 struct SocketPathValidator: Sendable {
@@ -55,7 +64,18 @@ struct SocketPathValidator: Sendable {
         guard mkdir(approvedRunRoot.path, 0o700) == 0 else {
             throw BridgeServerError.socketOperationFailed
         }
+        var createdInfo = stat()
+        let createdIdentity = lstat(approvedRunRoot.path, &createdInfo) == 0
+            ? SocketIdentity(device: createdInfo.st_dev, inode: createdInfo.st_ino, owner: createdInfo.st_uid)
+            : nil
         guard chmod(approvedRunRoot.path, 0o700) == 0 else {
+            if let createdIdentity {
+                var current = stat()
+                if lstat(approvedRunRoot.path, &current) == 0,
+                   SocketIdentity(device: current.st_dev, inode: current.st_ino, owner: current.st_uid) == createdIdentity {
+                    _ = rmdir(approvedRunRoot.path)
+                }
+            }
             throw BridgeServerError.socketOperationFailed
         }
     }
@@ -76,53 +96,111 @@ struct SocketPathValidator: Sendable {
 
     func removeStaleSocketIfSafe(at socketURL: URL) throws {
         try validate(socketURL: socketURL)
-        var info = stat()
-        guard lstat(socketURL.path, &info) == 0 else {
-            guard errno == ENOENT else { throw BridgeServerError.unsafeSocketEntry }
-            return
-        }
-        guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
-              info.st_uid == geteuid() else {
+        guard let entry = try quarantine(socketURL) else { return }
+        guard entry.fileType == mode_t(S_IFSOCK), entry.identity.owner == geteuid() else {
+            try restore(entry, to: socketURL)
             throw BridgeServerError.unsafeSocketEntry
         }
-        guard unlink(socketURL.path) == 0 else { throw BridgeServerError.socketOperationFailed }
+        guard unlink(entry.url.path) == 0 else {
+            try restore(entry, to: socketURL)
+            throw BridgeServerError.cleanupFailed
+        }
     }
 
-    func removeBoundSocketIfSafe(at socketURL: URL) {
-        try? removeStaleSocketIfSafe(at: socketURL)
+    func removeBoundSocketIfSafe(at socketURL: URL, expectedIdentity: SocketIdentity) throws {
+        try validate(socketURL: socketURL)
+        guard let entry = try quarantine(socketURL) else { return }
+        guard entry.fileType == mode_t(S_IFSOCK),
+              entry.identity == expectedIdentity,
+              entry.identity.owner == geteuid() else {
+            try restore(entry, to: socketURL)
+            throw BridgeServerError.socketIdentityMismatch
+        }
+        guard unlink(entry.url.path) == 0 else {
+            try restore(entry, to: socketURL)
+            throw BridgeServerError.cleanupFailed
+        }
     }
 
     private func containsParentTraversal(_ path: String) -> Bool {
         (path as NSString).pathComponents.contains("..")
     }
+
+    private func quarantine(_ socketURL: URL) throws -> QuarantinedEntry? {
+        let quarantineURL = approvedRunRoot.appendingPathComponent(
+            ".pca-quarantine-\(UUID().uuidString.lowercased())"
+        )
+        guard quarantineURL.deletingLastPathComponent().path == approvedRunRoot.path,
+              quarantineURL.lastPathComponent.hasPrefix(".pca-quarantine-") else {
+            throw BridgeServerError.cleanupFailed
+        }
+        guard renamex_np(socketURL.path, quarantineURL.path, UInt32(RENAME_EXCL)) == 0 else {
+            if errno == ENOENT { return nil }
+            throw BridgeServerError.cleanupFailed
+        }
+        var info = stat()
+        guard lstat(quarantineURL.path, &info) == 0 else {
+            throw BridgeServerError.cleanupFailed
+        }
+        return QuarantinedEntry(
+            url: quarantineURL,
+            identity: SocketIdentity(device: info.st_dev, inode: info.st_ino, owner: info.st_uid),
+            fileType: info.st_mode & mode_t(S_IFMT)
+        )
+    }
+
+    private func restore(_ entry: QuarantinedEntry, to socketURL: URL) throws {
+        if renamex_np(entry.url.path, socketURL.path, UInt32(RENAME_EXCL)) == 0 { return }
+        let preservedURL = approvedRunRoot.appendingPathComponent(
+            ".pca-preserved-\(UUID().uuidString.lowercased())"
+        )
+        guard renamex_np(entry.url.path, preservedURL.path, UInt32(RENAME_EXCL)) == 0 else {
+            throw BridgeServerError.cleanupFailed
+        }
+        throw BridgeServerError.cleanupFailed
+    }
+}
+
+private struct QuarantinedEntry {
+    let url: URL
+    let identity: SocketIdentity
+    let fileType: mode_t
 }
 
 actor BridgeServer {
     private let socketURL: URL
     private let pathValidator: SocketPathValidator
     private let handshakeHandler: HandshakeHandler
+    private let credentialProvider: any BridgeCredentialProviding
     private let handshakeTimeoutMilliseconds: UInt64
+    private let credentialTimeoutMilliseconds: UInt64
     private let idleTimeoutMilliseconds: UInt64
     private var listener: Int32 = -1
     private var connection: Int32 = -1
     private var shutdownRequested = false
+    private var boundSocketIdentity: SocketIdentity?
+    private var shutdownFailure: BridgeServerError?
 
     init(
         socketURL: URL,
         pathValidator: SocketPathValidator = SocketPathValidator(),
         handshakeHandler: HandshakeHandler,
+        credentialProvider: any BridgeCredentialProviding,
         handshakeTimeoutMilliseconds: UInt64 = 1_000,
+        credentialTimeoutMilliseconds: UInt64 = 1_000,
         idleTimeoutMilliseconds: UInt64 = 30_000
     ) {
         self.socketURL = socketURL
         self.pathValidator = pathValidator
         self.handshakeHandler = handshakeHandler
+        self.credentialProvider = credentialProvider
         self.handshakeTimeoutMilliseconds = max(handshakeTimeoutMilliseconds, 1)
+        self.credentialTimeoutMilliseconds = max(credentialTimeoutMilliseconds, 1)
         self.idleTimeoutMilliseconds = max(idleTimeoutMilliseconds, 1)
     }
 
     func start() throws {
-        guard !shutdownRequested else { throw BridgeServerError.notStarted }
+        guard !shutdownRequested else { throw BridgeServerError.shutdownRequested }
         guard listener == -1 else { throw BridgeServerError.alreadyStarted }
         try pathValidator.prepareRunDirectory()
         try pathValidator.validate(socketURL: socketURL)
@@ -130,6 +208,7 @@ actor BridgeServer {
 
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw BridgeServerError.socketOperationFailed }
+        var createdIdentity: SocketIdentity?
         do {
             try configure(descriptor)
             var address = try unixAddress(for: socketURL.path)
@@ -140,27 +219,45 @@ actor BridgeServer {
                     Darwin.bind(descriptor, $0, addressLength)
                 }
             }
-            guard result == 0,
-                  chmod(socketURL.path, 0o600) == 0,
-                  Darwin.listen(descriptor, 1) == 0 else {
+            guard result == 0 else {
                 throw BridgeServerError.socketOperationFailed
             }
             var info = stat()
             guard lstat(socketURL.path, &info) == 0,
                   info.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
-                  info.st_uid == geteuid(),
-                  info.st_mode & 0o777 == 0o600 else {
+                  info.st_uid == geteuid() else {
                 throw BridgeServerError.unsafeSocketEntry
             }
+            createdIdentity = SocketIdentity(
+                device: info.st_dev,
+                inode: info.st_ino,
+                owner: info.st_uid
+            )
+            guard chmod(socketURL.path, 0o600) == 0,
+                  Darwin.listen(descriptor, 1) == 0,
+                  lstat(socketURL.path, &info) == 0,
+                  info.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
+                  info.st_uid == geteuid(),
+                  info.st_mode & 0o777 == 0o600,
+                  SocketIdentity(device: info.st_dev, inode: info.st_ino, owner: info.st_uid) == createdIdentity else {
+                throw BridgeServerError.socketOperationFailed
+            }
+            boundSocketIdentity = createdIdentity
             listener = descriptor
-        } catch {
+        } catch let startupError {
             Darwin.close(descriptor)
-            pathValidator.removeBoundSocketIfSafe(at: socketURL)
-            throw error
+            if let createdIdentity {
+                try pathValidator.removeBoundSocketIfSafe(
+                    at: socketURL,
+                    expectedIdentity: createdIdentity
+                )
+            }
+            throw startupError
         }
     }
 
     func serve() async throws {
+        if shutdownRequested { return }
         guard listener >= 0 else { throw BridgeServerError.notStarted }
         while !Task.isCancelled, listener >= 0 {
             let accepted = Darwin.accept(listener, nil, nil)
@@ -188,7 +285,11 @@ actor BridgeServer {
         }
     }
 
-    func shutdown() {
+    func shutdown() throws {
+        if shutdownRequested {
+            if let shutdownFailure { throw shutdownFailure }
+            return
+        }
         shutdownRequested = true
         if connection >= 0 {
             Darwin.shutdown(connection, SHUT_RDWR)
@@ -199,7 +300,17 @@ actor BridgeServer {
             Darwin.close(listener)
             listener = -1
         }
-        pathValidator.removeBoundSocketIfSafe(at: socketURL)
+        if let boundSocketIdentity {
+            do {
+                try pathValidator.removeBoundSocketIfSafe(
+                    at: socketURL,
+                    expectedIdentity: boundSocketIdentity
+                )
+            } catch let error as BridgeServerError {
+                shutdownFailure = error
+                throw error
+            }
+        }
     }
 
     private func handleConnection(_ descriptor: Int32) async throws {
@@ -209,7 +320,22 @@ actor BridgeServer {
             reader: &reader,
             timeoutMilliseconds: handshakeTimeoutMilliseconds
         )
-        let handshake = try handshakeHandler.respond(to: challengeJSON)
+        let challenge = try handshakeHandler.validate(challengeJSON)
+        var secret = try await CredentialLoader.load(
+            from: credentialProvider,
+            timeoutMilliseconds: min(
+                credentialTimeoutMilliseconds,
+                challenge.deadlineMilliseconds
+            )
+        )
+        let handshake: HandshakeResult
+        do {
+            handshake = try handshakeHandler.respond(to: challenge, secret: secret)
+        } catch {
+            secret.resetBytes(in: 0..<secret.count)
+            throw error
+        }
+        secret.resetBytes(in: 0..<secret.count)
         try await writeFrame(
             descriptor,
             payload: handshake.responseJSON,
@@ -346,7 +472,7 @@ private struct SocketFrameReader {
     }
 }
 
-private enum CapabilityRequestHandler {
+enum CapabilityRequestHandler {
     private static let envelopeKeys: Set<String> = [
         "protocol_version", "request_id", "message_kind", "capability", "deadline_ms", "payload", "error",
     ]
@@ -375,6 +501,8 @@ private enum CapabilityRequestHandler {
               request.messageKind == .request,
               request.capability == "system.capabilities",
               request.deadlineMilliseconds > 0,
+              request.deadlineMilliseconds <= UInt64(Int.max),
+              request.deadlineMilliseconds <= BridgeWireLimits.maximumDeadlineMilliseconds,
               request.error == nil else {
             throw BridgeServerError.invalidRequest
         }

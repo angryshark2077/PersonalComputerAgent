@@ -4,6 +4,7 @@ import Foundation
 
 private enum BridgeArgumentsError: Error {
     case invalid
+    case terminated
 }
 
 private struct BridgeArguments {
@@ -31,20 +32,18 @@ do {
     let server = BridgeServer(
         socketURL: arguments.socketURL,
         pathValidator: validator,
-        handshakeHandler: HandshakeHandler(
-            credentialProvider: KeychainBridgeCredentialProvider(),
-            bridgeVersion: "0.0.0-s1a"
-        )
+        handshakeHandler: HandshakeHandler(bridgeVersion: "0.0.0-s1a"),
+        credentialProvider: KeychainBridgeCredentialProvider()
     )
     Darwin.signal(SIGINT, SIG_IGN)
     Darwin.signal(SIGTERM, SIG_IGN)
     let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT)
     let terminateSource = DispatchSource.makeSignalSource(signal: SIGTERM)
     interruptSource.setEventHandler {
-        Task { await server.shutdown() }
+        Task { try? await server.shutdown() }
     }
     terminateSource.setEventHandler {
-        Task { await server.shutdown() }
+        Task { try? await server.shutdown() }
     }
     interruptSource.resume()
     terminateSource.resume()
@@ -53,7 +52,11 @@ do {
         terminateSource.cancel()
     }
 
-    try await server.start()
+    do {
+        try await server.start()
+    } catch BridgeServerError.shutdownRequested {
+        throw BridgeArgumentsError.terminated
+    }
 
     let powerMonitor = await MainActor.run {
         let monitor = PowerMonitor { _ in
@@ -64,13 +67,20 @@ do {
     }
     do {
         try await server.serve()
-    } catch {
-        await server.shutdown()
+    } catch let serveError {
+        do {
+            try await server.shutdown()
+        } catch {
+            await MainActor.run { powerMonitor.stop() }
+            throw error
+        }
         await MainActor.run { powerMonitor.stop() }
-        throw error
+        throw serveError
     }
-    await server.shutdown()
+    try await server.shutdown()
     await MainActor.run { powerMonitor.stop() }
+} catch BridgeArgumentsError.terminated {
+    exit(0)
 } catch {
     safeFailure("startup or server failure")
     exit(1)
