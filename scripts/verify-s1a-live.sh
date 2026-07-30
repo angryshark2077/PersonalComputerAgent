@@ -128,7 +128,7 @@ for path in (root, app_dir, data, run):
     if stat.S_IMODE(path.lstat().st_mode) != 0o700:
         reject(f"directory is not mode 0700: {path}")
 
-required_regular = tuple(Path(value) for value in (info_text, agent_text, bridge_text, launch_agent_text, status_text, database_text))
+required_regular = tuple(Path(value) for value in (info_text, agent_text, bridge_text, launch_agent_text))
 for path in required_regular:
     try:
         metadata = path.lstat()
@@ -139,18 +139,24 @@ for path in required_regular:
     if metadata.st_uid != uid:
         reject(f"wrong file owner: {path}")
 
+for path in (Path(status_text), Path(database_text)):
+    if os.path.lexists(path):
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            reject(f"runtime file is not a regular file: {path}")
+        if metadata.st_uid != uid:
+            reject(f"wrong runtime file owner: {path}")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            reject(f"runtime file is not mode 0600: {path}")
 socket_path = Path(socket_text)
-try:
+if os.path.lexists(socket_path):
     socket_metadata = socket_path.lstat()
-except OSError:
-    reject(f"missing socket: {socket_path}")
-if stat.S_ISLNK(socket_metadata.st_mode) or not stat.S_ISSOCK(socket_metadata.st_mode):
-    reject(f"runtime socket is not a Unix socket: {socket_path}")
-if socket_metadata.st_uid != uid:
-    reject(f"wrong socket owner: {socket_path}")
-for path in (Path(status_text), socket_path, Path(database_text)):
-    if stat.S_IMODE(path.lstat().st_mode) != 0o600:
-        reject(f"runtime file is not mode 0600: {path}")
+    if stat.S_ISLNK(socket_metadata.st_mode) or not stat.S_ISSOCK(socket_metadata.st_mode):
+        reject(f"runtime socket is not a Unix socket: {socket_path}")
+    if socket_metadata.st_uid != uid:
+        reject(f"wrong socket owner: {socket_path}")
+    if stat.S_IMODE(socket_metadata.st_mode) != 0o600:
+        reject(f"runtime file is not mode 0600: {socket_path}")
 
 for current, directories, files in os.walk(app, followlinks=False):
     current_path = Path(current)
@@ -175,15 +181,25 @@ app_version=$(plutil -extract CFBundleShortVersionString raw -o - "$info" 2>/dev
 
 status_pid=""
 for ((attempt = 1; attempt <= health_polls; attempt++)); do
-  status_pid=$(python3 - "$status_file" "$app_version" <<'PY' 2>/dev/null || true
+  status_pid=$(python3 - "$status_file" "$app_version" "$socket_file" "$database_file" "$expected_uid" <<'PY' 2>/dev/null || true
 import json
 import os
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 path = Path(sys.argv[1])
 expected_version = sys.argv[2]
+socket_path = Path(sys.argv[3])
+database_path = Path(sys.argv[4])
+expected_uid = int(sys.argv[5])
+for runtime_path, expected_type in ((path, stat.S_ISREG), (database_path, stat.S_ISREG), (socket_path, stat.S_ISSOCK)):
+    metadata = runtime_path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not expected_type(metadata.st_mode):
+        raise SystemExit(1)
+    if metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SystemExit(1)
 expected_keys = {
     "agent_status", "bridge_status", "local_healthy", "heartbeat_at",
     "process_id", "app_version", "schema_version",

@@ -135,6 +135,30 @@ class S1ALiveVerificationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("healthy runtime status", result.stdout)
 
+    def test_runtime_files_may_appear_during_the_five_second_health_wait(self) -> None:
+        pending_status = self.status.with_suffix(".pending")
+        pending_socket = self.socket_path.with_suffix(".pending")
+        pending_database = self.database.with_suffix(".pending")
+        self.status.rename(pending_status)
+        self.socket_path.rename(pending_socket)
+        self.database.rename(pending_database)
+
+        result = self.run_verify(
+            "--installed",
+            environment_updates={
+                "PCA_S1A_LIVE_TEST_HEALTH_POLLS": "2",
+                "PCA_S1A_LIVE_TEST_RESTORE_RUNTIME": "1",
+                "PCA_S1A_LIVE_TEST_PENDING_STATUS": str(pending_status),
+                "PCA_S1A_LIVE_TEST_PENDING_SOCKET": str(pending_socket),
+                "PCA_S1A_LIVE_TEST_PENDING_DATABASE": str(pending_database),
+                "PCA_S1A_LIVE_TEST_TARGET_STATUS": str(self.status),
+                "PCA_S1A_LIVE_TEST_TARGET_SOCKET": str(self.socket_path),
+                "PCA_S1A_LIVE_TEST_TARGET_DATABASE": str(self.database),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_wrong_schema_or_app_version_is_rejected(self) -> None:
         for field, value in (("schema_version", 2), ("app_version", "9.9.9")):
             with self.subTest(field=field):
@@ -292,6 +316,18 @@ echo 0001:completed
 set -euo pipefail
 [[ $# -eq 1 && "$1" == /*.dmg ]]
 echo "open $1" >> "${PCA_S1A_LIVE_TEST_TOOL_LOG:?}"
+""",
+        )
+        self._write_tool(
+            "sleep",
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PCA_S1A_LIVE_TEST_RESTORE_RUNTIME:-0}" == "1" ]]; then
+  mv "${PCA_S1A_LIVE_TEST_PENDING_STATUS:?}" "${PCA_S1A_LIVE_TEST_TARGET_STATUS:?}"
+  mv "${PCA_S1A_LIVE_TEST_PENDING_SOCKET:?}" "${PCA_S1A_LIVE_TEST_TARGET_SOCKET:?}"
+  mv "${PCA_S1A_LIVE_TEST_PENDING_DATABASE:?}" "${PCA_S1A_LIVE_TEST_TARGET_DATABASE:?}"
+  export PCA_S1A_LIVE_TEST_RESTORE_RUNTIME=0
+fi
 """,
         )
         self._write_tool(
