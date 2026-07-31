@@ -326,6 +326,28 @@ class S1ALiveVerificationTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout)
 
+    def test_candidate_runtime_permissions_may_converge_during_health_wait(self) -> None:
+        dmg = self.temporary_directory / "permission-transition.dmg"
+        dmg.write_bytes(b"synthetic dmg")
+        for path in (self.status, self.socket_path, self.database):
+            path.chmod(0o644)
+
+        result = self.run_verify(
+            "--dmg",
+            str(dmg),
+            environment_updates={
+                "PCA_TEAM_ID": "ABCDEFGHIJ",
+                "PCA_S1A_LIVE_TEST_HEALTH_POLLS": "2",
+                "PCA_S1A_LIVE_TEST_POLL_SECONDS": "0.01",
+                "PCA_S1A_LIVE_TEST_REPAIR_RUNTIME_PERMISSIONS": "1",
+                "PCA_S1A_LIVE_TEST_TARGET_STATUS": str(self.status),
+                "PCA_S1A_LIVE_TEST_TARGET_SOCKET": str(self.socket_path),
+                "PCA_S1A_LIVE_TEST_TARGET_DATABASE": str(self.database),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_wrong_schema_or_app_version_is_rejected(self) -> None:
         for field, value in (("schema_version", 2), ("app_version", "9.9.9")):
             with self.subTest(field=field):
@@ -366,6 +388,17 @@ class S1ALiveVerificationTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("launchd job", result.stdout)
+
+    def test_launch_job_accepts_macos_26_relative_program_identifier(self) -> None:
+        result = self.run_verify(
+            "--installed",
+            environment_updates={
+                "PCA_S1A_LIVE_TEST_JOB_FIELD": "program identifier",
+                "PCA_S1A_LIVE_TEST_JOB_PROGRAM": "Contents/Resources/bin/pca-agentd (mode: 2)",
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
 
     def _make_layout(self) -> None:
         for directory in (self.runtime_root, self.app.parent, self.data, self.run):
@@ -437,7 +470,8 @@ set -euo pipefail
 cat <<EOF
 com.pca.agentd = {
     state = ${PCA_S1A_LIVE_TEST_JOB_STATE:?}
-    program = ${PCA_S1A_LIVE_TEST_JOB_PROGRAM:?}
+    ${PCA_S1A_LIVE_TEST_JOB_FIELD:-program} = ${PCA_S1A_LIVE_TEST_JOB_PROGRAM:?}
+    parent bundle identifier = com.pca.PersonalComputerAgent
     pid = ${PCA_S1A_LIVE_TEST_AGENT_PID:?}
 }
 EOF
@@ -585,6 +619,13 @@ if [[ "${PCA_S1A_LIVE_TEST_RESTORE_RUNTIME:-0}" == "1" ]]; then
   mv "${PCA_S1A_LIVE_TEST_PENDING_SOCKET:?}" "${PCA_S1A_LIVE_TEST_TARGET_SOCKET:?}"
   mv "${PCA_S1A_LIVE_TEST_PENDING_DATABASE:?}" "${PCA_S1A_LIVE_TEST_TARGET_DATABASE:?}"
   export PCA_S1A_LIVE_TEST_RESTORE_RUNTIME=0
+fi
+if [[ "${PCA_S1A_LIVE_TEST_REPAIR_RUNTIME_PERMISSIONS:-0}" == "1" ]]; then
+  chmod 600 \
+    "${PCA_S1A_LIVE_TEST_TARGET_STATUS:?}" \
+    "${PCA_S1A_LIVE_TEST_TARGET_SOCKET:?}" \
+    "${PCA_S1A_LIVE_TEST_TARGET_DATABASE:?}"
+  export PCA_S1A_LIVE_TEST_REPAIR_RUNTIME_PERMISSIONS=0
 fi
 if [[ "$1" != "0" ]]; then /bin/sleep "$1"; fi
 """,

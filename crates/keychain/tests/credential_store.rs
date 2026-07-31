@@ -232,3 +232,32 @@ fn production_credential_adapters_have_no_plaintext_fallback_channel() {
         }
     }
 }
+
+#[test]
+fn production_swift_store_recreates_items_instead_of_appending_acl_entries() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path =
+        manifest.join("../../platform/macos/Sources/BridgeProtocol/KeychainCredentialStore.swift");
+    let source = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to scan {}: {error}", path.display()));
+
+    let replacement_delete = source
+        .find("let replacementDeleteStatus = SecItemDelete(query as CFDictionary)")
+        .expect("store must remove the existing PCA credential before recreating its ACL");
+    let replacement_add = source
+        .find("let addStatus = SecItemAdd(item as CFDictionary, nil)")
+        .expect("store must recreate the PCA credential with the complete ACL");
+
+    assert!(
+        replacement_delete < replacement_add,
+        "replacement delete must happen before the credential is recreated"
+    );
+    assert!(
+        !source.contains("SecItemUpdate"),
+        "updating an existing item preserves stale ACL entries"
+    );
+    assert!(
+        !source.contains("SecKeychainItemSetAccess"),
+        "setting access on the existing item appends duplicate ACL entries"
+    );
+}

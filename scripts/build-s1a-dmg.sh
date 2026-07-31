@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo 'usage: build-s1a-dmg.sh --team-id TEAMID --identity "Apple Development: Name (TEAMID)" --version VERSION --output PATH.dmg' >&2
+  echo 'usage: build-s1a-dmg.sh --team-id TEAMID --identity "Apple Development: Name (IDENTIFIER)" --version VERSION --output PATH.dmg' >&2
   exit 2
 }
 
@@ -21,7 +21,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$team_id" =~ ^[A-Z0-9]{10}$ ]] || usage
-[[ "$identity" != *$'\n'* && "$identity" == "Apple Development: "*" ($team_id)" ]] || usage
+[[ "$identity" != *$'\n'* && "$identity" == "Apple Development: "?* ]] || usage
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
 [[ "$output" == *.dmg ]] || usage
 

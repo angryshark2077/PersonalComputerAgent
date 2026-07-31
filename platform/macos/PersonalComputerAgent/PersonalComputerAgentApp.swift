@@ -56,7 +56,8 @@ private struct PCAInstallerApplication: App {
             _model = StateObject(
                 wrappedValue: InstallerViewModel(
                     coordinator: coordinator,
-                    sourceBundle: Bundle.main.bundleURL
+                    sourceBundle: Bundle.main.bundleURL,
+                    automaticallyStart: CommandLine.arguments.dropFirst().first == "--setup-installed"
                 )
             )
         } catch {

@@ -1,4 +1,4 @@
-use std::{path::Path, thread, time::Duration};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, thread, time::Duration};
 
 #[cfg(feature = "process-test-hooks")]
 use std::path::PathBuf;
@@ -307,6 +307,8 @@ async fn receive<T>(receiver: oneshot::Receiver<Result<T, DbError>>) -> Result<T
 fn open_connection(path: &Path, app_version: &str) -> Result<Connection, DbError> {
     let mut connection =
         Connection::open(path).map_err(|error| DbError::startup_sqlite("open database", error))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| DbError::sqlite("restrict database permissions", error))?;
     connection
         .busy_timeout(Duration::from_secs(5))
         .map_err(|error| DbError::startup_sqlite("set busy timeout", error))?;

@@ -21,6 +21,7 @@ struct InstallerView: View {
         }
         .padding(28)
         .frame(width: 520, height: 310)
+        .onAppear { model.startIfRequested() }
     }
 
     @ViewBuilder

@@ -311,12 +311,12 @@ for path in map(Path, (status_text, database_text)):
     if os.path.lexists(path):
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode): reject(f"runtime file is not regular: {path}")
-        if metadata.st_uid != uid or stat.S_IMODE(metadata.st_mode) != 0o600: reject(f"runtime file is not mode 0600: {path}")
+        if metadata.st_uid != uid: reject(f"wrong runtime file owner: {path}")
 socket_path = Path(socket_text)
 if os.path.lexists(socket_path):
     metadata = socket_path.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISSOCK(metadata.st_mode): reject(f"runtime socket is invalid: {socket_path}")
-    if metadata.st_uid != uid or stat.S_IMODE(metadata.st_mode) != 0o600: reject(f"runtime file is not mode 0600: {socket_path}")
+    if metadata.st_uid != uid: reject(f"wrong runtime socket owner: {socket_path}")
 walk_errors = []
 def onerror(error): walk_errors.append(str(error))
 for current, directories, files in os.walk(app, followlinks=False, onerror=onerror):
@@ -430,11 +430,14 @@ PY
   fi
 done
 [[ "$status_pid" =~ ^[1-9][0-9]*$ ]] \
-  || fail "healthy runtime status newer than candidate activation was not observed within five seconds"
+  || fail "healthy runtime status with required owner and mode 0600 newer than candidate activation was not observed within five seconds"
 
 if ! capture job launchctl print "gui/$expected_uid/com.pca.agentd"; then fail "expected user-level launchd job is not registered"; fi
 [[ "$job" == *"state = running"* ]] || fail "expected launchd job is not running"
-[[ "$job" == *"program = $agent"* || "$job" == *"program = Contents/Resources/bin/pca-agentd"* ]] \
+[[ "$job" == *"program = $agent"* \
+  || "$job" == *"program = Contents/Resources/bin/pca-agentd"* \
+  || ( "$job" == *"program identifier = Contents/Resources/bin/pca-agentd (mode:"* \
+    && "$job" == *"parent bundle identifier = com.pca.PersonalComputerAgent"* ) ]] \
   || fail "launchd job does not resolve to the exact installed agent"
 [[ "$job" =~ pid\ =\ *$status_pid([^0-9]|$) ]] || fail "launchd job PID does not match runtime status"
 

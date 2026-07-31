@@ -27,6 +27,7 @@ final class InstallerViewModel: ObservableObject {
     private let coordinator: (any InstallCoordinating)?
     private let sourceBundle: URL
     private let terminator: any ApplicationTerminating
+    private var automaticStartPending: Bool
     private var activeInstall: (generation: UUID, task: Task<Void, Never>)?
 
     var installationAvailable: Bool { coordinator != nil }
@@ -35,18 +36,27 @@ final class InstallerViewModel: ObservableObject {
     init(
         coordinator: any InstallCoordinating,
         sourceBundle: URL,
+        automaticallyStart: Bool = false,
         terminator: any ApplicationTerminating = NSApplicationTerminator()
     ) {
         self.coordinator = coordinator
         self.sourceBundle = sourceBundle
+        automaticStartPending = automaticallyStart
         self.terminator = terminator
     }
 
     init(failureMessage: String, recoveryAction: String) {
         coordinator = nil
         sourceBundle = Bundle.main.bundleURL
+        automaticStartPending = false
         terminator = NSApplicationTerminator()
         state = .failed(message: failureMessage, recoveryAction: recoveryAction)
+    }
+
+    func startIfRequested() {
+        guard automaticStartPending else { return }
+        automaticStartPending = false
+        installAndStart()
     }
 
     func installAndStart() {

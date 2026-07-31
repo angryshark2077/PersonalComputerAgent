@@ -45,13 +45,15 @@ case "$input" in
     mounted=1
     command -v python3 >/dev/null 2>&1 || fail "python3 is required to parse hdiutil output"
     attached_device=$(python3 -c '
-import plistlib, sys
-requested = sys.argv[1]
+import os, plistlib, sys
+requested = os.path.realpath(sys.argv[1])
 document = plistlib.load(sys.stdin.buffer)
 matches = [
     item.get("dev-entry")
     for item in document.get("system-entities", [])
-    if item.get("mount-point") == requested and isinstance(item.get("dev-entry"), str)
+    if isinstance(item.get("mount-point"), str)
+    and os.path.realpath(item["mount-point"]) == requested
+    and isinstance(item.get("dev-entry"), str)
 ]
 if len(matches) != 1 or not matches[0].startswith("/dev/disk"):
     raise SystemExit(1)

@@ -1,4 +1,5 @@
 use std::{
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -96,6 +97,33 @@ async fn empty_database_is_migrated_and_reports_healthy() {
             "sync_outbox",
         ]
     );
+}
+
+#[tokio::test]
+async fn database_and_wal_files_are_owner_read_write_only() {
+    let (_directory, path) = database_path();
+
+    let _db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+
+    for runtime_file in [
+        path.clone(),
+        path.with_extension("sqlite3-wal"),
+        path.with_extension("sqlite3-shm"),
+    ] {
+        let mode = std::fs::metadata(&runtime_file)
+            .unwrap_or_else(|error| panic!("inspect {}: {error}", runtime_file.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} must be owner read/write only",
+            runtime_file.display()
+        );
+    }
 }
 
 #[tokio::test]

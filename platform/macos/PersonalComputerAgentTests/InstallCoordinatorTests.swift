@@ -25,9 +25,34 @@ final class InstallCoordinatorTests: XCTestCase {
         let result = try await fixture.coordinator.installOrFinish(from: fixture.paths.installedBundleURL)
 
         XCTAssertEqual(result, .success(version: "1.0.0"))
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 1)
+        XCTAssertEqual(
+            fixture.credentialProvisioner.trustedApplicationURLs,
+            [[
+                fixture.paths.installedBundleURL,
+                fixture.paths.installedAgentExecutableURL,
+                fixture.paths.installedBridgeExecutableURL,
+            ]]
+        )
         XCTAssertEqual(fixture.service.registerCount, 1)
         XCTAssertEqual(fixture.health.checkCount, 1)
         XCTAssertTrue(fixture.relauncher.urls.isEmpty)
+    }
+
+    func testCredentialProvisioningFailureUsesRollbackFunnelBeforeServiceRegistration() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
+        fixture.service.currentState = .enabled
+        _ = try await fixture.coordinator.prepareInstallation(from: fixture.candidate)
+        fixture.credentialProvisioner.error = .credentialProvisioningFailed
+
+        await XCTAssertThrowsErrorAsync(try await fixture.coordinator.finishInstalledSetup()) { error in
+            guard case .transactionFailed(primary: .registration, recovery: .restoredAndRelaunched) = error as? InstallError else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
     }
 
     func testRepeatInstallOfSameVersionUsesReplacementFlow() async throws {
@@ -402,6 +427,7 @@ private final class Fixture {
     let service = FakeServiceController()
     let health = FakeHealthChecker()
     let relauncher = FakeRelauncher()
+    let credentialProvisioner = FakeBridgeCredentialProvisioner()
     let fileSystem: FaultingInstallFileSystem
     let coordinator: InstallCoordinator
     let layoutIdentity: InstallLayoutIdentity
@@ -425,6 +451,7 @@ private final class Fixture {
             service: service,
             health: health,
             relauncher: relauncher,
+            credentialProvisioner: credentialProvisioner,
             fileSystem: fileSystem
         )
     }
@@ -476,6 +503,22 @@ private final class Fixture {
         )
         try Data(version.utf8).write(to: url.appendingPathComponent("version"))
         try Data("executable".utf8).write(to: url.appendingPathComponent("Contents/MacOS/PersonalComputerAgent"))
+    }
+}
+
+@MainActor
+private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisioning {
+    var provisionCount = 0
+    var trustedApplicationURLs: [[URL]] = []
+    var error: InstallError?
+
+    func ensureCredential(trustedApplicationURLs: [URL]) throws {
+        provisionCount += 1
+        self.trustedApplicationURLs.append(trustedApplicationURLs)
+        if let error {
+            self.error = nil
+            throw error
+        }
     }
 }
 
@@ -849,6 +892,23 @@ private final class FakeServiceBackend: ServiceBackend {
 
 @MainActor
 final class InstallerViewModelTests: XCTestCase {
+    func testInstalledSetupAutomaticallyStartsExactlyOnce() async throws {
+        let coordinator = CountingInstallCoordinator()
+        let model = InstallerViewModel(
+            coordinator: coordinator,
+            sourceBundle: URL(fileURLWithPath: "/tmp/installed.app"),
+            automaticallyStart: true,
+            terminator: FakeTerminator()
+        )
+
+        model.startIfRequested()
+        model.startIfRequested()
+
+        try await waitUntil { coordinator.callCount == 1 && !model.isInstalling }
+        XCTAssertEqual(coordinator.callCount, 1)
+        XCTAssertEqual(model.state, .success)
+    }
+
     func testRollbackRelaunchTerminatesCurrentInstallerWithoutShowingConcurrentFailureUI() async {
         let terminator = FakeTerminator()
         let model = InstallerViewModel(
@@ -883,6 +943,20 @@ final class InstallerViewModelTests: XCTestCase {
         model.installAndStart()
         try await waitUntil { coordinator.callCount == 2 }
         XCTAssertEqual(coordinator.callCount, 2)
+    }
+}
+
+@MainActor
+private final class CountingInstallCoordinator: InstallCoordinating {
+    var callCount = 0
+
+    func installOrFinish(
+        from sourceBundle: URL,
+        onState: @escaping @MainActor (InstallerState) -> Void
+    ) async throws -> InstallResult {
+        callCount += 1
+        onState(.success)
+        return .success(version: "2.0.0")
     }
 }
 

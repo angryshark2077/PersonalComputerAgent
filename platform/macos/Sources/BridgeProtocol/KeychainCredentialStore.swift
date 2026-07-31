@@ -38,33 +38,23 @@ public struct KeychainCredentialStore: Sendable {
         return secret
     }
 
-    public func store(_ secret: Data) throws {
+    public func store(_ secret: Data, trustedApplicationURLs: [URL]) throws {
         guard secret.count == Self.sharedSecretLength else {
             throw KeychainCredentialStoreError.invalidSecretLength
         }
+        let access = try Self.makeAccess(trustedApplicationURLs: trustedApplicationURLs)
 
         let query = Self.baseQuery()
-        let attributes = [kSecValueData as String: secret]
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-
-        if updateStatus == errSecSuccess {
-            return
-        }
-        guard updateStatus == errSecItemNotFound else {
-            throw Self.error(for: updateStatus)
+        let replacementDeleteStatus = SecItemDelete(query as CFDictionary)
+        guard replacementDeleteStatus == errSecSuccess || replacementDeleteStatus == errSecItemNotFound else {
+            throw Self.error(for: replacementDeleteStatus)
         }
 
         var item = query
         item[kSecValueData as String] = secret
+        item[kSecAttrAccess as String] = access
         let addStatus = SecItemAdd(item as CFDictionary, nil)
 
-        if addStatus == errSecDuplicateItem {
-            let retryStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-            guard retryStatus == errSecSuccess else {
-                throw Self.error(for: retryStatus)
-            }
-            return
-        }
         guard addStatus == errSecSuccess else {
             throw Self.error(for: addStatus)
         }
@@ -83,6 +73,40 @@ public struct KeychainCredentialStore: Sendable {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
+    }
+
+    private static func makeAccess(trustedApplicationURLs: [URL]) throws -> SecAccess {
+        let normalizedURLs = trustedApplicationURLs.map(\.standardizedFileURL)
+        guard !normalizedURLs.isEmpty,
+              normalizedURLs.allSatisfy({ $0.isFileURL && $0.path.hasPrefix("/") }),
+              Set(normalizedURLs.map(\.path)).count == normalizedURLs.count
+        else {
+            throw KeychainCredentialStoreError.operationFailed
+        }
+
+        var trustedApplications: [SecTrustedApplication] = []
+        trustedApplications.reserveCapacity(normalizedURLs.count)
+        for url in normalizedURLs {
+            var trustedApplication: SecTrustedApplication?
+            let status = url.path.withCString {
+                SecTrustedApplicationCreateFromPath($0, &trustedApplication)
+            }
+            guard status == errSecSuccess, let trustedApplication else {
+                throw Self.error(for: status)
+            }
+            trustedApplications.append(trustedApplication)
+        }
+
+        var access: SecAccess?
+        let status = SecAccessCreate(
+            "Personal Computer Agent Bridge Credential" as CFString,
+            trustedApplications as CFArray,
+            &access
+        )
+        guard status == errSecSuccess, let access else {
+            throw Self.error(for: status)
+        }
+        return access
     }
 
     private static func error(for status: OSStatus) -> KeychainCredentialStoreError {

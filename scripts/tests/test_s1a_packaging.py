@@ -37,6 +37,7 @@ class S1APackagingTests(unittest.TestCase):
         detach_failure: bool = False,
         traversal_failure: bool = False,
         attach_parse_failure: bool = False,
+        private_mount_alias: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = f"{self.tools}:{env['PATH']}"
@@ -47,6 +48,7 @@ class S1APackagingTests(unittest.TestCase):
         env["PCA_SYNTHETIC_DETACH_FAILURE"] = "1" if detach_failure else "0"
         env["PCA_SYNTHETIC_TRAVERSAL_FAILURE"] = "1" if traversal_failure else "0"
         env["PCA_SYNTHETIC_ATTACH_PARSE_FAILURE"] = "1" if attach_parse_failure else "0"
+        env["PCA_SYNTHETIC_PRIVATE_MOUNT_ALIAS"] = "1" if private_mount_alias else "0"
         env["PCA_SYNTHETIC_TEAM_ID"] = "ABCDEFGHIJ"
         env["PCA_SYNTHETIC_TOOL_LOG"] = str(self.temp / "tools.log")
         return subprocess.run(
@@ -123,6 +125,15 @@ class S1APackagingTests(unittest.TestCase):
         log = (self.temp / "hdiutil.log").read_text()
         self.assertIn("attach -readonly -nobrowse", log)
         self.assertIn("detach /dev/disk99s1", log)
+
+    def test_realpath_equivalent_private_mount_alias_is_accepted(self) -> None:
+        dmg = self.temp / "fixture.dmg"
+        dmg.write_bytes(b"synthetic image")
+
+        result = self.run_verify(dmg, private_mount_alias=True)
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("detach /dev/disk99s1", (self.temp / "hdiutil.log").read_text())
 
     def test_attach_parse_failure_still_detaches_requested_mountpoint(self) -> None:
         dmg = self.temp / "fixture.dmg"
@@ -227,6 +238,37 @@ class S1APackagingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue(marker.exists(), result.stdout)
 
+    def test_build_accepts_identity_label_id_that_differs_from_certificate_team_id(self) -> None:
+        output = self.temp / "personal-team.dmg"
+        identity = "Apple Development: Test (ZYXWVUTSRQ)"
+        env = os.environ.copy()
+        env["PATH"] = f"{self.tools}:{env['PATH']}"
+        env["PCA_SYNTHETIC_VALID_IDENTITY"] = "1"
+        env["PCA_SYNTHETIC_IDENTITY_LABEL"] = identity
+
+        result = subprocess.run(
+            [
+                str(BUILD),
+                "--team-id",
+                "ABCDEFGHIJ",
+                "--identity",
+                identity,
+                "--version",
+                "0.1.0",
+                "--output",
+                str(output),
+            ],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 77, result.stdout)
+        self.assertFalse(output.exists())
+
     def _make_app(self) -> None:
         executable = self.app / "Contents/MacOS/PersonalComputerAgent"
         agent = self.app / "Contents/Resources/bin/pca-agentd"
@@ -308,7 +350,12 @@ cat "$arch_file"
             """#!/usr/bin/env bash
 set -euo pipefail
 if [[ "${PCA_SYNTHETIC_VALID_IDENTITY:-0}" == "1" ]]; then
-  if [[ "$1" == "find-identity" ]]; then echo '  1) ABCDEF "Apple Development: Test (ABCDEFGHIJ)"'; else echo 'synthetic certificate'; fi
+  if [[ "$1" == "find-identity" ]]; then
+    identity="${PCA_SYNTHETIC_IDENTITY_LABEL:-Apple Development: Test (ABCDEFGHIJ)}"
+    printf '  1) ABCDEF "%s"\n' "$identity"
+  else
+    echo 'synthetic certificate'
+  fi
 else
   echo "  0 valid identities found"
 fi
@@ -345,11 +392,15 @@ if [[ "$1" == "attach" ]]; then
   if [[ "${PCA_SYNTHETIC_UNEXPECTED_PAYLOAD:-0}" == "1" ]]; then
     touch "$mountpoint/unexpected.txt"
   fi
+  reported_mountpoint="$mountpoint"
+  if [[ "${PCA_SYNTHETIC_PRIVATE_MOUNT_ALIAS:-0}" == "1" && "$mountpoint" == /var/* ]]; then
+    reported_mountpoint="/private$mountpoint"
+  fi
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>system-entities</key><array>
 <dict><key>dev-entry</key><string>/dev/disk99</string><key>content-hint</key><string>GUID_partition_scheme</string></dict>
-<dict><key>dev-entry</key><string>/dev/disk99s1</string><key>mount-point</key><string>$([[ "${PCA_SYNTHETIC_ATTACH_PARSE_FAILURE:-0}" == "1" ]] && echo /wrong/mount || echo "$mountpoint")</string></dict>
+<dict><key>dev-entry</key><string>/dev/disk99s1</string><key>mount-point</key><string>$([[ "${PCA_SYNTHETIC_ATTACH_PARSE_FAILURE:-0}" == "1" ]] && echo /wrong/mount || echo "$reported_mountpoint")</string></dict>
 </array></dict></plist>
 PLIST
 elif [[ "$1" == "detach" ]]; then

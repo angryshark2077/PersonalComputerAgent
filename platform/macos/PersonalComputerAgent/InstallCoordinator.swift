@@ -1,5 +1,7 @@
+import BridgeProtocol
 import Darwin
 import Foundation
+import Security
 
 enum InstallFailure: String, Equatable, Sendable {
     case activation
@@ -27,6 +29,7 @@ enum InstallError: Error, Equatable {
     case activationFailed
     case relaunchFailed
     case serviceRegistrationFailed
+    case credentialProvisioningFailed
     case approvalTimedOut
     case healthCheckFailed
     case uninstallConfirmationRequired
@@ -48,6 +51,7 @@ extension InstallError: LocalizedError {
         case .activationFailed: "The staged app could not be activated."
         case .relaunchFailed: "The installed app could not be opened."
         case .serviceRegistrationFailed: "The background service could not be registered."
+        case .credentialProvisioningFailed: "The Bridge credential could not be created in Keychain."
         case .approvalTimedOut: "Background-item approval was not completed in time."
         case .healthCheckFailed: "The local runtime did not become healthy."
         case .uninstallConfirmationRequired: "Complete uninstall cancelled because the confirmation token did not match."
@@ -125,6 +129,10 @@ struct InstallPaths: Equatable, Sendable {
 
     var installedAgentExecutableURL: URL {
         installedBundleURL.appendingPathComponent("Contents/Resources/bin/pca-agentd")
+    }
+
+    var installedBridgeExecutableURL: URL {
+        installedBundleURL.appendingPathComponent("Contents/Resources/bin/PCAPlatformBridge")
     }
 
     static func production(fileManager: FileManager = .default) throws -> InstallPaths {
@@ -496,12 +504,45 @@ protocol InstallCoordinating: AnyObject {
 }
 
 @MainActor
+protocol BridgeCredentialProvisioning {
+    func ensureCredential(trustedApplicationURLs: [URL]) throws
+}
+
+@MainActor
+struct KeychainBridgeCredentialProvisioner: BridgeCredentialProvisioning {
+    private let store = KeychainCredentialStore()
+
+    func ensureCredential(trustedApplicationURLs: [URL]) throws {
+        do {
+            let secret: Data
+            if let existingSecret = try store.load() {
+                secret = existingSecret
+            } else {
+                var generatedSecret = Data(count: KeychainCredentialStore.sharedSecretLength)
+                let status = generatedSecret.withUnsafeMutableBytes { buffer -> OSStatus in
+                    guard let baseAddress = buffer.baseAddress else { return errSecParam }
+                    return SecRandomCopyBytes(kSecRandomDefault, buffer.count, baseAddress)
+                }
+                guard status == errSecSuccess else {
+                    throw InstallError.credentialProvisioningFailed
+                }
+                secret = generatedSecret
+            }
+            try store.store(secret, trustedApplicationURLs: trustedApplicationURLs)
+        } catch {
+            throw (error as? InstallError) ?? InstallError.credentialProvisioningFailed
+        }
+    }
+}
+
+@MainActor
 final class InstallCoordinator: InstallCoordinating {
     private let paths: InstallPaths
     private let validator: any BundleValidating
     private let service: any ServiceControlling
     private let health: any HealthChecking
     private let relauncher: any Relaunching
+    private let credentialProvisioner: any BridgeCredentialProvisioning
     private let fileSystem: any InstallFileOperating
 
     init(
@@ -510,6 +551,7 @@ final class InstallCoordinator: InstallCoordinating {
         service: any ServiceControlling,
         health: any HealthChecking,
         relauncher: any Relaunching,
+        credentialProvisioner: any BridgeCredentialProvisioning = KeychainBridgeCredentialProvisioner(),
         fileSystem: any InstallFileOperating = LocalInstallFileSystem()
     ) {
         self.paths = paths
@@ -517,6 +559,7 @@ final class InstallCoordinator: InstallCoordinating {
         self.service = service
         self.health = health
         self.relauncher = relauncher
+        self.credentialProvisioner = credentialProvisioner
         self.fileSystem = fileSystem
     }
 
@@ -662,6 +705,21 @@ final class InstallCoordinator: InstallCoordinating {
         }
 
         let installedVersion = try validator.version(at: paths.installedBundleURL)
+        do {
+            try credentialProvisioner.ensureCredential(
+                trustedApplicationURLs: [
+                    paths.installedBundleURL,
+                    paths.installedAgentExecutableURL,
+                    paths.installedBridgeExecutableURL,
+                ]
+            )
+        } catch {
+            if let transaction {
+                let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
+                throw InstallError.transactionFailed(primary: .registration, recovery: recovery)
+            }
+            throw (error as? InstallError) ?? InstallError.credentialProvisioningFailed
+        }
         let attemptStartedAt = Date()
         onState(.starting)
         do {
