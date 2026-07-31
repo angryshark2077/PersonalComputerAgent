@@ -237,3 +237,10 @@ test("pairing and control contracts reject broadened inputs", () => {
     false,
   );
 });
+
+test("Dashboard control reads return only the fixed device shape", () => {
+  const device = fixture("dashboard-control.device.valid.json") as Record<string, unknown>;
+  assert.equal(validateContract("dashboard-control", device).valid, true);
+  device.access_token = "must-not-appear";
+  assert.equal(validateContract("dashboard-control", device).valid, false);
+});

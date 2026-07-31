@@ -70,6 +70,8 @@ export function repositoryErrorResponse(context: Context, error: unknown): Respo
   const status =
     error.code === "WORKSPACE_FORBIDDEN"
       ? 403
+      : error.code === "DEVICE_NOT_FOUND"
+        ? 404
       : error.code === "PAIRING_EXPIRED"
         ? 410
         : error.code === "PAIRING_REPLAYED" || error.code === "CONFLICT"

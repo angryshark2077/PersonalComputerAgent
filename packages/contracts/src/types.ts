@@ -167,3 +167,16 @@ export interface AgentControlSnapshot {
     };
   };
 }
+
+export interface DashboardDeviceStatus {
+  presence: "online" | "stale" | "offline" | "sleeping";
+  agent_version: string;
+  outbox_depth: number;
+  observed_at: string;
+}
+
+export interface DashboardDeviceDetail extends AgentControlSnapshot {
+  platform: "macos";
+  paired_at: string;
+  status: DashboardDeviceStatus | null;
+}

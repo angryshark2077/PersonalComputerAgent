@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { MemoryControlRepository } from "@pca/db-cloud/src/repository.js";
+import { validateContract } from "@pca/contracts/src/validate.js";
 
 import { createApp, type OwnerPrincipal } from "../index.js";
 import { pkceChallenge } from "../pairing.js";
@@ -144,6 +145,104 @@ test("refresh rotates credentials and a revoked device is rejected", async () =>
     }),
   });
   assert.equal(control.status, 401);
+});
+
+test("Owner reads only its device control state and configuration audit", async () => {
+  const { api, credentials, repository } = await pairedApi();
+  const config = {
+    network: { enabled: true },
+    "communication.wechat": {
+      enabled: true,
+      direction: "outgoing",
+      message_type: "text",
+      sync_mode: "full",
+    },
+  };
+  assert.equal(
+    (
+      await api.request(`/v1/devices/${credentials.device_id}/collector-config`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(config),
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await api.request("/v1/agent/control", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${credentials.device_access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          heartbeat_id: "01985555-7555-8555-8555-555555555556",
+          agent_version: "0.1.0",
+          presence: "online",
+          outbox_depth: 2,
+        }),
+      })
+    ).status,
+    200,
+  );
+
+  const workspaces = await api.request("/v1/workspaces");
+  assert.equal(workspaces.status, 200);
+  const workspaceBody = await workspaces.json();
+  assert.equal(validateContract("dashboard-control", workspaceBody).valid, true);
+  assert.deepEqual(workspaceBody, {
+    workspaces: [{ workspace_id: owner.workspaceId, name: "Personal Computer Agent" }],
+  });
+
+  const devices = await api.request("/v1/devices");
+  assert.equal(devices.status, 200);
+  const deviceListBody = await devices.json();
+  assert.equal(validateContract("dashboard-control", deviceListBody).valid, true);
+  const listed = deviceListBody as {
+    devices: Array<{ device_id: string; status: { presence: string } | null }>;
+  };
+  assert.deepEqual(listed.devices.map((device) => device.device_id), [credentials.device_id]);
+  assert.equal(listed.devices[0]?.status?.presence, "online");
+
+  const detail = await api.request(`/v1/devices/${credentials.device_id}`);
+  assert.equal(detail.status, 200);
+  const deviceBody = await detail.json();
+  assert.equal(validateContract("dashboard-control", deviceBody).valid, true);
+  const snapshot = deviceBody as {
+    collectors: { network: { enabled: boolean } };
+    configuration_revision: number;
+    status: { outbox_depth: number } | null;
+  };
+  assert.equal(snapshot.configuration_revision, 1);
+  assert.equal(snapshot.collectors.network.enabled, true);
+  assert.equal(snapshot.status?.outbox_depth, 2);
+  assert.equal(JSON.stringify(snapshot).includes("token"), false);
+
+  const audit = await api.request(`/v1/devices/${credentials.device_id}/collector-config/audit`);
+  assert.equal(audit.status, 200);
+  const auditBody = await audit.json();
+  assert.equal(validateContract("dashboard-control", auditBody).valid, true);
+  assert.deepEqual(auditBody, {
+    audit: [
+      {
+        actor_user_id: owner.userId,
+        configuration_revision: 1,
+        old_config: { network: { enabled: false }, "communication.wechat": { ...config["communication.wechat"], enabled: false } },
+        new_config: config,
+        created_at: (await repository.listCollectorConfigAudit(credentials.device_id, owner.workspaceId, owner.userId))[0]?.createdAt.toISOString(),
+      },
+    ],
+  });
+
+  const otherWorkspace = createApp({
+    repository,
+    ownerAuthenticator: async () => ({
+      userId: "01987777-7777-8777-8777-777777777777",
+      workspaceId: "01989999-7999-8999-8999-999999999999",
+    }),
+  });
+  assert.equal((await otherWorkspace.request(`/v1/devices/${credentials.device_id}`)).status, 403);
 });
 
 test("owner endpoints cannot cross Workspace boundaries", async () => {

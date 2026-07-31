@@ -1,5 +1,5 @@
 import type { AgentControlSnapshot } from "@pca/contracts/src/types.js";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, isNull } from "drizzle-orm";
 import { timingSafeEqual } from "node:crypto";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -14,6 +14,7 @@ import {
   pairingAuthorizationCodes,
   pairingSessions,
   workspaceMembers,
+  workspaces,
   type StoredCollectorConfig,
 } from "./schema.js";
 
@@ -121,6 +122,40 @@ export interface DeviceRevocationInput {
   now: Date;
 }
 
+export interface OwnerWorkspace {
+  workspaceId: string;
+  name: string;
+}
+
+export interface DeviceStatus {
+  presence: HeartbeatInput["presence"];
+  agentVersion: string;
+  outboxDepth: number;
+  observedAt: Date;
+}
+
+export interface OwnerDeviceSummary {
+  deviceId: string;
+  workspaceId: string;
+  platform: "macos";
+  pairedAt: Date;
+  revoked: boolean;
+  configurationRevision: number;
+  status: DeviceStatus | null;
+}
+
+export interface OwnerDeviceDetail extends OwnerDeviceSummary {
+  snapshot: AgentControlSnapshot;
+}
+
+export interface CollectorConfigAuditRecord {
+  actorUserId: string;
+  configurationRevision: number;
+  oldConfig: StoredCollectorConfig;
+  newConfig: StoredCollectorConfig;
+  createdAt: Date;
+}
+
 export interface ControlRepository {
   createPairingSession(input: PairingSessionInput): Promise<PairingSession>;
   authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string>;
@@ -139,6 +174,18 @@ export interface ControlRepository {
   appendConfigAudit(input: ConfigAuditInput): Promise<number>;
   revokeDevice(input: DeviceRevocationInput): Promise<void>;
   resolveOwnerWorkspace(userId: string): Promise<string | null>;
+  listOwnerWorkspaces(userId: string): Promise<OwnerWorkspace[]>;
+  listOwnerDevices(workspaceId: string, userId: string): Promise<OwnerDeviceSummary[]>;
+  loadOwnerDevice(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<OwnerDeviceDetail>;
+  listCollectorConfigAudit(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<CollectorConfigAuditRecord[]>;
 }
 
 export interface OwnerMembership {
@@ -155,6 +202,8 @@ interface DeviceRecord {
   workspaceId: string;
   ownerUserId: string;
   devicePublicKeyHash: string;
+  platform: "macos";
+  createdAt: Date;
   revokedAt: Date | null;
 }
 
@@ -181,10 +230,14 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #accessTokenHashes = new Set<string>();
   readonly #refreshTokenHashes = new Set<string>();
   readonly #revocationAuditIds = new Set<string>();
+  readonly #workspaceNames = new Map<string, string>();
+  readonly #latestHeartbeats = new Map<string, DeviceStatus>();
+  readonly #configAudit: Array<CollectorConfigAuditRecord & { workspaceId: string; deviceId: string }> = [];
 
   constructor(memberships: readonly OwnerMembership[] = []) {
     for (const membership of memberships) {
       this.#ownerMemberships.add(membershipKey(membership.workspaceId, membership.userId));
+      this.#workspaceNames.set(membership.workspaceId, "Personal Computer Agent");
     }
   }
 
@@ -259,6 +312,8 @@ export class MemoryControlRepository implements ControlRepository {
       workspaceId: code.workspaceId,
       ownerUserId: code.ownerUserId,
       devicePublicKeyHash: session.devicePublicKeyHash,
+      platform: "macos",
+      createdAt: input.now,
       revokedAt: null,
     });
     this.#devicePublicKeyHashes.add(session.devicePublicKeyHash);
@@ -353,6 +408,12 @@ export class MemoryControlRepository implements ControlRepository {
       throw new ControlRepositoryError("CONFLICT");
     }
     this.#heartbeatIds.add(input.heartbeatId);
+    this.#latestHeartbeats.set(input.deviceId, {
+      presence: input.presence,
+      agentVersion: input.agentVersion,
+      outboxDepth: input.outboxDepth,
+      observedAt: input.receivedAt,
+    });
   }
 
   async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
@@ -370,6 +431,18 @@ export class MemoryControlRepository implements ControlRepository {
     const revision = current.configurationRevision + 1;
     this.#configs.set(key, { ...input.config, configurationRevision: revision });
     this.#auditIds.add(input.auditId);
+    this.#configAudit.push({
+      workspaceId: input.workspaceId,
+      deviceId: input.deviceId,
+      actorUserId: input.actorUserId,
+      configurationRevision: revision,
+      oldConfig: {
+        networkEnabled: current.networkEnabled,
+        wechatEnabled: current.wechatEnabled,
+      },
+      newConfig: { ...input.config },
+      createdAt: input.now,
+    });
     return revision;
   }
 
@@ -399,6 +472,68 @@ export class MemoryControlRepository implements ControlRepository {
       }
     }
     return null;
+  }
+
+  async listOwnerWorkspaces(userId: string): Promise<OwnerWorkspace[]> {
+    const results: OwnerWorkspace[] = [];
+    for (const membership of this.#ownerMemberships) {
+      const [workspaceId, memberUserId] = membership.split(":");
+      if (memberUserId === userId && workspaceId !== undefined) {
+        results.push({
+          workspaceId,
+          name: this.#workspaceNames.get(workspaceId) ?? "Personal Computer Agent",
+        });
+      }
+    }
+    return results;
+  }
+
+  async listOwnerDevices(workspaceId: string, userId: string): Promise<OwnerDeviceSummary[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    return [...this.#devices.values()]
+      .filter((device) => device.workspaceId === workspaceId)
+      .map((device) => this.#ownerDeviceSummary(device));
+  }
+
+  async loadOwnerDevice(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<OwnerDeviceDetail> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    const device = this.#requireDevice(deviceId, workspaceId, true);
+    const summary = this.#ownerDeviceSummary(device);
+    return { ...summary, snapshot: await this.loadControlSnapshot(deviceId, workspaceId) };
+  }
+
+  async listCollectorConfigAudit(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<CollectorConfigAuditRecord[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    return this.#configAudit
+      .filter((record) => record.workspaceId === workspaceId && record.deviceId === deviceId)
+      .map(({ workspaceId: _workspaceId, deviceId: _deviceId, ...record }) => ({ ...record }))
+      .reverse();
+  }
+
+  #ownerDeviceSummary(device: DeviceRecord): OwnerDeviceSummary {
+    const config = this.#configs.get(configKey(device.workspaceId, device.id)) ?? {
+      configurationRevision: 0,
+      networkEnabled: false,
+      wechatEnabled: false,
+    };
+    return {
+      deviceId: device.id,
+      workspaceId: device.workspaceId,
+      platform: device.platform,
+      pairedAt: device.createdAt,
+      revoked: device.revokedAt !== null,
+      configurationRevision: config.configurationRevision,
+      status: this.#latestHeartbeats.get(device.id) ?? null,
+    };
   }
 
   #authenticateCredential(
@@ -838,6 +973,128 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
+  async listOwnerWorkspaces(userId: string): Promise<OwnerWorkspace[]> {
+    try {
+      return await this.database
+        .select({ workspaceId: workspaces.id, name: workspaces.name })
+        .from(workspaceMembers)
+        .innerJoin(workspaces, eq(workspaces.id, workspaceMembers.workspaceId))
+        .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.role, "owner")));
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listOwnerDevices(workspaceId: string, userId: string): Promise<OwnerDeviceSummary[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      const rows = await this.database
+        .select({ deviceId: devices.id })
+        .from(devices)
+        .where(eq(devices.workspaceId, workspaceId));
+      return Promise.all(
+        rows.map(async ({ deviceId }) => {
+          const detail = await this.loadOwnerDevice(deviceId, workspaceId, userId);
+          const { snapshot: _snapshot, ...summary } = detail;
+          return summary;
+        }),
+      );
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async loadOwnerDevice(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<OwnerDeviceDetail> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      const device = await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const [config] = await this.database
+        .select()
+        .from(collectorConfigs)
+        .where(
+          and(
+            eq(collectorConfigs.workspaceId, workspaceId),
+            eq(collectorConfigs.deviceId, deviceId),
+          ),
+        )
+        .limit(1);
+      const [heartbeat] = await this.database
+        .select({
+          presence: deviceHeartbeats.presence,
+          agentVersion: deviceHeartbeats.agentVersion,
+          outboxDepth: deviceHeartbeats.outboxDepth,
+          observedAt: deviceHeartbeats.receivedAt,
+        })
+        .from(deviceHeartbeats)
+        .where(
+          and(
+            eq(deviceHeartbeats.workspaceId, workspaceId),
+            eq(deviceHeartbeats.deviceId, deviceId),
+          ),
+        )
+        .orderBy(desc(deviceHeartbeats.receivedAt))
+        .limit(1);
+      const configRecord: ConfigRecord = {
+        configurationRevision: config?.configurationRevision ?? 0,
+        networkEnabled: config?.networkEnabled ?? false,
+        wechatEnabled: config?.wechatEnabled ?? false,
+      };
+      return {
+        deviceId: device.id,
+        workspaceId: device.workspaceId,
+        platform: device.platform,
+        pairedAt: device.createdAt,
+        revoked: device.revokedAt !== null,
+        configurationRevision: configRecord.configurationRevision,
+        status:
+          heartbeat === undefined
+            ? null
+            : {
+                presence: heartbeat.presence as HeartbeatInput["presence"],
+                agentVersion: heartbeat.agentVersion,
+                outboxDepth: heartbeat.outboxDepth,
+                observedAt: heartbeat.observedAt,
+              },
+        snapshot: snapshot(device, configRecord),
+      };
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listCollectorConfigAudit(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<CollectorConfigAuditRecord[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      return await this.database
+        .select({
+          actorUserId: collectorConfigAudit.actorUserId,
+          configurationRevision: collectorConfigAudit.configurationRevision,
+          oldConfig: collectorConfigAudit.oldConfig,
+          newConfig: collectorConfigAudit.newConfig,
+          createdAt: collectorConfigAudit.createdAt,
+        })
+        .from(collectorConfigAudit)
+        .where(
+          and(
+            eq(collectorConfigAudit.workspaceId, workspaceId),
+            eq(collectorConfigAudit.deviceId, deviceId),
+          ),
+        )
+        .orderBy(desc(collectorConfigAudit.createdAt));
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
   async #authenticateDatabaseCredential(
     credentialHash: string,
     now: Date,
@@ -893,6 +1150,8 @@ async function requireDatabaseDevice(
       workspaceId: devices.workspaceId,
       ownerUserId: devices.ownerUserId,
       devicePublicKeyHash: devices.devicePublicKeyHash,
+      platform: devices.platform,
+      createdAt: devices.createdAt,
       revokedAt: devices.revokedAt,
     })
     .from(devices)
@@ -907,7 +1166,7 @@ async function requireDatabaseDevice(
   if (!allowRevoked && device.revokedAt !== null) {
     throw new ControlRepositoryError("DEVICE_REVOKED");
   }
-  return device;
+  return { ...device, platform: device.platform as "macos" };
 }
 
 async function requireDatabaseOwnerMembership(

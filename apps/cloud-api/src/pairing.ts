@@ -91,7 +91,7 @@ export class PairingRateLimiter {
 
 export function errorResponse(
   context: Context,
-  status: 400 | 401 | 403 | 409 | 410 | 429,
+  status: 400 | 401 | 403 | 404 | 409 | 410 | 429,
   errorCode: string,
   message: string,
 ): Response {

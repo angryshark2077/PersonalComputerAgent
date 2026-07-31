@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pca.local/contracts/dashboard-control.schema.json",
+  "title": "DashboardControl",
+  "oneOf": [
+    { "$ref": "#/$defs/WorkspaceList" },
+    { "$ref": "#/$defs/DeviceList" },
+    { "$ref": "#/$defs/DeviceDetail" },
+    { "$ref": "#/$defs/AuditList" }
+  ],
+  "$defs": {
+    "CollectorConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "communication.wechat"],
+      "properties": {
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "communication.wechat": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "direction", "message_type", "sync_mode"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "direction": { "const": "outgoing" },
+            "message_type": { "const": "text" },
+            "sync_mode": { "const": "full" }
+          }
+        }
+      }
+    },
+    "DeviceStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["presence", "agent_version", "outbox_depth", "observed_at"],
+      "properties": {
+        "presence": { "enum": ["online", "stale", "offline", "sleeping"] },
+        "agent_version": { "type": "string", "minLength": 1 },
+        "outbox_depth": { "type": "integer", "minimum": 0 },
+        "observed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "DeviceSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "workspace_id", "platform", "paired_at", "revoked", "configuration_revision", "status"],
+      "properties": {
+        "device_id": { "type": "string", "format": "uuid" },
+        "workspace_id": { "type": "string", "format": "uuid" },
+        "platform": { "const": "macos" },
+        "paired_at": { "type": "string", "format": "date-time" },
+        "revoked": { "type": "boolean" },
+        "configuration_revision": { "type": "integer", "minimum": 0 },
+        "status": {
+          "anyOf": [{ "$ref": "#/$defs/DeviceStatus" }, { "type": "null" }]
+        }
+      }
+    },
+    "DeviceDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "workspace_id", "platform", "paired_at", "revoked", "configuration_revision", "status", "collectors"],
+      "properties": {
+        "device_id": { "type": "string", "format": "uuid" },
+        "workspace_id": { "type": "string", "format": "uuid" },
+        "platform": { "const": "macos" },
+        "paired_at": { "type": "string", "format": "date-time" },
+        "revoked": { "type": "boolean" },
+        "configuration_revision": { "type": "integer", "minimum": 0 },
+        "status": {
+          "anyOf": [{ "$ref": "#/$defs/DeviceStatus" }, { "type": "null" }]
+        },
+        "collectors": { "$ref": "#/$defs/CollectorConfig" }
+      }
+    },
+    "WorkspaceList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspaces"],
+      "properties": {
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["workspace_id", "name"],
+            "properties": {
+              "workspace_id": { "type": "string", "format": "uuid" },
+              "name": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "DeviceList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["devices"],
+      "properties": {
+        "devices": { "type": "array", "items": { "$ref": "#/$defs/DeviceSummary" } }
+      }
+    },
+    "AuditList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["audit"],
+      "properties": {
+        "audit": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["actor_user_id", "configuration_revision", "old_config", "new_config", "created_at"],
+            "properties": {
+              "actor_user_id": { "type": "string", "format": "uuid" },
+              "configuration_revision": { "type": "integer", "minimum": 1 },
+              "old_config": { "$ref": "#/$defs/CollectorConfig" },
+              "new_config": { "$ref": "#/$defs/CollectorConfig" },
+              "created_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

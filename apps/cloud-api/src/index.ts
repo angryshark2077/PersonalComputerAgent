@@ -200,6 +200,77 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.get("/v1/workspaces", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    try {
+      const workspaces = await options.repository.listOwnerWorkspaces(principal.userId);
+      return context.json({
+        workspaces: workspaces.map((workspace) => ({
+          workspace_id: workspace.workspaceId,
+          name: workspace.name,
+        })),
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.get("/v1/devices", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    try {
+      const devices = await options.repository.listOwnerDevices(
+        principal.workspaceId,
+        principal.userId,
+      );
+      return context.json({ devices: devices.map(ownerDeviceSummaryResponse) });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.get("/v1/devices/:deviceId", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    try {
+      const device = await options.repository.loadOwnerDevice(
+        context.req.param("deviceId"),
+        principal.workspaceId,
+        principal.userId,
+      );
+      return context.json({
+        ...ownerDeviceSummaryResponse(device),
+        collectors: device.snapshot.collectors,
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.get("/v1/devices/:deviceId/collector-config/audit", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    try {
+      const audit = await options.repository.listCollectorConfigAudit(
+        context.req.param("deviceId"),
+        principal.workspaceId,
+        principal.userId,
+      );
+      return context.json({
+        audit: audit.map((record) => ({
+          actor_user_id: record.actorUserId,
+          configuration_revision: record.configurationRevision,
+          old_config: collectorConfigResponse(record.oldConfig),
+          new_config: collectorConfigResponse(record.newConfig),
+          created_at: record.createdAt.toISOString(),
+        })),
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.put("/v1/devices/:deviceId/collector-config", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
@@ -307,6 +378,51 @@ function parseCallbackState(value: unknown): string | null {
   return Object.keys(body).length === 1 && typeof body.callback_state === "string" && /^[A-Za-z0-9_-]{43,}$/.test(body.callback_state)
     ? body.callback_state
     : null;
+}
+
+function ownerDeviceSummaryResponse(device: {
+  deviceId: string;
+  workspaceId: string;
+  platform: string;
+  pairedAt: Date;
+  revoked: boolean;
+  configurationRevision: number;
+  status: {
+    presence: string;
+    agentVersion: string;
+    outboxDepth: number;
+    observedAt: Date;
+  } | null;
+}) {
+  return {
+    device_id: device.deviceId,
+    workspace_id: device.workspaceId,
+    platform: device.platform,
+    paired_at: device.pairedAt.toISOString(),
+    revoked: device.revoked,
+    configuration_revision: device.configurationRevision,
+    status:
+      device.status === null
+        ? null
+        : {
+            presence: device.status.presence,
+            agent_version: device.status.agentVersion,
+            outbox_depth: device.status.outboxDepth,
+            observed_at: device.status.observedAt.toISOString(),
+          },
+  };
+}
+
+function collectorConfigResponse(config: { networkEnabled: boolean; wechatEnabled: boolean }) {
+  return {
+    network: { enabled: config.networkEnabled },
+    "communication.wechat": {
+      enabled: config.wechatEnabled,
+      direction: "outgoing" as const,
+      message_type: "text" as const,
+      sync_mode: "full" as const,
+    },
+  };
 }
 
 function requiredEnvironment(environment: ProductionEnvironment, key: keyof ProductionEnvironment): string {
