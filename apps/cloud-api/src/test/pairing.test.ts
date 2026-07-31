@@ -7,6 +7,7 @@ import { MemoryControlRepository } from "@pca/db-cloud/src/repository.js";
 import {
   createApp,
   createProductionApp,
+  createOwnerWorkspaceBootstrapHooks,
   createTrustedProxyClientAddress,
   type OwnerPrincipal,
 } from "../index.js";
@@ -249,4 +250,36 @@ test("production source IP accepts only an explicitly configured signed proxy he
     address(new Request("http://localhost", { headers: { "x-forwarded-for": ip } })),
     undefined,
   );
+});
+
+test("production signup bootstrap creates one Owner workspace before pairing authorization", async () => {
+  const userId = "01983333-7333-8333-8333-333333333334";
+  const repository = new MemoryControlRepository();
+  const hooks = createOwnerWorkspaceBootstrapHooks(repository);
+  await hooks.user.create.after({ id: userId });
+  await hooks.user.create.after({ id: userId });
+  const [workspace] = await repository.listOwnerWorkspaces(userId);
+  assert.notEqual(workspace, undefined);
+  assert.equal((await repository.listOwnerWorkspaces(userId)).length, 1);
+
+  const api = createApp({
+    repository,
+    ownerAuthenticator: async () => ({ userId, workspaceId: workspace?.workspaceId ?? "" }),
+  });
+  const pairing = await api.request("/v1/device-pairing/sessions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      ...start,
+      device_public_key: "fresh-signup-device-key",
+      code_challenge: pkceChallenge("fresh-signup-verifier"),
+    }),
+  });
+  const { session_id: sessionId } = (await pairing.json()) as { session_id: string };
+  const authorized = await api.request(`/v1/device-pairing/sessions/${sessionId}/authorize`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ callback_state: start.callback_state }),
+  });
+  assert.equal(authorized.status, 302);
 });

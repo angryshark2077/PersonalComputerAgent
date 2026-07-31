@@ -1,9 +1,10 @@
 import type { AgentControlSnapshot } from "@pca/contracts/src/types.js";
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
-import { timingSafeEqual } from "node:crypto";
+import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import {
+  authUsers,
   cloudSchema,
   collectorConfigAudit,
   collectorConfigs,
@@ -174,6 +175,7 @@ export interface ControlRepository {
   appendConfigAudit(input: ConfigAuditInput): Promise<number>;
   revokeDevice(input: DeviceRevocationInput): Promise<void>;
   resolveOwnerWorkspace(userId: string): Promise<string | null>;
+  bootstrapOwnerWorkspace(userId: string): Promise<OwnerWorkspace>;
   listOwnerWorkspaces(userId: string): Promise<OwnerWorkspace[]>;
   listOwnerDevices(workspaceId: string, userId: string): Promise<OwnerDeviceSummary[]>;
   loadOwnerDevice(
@@ -472,6 +474,23 @@ export class MemoryControlRepository implements ControlRepository {
       }
     }
     return null;
+  }
+
+  async bootstrapOwnerWorkspace(userId: string): Promise<OwnerWorkspace> {
+    const existingWorkspaceId = await this.resolveOwnerWorkspace(userId);
+    if (existingWorkspaceId !== null) {
+      return {
+        workspaceId: existingWorkspaceId,
+        name: this.#workspaceNames.get(existingWorkspaceId) ?? "Personal Computer Agent",
+      };
+    }
+    const workspace: OwnerWorkspace = {
+      workspaceId: randomUUID(),
+      name: "Personal Computer Agent",
+    };
+    this.#ownerMemberships.add(membershipKey(workspace.workspaceId, userId));
+    this.#workspaceNames.set(workspace.workspaceId, workspace.name);
+    return workspace;
   }
 
   async listOwnerWorkspaces(userId: string): Promise<OwnerWorkspace[]> {
@@ -968,6 +987,45 @@ export class DrizzleControlRepository implements ControlRepository {
         .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.role, "owner")))
         .limit(1);
       return membership?.workspaceId ?? null;
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async bootstrapOwnerWorkspace(userId: string): Promise<OwnerWorkspace> {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        await transaction.execute(
+          sql`SELECT id FROM ${authUsers} WHERE ${authUsers.id} = ${userId} FOR UPDATE`,
+        );
+        const [existing] = await transaction
+          .select({ workspaceId: workspaces.id, name: workspaces.name })
+          .from(workspaceMembers)
+          .innerJoin(workspaces, eq(workspaces.id, workspaceMembers.workspaceId))
+          .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.role, "owner")))
+          .limit(1);
+        if (existing !== undefined) return existing;
+
+        const workspace: OwnerWorkspace = {
+          workspaceId: randomUUID(),
+          name: "Personal Computer Agent",
+        };
+        const now = new Date();
+        await transaction.insert(workspaces).values({
+          id: workspace.workspaceId,
+          name: workspace.name,
+          slug: `pca-${workspace.workspaceId}`,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await transaction.insert(workspaceMembers).values({
+          workspaceId: workspace.workspaceId,
+          userId,
+          role: "owner",
+          createdAt: now,
+        });
+        return workspace;
+      });
     } catch (error) {
       throw repositoryError(error);
     }

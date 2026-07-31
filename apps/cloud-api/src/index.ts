@@ -339,6 +339,7 @@ export function createProductionApp(environment: ProductionEnvironment = process
     user: { fields: { image: "imageUrl" } },
     session: { fields: { token: "sessionToken" } },
     account: { fields: { password: "passwordHash" } },
+    databaseHooks: createOwnerWorkspaceBootstrapHooks(repository),
   });
   const app = createApp({
     repository,
@@ -347,6 +348,21 @@ export function createProductionApp(environment: ProductionEnvironment = process
   });
   app.all("/api/auth/*", (context) => auth.handler(context.req.raw));
   return app;
+}
+
+/** The Better Auth hook runs after a new user exists and creates its sole Owner Workspace. */
+export function createOwnerWorkspaceBootstrapHooks(
+  repository: Pick<ControlRepository, "bootstrapOwnerWorkspace">,
+) {
+  return {
+    user: {
+      create: {
+        after: async (user: { id: string }) => {
+          await repository.bootstrapOwnerWorkspace(user.id);
+        },
+      },
+    },
+  };
 }
 
 /**
