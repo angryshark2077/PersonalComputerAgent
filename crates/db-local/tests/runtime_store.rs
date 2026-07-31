@@ -423,6 +423,234 @@ async fn collector_commit_persists_event_outbox_and_state_idempotently() {
 }
 
 #[tokio::test]
+async fn collector_commit_rejects_existing_event_id_when_any_immutable_field_differs() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let prior_state = collector_state(CollectorStatus::Initializing);
+    db.upsert_collector_state(&prior_state)
+        .await
+        .expect("persist prior state");
+    let mut cases = Vec::new();
+    for (case, mutate) in [
+        ("workspace", 0_u8),
+        ("device", 1),
+        ("type", 2),
+        ("source", 3),
+        ("schema", 4),
+        ("occurred", 5),
+        ("created", 6),
+        ("sensitivity", 7),
+        ("payload", 8),
+        ("attachments", 9),
+        ("idempotency", 10),
+    ] {
+        let event_id = format!("collector-conflict-{case}");
+        let original = event(&event_id);
+        let mut conflicting = original.clone();
+        match mutate {
+            0 => conflicting.workspace_id = "workspace-2".to_owned(),
+            1 => conflicting.device_id = "device-2".to_owned(),
+            2 => conflicting.event_type = "SYSTEM_METRIC_SAMPLED".to_owned(),
+            3 => conflicting.source = "system".to_owned(),
+            4 => conflicting.schema_version = 2,
+            5 => conflicting.occurred_at = "2026-07-31T01:02:05.456Z".to_owned(),
+            6 => conflicting.created_at = "2026-07-31T01:02:06.567Z".to_owned(),
+            7 => conflicting.sensitivity = Sensitivity::High,
+            8 => {
+                conflicting
+                    .payload
+                    .insert("reason".to_owned(), Value::String("different".to_owned()));
+            }
+            9 => conflicting.attachment_refs = vec!["attachment-2".to_owned()],
+            10 => conflicting.idempotency_key = Some("startup-2".to_owned()),
+            _ => unreachable!("all immutable Event fields covered"),
+        }
+        cases.push((case, original, conflicting));
+    }
+
+    for (case, original, conflicting) in cases {
+        db.append_event_with_outbox(&original)
+            .await
+            .unwrap_or_else(|error| panic!("seed {case}: {error}"));
+        let before = event_and_outbox_rows(&Connection::open(&path).expect("open before snapshot"));
+        let commit = EventCommit::try_new(
+            vec![conflicting],
+            Some(collector_state(CollectorStatus::Running)),
+        )
+        .expect("valid conflicting commit");
+
+        let result = db.commit_events(&commit).await;
+
+        assert!(
+            matches!(result, Err(DbError::Sqlite { .. })),
+            "{case} conflict unexpectedly succeeded"
+        );
+        let after = event_and_outbox_rows(&Connection::open(&path).expect("open after snapshot"));
+        assert_eq!(after, before, "{case} conflict changed Event or Outbox");
+        assert_eq!(
+            db.load_collector_states()
+                .await
+                .expect("load preserved state"),
+            vec![prior_state.clone()],
+            "{case} conflict advanced Collector state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collector_commit_rejects_inconsistent_stable_outbox_and_rolls_back() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let prior_state = collector_state(CollectorStatus::Initializing);
+    db.upsert_collector_state(&prior_state)
+        .await
+        .expect("persist prior state");
+    db.append_event_with_outbox(&event("collector-outbox-wrong-entity"))
+        .await
+        .expect("seed wrong Outbox entity");
+    let connection = Connection::open(&path).expect("open Outbox corruption setup");
+    connection
+        .execute(
+            "UPDATE sync_outbox SET outbox_id = 'event:collector-outbox-target'
+             WHERE event_id = 'collector-outbox-wrong-entity'",
+            [],
+        )
+        .expect("point stable Outbox ID at wrong Event");
+    drop(connection);
+    let before = event_and_outbox_rows(&Connection::open(&path).expect("open before snapshot"));
+    let commit = collector_commit(
+        &["collector-outbox-target"],
+        collector_state(CollectorStatus::Running),
+    );
+
+    let result = db.commit_events(&commit).await;
+
+    assert!(matches!(result, Err(DbError::Sqlite { .. })));
+    let after = event_and_outbox_rows(&Connection::open(&path).expect("open after snapshot"));
+    assert_eq!(after, before);
+    assert_eq!(
+        db.load_collector_states()
+            .await
+            .expect("load preserved state"),
+        vec![prior_state]
+    );
+}
+
+#[tokio::test]
+async fn collector_commit_rejects_existing_outbox_with_different_created_time() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let prior_state = collector_state(CollectorStatus::Initializing);
+    db.upsert_collector_state(&prior_state)
+        .await
+        .expect("persist prior state");
+    let existing = event("collector-outbox-created-conflict");
+    db.append_event_with_outbox(&existing)
+        .await
+        .expect("seed Event and Outbox");
+    Connection::open(&path)
+        .expect("open Outbox corruption setup")
+        .execute(
+            "UPDATE sync_outbox SET created_at_ms = created_at_ms + 1
+             WHERE event_id = ?1",
+            [&existing.event_id],
+        )
+        .expect("change stable Outbox creation time");
+    let before = event_and_outbox_rows(&Connection::open(&path).expect("open before snapshot"));
+    let commit = EventCommit::try_new(
+        vec![existing],
+        Some(collector_state(CollectorStatus::Running)),
+    )
+    .expect("valid retry commit");
+
+    let result = db.commit_events(&commit).await;
+
+    assert!(matches!(result, Err(DbError::Sqlite { .. })));
+    let after = event_and_outbox_rows(&Connection::open(&path).expect("open after snapshot"));
+    assert_eq!(after, before);
+    assert_eq!(
+        db.load_collector_states()
+            .await
+            .expect("load preserved state"),
+        vec![prior_state]
+    );
+}
+
+#[tokio::test]
+async fn collector_commit_rejects_different_events_with_duplicate_id_in_one_batch() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let prior_state = collector_state(CollectorStatus::Initializing);
+    db.upsert_collector_state(&prior_state)
+        .await
+        .expect("persist prior state");
+    let first = event("collector-batch-duplicate-conflict");
+    let mut conflicting = first.clone();
+    conflicting
+        .payload
+        .insert("reason".to_owned(), Value::String("different".to_owned()));
+    let commit = EventCommit::try_new(
+        vec![first, conflicting],
+        Some(collector_state(CollectorStatus::Running)),
+    )
+    .expect("valid bounded commit");
+
+    let result = db.commit_events(&commit).await;
+
+    assert!(matches!(result, Err(DbError::Sqlite { .. })));
+    assert_eq!(
+        db.count_event_and_outbox("collector-batch-duplicate-conflict")
+            .await
+            .expect("count rolled back duplicate"),
+        (0, 0)
+    );
+    assert_eq!(
+        db.load_collector_states()
+            .await
+            .expect("load preserved state"),
+        vec![prior_state]
+    );
+}
+
+#[tokio::test]
+async fn collector_commit_accepts_identical_events_with_duplicate_id_in_one_batch() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let duplicate = event("collector-batch-identical-duplicate");
+    let expected_state = collector_state(CollectorStatus::Running);
+    let commit = EventCommit::try_new(
+        vec![duplicate.clone(), duplicate],
+        Some(expected_state.clone()),
+    )
+    .expect("valid bounded commit");
+
+    db.commit_events(&commit)
+        .await
+        .expect("collapse identical duplicate Events");
+
+    assert_eq!(
+        db.count_event_and_outbox("collector-batch-identical-duplicate")
+            .await
+            .expect("count idempotent duplicate"),
+        (1, 1)
+    );
+    assert_eq!(
+        db.load_collector_states().await.expect("load final state"),
+        vec![expected_state]
+    );
+}
+
+#[tokio::test]
 async fn collector_commit_state_failure_rolls_back_events_outbox_and_prior_state() {
     let (_directory, path) = database_path();
     let db = DbActorHandle::open(&path, "0.2.0")

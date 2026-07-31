@@ -85,7 +85,7 @@ fn insert_event(
     serialized: &SerializedEvent<'_>,
 ) -> Result<(), DbError> {
     let event = serialized.event;
-    transaction
+    let inserted = transaction
         .execute(
             "INSERT INTO events_local (
                 event_id, workspace_id, device_id, event_type, source,
@@ -112,15 +112,72 @@ fn insert_event(
                 event.idempotency_key,
             ],
         )
-        .map(|_| ())
-        .map_err(|error| DbError::sqlite("insert local event", error))
+        .map_err(|error| DbError::sqlite("insert local event", error))?;
+    if inserted == 0 {
+        validate_existing_event(transaction, serialized)?;
+    }
+    Ok(())
+}
+
+fn validate_existing_event(
+    transaction: &Transaction<'_>,
+    serialized: &SerializedEvent<'_>,
+) -> Result<(), DbError> {
+    let event = serialized.event;
+    let identical = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events_local
+                WHERE event_id = ?1
+                  AND workspace_id = ?2
+                  AND device_id = ?3
+                  AND event_type = ?4
+                  AND source = ?5
+                  AND schema_version = ?6
+                  AND occurred_at_ms =
+                      CAST(unixepoch(?7, 'subsec') * 1000 AS INTEGER)
+                  AND created_at_ms =
+                      CAST(unixepoch(?8, 'subsec') * 1000 AS INTEGER)
+                  AND sensitivity = ?9
+                  AND payload_json = ?10
+                  AND attachment_refs_json = ?11
+                  AND idempotency_key IS ?12
+            )",
+            params![
+                event.event_id,
+                event.workspace_id,
+                event.device_id,
+                event.event_type,
+                event.source,
+                event.schema_version,
+                event.occurred_at,
+                event.created_at,
+                sensitivity_name(event.sensitivity),
+                serialized.payload_json,
+                serialized.attachment_refs_json,
+                event.idempotency_key,
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| DbError::sqlite("validate existing local event", error))?;
+    if identical {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "validate existing local event",
+            format!(
+                "event ID {} conflicts with different immutable fields",
+                event.event_id
+            ),
+        ))
+    }
 }
 
 fn insert_stable_outbox(
     transaction: &Transaction<'_>,
     serialized: &SerializedEvent<'_>,
 ) -> Result<(), DbError> {
-    transaction
+    let inserted = transaction
         .execute(
             "INSERT INTO sync_outbox (outbox_id, event_id, state, created_at_ms)
              VALUES (
@@ -133,8 +190,45 @@ fn insert_stable_outbox(
                 serialized.event.created_at
             ],
         )
-        .map(|_| ())
-        .map_err(|error| DbError::sqlite("insert event outbox", error))
+        .map_err(|error| DbError::sqlite("insert event outbox", error))?;
+    if inserted == 0 {
+        validate_existing_outbox(transaction, serialized)?;
+    }
+    Ok(())
+}
+
+fn validate_existing_outbox(
+    transaction: &Transaction<'_>,
+    serialized: &SerializedEvent<'_>,
+) -> Result<(), DbError> {
+    let identical = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sync_outbox
+                WHERE outbox_id = ?1
+                  AND event_id = ?2
+                  AND created_at_ms =
+                      CAST(unixepoch(?3, 'subsec') * 1000 AS INTEGER)
+            )",
+            params![
+                serialized.outbox_id,
+                serialized.event.event_id,
+                serialized.event.created_at
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| DbError::sqlite("validate existing event Outbox", error))?;
+    if identical {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "validate existing event Outbox",
+            format!(
+                "stable Outbox {} conflicts with different immutable fields",
+                serialized.outbox_id
+            ),
+        ))
+    }
 }
 
 #[cfg(feature = "process-test-hooks")]
