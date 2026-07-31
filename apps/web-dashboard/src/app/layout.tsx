@@ -6,6 +6,7 @@ import { DashboardProvider } from "./providers";
 export const metadata: Metadata = {
   title: "Personal Computer Agent",
   description: "Owner Dashboard",
+  referrer: "no-referrer",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

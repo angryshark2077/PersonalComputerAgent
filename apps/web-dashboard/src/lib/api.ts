@@ -73,6 +73,9 @@ export async function authorizePairing(
   if (redirect === null || !isPairingCallback(redirect)) {
     throw new DashboardApiError("PAIRING_CALLBACK_INVALID", "Invalid pairing callback.");
   }
+  if (new URL(redirect).searchParams.get("state") !== callbackState) {
+    throw new DashboardApiError("PAIRING_CALLBACK_INVALID", "Pairing callback state mismatch.");
+  }
   return redirect;
 }
 
