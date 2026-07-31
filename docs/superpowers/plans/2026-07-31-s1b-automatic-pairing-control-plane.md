@@ -17,6 +17,7 @@
 - S1B adds no business Event sync, Collector source, attachment/R2 transfer, remote command, Network location inference, or WeChat database access.
 - Production remains unpaired until a valid S1B credential exists. Existing debug-only S2 test identity remains test-only and cannot become a release input.
 - Owner Cloud authorization is limited to `network` and `communication.wechat` configuration on the paired device's own Workspace. Every change needs an immutable actor/time/old/new/revision audit row; it cannot bypass macOS TCC.
+- Private-account bootstrap is fixed for S1B: Better Auth email/password registration creates the sole Owner Workspace for the first account. S1B exposes no public Workspace creation, invitation, role-management, or multi-tenant membership UI.
 - Cloud control polls every 30 seconds while healthy. Transient retry backs off with jitter and caps at five minutes. No request queue or retry loop is unbounded.
 - Raw Network and WeChat collection are not enabled by S1B itself; it only carries desired revisions. Later slices enforce 30-day Network raw retention and 90-day WeChat body/display-name retention.
 - Use only fixed, audited dependencies: Better Auth, Drizzle ORM, `pg`, `@hono/zod-validator`, Next.js, React, and Rust `reqwest` with rustls. Record license/version/lockfile impact in the dependency review. Do not modify `.env` or commit secrets.
@@ -189,7 +190,9 @@ Expected: missing migration, DTO, and DbActor methods.
 
 - [ ] **Step 3: Write the two immutable migrations**
 
-Cloud migration creates only `devices`, `device_credential_generations`,
+Cloud migration creates the Better Auth user/session/account tables plus one
+`workspaces` table and `workspace_members` table required to scope the first
+Owner. It also creates only the S1B domain tables `devices`, `device_credential_generations`,
 `pairing_sessions`, `pairing_authorization_codes`, `collector_configs`,
 `collector_config_audit`, and `device_heartbeats`. Store token/code hashes,
 expiry, consumed/revoked timestamps, and Workspace foreign keys; never store
