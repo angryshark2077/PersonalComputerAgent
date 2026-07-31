@@ -119,6 +119,36 @@ impl DeviceCredential {
         self
     }
 
+    /// Returns the Cloud device identifier without exposing either credential value.
+    #[must_use]
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// Returns the owning Workspace identifier without exposing either credential value.
+    #[must_use]
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    /// Returns the current Cloud credential generation.
+    #[must_use]
+    pub const fn credential_generation(&self) -> u64 {
+        self.credential_generation
+    }
+
+    /// Returns the access credential only to the authenticated Cloud client.
+    #[must_use]
+    pub fn access_credential(&self) -> &str {
+        &self.access_credential
+    }
+
+    /// Returns the refresh credential only to the authenticated Cloud client.
+    #[must_use]
+    pub fn refresh_credential(&self) -> &str {
+        &self.refresh_credential
+    }
+
     /// Serializes the record only after all schema and content checks succeed.
     pub fn encode(&self) -> Result<Vec<u8>, CredentialError> {
         self.validate()?;

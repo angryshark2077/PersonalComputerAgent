@@ -4,14 +4,14 @@ import Network
 @MainActor
 final class PairingCallbackServer {
     private static let callbackPath = "/pca/pair/callback"
-    private let expectedState: String
+    private var expectedState: String?
     private let listener: NWListener
     private var startContinuation: CheckedContinuation<URL, Error>?
     private var continuation: CheckedContinuation<URL, Error>?
     private var terminalResult: Result<URL, Error>?
     private(set) var isClosed = false
 
-    init(expectedState: String) throws {
+    init(expectedState: String? = nil) throws {
         self.expectedState = expectedState
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
@@ -26,6 +26,11 @@ final class PairingCallbackServer {
         listener.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in self?.handle(state) }
         }
+    }
+
+    func setExpectedState(_ state: String) throws {
+        guard !isClosed, !state.isEmpty else { throw PairingError.invalidCallback }
+        expectedState = state
     }
 
     func start() async throws -> URL {

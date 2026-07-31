@@ -488,6 +488,45 @@ pub(crate) fn clear_pairing_state(connection: &Connection) -> Result<(), DbError
         .map_err(|error| DbError::sqlite("clear pairing state", error))
 }
 
+pub(crate) fn clear_pairing_state_and_disable_sensitive_collectors(
+    connection: &mut Connection,
+) -> Result<(), DbError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start pairing revocation transaction", error))?;
+    transaction
+        .execute("DELETE FROM pairing_state WHERE singleton_id = 1", [])
+        .map_err(|error| DbError::sqlite("clear pairing state", error))?;
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    for collector_key in ["network", "communication.wechat"] {
+        transaction
+            .execute(
+                "INSERT INTO collector_states (
+                    collector_key, status, version, desired_revision, applied_revision,
+                    last_event_at_ms, last_health_at_ms, last_error_code,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, 'disabled', 's1b-unavailable', 0, 0, NULL, NULL, NULL, ?2, ?2)
+                 ON CONFLICT(collector_key) DO UPDATE SET
+                    status = 'disabled',
+                    desired_revision = 0,
+                    applied_revision = 0,
+                    last_error_code = NULL,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![collector_key, now_ms],
+            )
+            .map_err(|error| DbError::sqlite("disable sensitive Collector", error))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit pairing revocation transaction", error))
+}
+
 pub(crate) fn count_event_and_outbox(
     connection: &Connection,
     event_id: &str,

@@ -20,6 +20,7 @@ use pca_keychain::{
     BRIDGE_SHARED_SECRET_LENGTH,
 };
 use pca_keychain::{CredentialStore, MacOSKeychainStore};
+use pca_agentd::cloud_control::synchronize_pairing_state;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -209,6 +210,16 @@ impl RuntimeResources {
         };
         let (bridge_status_sender, mut bridge_status_receiver) =
             watch::channel(BridgeStatus::Disconnected);
+
+        // A build with process hooks has no production Keychain identity; keeping those harnesses
+        // explicitly unpaired prevents test-only identities from becoming a release input.
+        let pairing_valid = if cfg!(feature = "process-test-hooks") {
+            false
+        } else {
+            synchronize_pairing_state(self.database(), credential_store.as_ref())
+                .await
+                .unwrap_or(false)
+        };
         let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
         let bridge_task = start_bridge(
             config,
@@ -224,7 +235,13 @@ impl RuntimeResources {
         self.bridge_shutdown = Some(bridge_shutdown_sender);
 
         self.state
-            .transition_agent(AgentStatus::Unpaired)
+            .transition_agent(if pairing_valid {
+                // No bundled Cloud origin/local Setup transport is configured in this slice.
+                // A valid credential therefore remains locally healthy but Cloud-control degraded.
+                AgentStatus::Degraded
+            } else {
+                AgentStatus::Unpaired
+            })
             .map_err(|_| FailureStage::State)?;
         if self.bridge_task.is_none() {
             set_bridge_status(&mut self.state, BridgeStatus::Degraded)

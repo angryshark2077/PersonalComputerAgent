@@ -1,11 +1,10 @@
 import Foundation
-import Security
 
 @MainActor
 final class PairingCoordinator {
     private let agent: any PairingAgentHandingOff
     private let browser: any PairingBrowserOpening
-    private let callbackServerFactory: @MainActor @Sendable (String) throws -> PairingCallbackServer
+    private let callbackServerFactory: @MainActor @Sendable () throws -> PairingCallbackServer
     private var callbackServer: PairingCallbackServer?
     private var expectedState: String?
     private var consumed = false
@@ -13,7 +12,7 @@ final class PairingCoordinator {
     init(
         agent: any PairingAgentHandingOff,
         browser: any PairingBrowserOpening = SystemPairingBrowser(),
-        callbackServerFactory: @escaping @MainActor @Sendable (String) throws -> PairingCallbackServer = PairingCallbackServer.init
+        callbackServerFactory: @escaping @MainActor @Sendable () throws -> PairingCallbackServer = { try PairingCallbackServer() }
     ) {
         self.agent = agent
         self.browser = browser
@@ -21,7 +20,7 @@ final class PairingCoordinator {
     }
 
     static func fake(state: String) -> PairingCoordinator {
-        PairingCoordinator(agent: UnavailablePairingAgentBridge(), callbackServerFactory: { _ in
+        PairingCoordinator(agent: UnavailablePairingAgentBridge(), callbackServerFactory: {
             throw PairingError.unavailable
         }).configuredForTest(state: state)
     }
@@ -62,20 +61,16 @@ final class PairingCoordinator {
 
     private func start() async throws -> PairingResult {
         guard callbackServer == nil else { throw PairingError.alreadyConsumed }
-        let state = try randomURLSafeValue(byteCount: 32)
-        let verifier = try randomURLSafeValue(byteCount: 32)
-        let server = try callbackServerFactory(state)
+        let server = try callbackServerFactory()
         callbackServer = server
-        expectedState = state
         let callbackURI = try await server.start()
 
         do {
-            let handoff = PairingStartHandoff(
-                callbackURI: callbackURI,
-                callbackState: state
-            )
+            let handoff = PairingStartHandoff(callbackURI: callbackURI)
             let session = try await agent.beginPairing(handoff)
             activeSessionID = session.sessionID
+            expectedState = session.callbackState
+            try server.setExpectedState(session.callbackState)
             guard session.authorizationURL.scheme == "https", browser.open(session.authorizationURL) else {
                 throw PairingError.browserLaunchFailed
             }
@@ -91,8 +86,7 @@ final class PairingCoordinator {
             let acceptedCallback = try await accept(callback)
             let result = try await agent.completePairing(PairingCallbackHandoff(
                 sessionID: session.sessionID,
-                authorizationCode: acceptedCallback.authorizationCode,
-                codeVerifier: verifier
+                authorizationCode: acceptedCallback.authorizationCode
             ))
             activeSessionID = nil
             return result
@@ -112,15 +106,4 @@ final class PairingCoordinator {
         expectedState = state
         return self
     }
-}
-
-private func randomURLSafeValue(byteCount: Int) throws -> String {
-    var bytes = [UInt8](repeating: 0, count: byteCount)
-    guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-        throw PairingError.unavailable
-    }
-    return Data(bytes).base64EncodedString()
-        .replacingOccurrences(of: "+", with: "-")
-        .replacingOccurrences(of: "/", with: "_")
-        .replacingOccurrences(of: "=", with: "")
 }

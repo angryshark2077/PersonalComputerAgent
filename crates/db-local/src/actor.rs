@@ -131,6 +131,9 @@ enum Request {
     ClearPairingState {
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    ClearPairingStateAndDisableSensitiveCollectors {
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     Health {
         response: oneshot::Sender<Result<DbHealth, DbError>>,
     },
@@ -156,6 +159,7 @@ impl Request {
             | Self::SavePairingState { response, .. }
             | Self::SaveControlRevision { response, .. }
             | Self::ClearPairingState { response }
+            | Self::ClearPairingStateAndDisableSensitiveCollectors { response }
             | Self::Checkpoint { response } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
             Self::LoadPairingState { response } => response.is_closed(),
@@ -402,6 +406,25 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Atomically removes pairing and durably keeps future sensitive Collector sources disabled.
+    ///
+    /// S1B has no Network or WeChat source implementation; these rows prevent a later runtime
+    /// from treating a revoked pairing as an authorization to start either source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, transaction, or `SQLite` write error.
+    pub async fn clear_pairing_state_and_disable_sensitive_collectors(
+        &self,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::ClearPairingStateAndDisableSensitiveCollectors {
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Runs fresh integrity, foreign-key, and schema-version checks.
     ///
     /// # Errors
@@ -597,6 +620,13 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, option
             }
             Request::ClearPairingState { response } => {
                 let _ = response.send(repository::clear_pairing_state(&connection));
+            }
+            Request::ClearPairingStateAndDisableSensitiveCollectors { response } => {
+                let _ = response.send(
+                    repository::clear_pairing_state_and_disable_sensitive_collectors(
+                        &mut connection,
+                    ),
+                );
             }
             Request::Health { response } => {
                 let _ = response.send(repository::health(&connection));

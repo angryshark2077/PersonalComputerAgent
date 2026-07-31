@@ -14,14 +14,17 @@ path = "tests/support/fake_bridge.rs"
 required-features = ["process-test-hooks"]
 
 [dependencies]
+base64 = "=0.22.1"
 pca-agent-runtime = { path = "../../crates/agent-runtime" }
 pca-bridge-client = { path = "../../crates/bridge-client" }
 pca-db-local = { path = "../../crates/db-local" }
 pca-domain = { path = "../../crates/domain" }
 pca-keychain = { path = "../../crates/keychain" }
 pca-system-collector = { path = "../../crates/system-collector" }
+reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "=0.10.9"
 time = { version = "=0.3.36", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { workspace = true, features = ["v4"] }

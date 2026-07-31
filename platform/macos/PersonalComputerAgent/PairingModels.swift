@@ -30,18 +30,17 @@ enum PairingResult: Equatable, Sendable {
 
 struct PairingStartHandoff: Equatable, Sendable {
     let callbackURI: URL
-    let callbackState: String
 }
 
 struct PairingSessionHandoff: Equatable, Sendable {
     let sessionID: String
     let authorizationURL: URL
+    let callbackState: String
 }
 
 struct PairingCallbackHandoff: Equatable, Sendable {
     let sessionID: String
     let authorizationCode: String
-    let codeVerifier: String
 }
 
 @MainActor
