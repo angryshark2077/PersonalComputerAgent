@@ -8,12 +8,12 @@ rust-version.workspace = true
 [dependencies]
 pca-domain = { path = "../domain" }
 sysinfo = { version = "=0.33.1", default-features = false, features = ["system", "disk"] }
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 serde_json.workspace = true
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 
 [lints]
 workspace = true
