@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::{fmt, future::Future, pin::Pin};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,7 +19,8 @@ pub enum AgentStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CollectorStatus {
     Disabled,
     PermissionRequired,
@@ -28,6 +30,289 @@ pub enum CollectorStatus {
     Degraded,
     Unsupported,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectorDefinition {
+    pub key: &'static str,
+    pub version: &'static str,
+    pub supported_event_types: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectorState {
+    pub collector_key: String,
+    pub collector_version: String,
+    pub status: CollectorStatus,
+    pub desired_config_revision: u64,
+    pub applied_config_revision: u64,
+    pub last_event_at_ms: Option<i64>,
+    pub last_health_at_ms: Option<i64>,
+    pub last_error_code: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCpuMemory {
+    pub cpu_usage_percent: f64,
+    pub memory_total_bytes: u64,
+    pub memory_used_bytes: u64,
+}
+
+impl HostCpuMemory {
+    /// Creates a host CPU and memory sample after validating its percentage and totals.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when CPU usage is not finite or outside 0 through 100,
+    /// or when used memory exceeds total memory.
+    pub fn try_new(
+        cpu_usage_percent: f64,
+        memory_total_bytes: u64,
+        memory_used_bytes: u64,
+    ) -> Result<Self, DomainError> {
+        validate_percentage(cpu_usage_percent, "host cpu usage")?;
+        if memory_used_bytes > memory_total_bytes {
+            return Err(invalid_system_sample(
+                "host memory used bytes must not exceed total bytes",
+            ));
+        }
+
+        Ok(Self {
+            cpu_usage_percent,
+            memory_total_bytes,
+            memory_used_bytes,
+        })
+    }
+
+    fn validate(&self) -> Result<(), DomainError> {
+        validate_percentage(self.cpu_usage_percent, "host cpu usage")?;
+        if self.memory_used_bytes > self.memory_total_bytes {
+            return Err(invalid_system_sample(
+                "host memory used bytes must not exceed total bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCpuMemory {
+    pub cpu_usage_percent: f64,
+    pub memory_resident_bytes: u64,
+}
+
+impl AgentCpuMemory {
+    /// Creates an Agent CPU and memory sample after validating its percentage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when CPU usage is not finite or outside 0 through 100.
+    pub fn try_new(
+        cpu_usage_percent: f64,
+        memory_resident_bytes: u64,
+    ) -> Result<Self, DomainError> {
+        validate_percentage(cpu_usage_percent, "agent cpu usage")?;
+        Ok(Self {
+            cpu_usage_percent,
+            memory_resident_bytes,
+        })
+    }
+
+    fn validate(&self) -> Result<(), DomainError> {
+        validate_percentage(self.cpu_usage_percent, "agent cpu usage")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawCpuMemorySample")]
+pub struct CpuMemorySample {
+    pub sample_window_ms: u64,
+    pub logical_cpu_count: u32,
+    pub host: HostCpuMemory,
+    pub agent: AgentCpuMemory,
+}
+
+impl CpuMemorySample {
+    /// Creates a checked CPU and memory sample.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the sampling window or CPU count is zero, or when
+    /// either nested sample violates its percentage or byte-total constraints.
+    pub fn try_new(
+        sample_window_ms: u64,
+        logical_cpu_count: u32,
+        host: HostCpuMemory,
+        agent: AgentCpuMemory,
+    ) -> Result<Self, DomainError> {
+        if sample_window_ms == 0 {
+            return Err(invalid_system_sample(
+                "sample window milliseconds must be greater than zero",
+            ));
+        }
+        if logical_cpu_count == 0 {
+            return Err(invalid_system_sample(
+                "logical CPU count must be greater than zero",
+            ));
+        }
+        host.validate()?;
+        agent.validate()?;
+
+        Ok(Self {
+            sample_window_ms,
+            logical_cpu_count,
+            host,
+            agent,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCpuMemorySample {
+    sample_window_ms: u64,
+    logical_cpu_count: u32,
+    host: HostCpuMemory,
+    agent: AgentCpuMemory,
+}
+
+impl TryFrom<RawCpuMemorySample> for CpuMemorySample {
+    type Error = DomainError;
+
+    fn try_from(raw: RawCpuMemorySample) -> Result<Self, Self::Error> {
+        Self::try_new(
+            raw.sample_window_ms,
+            raw.logical_cpu_count,
+            raw.host,
+            raw.agent,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskScope {
+    PcaDataVolume,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawDiskSample")]
+pub struct DiskSample {
+    pub scope: DiskScope,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub used_percent: f64,
+    pub low_space: bool,
+    pub low_space_threshold_bytes: u64,
+    pub warning_code: Option<String>,
+}
+
+impl DiskSample {
+    /// Creates a checked PCA data-volume disk sample.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when totals, derived percentage, low-space state,
+    /// threshold, or warning code disagree with the canonical contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        scope: DiskScope,
+        total_bytes: u64,
+        available_bytes: u64,
+        used_percent: f64,
+        low_space: bool,
+        low_space_threshold_bytes: u64,
+        warning_code: Option<String>,
+    ) -> Result<Self, DomainError> {
+        const LOW_SPACE_THRESHOLD_BYTES: u64 = 2_147_483_648;
+
+        if total_bytes == 0 {
+            return Err(invalid_system_sample(
+                "disk total bytes must be greater than zero",
+            ));
+        }
+        if available_bytes > total_bytes {
+            return Err(invalid_system_sample(
+                "disk available bytes must not exceed total bytes",
+            ));
+        }
+        validate_percentage(used_percent, "disk used percentage")?;
+        if low_space_threshold_bytes != LOW_SPACE_THRESHOLD_BYTES {
+            return Err(invalid_system_sample(
+                "disk low-space threshold must be 2147483648 bytes",
+            ));
+        }
+
+        let expected_used_percent = disk_used_percentage(total_bytes, available_bytes);
+        if (used_percent - expected_used_percent).abs() > 0.01 {
+            return Err(invalid_system_sample(
+                "disk used percentage must match total and available bytes",
+            ));
+        }
+
+        let expected_low_space = available_bytes < low_space_threshold_bytes;
+        if low_space != expected_low_space {
+            return Err(invalid_system_sample(
+                "disk low-space state must match the available-byte threshold",
+            ));
+        }
+
+        let expected_warning_code = low_space.then_some("DISK_SPACE_LOW");
+        if warning_code.as_deref() != expected_warning_code {
+            return Err(invalid_system_sample(
+                "disk warning code must match the low-space state",
+            ));
+        }
+
+        Ok(Self {
+            scope,
+            total_bytes,
+            available_bytes,
+            used_percent,
+            low_space,
+            low_space_threshold_bytes,
+            warning_code,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDiskSample {
+    scope: DiskScope,
+    total_bytes: u64,
+    available_bytes: u64,
+    used_percent: f64,
+    low_space: bool,
+    low_space_threshold_bytes: u64,
+    warning_code: Option<String>,
+}
+
+impl TryFrom<RawDiskSample> for DiskSample {
+    type Error = DomainError;
+
+    fn try_from(raw: RawDiskSample) -> Result<Self, Self::Error> {
+        Self::try_new(
+            raw.scope,
+            raw.total_bytes,
+            raw.available_bytes,
+            raw.used_percent,
+            raw.low_space,
+            raw.low_space_threshold_bytes,
+            raw.warning_code,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "metric_group", rename_all = "snake_case")]
+pub enum SystemMetricSample {
+    CpuMemory(CpuMemorySample),
+    Disk(DiskSample),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,13 +430,95 @@ pub struct DomainError {
     pub retryable: bool,
 }
 
-pub trait EventSink: Send + Sync {
-    /// Persists an event through the configured sink.
+impl DomainError {
+    #[must_use]
+    pub fn new(code: &str, message: &str, retryable: bool) -> Self {
+        Self {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            retryable,
+        }
+    }
+}
+
+impl fmt::Display for DomainError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for DomainError {}
+
+fn invalid_system_sample(message: &str) -> DomainError {
+    DomainError::new("COLLECTOR_DEGRADED", message, false)
+}
+
+fn validate_percentage(value: f64, field: &str) -> Result<(), DomainError> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(invalid_system_sample(&format!(
+            "{field} must be finite and between zero and 100"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn disk_used_percentage(total_bytes: u64, available_bytes: u64) -> f64 {
+    ((total_bytes - available_bytes) as f64 / total_bytes as f64) * 100.0
+}
+
+pub const MAX_EVENTS_PER_COMMIT: usize = 4;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventCommit {
+    events: Vec<EventEnvelope>,
+    collector_state: Option<CollectorState>,
+}
+
+impl EventCommit {
+    /// Creates a commit that atomically persists one through four events and optional state.
     ///
     /// # Errors
     ///
-    /// Returns a domain error when the sink rejects or cannot persist the event.
-    fn emit(&self, event: EventEnvelope) -> Result<(), DomainError>;
+    /// Returns a domain error when the commit contains no events or more than four events.
+    pub fn try_new(
+        events: Vec<EventEnvelope>,
+        collector_state: Option<CollectorState>,
+    ) -> Result<Self, DomainError> {
+        if !(1..=MAX_EVENTS_PER_COMMIT).contains(&events.len()) {
+            return Err(DomainError::new(
+                "COLLECTOR_DEGRADED",
+                "event commit must contain one through four events",
+                false,
+            ));
+        }
+        Ok(Self {
+            events,
+            collector_state,
+        })
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[EventEnvelope] {
+        &self.events
+    }
+
+    #[must_use]
+    pub fn collector_state(&self) -> Option<&CollectorState> {
+        self.collector_state.as_ref()
+    }
+}
+
+pub type EventSinkFuture<'a> = Pin<Box<dyn Future<Output = Result<(), DomainError>> + Send + 'a>>;
+
+pub trait EventSink: Send + Sync {
+    /// Persists a bounded event commit through the configured sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the sink rejects or cannot persist the commit.
+    #[allow(clippy::elidable_lifetime_names)]
+    fn commit<'a>(&'a self, commit: EventCommit) -> EventSinkFuture<'a>;
 }
 
 pub trait Collector: Send {
