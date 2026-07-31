@@ -567,7 +567,7 @@ fn stale_health_and_unavailable_prepare_sleep_have_meaningful_exit_codes() {
         heartbeat_at: "2020-01-01T00:00:00Z".to_owned(),
         process_id: 1,
         app_version: "0.0.0".to_owned(),
-        schema_version: 1,
+        schema_version: 2,
     };
     fs::write(
         &paths.status_file,

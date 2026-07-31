@@ -418,7 +418,7 @@ valid = (value["agent_status"] in {"unpaired", "running"} and value["bridge_stat
          and heartbeat.timestamp() >= activation_lower_bound
          and path.stat().st_mtime >= activation_lower_bound
          and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-         and value["app_version"] == expected_version and value["schema_version"] == 1)
+         and value["app_version"] == expected_version and value["schema_version"] == 2)
 if not valid: raise SystemExit(1)
 print(pid)
 PY

@@ -1,4 +1,6 @@
-use pca_domain::{AgentStatus, BridgeStatus, EventEnvelope, Sensitivity};
+use pca_domain::{
+    AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventEnvelope, Sensitivity,
+};
 use rusqlite::{params, Connection};
 
 #[cfg(feature = "process-test-hooks")]
@@ -140,6 +142,102 @@ pub(crate) fn set_agent_state(
         .map_err(|error| DbError::sqlite("set agent state", error))
 }
 
+pub(crate) fn load_collector_states(
+    connection: &Connection,
+) -> Result<Vec<CollectorState>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT collector_key, status, version, desired_revision, applied_revision,
+                    last_event_at_ms, last_health_at_ms, last_error_code,
+                    created_at_ms, updated_at_ms
+             FROM collector_states
+             ORDER BY collector_key",
+        )
+        .map_err(|error| DbError::sqlite("prepare Collector state query", error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })
+        .map_err(|error| DbError::sqlite("query Collector states", error))?;
+
+    rows.map(|row| {
+        let (
+            collector_key,
+            status,
+            collector_version,
+            desired_config_revision,
+            applied_config_revision,
+            last_event_at_ms,
+            last_health_at_ms,
+            last_error_code,
+            created_at_ms,
+            updated_at_ms,
+        ) = row.map_err(|error| DbError::sqlite("read Collector state", error))?;
+        Ok(CollectorState {
+            collector_key,
+            collector_version,
+            status: collector_status(&status)?,
+            desired_config_revision,
+            applied_config_revision,
+            last_event_at_ms,
+            last_health_at_ms,
+            last_error_code,
+            created_at_ms,
+            updated_at_ms,
+        })
+    })
+    .collect()
+}
+
+pub(crate) fn upsert_collector_state_in(
+    connection: &Connection,
+    state: &CollectorState,
+) -> Result<(), DbError> {
+    connection
+        .execute(
+            "INSERT INTO collector_states (
+                collector_key, status, version, desired_revision, applied_revision,
+                last_event_at_ms, last_health_at_ms, last_error_code,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(collector_key) DO UPDATE SET
+                status = excluded.status,
+                version = excluded.version,
+                desired_revision = excluded.desired_revision,
+                applied_revision = excluded.applied_revision,
+                last_event_at_ms = excluded.last_event_at_ms,
+                last_health_at_ms = excluded.last_health_at_ms,
+                last_error_code = excluded.last_error_code,
+                created_at_ms = excluded.created_at_ms,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                state.collector_key,
+                collector_status_name(state.status),
+                state.collector_version,
+                state.desired_config_revision,
+                state.applied_config_revision,
+                state.last_event_at_ms,
+                state.last_health_at_ms,
+                state.last_error_code,
+                state.created_at_ms,
+                state.updated_at_ms,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("upsert Collector state", error))
+}
+
 pub(crate) fn count_event_and_outbox(
     connection: &Connection,
     event_id: &str,
@@ -194,6 +292,10 @@ pub(crate) fn smoke_queries(connection: &Connection) -> Result<(), DbError> {
         "SELECT key, value FROM local_meta LIMIT 1",
         "SELECT singleton_id, agent_status, bridge_status, local_healthy, updated_at_ms
          FROM agent_state LIMIT 1",
+        "SELECT collector_key, status, version, desired_revision, applied_revision,
+                last_event_at_ms, last_health_at_ms, last_error_code,
+                created_at_ms, updated_at_ms
+         FROM collector_states LIMIT 1",
         "SELECT event_id, workspace_id, device_id, event_type, source, schema_version,
                 occurred_at_ms, created_at_ms, sensitivity, payload_json,
                 attachment_refs_json, idempotency_key
@@ -272,6 +374,36 @@ const fn sensitivity_name(sensitivity: Sensitivity) -> &'static str {
         Sensitivity::Medium => "medium",
         Sensitivity::High => "high",
         Sensitivity::Secret => "secret",
+    }
+}
+
+const fn collector_status_name(status: CollectorStatus) -> &'static str {
+    match status {
+        CollectorStatus::Disabled => "disabled",
+        CollectorStatus::PermissionRequired => "permission_required",
+        CollectorStatus::Initializing => "initializing",
+        CollectorStatus::Running => "running",
+        CollectorStatus::Paused => "paused",
+        CollectorStatus::Degraded => "degraded",
+        CollectorStatus::Unsupported => "unsupported",
+        CollectorStatus::Error => "error",
+    }
+}
+
+fn collector_status(status: &str) -> Result<CollectorStatus, DbError> {
+    match status {
+        "disabled" => Ok(CollectorStatus::Disabled),
+        "permission_required" => Ok(CollectorStatus::PermissionRequired),
+        "initializing" => Ok(CollectorStatus::Initializing),
+        "running" => Ok(CollectorStatus::Running),
+        "paused" => Ok(CollectorStatus::Paused),
+        "degraded" => Ok(CollectorStatus::Degraded),
+        "unsupported" => Ok(CollectorStatus::Unsupported),
+        "error" => Ok(CollectorStatus::Error),
+        _ => Err(DbError::sqlite(
+            "decode Collector state",
+            format!("unknown Collector status {status}"),
+        )),
     }
 }
 

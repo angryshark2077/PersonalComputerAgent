@@ -8,10 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pca_db_local::{DbActorHandle, DbError};
-use pca_domain::{AgentStatus, BridgeStatus, EventEnvelope, Sensitivity};
+use pca_db_local::{DbActorHandle, DbError, BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION};
+use pca_domain::{
+    AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventEnvelope, Sensitivity,
+};
 use rusqlite::Connection;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -52,6 +55,74 @@ fn event(event_id: &str) -> EventEnvelope {
     }
 }
 
+fn collector_state(status: CollectorStatus) -> CollectorState {
+    CollectorState {
+        collector_key: "system".to_owned(),
+        collector_version: "0.2.0".to_owned(),
+        status,
+        desired_config_revision: 7,
+        applied_config_revision: 6,
+        last_event_at_ms: Some(1_754_013_723_000),
+        last_health_at_ms: Some(1_754_013_724_000),
+        last_error_code: Some("SYSTEM_SAMPLE_FAILED".to_owned()),
+        created_at_ms: 1_754_013_720_000,
+        updated_at_ms: 1_754_013_725_000,
+    }
+}
+
+fn apply_previous_migration_chain(connection: &Connection) {
+    for (id, sql) in [
+        ("0000", BASELINE_MIGRATION),
+        ("0001", S1A_RUNTIME_MIGRATION),
+    ] {
+        connection.execute_batch(sql).expect("apply old migration");
+        let checksum = format!("{:x}", Sha256::digest(sql.as_bytes()));
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (
+                    id, checksum, app_version, started_at, completed_at, status
+                 ) VALUES (?1, ?2, '0.1.0', 1, 1, 'completed')",
+                (id, checksum),
+            )
+            .expect("record old migration");
+    }
+}
+
+fn event_and_outbox_rows(connection: &Connection) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+    let events = connection
+        .prepare(
+            "SELECT event_id, workspace_id, device_id, event_type, source,
+                    CAST(schema_version AS TEXT), CAST(occurred_at_ms AS TEXT),
+                    CAST(created_at_ms AS TEXT), sensitivity, payload_json,
+                    attachment_refs_json, COALESCE(idempotency_key, '')
+             FROM events_local ORDER BY event_id",
+        )
+        .expect("prepare Event snapshot")
+        .query_map([], |row| {
+            (0..12)
+                .map(|index| row.get::<_, String>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .expect("query Event snapshot")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read Event snapshot");
+    let outbox = connection
+        .prepare(
+            "SELECT outbox_id, event_id, state, CAST(created_at_ms AS TEXT)
+             FROM sync_outbox ORDER BY outbox_id",
+        )
+        .expect("prepare Outbox snapshot")
+        .query_map([], |row| {
+            (0..4)
+                .map(|index| row.get::<_, String>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .expect("query Outbox snapshot")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read Outbox snapshot");
+    (events, outbox)
+}
+
 fn schema(connection: &Connection) -> Vec<(String, String, String)> {
     let mut statement = connection
         .prepare(
@@ -75,7 +146,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 1);
+    assert_eq!(health.schema_version, 2);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -90,12 +161,86 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         tables,
         vec![
             "agent_state",
+            "collector_states",
             "diagnostic_events",
             "events_local",
             "local_meta",
             "schema_migrations",
             "sync_outbox",
         ]
+    );
+}
+
+#[tokio::test]
+async fn collector_state_survives_reopen_but_runtime_status_is_data_not_policy() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let expected = collector_state(CollectorStatus::Running);
+    db.upsert_collector_state(&expected)
+        .await
+        .expect("persist state");
+    db.shutdown().await.expect("close database");
+
+    let db = DbActorHandle::open(&path, "0.2.1")
+        .await
+        .expect("reopen database");
+    assert_eq!(
+        db.load_collector_states().await.expect("load state"),
+        vec![expected]
+    );
+}
+
+#[tokio::test]
+async fn opening_previous_schema_adds_collector_state_without_changing_event_or_outbox() {
+    let (_directory, path) = database_path();
+    let connection = Connection::open(&path).expect("open previous database");
+    apply_previous_migration_chain(&connection);
+    connection
+        .execute(
+            "INSERT INTO events_local (
+                event_id, workspace_id, device_id, event_type, source, schema_version,
+                occurred_at_ms, created_at_ms, sensitivity, payload_json,
+                attachment_refs_json, idempotency_key
+             ) VALUES (
+                'event-before-s2', 'workspace-1', 'device-1', 'AGENT_STARTED',
+                'runtime', 1, 10, 11, 'normal', '{\"reason\":\"upgrade\"}',
+                '[\"attachment-before-s2\"]', 'startup-before-s2'
+             )",
+            [],
+        )
+        .expect("insert previous Event");
+    connection
+        .execute(
+            "INSERT INTO sync_outbox (outbox_id, event_id, state, created_at_ms)
+             VALUES ('event:event-before-s2', 'event-before-s2', 'pending', 11)",
+            [],
+        )
+        .expect("insert previous Outbox");
+    let before = event_and_outbox_rows(&connection);
+    drop(connection);
+
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("upgrade previous database");
+    assert_eq!(
+        db.health().await.expect("upgraded health").schema_version,
+        2
+    );
+    db.shutdown().await.expect("close upgraded database");
+
+    let connection = Connection::open(&path).expect("inspect upgraded database");
+    assert_eq!(event_and_outbox_rows(&connection), before);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE id = '0002'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("count S2 migration"),
+        1
     );
 }
 
@@ -303,7 +448,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0002', 'future', '9.0.0', 1, 1, 'completed')",
+             VALUES ('0003', 'future', '9.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -314,8 +459,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 2,
-            max_supported: 1
+            found: 3,
+            max_supported: 2
         })
     ));
 }
@@ -338,7 +483,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 1);
+    assert_eq!(health.schema_version, 2);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(

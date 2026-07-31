@@ -55,6 +55,7 @@ class EngineeringGateTests(unittest.TestCase):
         for relative_path in (
             "crates/db-local/migrations/0000_baseline.sql",
             "crates/db-local/migrations/0001_s1a_runtime.sql",
+            "crates/db-local/migrations/0002_s2_collector_state.sql",
             "packages/db-cloud/migrations/0000_baseline.sql",
         ):
             source = REPOSITORY_ROOT / relative_path
@@ -65,6 +66,7 @@ class EngineeringGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("0000_baseline.sql sha256=", result.stdout)
         self.assertIn("0001_s1a_runtime.sql sha256=", result.stdout)
+        self.assertIn("0002_s2_collector_state.sql sha256=", result.stdout)
 
     def test_domain_to_platform_import_is_rejected(self) -> None:
         root = self.make_repo()

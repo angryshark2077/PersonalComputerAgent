@@ -19,6 +19,9 @@ pub use error::DbError;
 pub const BASELINE_MIGRATION: &str = include_str!("../migrations/0000_baseline.sql");
 /// The immutable S1A runtime database migration.
 pub const S1A_RUNTIME_MIGRATION: &str = include_str!("../migrations/0001_s1a_runtime.sql");
+/// The immutable S2 Collector-state database migration.
+pub const S2_COLLECTOR_STATE_MIGRATION: &str =
+    include_str!("../migrations/0002_s2_collector_state.sql");
 
 /// Results of fresh `SQLite` health checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +36,7 @@ pub struct DbHealth {
 
 #[cfg(test)]
 mod tests {
-    use super::{BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION};
+    use super::{BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION, S2_COLLECTOR_STATE_MIGRATION};
 
     #[test]
     fn baseline_creates_only_the_migration_ledger() {
@@ -45,5 +48,14 @@ mod tests {
     fn s1a_runtime_migration_has_only_the_required_tables() {
         assert_eq!(S1A_RUNTIME_MIGRATION.matches("CREATE TABLE").count(), 5);
         assert_eq!(S1A_RUNTIME_MIGRATION.matches("CREATE INDEX").count(), 2);
+    }
+
+    #[test]
+    fn s2_collector_state_migration_has_only_the_required_table() {
+        assert_eq!(
+            S2_COLLECTOR_STATE_MIGRATION.matches("CREATE TABLE").count(),
+            1
+        );
+        assert!(!S2_COLLECTOR_STATE_MIGRATION.contains("CREATE INDEX"));
     }
 }

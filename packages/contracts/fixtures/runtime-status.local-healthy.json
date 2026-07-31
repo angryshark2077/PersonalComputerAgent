@@ -5,5 +5,5 @@
   "heartbeat_at": "2026-07-31T00:00:00Z",
   "process_id": 4242,
   "app_version": "0.0.0-s1a",
-  "schema_version": 1
+  "schema_version": 2
 }

@@ -13,7 +13,11 @@ MIGRATION_ROOTS = (
 )
 
 EXPECTED_MIGRATIONS = {
-    MIGRATION_ROOTS[0]: ["0000_baseline.sql", "0001_s1a_runtime.sql"],
+    MIGRATION_ROOTS[0]: [
+        "0000_baseline.sql",
+        "0001_s1a_runtime.sql",
+        "0002_s2_collector_state.sql",
+    ],
     MIGRATION_ROOTS[1]: ["0000_baseline.sql"],
 }
 

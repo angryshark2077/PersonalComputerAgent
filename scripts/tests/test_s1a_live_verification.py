@@ -349,7 +349,7 @@ class S1ALiveVerificationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_wrong_schema_or_app_version_is_rejected(self) -> None:
-        for field, value in (("schema_version", 2), ("app_version", "9.9.9")):
+        for field, value in (("schema_version", 1), ("app_version", "9.9.9")):
             with self.subTest(field=field):
                 self._write_status()
                 payload = json.loads(self.status.read_text(encoding="utf-8"))
@@ -454,7 +454,7 @@ class S1ALiveVerificationTests(unittest.TestCase):
                     "heartbeat_at": datetime.now(timezone.utc).isoformat(),
                     "process_id": 4101,
                     "app_version": "0.1.0",
-                    "schema_version": 1,
+                    "schema_version": 2,
                 }
             ),
             encoding="utf-8",

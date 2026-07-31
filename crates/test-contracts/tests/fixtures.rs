@@ -37,7 +37,7 @@ fn runtime_status_fixture_decodes_every_canonical_field() {
     assert_eq!(status.heartbeat_at, "2026-07-31T00:00:00Z");
     assert_eq!(status.process_id, 4242);
     assert_eq!(status.app_version, "0.0.0-s1a");
-    assert_eq!(status.schema_version, 1);
+    assert_eq!(status.schema_version, 2);
 }
 
 #[test]

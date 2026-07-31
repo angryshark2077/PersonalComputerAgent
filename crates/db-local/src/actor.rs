@@ -3,7 +3,7 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, thread, time::Duration};
 #[cfg(feature = "process-test-hooks")]
 use std::path::PathBuf;
 
-use pca_domain::{AgentStatus, BridgeStatus, EventEnvelope};
+use pca_domain::{AgentStatus, BridgeStatus, CollectorState, EventEnvelope};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
@@ -63,6 +63,13 @@ enum Request {
         updated_at_ms: i64,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    LoadCollectorStates {
+        response: oneshot::Sender<Result<Vec<CollectorState>, DbError>>,
+    },
+    UpsertCollectorState {
+        state: Box<CollectorState>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     Health {
         response: oneshot::Sender<Result<DbHealth, DbError>>,
     },
@@ -80,7 +87,9 @@ impl Request {
         match self {
             Self::AppendEvent { response, .. }
             | Self::SetAgentState { response, .. }
+            | Self::UpsertCollectorState { response, .. }
             | Self::Checkpoint { response } => response.is_closed(),
+            Self::LoadCollectorStates { response } => response.is_closed(),
             Self::Health { response } => response.is_closed(),
             Self::CountEventAndOutbox { response, .. } => response.is_closed(),
         }
@@ -209,6 +218,38 @@ impl DbActorHandle {
             bridge_status,
             local_healthy,
             updated_at_ms,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Loads all durable Collector runtime state ordered by Collector key.
+    ///
+    /// The persisted status is restart data; Agent Core remains responsible for recomputing
+    /// runtime policy before starting a Collector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, decoding, or `SQLite` query error.
+    pub async fn load_collector_states(&self) -> Result<Vec<CollectorState>, DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::LoadCollectorStates {
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Inserts or replaces one durable Collector runtime state row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, conversion, constraint, or `SQLite` write error.
+    pub async fn upsert_collector_state(&self, state: &CollectorState) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::UpsertCollectorState {
+            state: Box::new(state.clone()),
             response: response_sender,
         })
         .await?;
@@ -364,6 +405,12 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, option
                     local_healthy,
                     updated_at_ms,
                 ));
+            }
+            Request::LoadCollectorStates { response } => {
+                let _ = response.send(repository::load_collector_states(&connection));
+            }
+            Request::UpsertCollectorState { state, response } => {
+                let _ = response.send(repository::upsert_collector_state_in(&connection, &state));
             }
             Request::Health { response } => {
                 let _ = response.send(repository::health(&connection));
