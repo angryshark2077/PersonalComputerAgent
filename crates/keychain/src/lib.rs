@@ -1,5 +1,8 @@
 use std::{error::Error, fmt};
 
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
 mod macos;
 #[cfg(test)]
 mod macos_tests;
@@ -9,12 +12,16 @@ pub use macos::MacOSKeychainStore;
 pub const BRIDGE_CREDENTIAL_SERVICE: &str = "com.pca.bridge";
 pub const BRIDGE_CREDENTIAL_ACCOUNT: &str = "shared-secret-v1";
 pub const BRIDGE_SHARED_SECRET_LENGTH: usize = 32;
+pub const DEVICE_CREDENTIAL_SERVICE: &str = "com.pca.device";
+pub const DEVICE_CREDENTIAL_ACCOUNT: &str = "current-v1";
+const DEVICE_CREDENTIAL_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialError {
     Unavailable,
     InvalidSecretLength,
     CorruptSecret,
+    InvalidCredential,
     OperationFailed,
     UnsupportedIdentity,
 }
@@ -25,6 +32,7 @@ impl fmt::Display for CredentialError {
             Self::Unavailable => "credential store unavailable",
             Self::InvalidSecretLength => "invalid credential length",
             Self::CorruptSecret => "stored credential is corrupt",
+            Self::InvalidCredential => "device credential is invalid",
             Self::OperationFailed => "credential operation failed",
             Self::UnsupportedIdentity => "credential identity unsupported",
         };
@@ -55,6 +63,118 @@ pub trait CredentialStore: Send + Sync {
     ///
     /// Returns a safe [`CredentialError`] when the backing store cannot complete the operation.
     fn delete(&self, service: &str, account: &str) -> Result<(), CredentialError>;
+}
+
+/// The versioned device credential payload kept in the dedicated macOS Keychain item.
+///
+/// The value is intentionally opaque to SQLite, Events, and logs. Task 6 must add the Agent
+/// local-IPC Keychain adapter that creates this item with an ACL for the installed Setup app and
+/// `agentd`; this crate deliberately supplies only the versioned codec and fixed identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceCredential {
+    version: u8,
+    device_id: String,
+    workspace_id: String,
+    credential_generation: u64,
+    access_expires_at_ms: i64,
+    refresh_expires_at_ms: i64,
+    access_credential: String,
+    refresh_credential: String,
+}
+
+impl DeviceCredential {
+    /// Creates a validated credential with initial generation and expiry metadata.
+    /// Call [`Self::with_metadata`] with the exchange values before persisting it.
+    pub fn new(
+        device_id: String,
+        workspace_id: String,
+        access_credential: &str,
+        refresh_credential: &str,
+    ) -> Result<Self, CredentialError> {
+        let credential = Self {
+            version: DEVICE_CREDENTIAL_VERSION,
+            device_id,
+            workspace_id,
+            credential_generation: 0,
+            access_expires_at_ms: 0,
+            refresh_expires_at_ms: 0,
+            access_credential: access_credential.to_owned(),
+            refresh_credential: refresh_credential.to_owned(),
+        };
+        credential.validate()?;
+        Ok(credential)
+    }
+
+    #[must_use]
+    pub fn with_metadata(
+        mut self,
+        credential_generation: u64,
+        access_expires_at_ms: i64,
+        refresh_expires_at_ms: i64,
+    ) -> Self {
+        self.credential_generation = credential_generation;
+        self.access_expires_at_ms = access_expires_at_ms;
+        self.refresh_expires_at_ms = refresh_expires_at_ms;
+        self
+    }
+
+    /// Serializes the record only after all schema and content checks succeed.
+    pub fn encode(&self) -> Result<Vec<u8>, CredentialError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| CredentialError::InvalidCredential)
+    }
+
+    /// Decodes a versioned record without exposing its contents through an error.
+    pub fn decode(value: &[u8]) -> Result<Self, CredentialError> {
+        let credential: Self = serde_json::from_slice(value).map_err(|_| CredentialError::InvalidCredential)?;
+        credential.validate()?;
+        Ok(credential)
+    }
+
+    fn validate(&self) -> Result<(), CredentialError> {
+        let identifiers_valid = self.version == DEVICE_CREDENTIAL_VERSION
+            && Uuid::parse_str(&self.device_id).is_ok()
+            && Uuid::parse_str(&self.workspace_id).is_ok();
+        let expiry_valid = self.access_expires_at_ms >= 0
+            && self.refresh_expires_at_ms >= self.access_expires_at_ms;
+        if identifiers_valid
+            && expiry_valid
+            && !self.access_credential.is_empty()
+            && !self.refresh_credential.is_empty()
+        {
+            Ok(())
+        } else {
+            Err(CredentialError::InvalidCredential)
+        }
+    }
+}
+
+/// Loads and validates the device credential at `com.pca.device/current-v1`.
+pub fn load_device_credential(
+    store: &dyn CredentialStore,
+) -> Result<Option<DeviceCredential>, CredentialError> {
+    store
+        .load(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT)?
+        .map(|record| DeviceCredential::decode(&record))
+        .transpose()
+}
+
+/// Stores a fully validated device credential at `com.pca.device/current-v1`.
+pub fn store_device_credential(
+    store: &dyn CredentialStore,
+    credential: &DeviceCredential,
+) -> Result<(), CredentialError> {
+    store.store(
+        DEVICE_CREDENTIAL_SERVICE,
+        DEVICE_CREDENTIAL_ACCOUNT,
+        &credential.encode()?,
+    )
+}
+
+/// Deletes the device credential when it is present.
+pub fn delete_device_credential(store: &dyn CredentialStore) -> Result<(), CredentialError> {
+    store.delete(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT)
 }
 
 /// Loads the fixed Bridge shared secret and validates its exact length.

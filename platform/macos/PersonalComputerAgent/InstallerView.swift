@@ -18,6 +18,11 @@ struct InstallerView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
             }
+            if canRepairPairing {
+                Button("Retry Pairing") { model.repairPairing() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+            }
         }
         .padding(28)
         .frame(width: 520, height: 310)
@@ -37,6 +42,15 @@ struct InstallerView: View {
             progress("Approve Personal Computer Agent in System Settings > General > Login Items.")
         case .starting:
             progress("Starting the local runtime…")
+        case .pairing:
+            progress("Opening the secure pairing flow…")
+        case let .repair(message):
+            VStack(alignment: .leading, spacing: 8) {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                Text("Retry pairing after the local Agent is available. Existing device credentials were not changed.")
+                    .foregroundStyle(.secondary)
+            }
         case .success:
             Label("Installed and running", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
@@ -55,6 +69,11 @@ struct InstallerView: View {
         case .ready, .failed: true
         default: false
         }
+    }
+
+    private var canRepairPairing: Bool {
+        if case .repair = model.state { return !model.isPairing }
+        return false
     }
 
     private func progress(_ text: String) -> some View {

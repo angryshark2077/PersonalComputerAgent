@@ -57,7 +57,8 @@ private struct PCAInstallerApplication: App {
                 wrappedValue: InstallerViewModel(
                     coordinator: coordinator,
                     sourceBundle: Bundle.main.bundleURL,
-                    automaticallyStart: CommandLine.arguments.dropFirst().first == "--setup-installed"
+                    automaticallyStart: CommandLine.arguments.dropFirst().first == "--setup-installed",
+                    pairingCoordinator: PairingCoordinator(agent: UnavailablePairingAgentBridge())
                 )
             )
         } catch {

@@ -7,6 +7,8 @@ enum InstallerState: Equatable, Sendable {
     case validating
     case waitingApproval
     case starting
+    case pairing
+    case repair(message: String)
     case success
     case failed(message: String, recoveryAction: String)
 }
@@ -27,21 +29,26 @@ final class InstallerViewModel: ObservableObject {
     private let coordinator: (any InstallCoordinating)?
     private let sourceBundle: URL
     private let terminator: any ApplicationTerminating
+    private let pairingCoordinator: PairingCoordinator?
     private var automaticStartPending: Bool
     private var activeInstall: (generation: UUID, task: Task<Void, Never>)?
+    private var activePairing: Task<Void, Never>?
 
     var installationAvailable: Bool { coordinator != nil }
     var isInstalling: Bool { activeInstall != nil }
+    var isPairing: Bool { activePairing != nil }
 
     init(
         coordinator: any InstallCoordinating,
         sourceBundle: URL,
         automaticallyStart: Bool = false,
+        pairingCoordinator: PairingCoordinator? = nil,
         terminator: any ApplicationTerminating = NSApplicationTerminator()
     ) {
         self.coordinator = coordinator
         self.sourceBundle = sourceBundle
         automaticStartPending = automaticallyStart
+        self.pairingCoordinator = pairingCoordinator
         self.terminator = terminator
     }
 
@@ -49,6 +56,7 @@ final class InstallerViewModel: ObservableObject {
         coordinator = nil
         sourceBundle = Bundle.main.bundleURL
         automaticStartPending = false
+        pairingCoordinator = nil
         terminator = NSApplicationTerminator()
         state = .failed(message: failureMessage, recoveryAction: recoveryAction)
     }
@@ -90,6 +98,8 @@ final class InstallerViewModel: ObservableObject {
             }
             if case .relaunchRequired = result {
                 terminator.terminate()
+            } else if pairingCoordinator != nil {
+                startPairing(repair: false)
             }
         } catch let error as InstallError {
             if error.shouldTerminateCurrentProcess {
@@ -110,5 +120,25 @@ final class InstallerViewModel: ObservableObject {
 
     func cancel() {
         activeInstall?.task.cancel()
+    }
+
+    func repairPairing() {
+        startPairing(repair: true)
+    }
+
+    private func startPairing(repair: Bool) {
+        guard activePairing == nil, let pairingCoordinator else { return }
+        state = .pairing
+        activePairing = Task { [weak self] in
+            defer { self?.activePairing = nil }
+            do {
+                _ = try await (repair ? pairingCoordinator.repair() : pairingCoordinator.startIfUnpaired())
+                self?.state = .success
+            } catch let error as PairingError {
+                self?.state = .repair(message: error.localizedDescription)
+            } catch {
+                self?.state = .repair(message: "Pairing could not be completed safely.")
+            }
+        }
     }
 }
