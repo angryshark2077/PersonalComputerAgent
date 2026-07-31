@@ -113,9 +113,7 @@ export const devices = pgTable(
     workspaceId: uuid("workspace_id")
       .notNull()
       .references(() => workspaces.id, { onDelete: "restrict" }),
-    ownerUserId: uuid("owner_user_id")
-      .notNull()
-      .references(() => authUsers.id, { onDelete: "restrict" }),
+    ownerUserId: uuid("owner_user_id").notNull(),
     devicePublicKeyHash: char("device_public_key_hash", { length: 64 }).notNull(),
     platform: text("platform").notNull(),
     createdAt: timestampColumn("created_at").notNull(),
@@ -123,6 +121,11 @@ export const devices = pgTable(
   },
   (table) => [
     unique("devices_workspace_id_unique").on(table.workspaceId, table.id),
+    foreignKey({
+      name: "devices_owner_membership_fk",
+      columns: [table.workspaceId, table.ownerUserId],
+      foreignColumns: [workspaceMembers.workspaceId, workspaceMembers.userId],
+    }).onDelete("restrict"),
     uniqueIndex("devices_public_key_hash_unique").on(table.devicePublicKeyHash),
     index("idx_devices_workspace").on(table.workspaceId, table.id),
     check("devices_macos_only", sql`${table.platform} = 'macos'`),
@@ -199,9 +202,7 @@ export const pairingAuthorizationCodes = pgTable(
     workspaceId: uuid("workspace_id")
       .notNull()
       .references(() => workspaces.id, { onDelete: "restrict" }),
-    ownerUserId: uuid("owner_user_id")
-      .notNull()
-      .references(() => authUsers.id, { onDelete: "restrict" }),
+    ownerUserId: uuid("owner_user_id").notNull(),
     callbackStateHash: char("callback_state_hash", { length: 64 }).notNull(),
     expiresAt: timestampColumn("expires_at").notNull(),
     createdAt: timestampColumn("created_at").notNull(),
@@ -209,6 +210,11 @@ export const pairingAuthorizationCodes = pgTable(
   },
   (table) => [
     unique("pairing_authorization_codes_session_unique").on(table.sessionIdHash),
+    foreignKey({
+      name: "pairing_codes_owner_membership_fk",
+      columns: [table.workspaceId, table.ownerUserId],
+      foreignColumns: [workspaceMembers.workspaceId, workspaceMembers.userId],
+    }).onDelete("restrict"),
     check(
       "pairing_authorization_code_hash_hex",
       sql`${table.authorizationCodeHash} ~ '^[0-9a-f]{64}$'`,
@@ -248,9 +254,7 @@ export const collectorConfigAudit = pgTable(
     id: uuid("id").primaryKey(),
     workspaceId: uuid("workspace_id").notNull(),
     deviceId: uuid("device_id").notNull(),
-    actorUserId: uuid("actor_user_id")
-      .notNull()
-      .references(() => authUsers.id, { onDelete: "restrict" }),
+    actorUserId: uuid("actor_user_id").notNull(),
     configurationRevision: bigint("configuration_revision", { mode: "number" }).notNull(),
     oldConfig: jsonb("old_config").$type<StoredCollectorConfig>().notNull(),
     newConfig: jsonb("new_config").$type<StoredCollectorConfig>().notNull(),
@@ -261,6 +265,11 @@ export const collectorConfigAudit = pgTable(
       columns: [table.workspaceId, table.deviceId],
       foreignColumns: [devices.workspaceId, devices.id],
     }).onDelete("cascade"),
+    foreignKey({
+      name: "config_audit_actor_membership_fk",
+      columns: [table.workspaceId, table.actorUserId],
+      foreignColumns: [workspaceMembers.workspaceId, workspaceMembers.userId],
+    }).onDelete("restrict"),
     unique("collector_config_audit_device_revision_unique").on(
       table.deviceId,
       table.configurationRevision,

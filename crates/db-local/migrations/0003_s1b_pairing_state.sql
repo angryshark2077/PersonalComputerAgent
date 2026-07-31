@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS pairing_state (
         AND substr(device_id, 19, 1) = '-'
         AND substr(device_id, 24, 1) = '-'
         AND device_id NOT GLOB '*[^0-9A-Fa-f-]*'
+        AND length(replace(device_id, '-', '')) = 32
     ),
     workspace_id TEXT NOT NULL CHECK (
         length(workspace_id) = 36
@@ -15,6 +16,7 @@ CREATE TABLE IF NOT EXISTS pairing_state (
         AND substr(workspace_id, 19, 1) = '-'
         AND substr(workspace_id, 24, 1) = '-'
         AND workspace_id NOT GLOB '*[^0-9A-Fa-f-]*'
+        AND length(replace(workspace_id, '-', '')) = 32
     ),
     credential_ref TEXT NOT NULL CHECK (
         credential_ref LIKE 'keychain://%'

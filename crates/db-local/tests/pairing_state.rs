@@ -153,6 +153,14 @@ async fn pairing_state_rejects_non_uuid_identifiers_and_non_keychain_references(
     );
     assert!(db.save_pairing_state(&invalid_id).await.is_err());
 
+    let misplaced_hyphen = PairingState::paired(
+        "-1981111-7111-8111-8111-111111111111",
+        workspace_id(),
+        "keychain://pca/device/current",
+        1,
+    );
+    assert!(db.save_pairing_state(&misplaced_hyphen).await.is_err());
+
     let inline_credential = PairingState::paired(device_id(), workspace_id(), "secret-body", 1);
     assert!(db.save_pairing_state(&inline_credential).await.is_err());
 }

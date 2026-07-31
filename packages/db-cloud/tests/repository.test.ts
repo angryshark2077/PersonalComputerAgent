@@ -9,6 +9,9 @@ import {
 const hash = (character: string): string => character.repeat(64);
 const now = new Date("2026-07-31T12:00:00.000Z");
 const later = new Date("2026-07-31T12:05:00.000Z");
+const workspaceId = "01982222-7222-8222-8222-222222222222";
+const ownerUserId = "01983333-7333-8333-8333-333333333333";
+const membership = { workspaceId, userId: ownerUserId };
 
 async function pairDevice(repository: MemoryControlRepository): Promise<void> {
   await repository.createPairingSession({
@@ -22,8 +25,8 @@ async function pairDevice(repository: MemoryControlRepository): Promise<void> {
   await repository.authorizePairingSession({
     sessionIdHash: hash("1"),
     authorizationCodeHash: hash("3"),
-    workspaceId: "01982222-7222-8222-8222-222222222222",
-    ownerUserId: "01983333-7333-8333-8333-333333333333",
+    workspaceId,
+    ownerUserId,
     callbackStateHash: hash("4"),
     expiresAt: later,
     now,
@@ -42,7 +45,7 @@ async function pairDevice(repository: MemoryControlRepository): Promise<void> {
 }
 
 test("authorization codes are PKCE-bound and consumed only once", async () => {
-  const repository = new MemoryControlRepository();
+  const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);
 
   await assert.rejects(
@@ -63,7 +66,7 @@ test("authorization codes are PKCE-bound and consumed only once", async () => {
 });
 
 test("pairing session identifiers are unique and expired sessions cannot be authorized", async () => {
-  const repository = new MemoryControlRepository();
+  const repository = new MemoryControlRepository([membership]);
   const session = {
     sessionIdHash: hash("9"),
     devicePublicKeyHash: hash("8"),
@@ -81,8 +84,8 @@ test("pairing session identifiers are unique and expired sessions cannot be auth
     repository.authorizePairingSession({
       sessionIdHash: hash("9"),
       authorizationCodeHash: hash("7"),
-      workspaceId: "01982222-7222-8222-8222-222222222222",
-      ownerUserId: "01983333-7333-8333-8333-333333333333",
+      workspaceId,
+      ownerUserId,
       callbackStateHash: hash("6"),
       expiresAt: later,
       now,
@@ -93,7 +96,7 @@ test("pairing session identifiers are unique and expired sessions cannot be auth
 });
 
 test("wrong PKCE challenge does not consume the authorization code", async () => {
-  const repository = new MemoryControlRepository();
+  const repository = new MemoryControlRepository([membership]);
   await repository.createPairingSession({
     sessionIdHash: hash("a"),
     devicePublicKeyHash: hash("b"),
@@ -105,8 +108,8 @@ test("wrong PKCE challenge does not consume the authorization code", async () =>
   await repository.authorizePairingSession({
     sessionIdHash: hash("a"),
     authorizationCodeHash: hash("c"),
-    workspaceId: "01982222-7222-8222-8222-222222222222",
-    ownerUserId: "01983333-7333-8333-8333-333333333333",
+    workspaceId,
+    ownerUserId,
     callbackStateHash: hash("d"),
     expiresAt: later,
     now,
@@ -137,7 +140,7 @@ test("wrong PKCE challenge does not consume the authorization code", async () =>
 });
 
 test("control state is Workspace-scoped, monotonic, and audited", async () => {
-  const repository = new MemoryControlRepository();
+  const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);
 
   await assert.rejects(
@@ -151,8 +154,8 @@ test("control state is Workspace-scoped, monotonic, and audited", async () => {
 
   const revision = await repository.appendConfigAudit({
     auditId: "01985555-7555-8555-8555-555555555555",
-    actorUserId: "01983333-7333-8333-8333-333333333333",
-    workspaceId: "01982222-7222-8222-8222-222222222222",
+    actorUserId: ownerUserId,
+    workspaceId,
     deviceId: "01981111-7111-8111-8111-111111111111",
     config: { networkEnabled: true, wechatEnabled: false },
     now,
@@ -160,7 +163,7 @@ test("control state is Workspace-scoped, monotonic, and audited", async () => {
   assert.equal(revision, 1);
   const snapshot = await repository.loadControlSnapshot(
     "01981111-7111-8111-8111-111111111111",
-    "01982222-7222-8222-8222-222222222222",
+    workspaceId,
   );
   assert.equal(snapshot.configuration_revision, 1);
   assert.deepEqual(snapshot.collectors.network, { enabled: true });
@@ -173,10 +176,10 @@ test("control state is Workspace-scoped, monotonic, and audited", async () => {
 });
 
 test("credential rotation revokes the prior refresh hash", async () => {
-  const repository = new MemoryControlRepository();
+  const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);
   const rotation = {
-    workspaceId: "01982222-7222-8222-8222-222222222222",
+    workspaceId,
     deviceId: "01981111-7111-8111-8111-111111111111",
     currentRefreshTokenHash: hash("6"),
     newAccessTokenHash: hash("a"),
@@ -200,11 +203,11 @@ test("credential rotation revokes the prior refresh hash", async () => {
 });
 
 test("heartbeats are append-only and Workspace-scoped", async () => {
-  const repository = new MemoryControlRepository();
+  const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);
   const heartbeat = {
     heartbeatId: "01986666-7666-8666-8666-666666666666",
-    workspaceId: "01982222-7222-8222-8222-222222222222",
+    workspaceId,
     deviceId: "01981111-7111-8111-8111-111111111111",
     receivedAt: now,
     agentVersion: "0.3.0",
@@ -214,6 +217,149 @@ test("heartbeats are append-only and Workspace-scoped", async () => {
   await repository.recordHeartbeat(heartbeat);
   await assert.rejects(
     repository.recordHeartbeat(heartbeat),
+    (error) => error instanceof ControlRepositoryError && error.code === "CONFLICT",
+  );
+});
+
+test("pairing authorization and config audit require Owner membership", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await repository.createPairingSession({
+    sessionIdHash: hash("a"),
+    devicePublicKeyHash: hash("b"),
+    codeChallenge: "challenge-owner",
+    callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    expiresAt: later,
+    createdAt: now,
+  });
+  await assert.rejects(
+    repository.authorizePairingSession({
+      sessionIdHash: hash("a"),
+      authorizationCodeHash: hash("c"),
+      workspaceId,
+      ownerUserId: "01987777-7777-8777-8777-777777777777",
+      callbackStateHash: hash("d"),
+      expiresAt: later,
+      now,
+    }),
+    (error) =>
+      error instanceof ControlRepositoryError && error.code === "WORKSPACE_FORBIDDEN",
+  );
+
+  await pairDevice(repository);
+  await assert.rejects(
+    repository.appendConfigAudit({
+      auditId: "01988888-7888-8888-8888-888888888888",
+      actorUserId: "01987777-7777-8777-8777-777777777777",
+      workspaceId,
+      deviceId: "01981111-7111-8111-8111-111111111111",
+      config: { networkEnabled: false, wechatEnabled: false },
+      now,
+    }),
+    (error) =>
+      error instanceof ControlRepositoryError && error.code === "WORKSPACE_FORBIDDEN",
+  );
+});
+
+test("device and credential hashes are globally unique", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  await repository.createPairingSession({
+    sessionIdHash: hash("7"),
+    devicePublicKeyHash: hash("2"),
+    codeChallenge: "challenge-duplicate-key",
+    callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    expiresAt: later,
+    createdAt: now,
+  });
+  await repository.authorizePairingSession({
+    sessionIdHash: hash("7"),
+    authorizationCodeHash: hash("8"),
+    workspaceId,
+    ownerUserId,
+    callbackStateHash: hash("9"),
+    expiresAt: later,
+    now,
+  });
+  await assert.rejects(
+    repository.consumeAuthorizationCode({
+      sessionIdHash: hash("7"),
+      authorizationCodeHash: hash("8"),
+      codeChallenge: "challenge-duplicate-key",
+      deviceId: "01984444-7444-8444-8444-444444444444",
+      accessTokenHash: hash("a"),
+      refreshTokenHash: hash("b"),
+      accessExpiresAt: later,
+      refreshExpiresAt: later,
+      now,
+    }),
+    (error) => error instanceof ControlRepositoryError && error.code === "CONFLICT",
+  );
+
+  await repository.createPairingSession({
+    sessionIdHash: hash("0"),
+    devicePublicKeyHash: hash("f"),
+    codeChallenge: "challenge-duplicate-credential",
+    callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    expiresAt: later,
+    createdAt: now,
+  });
+  await repository.authorizePairingSession({
+    sessionIdHash: hash("0"),
+    authorizationCodeHash: hash("e"),
+    workspaceId,
+    ownerUserId,
+    callbackStateHash: hash("d"),
+    expiresAt: later,
+    now,
+  });
+  const secondDevice = {
+    sessionIdHash: hash("0"),
+    authorizationCodeHash: hash("e"),
+    codeChallenge: "challenge-duplicate-credential",
+    deviceId: "01985555-7555-8555-8555-555555555555",
+    accessExpiresAt: later,
+    refreshExpiresAt: later,
+    now,
+  };
+  await assert.rejects(
+    repository.consumeAuthorizationCode({
+      ...secondDevice,
+      accessTokenHash: hash("5"),
+      refreshTokenHash: hash("c"),
+    }),
+    (error) => error instanceof ControlRepositoryError && error.code === "CONFLICT",
+  );
+  await assert.rejects(
+    repository.consumeAuthorizationCode({
+      ...secondDevice,
+      accessTokenHash: hash("d"),
+      refreshTokenHash: hash("6"),
+    }),
+    (error) => error instanceof ControlRepositoryError && error.code === "CONFLICT",
+  );
+
+  const rotation = {
+    workspaceId,
+    deviceId: "01981111-7111-8111-8111-111111111111",
+    currentRefreshTokenHash: hash("6"),
+    accessExpiresAt: later,
+    refreshExpiresAt: later,
+    now,
+  };
+  await assert.rejects(
+    repository.rotateDeviceCredentials({
+      ...rotation,
+      newAccessTokenHash: hash("5"),
+      newRefreshTokenHash: hash("c"),
+    }),
+    (error) => error instanceof ControlRepositoryError && error.code === "CONFLICT",
+  );
+  await assert.rejects(
+    repository.rotateDeviceCredentials({
+      ...rotation,
+      newAccessTokenHash: hash("d"),
+      newRefreshTokenHash: hash("6"),
+    }),
     (error) => error instanceof ControlRepositoryError && error.code === "CONFLICT",
   );
 });

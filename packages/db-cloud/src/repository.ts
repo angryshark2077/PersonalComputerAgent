@@ -11,6 +11,7 @@ import {
   devices,
   pairingAuthorizationCodes,
   pairingSessions,
+  workspaceMembers,
   type StoredCollectorConfig,
 } from "./schema.js";
 
@@ -114,6 +115,11 @@ export interface ControlRepository {
   appendConfigAudit(input: ConfigAuditInput): Promise<number>;
 }
 
+export interface OwnerMembership {
+  workspaceId: string;
+  userId: string;
+}
+
 interface AuthorizationCodeRecord extends AuthorizePairingSessionInput {
   consumedAt: Date | null;
 }
@@ -144,6 +150,16 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #configs = new Map<string, ConfigRecord>();
   readonly #heartbeatIds = new Set<string>();
   readonly #auditIds = new Set<string>();
+  readonly #ownerMemberships = new Set<string>();
+  readonly #devicePublicKeyHashes = new Set<string>();
+  readonly #accessTokenHashes = new Set<string>();
+  readonly #refreshTokenHashes = new Set<string>();
+
+  constructor(memberships: readonly OwnerMembership[] = []) {
+    for (const membership of memberships) {
+      this.#ownerMemberships.add(membershipKey(membership.workspaceId, membership.userId));
+    }
+  }
 
   async createPairingSession(input: PairingSessionInput): Promise<PairingSession> {
     if (this.#sessions.has(input.sessionIdHash)) {
@@ -155,6 +171,7 @@ export class MemoryControlRepository implements ControlRepository {
   }
 
   async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<void> {
+    this.#requireOwnerMembership(input.workspaceId, input.ownerUserId);
     const session = this.#sessions.get(input.sessionIdHash);
     if (session === undefined || session.expiresAt <= input.now) {
       throw new ControlRepositoryError("PAIRING_EXPIRED");
@@ -190,6 +207,13 @@ export class MemoryControlRepository implements ControlRepository {
     if (this.#devices.has(input.deviceId)) {
       throw new ControlRepositoryError("CONFLICT");
     }
+    if (
+      this.#devicePublicKeyHashes.has(session.devicePublicKeyHash) ||
+      this.#accessTokenHashes.has(input.accessTokenHash) ||
+      this.#refreshTokenHashes.has(input.refreshTokenHash)
+    ) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
 
     const grant: DeviceCredentialGrant = {
       workspaceId: code.workspaceId,
@@ -206,6 +230,9 @@ export class MemoryControlRepository implements ControlRepository {
       devicePublicKeyHash: session.devicePublicKeyHash,
       revokedAt: null,
     });
+    this.#devicePublicKeyHashes.add(session.devicePublicKeyHash);
+    this.#accessTokenHashes.add(input.accessTokenHash);
+    this.#refreshTokenHashes.add(input.refreshTokenHash);
     this.#credentials.set(input.deviceId, [
       {
         ...grant,
@@ -237,6 +264,12 @@ export class MemoryControlRepository implements ControlRepository {
     if (current === undefined) {
       throw new ControlRepositoryError("CREDENTIAL_INVALID");
     }
+    if (
+      this.#accessTokenHashes.has(input.newAccessTokenHash) ||
+      this.#refreshTokenHashes.has(input.newRefreshTokenHash)
+    ) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
     current.revokedAt = input.now;
     const grant: DeviceCredentialGrant = {
       workspaceId: input.workspaceId,
@@ -251,6 +284,8 @@ export class MemoryControlRepository implements ControlRepository {
       refreshTokenHash: input.newRefreshTokenHash,
       revokedAt: null,
     });
+    this.#accessTokenHashes.add(input.newAccessTokenHash);
+    this.#refreshTokenHashes.add(input.newRefreshTokenHash);
     return grant;
   }
 
@@ -276,6 +311,7 @@ export class MemoryControlRepository implements ControlRepository {
   }
 
   async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
+    this.#requireOwnerMembership(input.workspaceId, input.actorUserId);
     this.#requireDevice(input.deviceId, input.workspaceId, false);
     if (this.#auditIds.has(input.auditId)) {
       throw new ControlRepositoryError("CONFLICT");
@@ -305,6 +341,12 @@ export class MemoryControlRepository implements ControlRepository {
     }
     return device;
   }
+
+  #requireOwnerMembership(workspaceId: string, userId: string): void {
+    if (!this.#ownerMemberships.has(membershipKey(workspaceId, userId))) {
+      throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+    }
+  }
 }
 
 export class DrizzleControlRepository implements ControlRepository {
@@ -328,6 +370,11 @@ export class DrizzleControlRepository implements ControlRepository {
   async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<void> {
     try {
       await this.database.transaction(async (transaction) => {
+        await requireDatabaseOwnerMembership(
+          transaction,
+          input.workspaceId,
+          input.ownerUserId,
+        );
         const [authorized] = await transaction
           .update(pairingSessions)
           .set({ authorizedAt: input.now })
@@ -557,6 +604,11 @@ export class DrizzleControlRepository implements ControlRepository {
   async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
     try {
       return await this.database.transaction(async (transaction) => {
+        await requireDatabaseOwnerMembership(
+          transaction,
+          input.workspaceId,
+          input.actorUserId,
+        );
         await requireDatabaseDevice(transaction, input.deviceId, input.workspaceId, false);
         const [current] = await transaction
           .select()
@@ -650,8 +702,33 @@ async function requireDatabaseDevice(
   return device;
 }
 
+async function requireDatabaseOwnerMembership(
+  database: DatabaseExecutor,
+  workspaceId: string,
+  userId: string,
+): Promise<void> {
+  const [membership] = await database
+    .select({ userId: workspaceMembers.userId })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, userId),
+        eq(workspaceMembers.role, "owner"),
+      ),
+    )
+    .limit(1);
+  if (membership === undefined) {
+    throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+  }
+}
+
 function configKey(workspaceId: string, deviceId: string): string {
   return `${workspaceId}:${deviceId}`;
+}
+
+function membershipKey(workspaceId: string, userId: string): string {
+  return `${workspaceId}:${userId}`;
 }
 
 function snapshot(device: DeviceRecord, config: ConfigRecord): AgentControlSnapshot {
@@ -678,6 +755,15 @@ function repositoryError(error: unknown): ControlRepositoryError {
   }
   if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
     return new ControlRepositoryError("CONFLICT");
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "constraint" in error &&
+    typeof error.constraint === "string" &&
+    error.constraint.endsWith("membership_fk")
+  ) {
+    return new ControlRepositoryError("WORKSPACE_FORBIDDEN");
   }
   throw error;
 }

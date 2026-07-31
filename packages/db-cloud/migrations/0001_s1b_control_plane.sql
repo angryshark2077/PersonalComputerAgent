@@ -52,13 +52,16 @@ CREATE TABLE IF NOT EXISTS workspace_members (
 CREATE TABLE IF NOT EXISTS devices (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
-    owner_user_id uuid NOT NULL REFERENCES auth_users(id) ON DELETE RESTRICT,
+    owner_user_id uuid NOT NULL,
     device_public_key_hash character(64) NOT NULL UNIQUE CHECK (
         device_public_key_hash ~ '^[0-9a-f]{64}$'
     ),
     platform text NOT NULL CHECK (platform = 'macos'),
     created_at timestamptz NOT NULL,
     revoked_at timestamptz,
+    CONSTRAINT devices_owner_membership_fk
+        FOREIGN KEY (workspace_id, owner_user_id)
+        REFERENCES workspace_members(workspace_id, user_id) ON DELETE RESTRICT,
     UNIQUE (workspace_id, id)
 );
 
@@ -102,13 +105,16 @@ CREATE TABLE IF NOT EXISTS pairing_authorization_codes (
     session_id_hash character(64) NOT NULL UNIQUE
         REFERENCES pairing_sessions(session_id_hash) ON DELETE CASCADE,
     workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
-    owner_user_id uuid NOT NULL REFERENCES auth_users(id) ON DELETE RESTRICT,
+    owner_user_id uuid NOT NULL,
     callback_state_hash character(64) NOT NULL CHECK (
         callback_state_hash ~ '^[0-9a-f]{64}$'
     ),
     expires_at timestamptz NOT NULL,
     created_at timestamptz NOT NULL,
-    consumed_at timestamptz
+    consumed_at timestamptz,
+    CONSTRAINT pairing_codes_owner_membership_fk
+        FOREIGN KEY (workspace_id, owner_user_id)
+        REFERENCES workspace_members(workspace_id, user_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS collector_configs (
@@ -129,11 +135,14 @@ CREATE TABLE IF NOT EXISTS collector_config_audit (
     id uuid PRIMARY KEY,
     workspace_id uuid NOT NULL,
     device_id uuid NOT NULL,
-    actor_user_id uuid NOT NULL REFERENCES auth_users(id) ON DELETE RESTRICT,
+    actor_user_id uuid NOT NULL,
     configuration_revision bigint NOT NULL CHECK (configuration_revision > 0),
     old_config jsonb NOT NULL,
     new_config jsonb NOT NULL,
     created_at timestamptz NOT NULL,
+    CONSTRAINT config_audit_actor_membership_fk
+        FOREIGN KEY (workspace_id, actor_user_id)
+        REFERENCES workspace_members(workspace_id, user_id) ON DELETE RESTRICT,
     FOREIGN KEY (workspace_id, device_id)
         REFERENCES devices(workspace_id, id) ON DELETE CASCADE,
     UNIQUE (device_id, configuration_revision)
