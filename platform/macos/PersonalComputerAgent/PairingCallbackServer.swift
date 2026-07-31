@@ -91,11 +91,7 @@ final class PairingCallbackServer {
     }
 
     private func validate(_ url: URL) -> Bool {
-        url.scheme == "http"
-            && url.host == "127.0.0.1"
-            && url.path == Self.callbackPath
-            && url.queryParameters["code"]?.isEmpty == false
-            && url.queryParameters["state"] == expectedState
+        PairingCallback.parse(url)?.state == expectedState
     }
 
     private func respond(_ connection: NWConnection, status: String, body: String) {
@@ -144,9 +140,22 @@ private extension NWEndpoint {
     }
 }
 
-private extension URL {
-    var queryParameters: [String: String] {
-        Dictionary(uniqueKeysWithValues: (URLComponents(url: self, resolvingAgainstBaseURL: false)?.queryItems ?? [])
-            .compactMap { item in item.value.map { (item.name, $0) } })
+struct PairingCallback: Equatable, Sendable {
+    let authorizationCode: String
+    let state: String
+
+    static func parse(_ url: URL) -> PairingCallback? {
+        guard url.scheme == "http", url.host == "127.0.0.1", url.path == "/pca/pair/callback",
+              let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+              let authorizationCode = uniqueNonEmptyValue(named: "code", in: queryItems),
+              let state = uniqueNonEmptyValue(named: "state", in: queryItems)
+        else { return nil }
+        return PairingCallback(authorizationCode: authorizationCode, state: state)
+    }
+
+    private static func uniqueNonEmptyValue(named name: String, in queryItems: [URLQueryItem]) -> String? {
+        let values = queryItems.compactMap { item in item.name == name ? item.value : nil }
+        guard values.count == 1, let value = values.first, !value.isEmpty else { return nil }
+        return value
     }
 }

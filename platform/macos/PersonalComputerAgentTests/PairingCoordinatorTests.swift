@@ -16,4 +16,20 @@ final class PairingCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(coordinator.listenerIsClosed)
     }
+
+    func testCallbackRejectsDuplicateCodeOrStateAndStopsListener() async throws {
+        for query in ["code=first&code=second&state=expected", "code=x&state=expected&state=again"] {
+            let coordinator = PairingCoordinator.fake(state: "expected")
+            let callback = URL(string: "http://127.0.0.1/pca/pair/callback?\(query)")!
+
+            do {
+                _ = try await coordinator.accept(callback)
+                XCTFail("duplicate callback query must fail")
+            } catch let error as PairingError {
+                XCTAssertEqual(error, .invalidCallback)
+            }
+
+            XCTAssertTrue(coordinator.listenerIsClosed)
+        }
+    }
 }

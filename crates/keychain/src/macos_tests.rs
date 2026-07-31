@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
-    macos::{delete_for_identity, load_for_identity, store_for_identity},
-    CredentialError, BRIDGE_CREDENTIAL_ACCOUNT, BRIDGE_CREDENTIAL_SERVICE,
-    BRIDGE_SHARED_SECRET_LENGTH,
+    macos::{delete_for_supported_identity, load_for_identity, load_for_supported_identity, store_device_for_identity, store_for_identity},
+    CredentialError, DeviceCredential, BRIDGE_CREDENTIAL_ACCOUNT, BRIDGE_CREDENTIAL_SERVICE,
+    BRIDGE_SHARED_SECRET_LENGTH, DEVICE_CREDENTIAL_ACCOUNT, DEVICE_CREDENTIAL_SERVICE,
 };
 
 #[test]
@@ -53,7 +53,7 @@ fn trait_dispatch_rejects_non_bridge_identity_before_reaching_backend() {
         load_backend_called.store(true, Ordering::Relaxed);
         Ok(Some(valid.to_vec()))
     });
-    let delete_result = delete_for_identity("other.service", "other-account", || {
+    let delete_result = delete_for_supported_identity("other.service", "other-account", || {
         delete_backend_called.store(true, Ordering::Relaxed);
         Ok(())
     });
@@ -88,5 +88,38 @@ fn trait_dispatch_accepts_the_fixed_identity_and_exact_length() {
             Some(expected.clone())
         ),),
         Ok(Some(expected))
+    );
+}
+
+#[test]
+fn device_dispatch_uses_its_versioned_identity_without_touching_bridge_validation() {
+    let record = DeviceCredential::new(
+        "11111111-1111-4111-8111-111111111111".to_owned(),
+        "22222222-2222-4222-8222-222222222222".to_owned(),
+        "test-access",
+        "test-refresh",
+    )
+    .expect("valid fixture")
+    .encode()
+    .expect("encoded fixture");
+    let store_called = AtomicBool::new(false);
+
+    store_device_for_identity(
+        DEVICE_CREDENTIAL_SERVICE,
+        DEVICE_CREDENTIAL_ACCOUNT,
+        &record,
+        || {
+            store_called.store(true, Ordering::Relaxed);
+            Ok(())
+        },
+    )
+    .expect("device dispatch");
+
+    assert!(store_called.load(Ordering::Relaxed));
+    assert_eq!(
+        load_for_supported_identity(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT, || {
+            Ok(Some(record.clone()))
+        }),
+        Ok(Some(record))
     );
 }

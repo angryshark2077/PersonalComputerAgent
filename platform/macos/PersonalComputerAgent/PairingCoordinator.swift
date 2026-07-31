@@ -39,19 +39,17 @@ final class PairingCoordinator {
         try await start()
     }
 
-    func accept(_ url: URL) async throws {
+    func accept(_ url: URL) async throws -> PairingCallback {
         defer {
             consumed = true
             closeListener()
         }
         guard !consumed else { throw PairingError.alreadyConsumed }
-        guard url.scheme == "http", url.host == "127.0.0.1", url.path == "/pca/pair/callback" else {
-            throw PairingError.invalidCallback
-        }
+        guard let callback = PairingCallback.parse(url) else { throw PairingError.invalidCallback }
         guard let expectedState else { throw PairingError.invalidCallback }
-        guard url.queryValue(named: "state") == expectedState else { throw PairingError.stateMismatch }
-        guard url.queryValue(named: "code")?.isEmpty == false else { throw PairingError.invalidCallback }
+        guard callback.state == expectedState else { throw PairingError.stateMismatch }
         consumed = true
+        return callback
     }
 
     func cancel() async {
@@ -90,10 +88,10 @@ final class PairingCoordinator {
                 defer { group.cancelAll() }
                 return try await group.next()!
             }
-            try await accept(callback)
+            let acceptedCallback = try await accept(callback)
             let result = try await agent.completePairing(PairingCallbackHandoff(
                 sessionID: session.sessionID,
-                authorizationCode: callback.queryValue(named: "code")!,
+                authorizationCode: acceptedCallback.authorizationCode,
                 codeVerifier: verifier
             ))
             activeSessionID = nil
@@ -125,10 +123,4 @@ private func randomURLSafeValue(byteCount: Int) throws -> String {
         .replacingOccurrences(of: "+", with: "-")
         .replacingOccurrences(of: "/", with: "_")
         .replacingOccurrences(of: "=", with: "")
-}
-
-private extension URL {
-    func queryValue(named name: String) -> String? {
-        URLComponents(url: self, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == name })?.value
-    }
 }
