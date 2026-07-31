@@ -37,6 +37,8 @@ The live verifier does not change installation, service, permission,
 Gatekeeper, TCC, approval-database, or process state. Its `--dmg` mode creates
 only a current-user private temporary DMG snapshot, verifies and opens that
 same identity-checked file, and removes it with bounded cleanup.
+The private modes isolate other users; they do not claim absolute atomic
+protection from a malicious process already running as the same UID.
 
 Default local uninstall is the installed executable command:
 

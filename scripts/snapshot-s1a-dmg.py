@@ -141,11 +141,54 @@ def validate_snapshot(identity: Dict[str, Any]) -> None:
 
 
 def cleanup_snapshot(identity: Dict[str, Any]) -> None:
-    validate_snapshot(identity)
-    snapshot = Path(identity["file_path"])
     directory = Path(identity["dir_path"])
-    snapshot.unlink()
-    directory.rmdir()
+    snapshot = Path(identity["file_path"])
+    if snapshot.parent != directory or snapshot.name != "candidate.dmg":
+        fail("snapshot cleanup path is not fixed")
+    reject_symlink_components(directory.parent)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(directory.parent, directory_flags)
+    try:
+        directory_fd = os.open(directory.name, directory_flags, dir_fd=parent_fd)
+        try:
+            directory_metadata = os.fstat(directory_fd)
+            for key, actual in (
+                ("dir_dev", directory_metadata.st_dev), ("dir_ino", directory_metadata.st_ino),
+                ("dir_uid", directory_metadata.st_uid), ("dir_mode", stat.S_IMODE(directory_metadata.st_mode)),
+            ):
+                if actual != identity.get(key):
+                    fail(f"snapshot cleanup directory identity changed: {key}")
+            file_fd = os.open("candidate.dmg", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+            try:
+                metadata = os.fstat(file_fd)
+                digest = hashlib.sha256()
+                size = 0
+                while True:
+                    chunk = os.read(file_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size += len(chunk)
+                checks = {
+                    "file_dev": metadata.st_dev, "file_ino": metadata.st_ino,
+                    "file_uid": metadata.st_uid, "file_mode": stat.S_IMODE(metadata.st_mode),
+                    "file_size": size, "file_sha256": digest.hexdigest(),
+                }
+                for key, actual in checks.items():
+                    if actual != identity.get(key):
+                        fail(f"snapshot cleanup file identity changed: {key}")
+            finally:
+                os.close(file_fd)
+            os.unlink("candidate.dmg", dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            entry_metadata = os.stat(directory.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (entry_metadata.st_dev, entry_metadata.st_ino) != (directory_metadata.st_dev, directory_metadata.st_ino):
+                fail("snapshot directory entry changed before identity-bound rmdir")
+            os.rmdir(directory.name, dir_fd=parent_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def main() -> int:

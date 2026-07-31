@@ -111,7 +111,7 @@ database_file="$data_directory/agent.sqlite3"
 
 snapshot_install() {
   capture "$1" python3 - "$app" "$info" "$main" <<'PY'
-import os, plistlib, sys
+import os, plistlib, sys, time
 from pathlib import Path
 app, info, main = map(Path, sys.argv[1:])
 if not app.is_dir() or not info.is_file() or not main.is_file():
@@ -122,7 +122,7 @@ with info.open("rb") as source:
     version = plistlib.load(source).get("CFBundleShortVersionString")
 if not isinstance(version, str):
     raise SystemExit(4)
-print(f"version={version} app_dev={app_metadata.st_dev} app_ino={app_metadata.st_ino} main_dev={main_metadata.st_dev} main_ino={main_metadata.st_ino}")
+print(f"version={version} app_dev={app_metadata.st_dev} app_ino={app_metadata.st_ino} main_dev={main_metadata.st_dev} main_ino={main_metadata.st_ino} observed_mono={time.monotonic():.9f} observed_wall={time.time():.9f}")
 PY
 }
 
@@ -158,7 +158,17 @@ if [[ "$mode" == "dmg" ]]; then
   if ! capture snapshot_check "$snapshot_helper" validate --identity-json "$snapshot_identity"; then
     fail "private DMG snapshot identity validation failed: $snapshot_check"
   fi
-  if snapshot_install pre_open_snapshot; then :; else pre_open_snapshot="<not-installed>"; fi
+  if snapshot_install pre_open_snapshot; then
+    if ! capture activation_bounds python3 -c 'import sys; d=dict(x.split("=",1) for x in sys.argv[1].split()); print(d["observed_mono"], d["observed_wall"])' "$pre_open_snapshot"; then
+      fail "could not parse old-install observation bounds"
+    fi
+  elif capture absent_check python3 -c 'import os,sys,time; absent=not os.path.lexists(sys.argv[1]) and not os.path.lexists(sys.argv[2]); print(f"{time.monotonic():.9f} {time.time():.9f}") if absent else None; raise SystemExit(0 if absent else 1)' "$app" "$main"; then
+    pre_open_snapshot="<not-installed>"
+    activation_bounds=$absent_check
+  else
+    fail "pre-open App/main state is partial or unsafe"
+  fi
+  read -r activation_monotonic activation_wall <<<"$activation_bounds"
   if ! capture bundle_output "$bundle_verifier" --team-id "$team_id" "$snapshot_dmg"; then
     fail "read-only DMG bundle verification failed: $bundle_output"
   fi
@@ -185,11 +195,21 @@ if [[ "$mode" == "dmg" ]]; then
   if ! capture snapshot_check "$snapshot_helper" validate --identity-json "$snapshot_identity"; then
     fail "private DMG snapshot changed between verification and open: $snapshot_check"
   fi
-  if ! capture activation_bounds python3 -c 'import time; print(f"{time.monotonic():.9f} {time.time():.9f}")'; then
-    fail "could not record candidate activation lower bound"
-  fi
-  read -r activation_monotonic activation_wall <<<"$activation_bounds"
   if ! capture open_output open "$snapshot_dmg"; then fail "could not open DMG: $open_output"; fi
+  immediate_snapshot=""
+  if snapshot_install immediate_snapshot && [[ "$pre_open_snapshot" != "<not-installed>" ]]; then
+    if capture immediate_old_bounds python3 -c '
+import sys
+def parse(value): return dict(field.split("=", 1) for field in value.split())
+before, after = parse(sys.argv[1]), parse(sys.argv[2]); keys=("app_dev","app_ino","main_dev","main_ino")
+if all(before[k] == after[k] for k in keys): print(after["observed_mono"], after["observed_wall"])
+else: raise SystemExit(1)
+' "$pre_open_snapshot" "$immediate_snapshot"; then
+      read -r activation_monotonic activation_wall <<<"$immediate_old_bounds"
+    fi
+  elif [[ "$pre_open_snapshot" == "<not-installed>" ]] && capture immediate_absent python3 -c 'import os,sys,time; absent=not os.path.lexists(sys.argv[1]) and not os.path.lexists(sys.argv[2]); print(f"{time.monotonic():.9f} {time.time():.9f}") if absent else None; raise SystemExit(0 if absent else 1)' "$app" "$main"; then
+    read -r activation_monotonic activation_wall <<<"$immediate_absent"
+  fi
   if ! capture snapshot_check "$snapshot_helper" validate --identity-json "$snapshot_identity"; then
     fail "private DMG snapshot changed while being opened: $snapshot_check"
   fi
@@ -213,6 +233,20 @@ raise SystemExit(0 if app_changed and main_changed else 1)
 ' "$pre_open_snapshot" "$current_snapshot"; then
         candidate_activated=1
         break
+      fi
+      if capture old_bounds python3 -c '
+import sys
+def parse(value): return dict(field.split("=", 1) for field in value.split())
+before, after = parse(sys.argv[1]), parse(sys.argv[2])
+keys=("app_dev","app_ino","main_dev","main_ino")
+if all(before[k] == after[k] for k in keys): print(after["observed_mono"], after["observed_wall"])
+else: raise SystemExit(1)
+' "$pre_open_snapshot" "$current_snapshot"; then
+        read -r activation_monotonic activation_wall <<<"$old_bounds"
+      fi
+    elif [[ "$pre_open_snapshot" == "<not-installed>" ]]; then
+      if capture absent_check python3 -c 'import os,sys,time; absent=not os.path.lexists(sys.argv[1]) and not os.path.lexists(sys.argv[2]); print(f"{time.monotonic():.9f} {time.time():.9f}") if absent else None; raise SystemExit(0 if absent else 1)' "$app" "$main"; then
+        read -r activation_monotonic activation_wall <<<"$absent_check"
       fi
     fi
     if (( attempt < install_polls )); then
@@ -349,7 +383,14 @@ if [[ "$mode" == "dmg" ]]; then
     || fail "installed signatures do not match the verified candidate"
 fi
 
-new_deadline 5
+if [[ "$mode" == "dmg" ]]; then
+  if ! capture health_deadline python3 -c 'import sys; print(f"{float(sys.argv[1])+5.0:.9f}")' "$activation_monotonic"; then
+    fail "candidate activation health deadline already expired"
+  fi
+  deadline=$health_deadline
+else
+  new_deadline 5
+fi
 status_pid=""
 for ((attempt = 1; attempt <= health_polls; attempt++)); do
   candidate_pid=""

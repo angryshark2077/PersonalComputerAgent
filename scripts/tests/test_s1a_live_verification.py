@@ -34,6 +34,7 @@ class S1ALiveVerificationTests(unittest.TestCase):
         self.old_app = self.temporary_directory / "old-installed.app"
         self.snapshot_parent = self.temporary_directory / "snapshots"
         self.snapshot_parent.mkdir(mode=0o700)
+        self.process_start_file = self.temporary_directory / "process-start"
         self.tools = self.temporary_directory / "tools"
         self.tools.mkdir()
         self.tool_log = self.temporary_directory / "tools.log"
@@ -76,6 +77,7 @@ class S1ALiveVerificationTests(unittest.TestCase):
                 "PCA_S1A_LIVE_TEST_SNAPSHOT_PARENT": str(self.snapshot_parent),
                 "PCA_S1A_LIVE_TEST_SOURCE_DMG": "",
                 "PCA_S1A_LIVE_TEST_PROCESS_INSPECTOR": str(self.tools / "process-inspector"),
+                "PCA_S1A_LIVE_TEST_PROCESS_START_FILE": str(self.process_start_file),
             }
         )
         if arguments[:1] == ("--dmg",):
@@ -194,6 +196,35 @@ class S1ALiveVerificationTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("activation", result.stdout.lower())
+
+    def test_agent_started_after_open_but_before_delayed_replacement_is_rejected(self) -> None:
+        dmg = self.temporary_directory / "delayed-old-agent.dmg"
+        dmg.write_bytes(b"synthetic dmg")
+        result = self.run_verify(
+            "--dmg", str(dmg),
+            environment_updates={
+                "PCA_TEAM_ID": "ABCDEFGHIJ",
+                "PCA_S1A_LIVE_TEST_DELAYED_ACTIVATION": "old-agent",
+                "PCA_S1A_LIVE_TEST_INSTALL_POLLS": "10",
+                "PCA_S1A_LIVE_TEST_POLL_SECONDS": "0.05",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("activation", result.stdout.lower())
+
+    def test_agent_started_after_delayed_replacement_is_accepted(self) -> None:
+        dmg = self.temporary_directory / "delayed-new-agent.dmg"
+        dmg.write_bytes(b"synthetic dmg")
+        result = self.run_verify(
+            "--dmg", str(dmg),
+            environment_updates={
+                "PCA_TEAM_ID": "ABCDEFGHIJ",
+                "PCA_S1A_LIVE_TEST_DELAYED_ACTIVATION": "new-agent",
+                "PCA_S1A_LIVE_TEST_INSTALL_POLLS": "10",
+                "PCA_S1A_LIVE_TEST_POLL_SECONDS": "0.05",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_dmg_does_not_accept_an_old_healthy_install_without_candidate_activation(self) -> None:
         dmg = self.temporary_directory / "PersonalComputerAgent-S1A-arm64.dmg"
@@ -492,16 +523,33 @@ if [[ -n "${PCA_S1A_LIVE_TEST_OPEN_CAPTURE:-}" ]]; then
 fi
 if [[ "${PCA_S1A_LIVE_TEST_ACTIVATE_CANDIDATE:-0}" == "1" ]]; then
   python3 - <<'PY'
-import json, os
+import json, os, subprocess, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 app = Path(os.environ["PCA_S1A_LIVE_TEST_ROOT"]) / "App/PersonalComputerAgent.app"
 candidate = Path(os.environ["PCA_S1A_LIVE_TEST_CANDIDATE_APP"])
 old = Path(os.environ["PCA_S1A_LIVE_TEST_OLD_APP"])
-os.replace(app, old)
-os.replace(candidate, app)
-if os.environ.get("PCA_S1A_LIVE_TEST_KEEP_OLD_RUNTIME") != "1":
-    status = Path(os.environ["PCA_S1A_LIVE_TEST_STATUS_PATH"])
+status = Path(os.environ["PCA_S1A_LIVE_TEST_STATUS_PATH"])
+start_file = Path(os.environ["PCA_S1A_LIVE_TEST_PROCESS_START_FILE"])
+mode = os.environ.get("PCA_S1A_LIVE_TEST_DELAYED_ACTIVATION", "")
+worker = '''import json, os, time
+from datetime import datetime, timezone
+from pathlib import Path
+time.sleep(0.2)
+app=Path(os.environ["PCA_S1A_LIVE_TEST_ROOT"])/"App/PersonalComputerAgent.app"
+os.replace(app, Path(os.environ["PCA_S1A_LIVE_TEST_OLD_APP"]))
+os.replace(Path(os.environ["PCA_S1A_LIVE_TEST_CANDIDATE_APP"]), app)
+status=Path(os.environ["PCA_S1A_LIVE_TEST_STATUS_PATH"])
+value=json.loads(status.read_text()); value["heartbeat_at"]=datetime.now(timezone.utc).isoformat(); status.write_text(json.dumps(value))
+if os.environ.get("PCA_S1A_LIVE_TEST_DELAYED_ACTIVATION") == "new-agent": Path(os.environ["PCA_S1A_LIVE_TEST_PROCESS_START_FILE"]).write_text(str(time.time()))
+'''
+if mode:
+    if mode == "old-agent": start_file.write_text(str(time.time()))
+    subprocess.Popen([sys.executable, "-c", worker], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+else:
+    os.replace(app, old)
+    os.replace(candidate, app)
+if not mode and os.environ.get("PCA_S1A_LIVE_TEST_KEEP_OLD_RUNTIME") != "1":
     value = json.loads(status.read_text())
     value["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
     status.write_text(json.dumps(value))
@@ -519,9 +567,11 @@ if [[ "${PCA_S1A_LIVE_TEST_DUPLICATE_AGENT:-0}" == "1" ]]; then
 fi
 python3 - <<'PY'
 import json, os, time
+start_file = os.environ.get("PCA_S1A_LIVE_TEST_PROCESS_START_FILE")
+start = float(open(start_file).read()) if start_file and os.path.exists(start_file) else float(os.environ.get("PCA_S1A_LIVE_TEST_PROCESS_START", time.time()))
 print(json.dumps({
-  "agent": {"pid": 4101, "ppid": 1, "uid": int(os.environ["PCA_S1A_LIVE_TEST_AGENT_UID"]), "path": os.environ["PCA_S1A_LIVE_TEST_AGENT_PATH"], "start_time": float(os.environ.get("PCA_S1A_LIVE_TEST_PROCESS_START", time.time()))},
-  "bridge": {"pid": 4102, "ppid": 4101, "uid": int(os.environ["PCA_S1A_LIVE_TEST_BRIDGE_UID"]), "path": os.environ["PCA_S1A_LIVE_TEST_BRIDGE_PATH"], "start_time": float(os.environ.get("PCA_S1A_LIVE_TEST_PROCESS_START", time.time()))},
+  "agent": {"pid": 4101, "ppid": 1, "uid": int(os.environ["PCA_S1A_LIVE_TEST_AGENT_UID"]), "path": os.environ["PCA_S1A_LIVE_TEST_AGENT_PATH"], "start_time": start},
+  "bridge": {"pid": 4102, "ppid": 4101, "uid": int(os.environ["PCA_S1A_LIVE_TEST_BRIDGE_UID"]), "path": os.environ["PCA_S1A_LIVE_TEST_BRIDGE_PATH"], "start_time": start},
 }))
 PY
 """,
@@ -536,6 +586,7 @@ if [[ "${PCA_S1A_LIVE_TEST_RESTORE_RUNTIME:-0}" == "1" ]]; then
   mv "${PCA_S1A_LIVE_TEST_PENDING_DATABASE:?}" "${PCA_S1A_LIVE_TEST_TARGET_DATABASE:?}"
   export PCA_S1A_LIVE_TEST_RESTORE_RUNTIME=0
 fi
+if [[ "$1" != "0" ]]; then /bin/sleep "$1"; fi
 """,
         )
         self._write_tool(
