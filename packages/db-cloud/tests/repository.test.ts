@@ -19,6 +19,7 @@ async function pairDevice(repository: MemoryControlRepository): Promise<void> {
     devicePublicKeyHash: hash("2"),
     codeChallenge: "challenge-a",
     callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("s"),
     expiresAt: later,
     createdAt: now,
   });
@@ -27,7 +28,7 @@ async function pairDevice(repository: MemoryControlRepository): Promise<void> {
     authorizationCodeHash: hash("3"),
     workspaceId,
     ownerUserId,
-    callbackStateHash: hash("4"),
+    callbackStateHash: hash("s"),
     expiresAt: later,
     now,
   });
@@ -72,6 +73,7 @@ test("pairing session identifiers are unique and expired sessions cannot be auth
     devicePublicKeyHash: hash("8"),
     codeChallenge: "challenge-expired",
     callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("s"),
     expiresAt: now,
     createdAt: new Date("2026-07-31T11:55:00.000Z"),
   };
@@ -86,7 +88,7 @@ test("pairing session identifiers are unique and expired sessions cannot be auth
       authorizationCodeHash: hash("7"),
       workspaceId,
       ownerUserId,
-      callbackStateHash: hash("6"),
+      callbackStateHash: hash("s"),
       expiresAt: later,
       now,
     }),
@@ -102,6 +104,7 @@ test("wrong PKCE challenge does not consume the authorization code", async () =>
     devicePublicKeyHash: hash("b"),
     codeChallenge: "expected-challenge",
     callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("s"),
     expiresAt: later,
     createdAt: now,
   });
@@ -110,7 +113,7 @@ test("wrong PKCE challenge does not consume the authorization code", async () =>
     authorizationCodeHash: hash("c"),
     workspaceId,
     ownerUserId,
-    callbackStateHash: hash("d"),
+    callbackStateHash: hash("s"),
     expiresAt: later,
     now,
   });
@@ -228,6 +231,7 @@ test("pairing authorization and config audit require Owner membership", async ()
     devicePublicKeyHash: hash("b"),
     codeChallenge: "challenge-owner",
     callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("s"),
     expiresAt: later,
     createdAt: now,
   });
@@ -237,7 +241,7 @@ test("pairing authorization and config audit require Owner membership", async ()
       authorizationCodeHash: hash("c"),
       workspaceId,
       ownerUserId: "01987777-7777-8777-8777-777777777777",
-      callbackStateHash: hash("d"),
+      callbackStateHash: hash("s"),
       expiresAt: later,
       now,
     }),
@@ -268,6 +272,7 @@ test("device and credential hashes are globally unique", async () => {
     devicePublicKeyHash: hash("2"),
     codeChallenge: "challenge-duplicate-key",
     callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("s"),
     expiresAt: later,
     createdAt: now,
   });
@@ -276,7 +281,7 @@ test("device and credential hashes are globally unique", async () => {
     authorizationCodeHash: hash("8"),
     workspaceId,
     ownerUserId,
-    callbackStateHash: hash("9"),
+    callbackStateHash: hash("s"),
     expiresAt: later,
     now,
   });
@@ -300,6 +305,7 @@ test("device and credential hashes are globally unique", async () => {
     devicePublicKeyHash: hash("f"),
     codeChallenge: "challenge-duplicate-credential",
     callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("s"),
     expiresAt: later,
     createdAt: now,
   });
@@ -308,7 +314,7 @@ test("device and credential hashes are globally unique", async () => {
     authorizationCodeHash: hash("e"),
     workspaceId,
     ownerUserId,
-    callbackStateHash: hash("d"),
+    callbackStateHash: hash("s"),
     expiresAt: later,
     now,
   });

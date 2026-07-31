@@ -46,7 +46,8 @@ export const authSessions = pgTable(
     userId: uuid("user_id")
       .notNull()
       .references(() => authUsers.id, { onDelete: "cascade" }),
-    sessionTokenHash: char("session_token_hash", { length: 64 }).notNull(),
+    sessionTokenHash: char("session_token_hash", { length: 64 }),
+    sessionToken: text("session_token"),
     expiresAt: timestampColumn("expires_at").notNull(),
     ipAddress: inet("ip_address"),
     userAgent: text("user_agent"),
@@ -55,7 +56,13 @@ export const authSessions = pgTable(
   },
   (table) => [
     uniqueIndex("auth_sessions_token_hash_unique").on(table.sessionTokenHash),
-    check("auth_sessions_token_hash_hex", sql`${table.sessionTokenHash} ~ '^[0-9a-f]{64}$'`),
+    uniqueIndex("auth_sessions_session_token_unique")
+      .on(table.sessionToken)
+      .where(sql`${table.sessionToken} IS NOT NULL`),
+    check(
+      "auth_sessions_token_hash_hex",
+      sql`${table.sessionTokenHash} IS NULL OR ${table.sessionTokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
   ],
 );
 
@@ -176,6 +183,7 @@ export const pairingSessions = pgTable(
     devicePublicKeyHash: char("device_public_key_hash", { length: 64 }).notNull(),
     codeChallenge: text("code_challenge").notNull(),
     callbackUri: text("callback_uri").notNull(),
+    callbackStateHash: char("callback_state_hash", { length: 64 }),
     expiresAt: timestampColumn("expires_at").notNull(),
     createdAt: timestampColumn("created_at").notNull(),
     authorizedAt: timestampColumn("authorized_at"),
@@ -188,6 +196,10 @@ export const pairingSessions = pgTable(
     check(
       "pairing_sessions_public_key_hash_hex",
       sql`${table.devicePublicKeyHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "pairing_sessions_callback_state_hash_hex",
+      sql`${table.callbackStateHash} IS NULL OR ${table.callbackStateHash} ~ '^[0-9a-f]{64}$'`,
     ),
   ],
 );

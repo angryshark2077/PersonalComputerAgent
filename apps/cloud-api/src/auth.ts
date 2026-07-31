@@ -14,6 +14,27 @@ export interface OwnerPrincipal {
 
 export type OwnerAuthenticator = (request: Request) => Promise<OwnerPrincipal | null>;
 
+export interface BetterAuthSessionReader {
+  api: {
+    getSession(input: { headers: Headers }): Promise<{ user?: { id?: string } } | null>;
+  };
+}
+
+export function createBetterAuthOwnerAuthenticator(
+  auth: BetterAuthSessionReader,
+  repository: ControlRepository,
+): OwnerAuthenticator {
+  return async (request) => {
+    const session = await auth.api.getSession({ headers: request.headers });
+    const userId = session?.user?.id;
+    if (userId === undefined) {
+      return null;
+    }
+    const workspaceId = await repository.resolveOwnerWorkspace(userId);
+    return workspaceId === null ? null : { userId, workspaceId };
+  };
+}
+
 export async function requireOwner(
   context: Context,
   ownerAuthenticator: OwnerAuthenticator | undefined,

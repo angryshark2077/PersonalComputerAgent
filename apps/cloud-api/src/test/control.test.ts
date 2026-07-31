@@ -4,6 +4,7 @@ import test from "node:test";
 import { MemoryControlRepository } from "@pca/db-cloud/src/repository.js";
 
 import { createApp, type OwnerPrincipal } from "../index.js";
+import { pkceChallenge } from "../pairing.js";
 
 const owner: OwnerPrincipal = {
   userId: "01983333-7333-8333-8333-333333333333",
@@ -20,14 +21,21 @@ async function pairedApi() {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       device_public_key: "device-public-key-control",
-      code_challenge: "verifier-control",
+      code_challenge: pkceChallenge("verifier-control"),
       callback_uri: "http://127.0.0.1:43123/pca/pair/callback",
+      callback_state: "1234567890123456789012345678901234567890123",
     }),
   });
   const { session_id: sessionId } = (await start.json()) as { session_id: string };
   const authorized = await api.request(
     `/v1/device-pairing/sessions/${sessionId}/authorize`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        callback_state: "1234567890123456789012345678901234567890123",
+      }),
+    },
   );
   const code = new URL(authorized.headers.get("location") ?? "").searchParams.get("code");
   const exchange = await api.request("/v1/device-pairing/exchange", {

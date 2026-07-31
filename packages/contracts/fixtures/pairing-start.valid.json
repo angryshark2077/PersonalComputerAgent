@@ -1,5 +1,6 @@
 {
   "device_public_key": "test-device-public-key",
   "code_challenge": "test-pkce-challenge",
-  "callback_uri": "http://127.0.0.1:43127/pca/pair/callback"
+  "callback_uri": "http://127.0.0.1:43127/pca/pair/callback",
+  "callback_state": "1234567890123456789012345678901234567890123"
 }

@@ -143,6 +143,7 @@ export interface DevicePairingStart {
   device_public_key: string;
   code_challenge: string;
   callback_uri: string;
+  callback_state: string;
 }
 
 export interface DevicePairingExchange {

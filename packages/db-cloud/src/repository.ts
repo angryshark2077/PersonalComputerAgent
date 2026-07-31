@@ -1,5 +1,6 @@
 import type { AgentControlSnapshot } from "@pca/contracts/src/types.js";
 import { and, eq, gt, isNull } from "drizzle-orm";
+import { timingSafeEqual } from "node:crypto";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import {
@@ -38,6 +39,7 @@ export interface PairingSessionInput {
   devicePublicKeyHash: string;
   codeChallenge: string;
   callbackUri: string;
+  callbackStateHash: string;
   expiresAt: Date;
   createdAt: Date;
 }
@@ -49,9 +51,9 @@ export interface PairingSession extends PairingSessionInput {
 export interface AuthorizePairingSessionInput {
   sessionIdHash: string;
   authorizationCodeHash: string;
+  callbackStateHash: string;
   workspaceId: string;
   ownerUserId: string;
-  callbackStateHash: string;
   expiresAt: Date;
   now: Date;
 }
@@ -136,6 +138,7 @@ export interface ControlRepository {
   recordHeartbeat(input: HeartbeatInput): Promise<void>;
   appendConfigAudit(input: ConfigAuditInput): Promise<number>;
   revokeDevice(input: DeviceRevocationInput): Promise<void>;
+  resolveOwnerWorkspace(userId: string): Promise<string | null>;
 }
 
 export interface OwnerMembership {
@@ -203,6 +206,9 @@ export class MemoryControlRepository implements ControlRepository {
     if (session.authorizedAt !== null || this.#authorizationCodes.has(input.authorizationCodeHash)) {
       throw new ControlRepositoryError("CONFLICT");
     }
+    if (!secureEqual(session.callbackStateHash, input.callbackStateHash)) {
+      throw new ControlRepositoryError("PAIRING_EXPIRED");
+    }
     session.authorizedAt = input.now;
     this.#authorizationCodes.set(input.authorizationCodeHash, {
       ...input,
@@ -226,7 +232,7 @@ export class MemoryControlRepository implements ControlRepository {
     if (code.consumedAt !== null) {
       throw new ControlRepositoryError("PAIRING_REPLAYED");
     }
-    if (session.codeChallenge !== input.codeChallenge) {
+    if (!secureEqual(session.codeChallenge, input.codeChallenge)) {
       throw new ControlRepositoryError("PKCE_INVALID");
     }
     if (this.#devices.has(input.deviceId)) {
@@ -385,6 +391,16 @@ export class MemoryControlRepository implements ControlRepository {
     this.#revocationAuditIds.add(input.auditId);
   }
 
+  async resolveOwnerWorkspace(userId: string): Promise<string | null> {
+    for (const membership of this.#ownerMemberships) {
+      const [workspaceId, memberUserId] = membership.split(":");
+      if (memberUserId === userId && workspaceId !== undefined) {
+        return workspaceId;
+      }
+    }
+    return null;
+  }
+
   #authenticateCredential(
     credentialHash: string,
     now: Date,
@@ -442,10 +458,11 @@ export class DrizzleControlRepository implements ControlRepository {
         .insert(pairingSessions)
         .values({ ...input, authorizedAt: null })
         .returning();
-      if (created === undefined) {
+      const callbackStateHash = created?.callbackStateHash;
+      if (created === undefined || callbackStateHash === undefined || callbackStateHash === null) {
         throw new ControlRepositoryError("CONFLICT");
       }
-      return created;
+      return { ...created, callbackStateHash };
     } catch (error) {
       throw repositoryError(error);
     }
@@ -465,6 +482,7 @@ export class DrizzleControlRepository implements ControlRepository {
           .where(
             and(
               eq(pairingSessions.sessionIdHash, input.sessionIdHash),
+              eq(pairingSessions.callbackStateHash, input.callbackStateHash),
               isNull(pairingSessions.authorizedAt),
               gt(pairingSessions.expiresAt, input.now),
             ),
@@ -525,7 +543,7 @@ export class DrizzleControlRepository implements ControlRepository {
         if (binding.consumedAt !== null) {
           throw new ControlRepositoryError("PAIRING_REPLAYED");
         }
-        if (binding.codeChallenge !== input.codeChallenge) {
+        if (!secureEqual(binding.codeChallenge, input.codeChallenge)) {
           throw new ControlRepositoryError("PKCE_INVALID");
         }
         const [consumed] = await transaction
@@ -807,6 +825,19 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
+  async resolveOwnerWorkspace(userId: string): Promise<string | null> {
+    try {
+      const [membership] = await this.database
+        .select({ workspaceId: workspaceMembers.workspaceId })
+        .from(workspaceMembers)
+        .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.role, "owner")))
+        .limit(1);
+      return membership?.workspaceId ?? null;
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
   async #authenticateDatabaseCredential(
     credentialHash: string,
     now: Date,
@@ -906,6 +937,12 @@ function configKey(workspaceId: string, deviceId: string): string {
 
 function membershipKey(workspaceId: string, userId: string): string {
   return `${workspaceId}:${userId}`;
+}
+
+function secureEqual(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function snapshot(device: DeviceRecord, config: ConfigRecord): AgentControlSnapshot {
