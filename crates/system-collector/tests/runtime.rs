@@ -9,7 +9,7 @@ use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        mpsc as std_mpsc, Arc, Mutex,
     },
     time::Duration,
 };
@@ -54,6 +54,15 @@ impl FakeControls {
 
 struct FakeSource {
     controls: FakeControls,
+    owner_stopped: Option<std_mpsc::Sender<()>>,
+}
+
+impl Drop for FakeSource {
+    fn drop(&mut self) {
+        if let Some(owner_stopped) = self.owner_stopped.take() {
+            let _ = owner_stopped.send(());
+        }
+    }
 }
 
 impl SystemMetricsSource for FakeSource {
@@ -118,9 +127,21 @@ fn test_runtime(
     pca_system_collector::SystemCollectorHandle,
     mpsc::Receiver<SystemObservation>,
 ) {
+    test_runtime_with_owner_signal(controls, capacity, None)
+}
+
+fn test_runtime_with_owner_signal(
+    controls: &FakeControls,
+    capacity: usize,
+    owner_stopped: Option<std_mpsc::Sender<()>>,
+) -> (
+    pca_system_collector::SystemCollectorHandle,
+    mpsc::Receiver<SystemObservation>,
+) {
     start_system_collector(
         start_sampler(FakeSource {
             controls: controls.clone(),
+            owner_stopped,
         }),
         capacity,
     )
@@ -219,6 +240,17 @@ fn drain_groups(observations: &mut mpsc::Receiver<SystemObservation>) -> Vec<Met
         groups.push(observation_group(&observation));
     }
     groups
+}
+
+async fn wait_for_owner_stop(owner_stopped: std_mpsc::Receiver<()>) {
+    let stopped =
+        tokio::task::spawn_blocking(move || owner_stopped.recv_timeout(Duration::from_secs(1)))
+            .await
+            .expect("owner-stop observer task");
+    assert!(
+        stopped.is_ok(),
+        "sampler owner did not stop after observation receiver closed"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -337,6 +369,28 @@ async fn suppression_never_requests_the_sampler_and_resume_samples_fresh() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn coalesced_suppress_resume_samples_each_group_fresh_and_resets_schedules() {
+    let controls = FakeControls::cpu_script([Err(retryable_error()), Ok(())]);
+    let (handle, mut observations) = test_runtime(&controls, 16);
+    assert_initial_groups(&mut observations).await;
+
+    handle.set_suppressed(true);
+    handle.set_suppressed(false);
+
+    wait_for_calls(&controls, 2, 2).await;
+    assert_initial_groups(&mut observations).await;
+    assert_eq!((controls.cpu_calls(), controls.disk_calls()), (2, 2));
+
+    tokio::time::advance(Duration::from_secs(29)).await;
+    tokio::task::yield_now().await;
+    assert_eq!((controls.cpu_calls(), controls.disk_calls()), (2, 2));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let _ = next_for_group(&mut observations, MetricGroup::CpuMemory).await;
+    assert_eq!((controls.cpu_calls(), controls.disk_calls()), (3, 2));
+    handle.shutdown().await.expect("collector shutdown");
+}
+
+#[tokio::test(start_paused = true)]
 async fn bounded_output_skips_missed_ticks_instead_of_bursting() {
     let controls = FakeControls::always_succeeds();
     let (handle, mut observations) = test_runtime(&controls, 1);
@@ -363,12 +417,42 @@ fn zero_observation_capacity_is_rejected() {
     let _ = test_runtime(&controls, 0);
 }
 
-#[tokio::test(start_paused = true)]
-async fn receiver_drop_stops_the_runtime_and_sampler_cleanly() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn receiver_drop_during_normal_wait_stops_owner_before_handle_shutdown() {
     let controls = FakeControls::always_succeeds();
-    let (handle, observations) = test_runtime(&controls, 1);
+    let (owner_stopped_sender, owner_stopped_receiver) = std_mpsc::channel();
+    let (handle, mut observations) =
+        test_runtime_with_owner_signal(&controls, 16, Some(owner_stopped_sender));
+    assert_initial_groups(&mut observations).await;
     drop(observations);
 
+    wait_for_owner_stop(owner_stopped_receiver).await;
+    handle.shutdown().await.expect("collector shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn receiver_drop_during_retry_wait_stops_owner_before_handle_shutdown() {
+    let controls = FakeControls::cpu_script([Err(retryable_error())]);
+    let (owner_stopped_sender, owner_stopped_receiver) = std_mpsc::channel();
+    let (handle, mut observations) =
+        test_runtime_with_owner_signal(&controls, 16, Some(owner_stopped_sender));
+    assert_initial_groups(&mut observations).await;
+    drop(observations);
+
+    wait_for_owner_stop(owner_stopped_receiver).await;
+    handle.shutdown().await.expect("collector shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn receiver_drop_with_full_channel_stops_owner_before_handle_shutdown() {
+    let controls = FakeControls::always_succeeds();
+    let (owner_stopped_sender, owner_stopped_receiver) = std_mpsc::channel();
+    let (handle, observations) =
+        test_runtime_with_owner_signal(&controls, 1, Some(owner_stopped_sender));
+    wait_for_calls(&controls, 1, 1).await;
+    drop(observations);
+
+    wait_for_owner_stop(owner_stopped_receiver).await;
     handle.shutdown().await.expect("collector shutdown");
 }
 

@@ -34,33 +34,56 @@ pub enum SystemObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Control {
+enum ControlMode {
     Running,
     Suppressed,
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ControlState {
+    mode: ControlMode,
+    resume_generation: u64,
+}
+
+impl ControlState {
+    const fn running() -> Self {
+        Self {
+            mode: ControlMode::Running,
+            resume_generation: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    Ready,
+    ControlChanged,
+    ReceiverClosed,
+}
+
 pub struct SystemCollectorHandle {
-    control: watch::Sender<Control>,
+    control: watch::Sender<ControlState>,
     supervisor: Option<JoinHandle<Result<(), SystemSampleError>>>,
 }
 
 impl SystemCollectorHandle {
     /// Suppresses or resumes both metric groups without blocking on sampling work.
     pub fn set_suppressed(&self, suppressed: bool) {
-        let next = if suppressed {
-            Control::Suppressed
-        } else {
-            Control::Running
-        };
-        self.control.send_if_modified(|current| {
-            if *current == Control::Shutdown || *current == next {
-                false
-            } else {
-                *current = next;
-                true
-            }
-        });
+        self.control
+            .send_if_modified(|current| match (current.mode, suppressed) {
+                (ControlMode::Shutdown | ControlMode::Suppressed, true)
+                | (ControlMode::Shutdown | ControlMode::Running, false) => false,
+                (ControlMode::Running, true) => {
+                    current.mode = ControlMode::Suppressed;
+                    true
+                }
+                (ControlMode::Suppressed, false) => {
+                    current.mode = ControlMode::Running;
+                    current.resume_generation = current.resume_generation.wrapping_add(1);
+                    true
+                }
+            });
     }
 
     /// Stops both schedules and joins the dedicated sampler owner thread.
@@ -69,7 +92,7 @@ impl SystemCollectorHandle {
     ///
     /// Returns a typed fatal error if a runtime task or the sampler owner fails to stop.
     pub async fn shutdown(mut self) -> Result<(), SystemSampleError> {
-        self.control.send_replace(Control::Shutdown);
+        request_shutdown(&self.control);
         let supervisor = self.supervisor.take().ok_or_else(runtime_stopped_error)?;
         supervisor.await.map_err(|error| {
             SystemSampleError::new(
@@ -83,7 +106,7 @@ impl SystemCollectorHandle {
 
 impl Drop for SystemCollectorHandle {
     fn drop(&mut self) {
-        self.control.send_replace(Control::Shutdown);
+        request_shutdown(&self.control);
     }
 }
 
@@ -105,7 +128,7 @@ pub fn start_system_collector(
         "observation capacity must be greater than zero"
     );
     let (observations, receiver) = mpsc::channel(observation_capacity);
-    let (control, control_receiver) = watch::channel(Control::Running);
+    let (control, control_receiver) = watch::channel(ControlState::running());
     let supervisor = tokio::spawn(supervise(sampler, observations, control_receiver));
 
     (
@@ -120,7 +143,7 @@ pub fn start_system_collector(
 async fn supervise(
     sampler: SamplerHandle,
     observations: mpsc::Sender<SystemObservation>,
-    control: watch::Receiver<Control>,
+    control: watch::Receiver<ControlState>,
 ) -> Result<(), SystemSampleError> {
     let sampler = Arc::new(sampler);
     let cpu_task = tokio::spawn(run_group(
@@ -167,37 +190,45 @@ async fn run_group(
     period: Duration,
     sampler: Arc<SamplerHandle>,
     observations: mpsc::Sender<SystemObservation>,
-    mut control: watch::Receiver<Control>,
+    mut control: watch::Receiver<ControlState>,
 ) {
     let mut schedule = normal_schedule(period);
     let mut retry_index = 0_usize;
     let mut retry_delay = None;
     let mut sample_now = true;
+    let mut seen_resume_generation = 0_u64;
 
     loop {
-        let current_control = *control.borrow_and_update();
-        match current_control {
-            Control::Shutdown => return,
-            Control::Suppressed => {
-                if !wait_until_running(&mut control, &observations).await {
+        let mut current_control = *control.borrow_and_update();
+        match current_control.mode {
+            ControlMode::Shutdown => return,
+            ControlMode::Suppressed => {
+                let Some(running_control) = wait_until_running(&mut control, &observations).await
+                else {
                     return;
-                }
-                retry_index = 0;
-                retry_delay = None;
-                schedule = normal_schedule(period);
-                sample_now = true;
+                };
+                current_control = running_control;
             }
-            Control::Running => {}
+            ControlMode::Running => {}
+        }
+        if current_control.resume_generation != seen_resume_generation {
+            seen_resume_generation = current_control.resume_generation;
+            retry_index = 0;
+            retry_delay = None;
+            schedule = normal_schedule(period);
+            sample_now = true;
         }
 
         if !sample_now {
-            let ready = if let Some(delay) = retry_delay.take() {
+            let outcome = if let Some(delay) = retry_delay.take() {
                 wait_for_retry(delay, &mut control, &observations).await
             } else {
                 wait_for_schedule(&mut schedule, &mut control, &observations).await
             };
-            if !ready {
-                continue;
+            match outcome {
+                WaitOutcome::Ready => {}
+                WaitOutcome::ControlChanged => continue,
+                WaitOutcome::ReceiverClosed => return,
             }
         }
 
@@ -212,7 +243,7 @@ async fn run_group(
             () = observations.closed() => return,
             result = sampler.sample(group) => result,
         };
-        if *control.borrow() != Control::Running {
+        if control.borrow().mode != ControlMode::Running {
             continue;
         }
 
@@ -228,8 +259,10 @@ async fn run_group(
                 observed_at_ms: observed_at_ms(),
             },
         };
-        if !send_observation(observation, &observations, &mut control).await {
-            continue;
+        match send_observation(observation, &observations, &mut control).await {
+            WaitOutcome::Ready => {}
+            WaitOutcome::ControlChanged => continue,
+            WaitOutcome::ReceiverClosed => return,
         }
 
         if succeeded {
@@ -245,73 +278,91 @@ async fn run_group(
 }
 
 async fn wait_until_running(
-    control: &mut watch::Receiver<Control>,
+    control: &mut watch::Receiver<ControlState>,
     observations: &mpsc::Sender<SystemObservation>,
-) -> bool {
+) -> Option<ControlState> {
     loop {
         let current_control = *control.borrow_and_update();
-        match current_control {
-            Control::Running => return true,
-            Control::Shutdown => return false,
-            Control::Suppressed => {}
+        match current_control.mode {
+            ControlMode::Running => return Some(current_control),
+            ControlMode::Shutdown => return None,
+            ControlMode::Suppressed => {}
         }
         tokio::select! {
             biased;
             changed = control.changed() => {
                 if changed.is_err() {
-                    return false;
+                    return None;
                 }
             }
-            () = observations.closed() => return false,
+            () = observations.closed() => return None,
         }
     }
 }
 
 async fn wait_for_retry(
     delay: Duration,
-    control: &mut watch::Receiver<Control>,
+    control: &mut watch::Receiver<ControlState>,
     observations: &mpsc::Sender<SystemObservation>,
-) -> bool {
+) -> WaitOutcome {
     tokio::select! {
         biased;
-        changed = control.changed() => {
-            let _ = changed;
-            false
-        }
-        () = observations.closed() => false,
-        () = time::sleep(delay) => true,
+        changed = control.changed() => if changed.is_ok() {
+            WaitOutcome::ControlChanged
+        } else {
+            WaitOutcome::ReceiverClosed
+        },
+        () = observations.closed() => WaitOutcome::ReceiverClosed,
+        () = time::sleep(delay) => WaitOutcome::Ready,
     }
 }
 
 async fn wait_for_schedule(
     schedule: &mut time::Interval,
-    control: &mut watch::Receiver<Control>,
+    control: &mut watch::Receiver<ControlState>,
     observations: &mpsc::Sender<SystemObservation>,
-) -> bool {
+) -> WaitOutcome {
     tokio::select! {
         biased;
-        changed = control.changed() => {
-            let _ = changed;
-            false
-        }
-        () = observations.closed() => false,
-        _ = schedule.tick() => true,
+        changed = control.changed() => if changed.is_ok() {
+            WaitOutcome::ControlChanged
+        } else {
+            WaitOutcome::ReceiverClosed
+        },
+        () = observations.closed() => WaitOutcome::ReceiverClosed,
+        _ = schedule.tick() => WaitOutcome::Ready,
     }
 }
 
 async fn send_observation(
     observation: SystemObservation,
     observations: &mpsc::Sender<SystemObservation>,
-    control: &mut watch::Receiver<Control>,
-) -> bool {
+    control: &mut watch::Receiver<ControlState>,
+) -> WaitOutcome {
     tokio::select! {
         biased;
-        changed = control.changed() => {
-            let _ = changed;
-            false
-        }
-        sent = observations.send(observation) => sent.is_ok(),
+        changed = control.changed() => if changed.is_ok() {
+            WaitOutcome::ControlChanged
+        } else {
+            WaitOutcome::ReceiverClosed
+        },
+        sent = observations.send(observation) => if sent.is_ok() {
+            WaitOutcome::Ready
+        } else {
+            WaitOutcome::ReceiverClosed
+        },
     }
+}
+
+fn request_shutdown(control: &watch::Sender<ControlState>) {
+    control.send_if_modified(|current| {
+        if current.mode == ControlMode::Shutdown {
+            false
+        } else {
+            current.mode = ControlMode::Shutdown;
+            true
+        }
+    });
 }
 
 fn normal_schedule(period: Duration) -> time::Interval {
