@@ -280,8 +280,13 @@ async fn run_group(
                 observed_at_ms: observed_at_ms(),
             },
         };
+        let terminal = matches!(
+            error_kind,
+            Some(SystemSampleErrorKind::Unsupported | SystemSampleErrorKind::Fatal)
+        );
         match send_observation(observation, &observations, &mut control).await {
             WaitOutcome::Ready => {}
+            WaitOutcome::ControlChanged if terminal => return,
             WaitOutcome::ControlChanged => continue,
             WaitOutcome::ReceiverClosed => return,
         }

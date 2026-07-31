@@ -405,6 +405,46 @@ async fn fatal_error_stops_only_its_metric_group_until_shutdown() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn terminal_result_stays_terminal_when_control_changes_during_observation_delivery() {
+    let controls = FakeControls::cpu_script([
+        Ok(()),
+        Err(terminal_error(SystemSampleErrorKind::Unsupported)),
+        Ok(()),
+    ]);
+    let (handle, mut observations) = test_runtime(&controls, 2);
+    wait_for_calls(&controls, 1, 1).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    wait_for_calls(&controls, 2, 1).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    handle.set_suppressed(true);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    handle.set_suppressed(false);
+    let _ = next_group(&mut observations).await;
+    let _ = next_group(&mut observations).await;
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+        std::thread::yield_now();
+    }
+    assert_eq!(controls.disk_calls(), 2);
+    assert_eq!(
+        controls.cpu_calls(),
+        2,
+        "a terminal sample result must survive an interrupted observation send"
+    );
+
+    handle.shutdown().await.expect("collector shutdown");
+}
+
+#[tokio::test(start_paused = true)]
 async fn suppression_never_requests_the_sampler_and_resume_samples_fresh() {
     let controls = FakeControls::always_succeeds();
     let (handle, mut observations) = test_runtime(&controls, 16);
