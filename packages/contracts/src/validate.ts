@@ -10,6 +10,9 @@ export type ContractSchemaName =
   | "command-envelope"
   | "error-envelope"
   | "event-envelope"
+  | "system-metric-sampled"
+  | "collector-status-changed"
+  | "system-health-changed"
   | "sync-batch-request"
   | "sync-batch-response"
   | "wechat-provider-state";
@@ -26,6 +29,9 @@ const schemaNames: ContractSchemaName[] = [
   "command-envelope",
   "error-envelope",
   "event-envelope",
+  "system-metric-sampled",
+  "collector-status-changed",
+  "system-health-changed",
   "sync-batch-request",
   "sync-batch-response",
   "wechat-provider-state",
@@ -75,12 +81,86 @@ export function validateContract(
     return { valid: false, errors: [`unknown contract schema: ${schemaName}`] };
   }
 
-  if (validate(value)) {
-    return { valid: true, errors: [] };
+  if (!validate(value)) {
+    return {
+      valid: false,
+      errors: (validate.errors ?? []).map(formatError),
+    };
   }
 
-  return {
-    valid: false,
-    errors: (validate.errors ?? []).map(formatError),
+  const relationshipErrors =
+    schemaName === "system-metric-sampled"
+      ? validateSystemMetricRelationships(value)
+      : schemaName === "collector-status-changed"
+        ? validateCollectorStatusRelationships(value)
+        : [];
+
+  return relationshipErrors.length === 0
+    ? { valid: true, errors: [] }
+    : { valid: false, errors: relationshipErrors };
+}
+
+function validateSystemMetricRelationships(value: unknown): string[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return [];
+  }
+
+  const payload = value as Record<string, unknown>;
+  if (payload.metric_group === "cpu_memory") {
+    const host = payload.host as {
+      memory_total_bytes: number;
+      memory_used_bytes: number;
+    };
+    return host.memory_used_bytes > host.memory_total_bytes
+      ? ["/host/memory_used_bytes must not exceed memory_total_bytes"]
+      : [];
+  }
+
+  if (payload.metric_group !== "disk") {
+    return [];
+  }
+
+  const totalBytes = payload.total_bytes as number;
+  const availableBytes = payload.available_bytes as number;
+  const thresholdBytes = payload.low_space_threshold_bytes as number;
+  const lowSpace = payload.low_space as boolean;
+  const warningCode = payload.warning_code as string | null;
+  const usedPercent = payload.used_percent as number;
+  const errors: string[] = [];
+
+  if (availableBytes > totalBytes) {
+    errors.push("/available_bytes must not exceed total_bytes");
+  }
+  if (lowSpace !== (availableBytes < thresholdBytes)) {
+    errors.push("/low_space must match the available_bytes threshold");
+  }
+  if (warningCode !== (lowSpace ? "DISK_SPACE_LOW" : null)) {
+    errors.push("/warning_code must match low_space");
+  }
+  if (Math.abs(usedPercent - ((totalBytes - availableBytes) / totalBytes) * 100) > 0.01) {
+    errors.push("/used_percent must match total_bytes and available_bytes");
+  }
+  return errors;
+}
+
+function validateCollectorStatusRelationships(value: unknown): string[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return [];
+  }
+
+  const payload = value as Record<string, unknown>;
+  const expectedErrorCode: Record<string, string | null> = {
+    disabled: null,
+    permission_required: null,
+    initializing: null,
+    running: null,
+    paused: null,
+    degraded: "COLLECTOR_DEGRADED",
+    unsupported: "COLLECTOR_UNSUPPORTED",
+    error: "COLLECTOR_INIT_FAILED",
   };
+  const expected = expectedErrorCode[payload.status as string];
+  return expected === undefined || payload.error_code === expected
+    ? []
+    : ["/error_code must match status"];
 }

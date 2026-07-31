@@ -1,0 +1,9 @@
+{
+  "collector_key": "system",
+  "previous_status": "initializing",
+  "status": "running",
+  "desired_config_revision": 0,
+  "applied_config_revision": 0,
+  "reason": "initial_samples_succeeded",
+  "error_code": null
+}

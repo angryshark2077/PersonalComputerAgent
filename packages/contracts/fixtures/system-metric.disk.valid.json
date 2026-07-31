@@ -1,0 +1,10 @@
+{
+  "metric_group": "disk",
+  "scope": "pca_data_volume",
+  "total_bytes": 107374182400,
+  "available_bytes": 53687091200,
+  "used_percent": 50,
+  "low_space": false,
+  "low_space_threshold_bytes": 2147483648,
+  "warning_code": null
+}

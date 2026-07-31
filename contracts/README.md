@@ -21,3 +21,6 @@
 - `wechat-provider-state.schema.json`
 - `collector-state.schema.json`
 - `error-envelope.schema.json`
+- `system-metric-sampled.schema.json`
+- `collector-status-changed.schema.json`
+- `system-health-changed.schema.json`

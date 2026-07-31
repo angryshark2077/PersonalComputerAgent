@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/system-health-changed.schema.json",
+  "title": "SystemHealthChanged",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "condition",
+    "active",
+    "error_code",
+    "available_bytes",
+    "threshold_bytes"
+  ],
+  "properties": {
+    "condition": { "const": "disk_space_low" },
+    "active": { "type": "boolean" },
+    "error_code": { "const": "DISK_SPACE_LOW" },
+    "available_bytes": { "type": "integer", "minimum": 0 },
+    "threshold_bytes": { "const": 2147483648 }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/collector-status-changed.schema.json",
+  "title": "CollectorStatusChanged",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "collector_key",
+    "previous_status",
+    "status",
+    "desired_config_revision",
+    "applied_config_revision",
+    "reason",
+    "error_code"
+  ],
+  "properties": {
+    "collector_key": { "type": "string", "minLength": 1 },
+    "previous_status": {
+      "enum": [
+        "disabled",
+        "permission_required",
+        "initializing",
+        "running",
+        "paused",
+        "degraded",
+        "unsupported",
+        "error"
+      ]
+    },
+    "status": {
+      "enum": [
+        "disabled",
+        "permission_required",
+        "initializing",
+        "running",
+        "paused",
+        "degraded",
+        "unsupported",
+        "error"
+      ]
+    },
+    "desired_config_revision": { "type": "integer", "minimum": 0 },
+    "applied_config_revision": { "type": "integer", "minimum": 0 },
+    "reason": {
+      "enum": [
+        "identity_available",
+        "initial_samples_succeeded",
+        "sampling_failed",
+        "sampling_recovered",
+        "outbox_backpressure",
+        "outbox_recovered",
+        "persistence_failed",
+        "persistence_recovered",
+        "collector_unsupported",
+        "collector_error"
+      ]
+    },
+    "error_code": { "type": ["string", "null"] }
+  }
+}

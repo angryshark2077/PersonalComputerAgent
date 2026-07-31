@@ -39,6 +39,105 @@ test("valid Event fixture satisfies the canonical schema", () => {
   });
 });
 
+test("System metric payloads are strict discriminated unions", () => {
+  for (const name of [
+    "system-metric.cpu-memory.valid.json",
+    "system-metric.disk.valid.json",
+  ]) {
+    assert.deepEqual(
+      validateContract("system-metric-sampled", fixture(name)),
+      { valid: true, errors: [] },
+    );
+  }
+
+  assert.equal(
+    validateContract(
+      "system-metric-sampled",
+      fixture("system-metric.invalid-percent.json"),
+    ).valid,
+    false,
+  );
+  assert.equal(
+    validateContract(
+      "system-metric-sampled",
+      fixture("system-metric.invalid-unknown-field.json"),
+    ).valid,
+    false,
+  );
+});
+
+test("System metric payloads reject inconsistent relationships", () => {
+  const cpu = fixture("system-metric.cpu-memory.valid.json") as {
+    host: { memory_total_bytes: number; memory_used_bytes: number };
+  };
+  cpu.host.memory_used_bytes = cpu.host.memory_total_bytes + 1;
+  assert.equal(validateContract("system-metric-sampled", cpu).valid, false);
+
+  const diskWithExtraSpace = fixture("system-metric.disk.valid.json") as {
+    total_bytes: number;
+    available_bytes: number;
+  };
+  diskWithExtraSpace.available_bytes = diskWithExtraSpace.total_bytes + 1;
+  assert.equal(
+    validateContract("system-metric-sampled", diskWithExtraSpace).valid,
+    false,
+  );
+
+  const diskWithMismatchedLowSpace = fixture("system-metric.disk.valid.json") as {
+    low_space: boolean;
+  };
+  diskWithMismatchedLowSpace.low_space = true;
+  assert.equal(
+    validateContract("system-metric-sampled", diskWithMismatchedLowSpace).valid,
+    false,
+  );
+
+  const diskWithMismatchedWarning = fixture("system-metric.disk.valid.json") as {
+    warning_code: string | null;
+  };
+  diskWithMismatchedWarning.warning_code = "DISK_SPACE_LOW";
+  assert.equal(
+    validateContract("system-metric-sampled", diskWithMismatchedWarning).valid,
+    false,
+  );
+
+  const diskWithMismatchedPercent = fixture("system-metric.disk.valid.json") as {
+    used_percent: number;
+  };
+  diskWithMismatchedPercent.used_percent = 50.02;
+  assert.equal(
+    validateContract("system-metric-sampled", diskWithMismatchedPercent).valid,
+    false,
+  );
+});
+
+test("Collector status and System health payloads validate", () => {
+  assert.equal(
+    validateContract(
+      "collector-status-changed",
+      fixture("collector-status.valid.json"),
+    ).valid,
+    true,
+  );
+  assert.equal(
+    validateContract("system-health-changed", fixture("system-health.active.json"))
+      .valid,
+    true,
+  );
+});
+
+test("Collector status requires the status-specific error code", () => {
+  const degraded = fixture("collector-status.valid.json") as {
+    status: string;
+    error_code: string | null;
+    reason: string;
+  };
+  degraded.status = "degraded";
+  degraded.reason = "sampling_failed";
+  degraded.error_code = null;
+  assert.equal(validateContract("collector-status-changed", degraded).valid, false);
+});
+
 test("registry contains every Appendix C enum group without duplicates", () => {
   const registry = JSON.parse(
     readFileSync(join(here, "../registry.json"), "utf8"),

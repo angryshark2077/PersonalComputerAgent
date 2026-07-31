@@ -1,0 +1,7 @@
+{
+  "condition": "disk_space_low",
+  "active": true,
+  "error_code": "DISK_SPACE_LOW",
+  "available_bytes": 1073741824,
+  "threshold_bytes": 2147483648
+}

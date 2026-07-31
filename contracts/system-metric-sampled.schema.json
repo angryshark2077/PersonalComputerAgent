@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/system-metric-sampled.schema.json",
+  "title": "SystemMetricSampled",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric_group",
+        "sample_window_ms",
+        "logical_cpu_count",
+        "host",
+        "agent"
+      ],
+      "properties": {
+        "metric_group": { "const": "cpu_memory" },
+        "sample_window_ms": { "type": "integer", "minimum": 1 },
+        "logical_cpu_count": { "type": "integer", "minimum": 1 },
+        "host": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpu_usage_percent",
+            "memory_total_bytes",
+            "memory_used_bytes"
+          ],
+          "properties": {
+            "cpu_usage_percent": { "type": "number", "minimum": 0, "maximum": 100 },
+            "memory_total_bytes": { "type": "integer", "minimum": 0 },
+            "memory_used_bytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu_usage_percent", "memory_resident_bytes"],
+          "properties": {
+            "cpu_usage_percent": { "type": "number", "minimum": 0, "maximum": 100 },
+            "memory_resident_bytes": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric_group",
+        "scope",
+        "total_bytes",
+        "available_bytes",
+        "used_percent",
+        "low_space",
+        "low_space_threshold_bytes",
+        "warning_code"
+      ],
+      "properties": {
+        "metric_group": { "const": "disk" },
+        "scope": { "const": "pca_data_volume" },
+        "total_bytes": { "type": "integer", "minimum": 1 },
+        "available_bytes": { "type": "integer", "minimum": 0 },
+        "used_percent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "low_space": { "type": "boolean" },
+        "low_space_threshold_bytes": { "const": 2147483648 },
+        "warning_code": { "type": ["string", "null"], "enum": ["DISK_SPACE_LOW", null] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "low_space": { "const": true } } },
+          "then": { "properties": { "warning_code": { "const": "DISK_SPACE_LOW" } } },
+          "else": { "properties": { "warning_code": { "type": "null" } } }
+        }
+      ]
+    }
+  ]
+}

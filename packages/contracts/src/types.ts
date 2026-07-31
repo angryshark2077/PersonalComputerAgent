@@ -82,3 +82,59 @@ export interface EventEnvelope {
   attachment_refs?: string[];
   idempotency_key?: string;
 }
+
+export interface CpuMemoryMetricPayload {
+  metric_group: "cpu_memory";
+  sample_window_ms: number;
+  logical_cpu_count: number;
+  host: {
+    cpu_usage_percent: number;
+    memory_total_bytes: number;
+    memory_used_bytes: number;
+  };
+  agent: {
+    cpu_usage_percent: number;
+    memory_resident_bytes: number;
+  };
+}
+
+export interface DiskMetricPayload {
+  metric_group: "disk";
+  scope: "pca_data_volume";
+  total_bytes: number;
+  available_bytes: number;
+  used_percent: number;
+  low_space: boolean;
+  low_space_threshold_bytes: 2147483648;
+  warning_code: "DISK_SPACE_LOW" | null;
+}
+
+export type SystemMetricPayload = CpuMemoryMetricPayload | DiskMetricPayload;
+
+export type CollectorStatus =
+  | "disabled"
+  | "permission_required"
+  | "initializing"
+  | "running"
+  | "paused"
+  | "degraded"
+  | "unsupported"
+  | "error";
+
+export interface CollectorStatusChangedPayload {
+  collector_key: string;
+  previous_status: CollectorStatus;
+  status: CollectorStatus;
+  desired_config_revision: number;
+  applied_config_revision: number;
+  reason: string;
+  error_code: string | null;
+}
+
+export interface SystemHealthChangedPayload {
+  condition: "disk_space_low";
+  active: boolean;
+  error_code: "DISK_SPACE_LOW";
+  available_bytes: number;
+  threshold_bytes: 2147483648;
+}
