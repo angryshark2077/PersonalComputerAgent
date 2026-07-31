@@ -13,7 +13,7 @@ use std::{
 };
 
 #[cfg(feature = "process-test-hooks")]
-use crate::actor::ProcessTestHooks;
+use crate::actor::{ProcessTestBarrier, ProcessTestHooks};
 use crate::{migrations::MAX_SUPPORTED_SCHEMA_VERSION, DbError, DbHealth};
 
 struct SerializedEvent<'a> {
@@ -35,7 +35,9 @@ pub(crate) fn append_event_with_outbox(
     insert_event(&transaction, &serialized)?;
     #[cfg(feature = "process-test-hooks")]
     if let Some(hooks) = process_test_hooks {
-        wait_at_process_test_barrier(hooks)?;
+        if let Some(barrier) = hooks.event_outbox.as_ref() {
+            wait_at_process_test_barrier(barrier, b"event-inserted\n")?;
+        }
     }
     insert_stable_outbox(&transaction, &serialized)?;
     transaction
@@ -46,6 +48,7 @@ pub(crate) fn append_event_with_outbox(
 pub(crate) fn commit_events(
     connection: &mut Connection,
     commit: &EventCommit,
+    #[cfg(feature = "process-test-hooks")] process_test_hooks: Option<&ProcessTestHooks>,
 ) -> Result<(), DbError> {
     let serialized = commit
         .events()
@@ -58,6 +61,13 @@ pub(crate) fn commit_events(
     for event in &serialized {
         insert_event(&transaction, event)?;
         insert_stable_outbox(&transaction, event)?;
+    }
+    #[cfg(feature = "process-test-hooks")]
+    if commit.collector_state().is_some() {
+        if let Some(barrier) = process_test_hooks.and_then(|hooks| hooks.collector_commit.as_ref())
+        {
+            wait_at_process_test_barrier(barrier, b"collector-event-outbox-inserted\n")?;
+        }
     }
     if let Some(state) = commit.collector_state() {
         upsert_collector_state_in(&transaction, state)?;
@@ -232,20 +242,23 @@ fn validate_existing_outbox(
 }
 
 #[cfg(feature = "process-test-hooks")]
-fn wait_at_process_test_barrier(hooks: &ProcessTestHooks) -> Result<(), DbError> {
+fn wait_at_process_test_barrier(
+    barrier: &ProcessTestBarrier,
+    ready_contents: &[u8],
+) -> Result<(), DbError> {
     let mut ready = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&hooks.event_inserted_ready)
+        .open(&barrier.ready)
         .map_err(|error| DbError::sqlite("create process test barrier", error))?;
     ready
-        .write_all(b"event-inserted\n")
+        .write_all(ready_contents)
         .and_then(|()| ready.sync_all())
         .map_err(|error| DbError::sqlite("publish process test barrier", error))?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match fs::symlink_metadata(&hooks.event_inserted_release) {
+        match fs::symlink_metadata(&barrier.release) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                 return Ok(())
             }

@@ -28,6 +28,7 @@ use crate::config::ProcessTestFatalCleanupConfig;
 use crate::{
     config::{CommandConfig, RunConfig},
     lifecycle::{LifecycleRuntime, NoopCapabilityRefresher, RuntimeIdentity},
+    system_runtime::SystemRuntimeHandle,
 };
 
 pub(crate) const EXIT_USAGE: u8 = 2;
@@ -70,6 +71,7 @@ enum FailureStage {
     DatabaseHealth,
     State,
     Lifecycle,
+    SystemCollector,
     Heartbeat,
     Signal,
     #[cfg(feature = "process-test-hooks")]
@@ -77,6 +79,7 @@ enum FailureStage {
     #[cfg(feature = "process-test-hooks")]
     InjectedHeartbeat,
     LifecycleCleanup,
+    SystemCollectorCleanup,
     BridgeCleanup,
     Checkpoint,
     FinalStatus,
@@ -95,6 +98,7 @@ impl FailureStage {
             Self::DatabaseHealth => "database_health",
             Self::State => "state",
             Self::Lifecycle => "lifecycle",
+            Self::SystemCollector => "system_collector",
             Self::Heartbeat => "heartbeat",
             Self::Signal => "signal",
             #[cfg(feature = "process-test-hooks")]
@@ -102,6 +106,7 @@ impl FailureStage {
             #[cfg(feature = "process-test-hooks")]
             Self::InjectedHeartbeat => "injected_heartbeat",
             Self::LifecycleCleanup => "lifecycle_cleanup",
+            Self::SystemCollectorCleanup => "system_collector_cleanup",
             Self::BridgeCleanup => "bridge_cleanup",
             Self::Checkpoint => "checkpoint",
             Self::FinalStatus => "final_status",
@@ -155,6 +160,7 @@ impl AppError {
 struct RuntimeResources {
     database: Option<Arc<DbActorHandle>>,
     lifecycle: Option<LifecycleRuntime>,
+    system_runtime: Option<SystemRuntimeHandle>,
     bridge_shutdown: Option<watch::Sender<bool>>,
     bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
     heartbeat: Option<LocalHeartbeatWriter>,
@@ -167,6 +173,7 @@ impl RuntimeResources {
         Self {
             database: Some(Arc::new(database)),
             lifecycle: None,
+            system_runtime: None,
             bridge_shutdown: None,
             bridge_task: None,
             heartbeat: None,
@@ -250,6 +257,8 @@ impl RuntimeResources {
             .await
             .map_err(|_| FailureStage::Lifecycle)?;
 
+        self.start_system_collector(config).await?;
+
         #[cfg(feature = "process-test-hooks")]
         if let Some(hook) = &config.process_test_fatal_cleanup {
             await_fatal_cleanup_release(hook, &mut bridge_status_receiver).await?;
@@ -290,6 +299,23 @@ impl RuntimeResources {
         }
     }
 
+    async fn start_system_collector(&mut self, config: &RunConfig) -> Result<(), FailureStage> {
+        self.system_runtime = Some(
+            SystemRuntimeHandle::start(
+                Arc::clone(
+                    self.database
+                        .as_ref()
+                        .expect("database exists until cleanup"),
+                ),
+                config.collector_identity(),
+                config.paths.data_dir.clone(),
+            )
+            .await
+            .map_err(|_| FailureStage::SystemCollector)?,
+        );
+        Ok(())
+    }
+
     async fn persist_status(&self) -> Result<(), FailureStage> {
         let heartbeat = self.heartbeat.as_ref().ok_or(FailureStage::Heartbeat)?;
         let schema_version = self.schema_version.ok_or(FailureStage::Heartbeat)?;
@@ -300,6 +326,12 @@ impl RuntimeResources {
 
     async fn cleanup(mut self, clean_shutdown: bool) -> Vec<FailureStage> {
         let mut failures = Vec::new();
+
+        if let Some(system_runtime) = self.system_runtime.take() {
+            if system_runtime.shutdown().await.is_err() {
+                failures.push(FailureStage::SystemCollectorCleanup);
+            }
+        }
 
         if let Some(lifecycle) = self.lifecycle.take() {
             let result = if clean_shutdown {
@@ -413,9 +445,31 @@ async fn run(config: &RunConfig) -> Result<(), AppError> {
 
 async fn open_database(config: &RunConfig) -> Result<DbActorHandle, FailureStage> {
     #[cfg(feature = "process-test-hooks")]
-    if let Some(ref barrier) = config.process_test_barrier {
-        let hooks = ProcessTestHooks::new(barrier.ready.clone(), barrier.release.clone())
-            .map_err(|_| FailureStage::DatabaseOpen)?;
+    if config.process_test_barrier.is_some() || config.process_test_collector_barrier.is_some() {
+        let hooks = match (
+            config.process_test_barrier.as_ref(),
+            config.process_test_collector_barrier.as_ref(),
+        ) {
+            (Some(event), Some(collector)) => {
+                ProcessTestHooks::new(event.ready.clone(), event.release.clone()).and_then(
+                    |hooks| {
+                        hooks.with_collector_commit_barrier(
+                            collector.ready.clone(),
+                            collector.release.clone(),
+                        )
+                    },
+                )
+            }
+            (Some(event), None) => {
+                ProcessTestHooks::new(event.ready.clone(), event.release.clone())
+            }
+            (None, Some(collector)) => ProcessTestHooks::collector_commit(
+                collector.ready.clone(),
+                collector.release.clone(),
+            ),
+            (None, None) => unreachable!("barrier presence checked"),
+        }
+        .map_err(|_| FailureStage::DatabaseOpen)?;
         return DbActorHandle::open_with_process_test_hooks(
             &config.paths.database_file,
             app_version(),

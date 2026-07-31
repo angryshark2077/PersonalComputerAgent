@@ -226,10 +226,6 @@ impl CollectorRegistry {
         self.update(transition, None)
     }
 
-    pub(crate) const fn status(&self) -> CollectorStatus {
-        self.state.status
-    }
-
     pub(crate) const fn persistence_failed(&self) -> bool {
         self.persistence_failed
     }
@@ -387,10 +383,9 @@ mod tests {
 
     #[test]
     fn unpaired_restore_is_disabled_without_transition_and_resets_revisions() {
-        let (registry, update) =
+        let (_registry, update) =
             CollectorRegistry::restore(Some(prior_state(CollectorStatus::Running)), false, 0, NOW);
 
-        assert_eq!(registry.status(), CollectorStatus::Disabled);
         assert_eq!(update.state.desired_config_revision, 0);
         assert_eq!(update.state.applied_config_revision, 0);
         assert_eq!(update.state.status, CollectorStatus::Disabled);

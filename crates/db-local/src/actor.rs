@@ -13,9 +13,16 @@ const REQUEST_CAPACITY: usize = 64;
 
 #[cfg(feature = "process-test-hooks")]
 #[derive(Clone, Debug)]
+pub(crate) struct ProcessTestBarrier {
+    pub(crate) ready: PathBuf,
+    pub(crate) release: PathBuf,
+}
+
+#[cfg(feature = "process-test-hooks")]
+#[derive(Clone, Debug)]
 pub struct ProcessTestHooks {
-    pub(crate) event_inserted_ready: PathBuf,
-    pub(crate) event_inserted_release: PathBuf,
+    pub(crate) event_outbox: Option<ProcessTestBarrier>,
+    pub(crate) collector_commit: Option<ProcessTestBarrier>,
 }
 
 #[cfg(feature = "process-test-hooks")]
@@ -28,21 +35,57 @@ impl ProcessTestHooks {
     ///
     /// Returns an error unless both paths are absolute, distinct, and share one parent.
     pub fn new(ready: PathBuf, release: PathBuf) -> Result<Self, DbError> {
-        if !ready.is_absolute()
-            || !release.is_absolute()
-            || ready == release
-            || ready.parent() != release.parent()
-        {
-            return Err(DbError::sqlite(
-                "configure process test barrier",
-                "barrier paths must be distinct absolute siblings",
-            ));
-        }
+        let event_outbox = validate_process_test_barrier(ready, release)?;
         Ok(Self {
-            event_inserted_ready: ready,
-            event_inserted_release: release,
+            event_outbox: Some(event_outbox),
+            collector_commit: None,
         })
     }
+
+    /// Configures only the deterministic Collector commit rendezvous.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless both paths are absolute, distinct, and share one parent.
+    pub fn collector_commit(ready: PathBuf, release: PathBuf) -> Result<Self, DbError> {
+        let collector_commit = validate_process_test_barrier(ready, release)?;
+        Ok(Self {
+            event_outbox: None,
+            collector_commit: Some(collector_commit),
+        })
+    }
+
+    /// Adds a deterministic Collector commit rendezvous without changing the Event/Outbox hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless both paths are absolute, distinct, and share one parent.
+    pub fn with_collector_commit_barrier(
+        mut self,
+        ready: PathBuf,
+        release: PathBuf,
+    ) -> Result<Self, DbError> {
+        self.collector_commit = Some(validate_process_test_barrier(ready, release)?);
+        Ok(self)
+    }
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn validate_process_test_barrier(
+    ready: PathBuf,
+    release: PathBuf,
+) -> Result<ProcessTestBarrier, DbError> {
+    if !ready.is_absolute()
+        || !release.is_absolute()
+        || ready == release
+        || ready.parent() != release.parent()
+    {
+        return Err(DbError::sqlite(
+            "configure process test barrier",
+            "barrier paths must be distinct absolute siblings",
+        ));
+    }
+    Ok(ProcessTestBarrier { ready, release })
 }
 
 #[derive(Default)]
@@ -430,7 +473,12 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, option
                 ));
             }
             Request::CommitEvents { commit, response } => {
-                let _ = response.send(repository::commit_events(&mut connection, &commit));
+                let _ = response.send(repository::commit_events(
+                    &mut connection,
+                    &commit,
+                    #[cfg(feature = "process-test-hooks")]
+                    options.process_test_hooks.as_ref(),
+                ));
             }
             Request::SetAgentState {
                 agent_status,

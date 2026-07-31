@@ -601,6 +601,10 @@ fn default_binary_does_not_recognize_process_test_hook_flags() {
     for flag in [
         "--process-test-event-barrier-ready",
         "--process-test-event-barrier-release",
+        "--process-test-workspace-id",
+        "--process-test-device-id",
+        "--process-test-collector-barrier-ready",
+        "--process-test-collector-barrier-release",
         "--process-test-fail-heartbeat-after-bridge-pid",
         "--process-test-fatal-armed",
         "--process-test-fatal-release",
@@ -616,4 +620,137 @@ fn default_binary_does_not_recognize_process_test_hook_flags() {
 
         assert_eq!(output.status.code(), Some(2), "default accepted {flag}");
     }
+}
+
+#[cfg(feature = "process-test-hooks")]
+#[test]
+fn collector_identity_flags_require_a_valid_pair_on_run_with_an_explicit_root() {
+    const WORKSPACE_ID: &str = "018f3f4a-2d9b-7d21-a310-2c49d9b43c13";
+    const DEVICE_ID: &str = "018f3f4a-2d9b-7d21-a310-2c49d9b43c14";
+    let root = tempfile::tempdir().expect("temporary runtime root");
+
+    let cases = [
+        vec![
+            "run",
+            "--runtime-root",
+            root.path().to_str().expect("UTF-8 root"),
+            "--process-test-workspace-id",
+            WORKSPACE_ID,
+        ],
+        vec![
+            "run",
+            "--runtime-root",
+            root.path().to_str().expect("UTF-8 root"),
+            "--process-test-device-id",
+            DEVICE_ID,
+        ],
+        vec![
+            "run",
+            "--runtime-root",
+            root.path().to_str().expect("UTF-8 root"),
+            "--process-test-workspace-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--process-test-device-id",
+            DEVICE_ID,
+        ],
+        vec![
+            "run",
+            "--runtime-root",
+            root.path().to_str().expect("UTF-8 root"),
+            "--process-test-workspace-id",
+            WORKSPACE_ID,
+            "--process-test-device-id",
+            "not-a-uuid",
+        ],
+        vec![
+            "health",
+            "--runtime-root",
+            root.path().to_str().expect("UTF-8 root"),
+            "--process-test-workspace-id",
+            WORKSPACE_ID,
+            "--process-test-device-id",
+            DEVICE_ID,
+        ],
+        vec![
+            "run",
+            "--process-test-workspace-id",
+            WORKSPACE_ID,
+            "--process-test-device-id",
+            DEVICE_ID,
+        ],
+    ];
+
+    for arguments in cases {
+        let output = Command::new(binary())
+            .args(arguments)
+            .output()
+            .expect("run agentd with invalid process identity");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "invalid process identity reached runtime: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(feature = "process-test-hooks")]
+#[test]
+fn collector_barrier_flags_require_distinct_run_siblings() {
+    let root = tempfile::tempdir().expect("temporary runtime root");
+    let run = root.path().join("Run");
+    let same = run.join("same");
+    let outside = root.path().join("outside");
+    let ready = run.join("collector.ready");
+    let release = run.join("collector.release");
+
+    for (ready, release) in [(&same, &same), (&same, &outside)] {
+        let output = Command::new(binary())
+            .args(["run", "--runtime-root"])
+            .arg(root.path())
+            .arg("--process-test-collector-barrier-ready")
+            .arg(ready)
+            .arg("--process-test-collector-barrier-release")
+            .arg(release)
+            .output()
+            .expect("run agentd with invalid collector barrier");
+        assert_eq!(output.status.code(), Some(2));
+    }
+
+    for flag in [
+        "--process-test-collector-barrier-ready",
+        "--process-test-collector-barrier-release",
+    ] {
+        let output = Command::new(binary())
+            .args(["run", "--runtime-root"])
+            .arg(root.path())
+            .arg(flag)
+            .arg(run.join("one-sided"))
+            .output()
+            .expect("run agentd with one-sided collector barrier");
+        assert_eq!(output.status.code(), Some(2));
+    }
+
+    for command in ["health", "prepare-sleep"] {
+        let output = Command::new(binary())
+            .args([command, "--runtime-root"])
+            .arg(root.path())
+            .arg("--process-test-collector-barrier-ready")
+            .arg(&ready)
+            .arg("--process-test-collector-barrier-release")
+            .arg(&release)
+            .output()
+            .expect("run non-run command with collector barrier");
+        assert_eq!(output.status.code(), Some(2));
+    }
+
+    let output = Command::new(binary())
+        .arg("run")
+        .arg("--process-test-collector-barrier-ready")
+        .arg(&ready)
+        .arg("--process-test-collector-barrier-release")
+        .arg(&release)
+        .output()
+        .expect("run collector barrier without explicit root");
+    assert_eq!(output.status.code(), Some(2));
 }

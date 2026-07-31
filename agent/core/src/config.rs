@@ -3,13 +3,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::collector_registry::CollectorIdentity;
 use pca_agent_runtime::RuntimePaths;
+#[cfg(feature = "process-test-hooks")]
+use uuid::Uuid;
 
 #[cfg(feature = "process-test-hooks")]
 #[derive(Debug)]
 pub(crate) struct ProcessTestBarrierConfig {
     pub(crate) ready: PathBuf,
     pub(crate) release: PathBuf,
+}
+
+#[cfg(feature = "process-test-hooks")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProcessTestIdentityConfig {
+    workspace_id: Uuid,
+    device_id: Uuid,
 }
 
 #[cfg(feature = "process-test-hooks")]
@@ -26,6 +36,10 @@ pub(crate) struct ProcessTestFatalCleanupConfig {
 struct ProcessTestOptions {
     barrier_ready: Option<PathBuf>,
     barrier_release: Option<PathBuf>,
+    collector_barrier_ready: Option<PathBuf>,
+    collector_barrier_release: Option<PathBuf>,
+    workspace_id: Option<String>,
+    device_id: Option<String>,
     fail_after_bridge_pid: Option<PathBuf>,
     fatal_armed: Option<PathBuf>,
     fatal_release: Option<PathBuf>,
@@ -39,12 +53,37 @@ impl ProcessTestOptions {
         argument: &str,
         remaining: &mut impl Iterator<Item = OsString>,
     ) -> Result<bool, String> {
+        let identity_target = match argument {
+            "--process-test-workspace-id" if self.workspace_id.is_none() => {
+                Some(&mut self.workspace_id)
+            }
+            "--process-test-device-id" if self.device_id.is_none() => Some(&mut self.device_id),
+            _ => None,
+        };
+        if let Some(target) = identity_target {
+            *target = Some(
+                remaining
+                    .next()
+                    .ok_or_else(usage)?
+                    .into_string()
+                    .map_err(|_| usage())?,
+            );
+            return Ok(true);
+        }
         let target = match argument {
             "--process-test-event-barrier-ready" if self.barrier_ready.is_none() => {
                 &mut self.barrier_ready
             }
             "--process-test-event-barrier-release" if self.barrier_release.is_none() => {
                 &mut self.barrier_release
+            }
+            "--process-test-collector-barrier-ready" if self.collector_barrier_ready.is_none() => {
+                &mut self.collector_barrier_ready
+            }
+            "--process-test-collector-barrier-release"
+                if self.collector_barrier_release.is_none() =>
+            {
+                &mut self.collector_barrier_release
             }
             "--process-test-fail-heartbeat-after-bridge-pid"
                 if self.fail_after_bridge_pid.is_none() =>
@@ -68,6 +107,8 @@ impl ProcessTestOptions {
         for path in [
             &mut self.barrier_ready,
             &mut self.barrier_release,
+            &mut self.collector_barrier_ready,
+            &mut self.collector_barrier_release,
             &mut self.fail_after_bridge_pid,
             &mut self.fatal_armed,
             &mut self.fatal_release,
@@ -82,6 +123,8 @@ impl ProcessTestOptions {
         if [
             &self.barrier_ready,
             &self.barrier_release,
+            &self.collector_barrier_ready,
+            &self.collector_barrier_release,
             &self.fail_after_bridge_pid,
             &self.fatal_armed,
             &self.fatal_release,
@@ -89,6 +132,8 @@ impl ProcessTestOptions {
         ]
         .iter()
         .all(|path| path.is_none())
+            && self.workspace_id.is_none()
+            && self.device_id.is_none()
         {
             Ok(())
         } else {
@@ -104,13 +149,35 @@ pub(crate) struct RunConfig {
     #[cfg(feature = "process-test-hooks")]
     pub(crate) process_test_barrier: Option<ProcessTestBarrierConfig>,
     #[cfg(feature = "process-test-hooks")]
+    pub(crate) process_test_collector_barrier: Option<ProcessTestBarrierConfig>,
+    #[cfg(feature = "process-test-hooks")]
+    process_test_identity: Option<ProcessTestIdentityConfig>,
+    #[cfg(feature = "process-test-hooks")]
     pub(crate) process_test_fatal_cleanup: Option<ProcessTestFatalCleanupConfig>,
+}
+
+impl RunConfig {
+    pub(crate) fn collector_identity(&self) -> Option<CollectorIdentity> {
+        #[cfg(feature = "process-test-hooks")]
+        {
+            self.process_test_identity
+                .map(|identity| CollectorIdentity {
+                    workspace_id: identity.workspace_id,
+                    device_id: identity.device_id,
+                })
+        }
+        #[cfg(not(feature = "process-test-hooks"))]
+        {
+            let _ = &self.paths;
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) enum CommandConfig {
-    Run(RunConfig),
-    Health(RuntimePaths),
+    Run(Box<RunConfig>),
+    Health(Box<RuntimePaths>),
     PrepareSleep,
 }
 
@@ -161,6 +228,21 @@ impl CommandConfig {
                     &paths,
                     process_test.barrier_ready,
                     process_test.barrier_release,
+                    "process test barrier",
+                )?;
+                #[cfg(feature = "process-test-hooks")]
+                let process_test_collector_barrier = barrier_config(
+                    explicit_root,
+                    &paths,
+                    process_test.collector_barrier_ready,
+                    process_test.collector_barrier_release,
+                    "Collector process test barrier",
+                )?;
+                #[cfg(feature = "process-test-hooks")]
+                let process_test_identity = identity_config(
+                    explicit_root,
+                    process_test.workspace_id,
+                    process_test.device_id,
                 )?;
                 #[cfg(feature = "process-test-hooks")]
                 let process_test_fatal_cleanup = fatal_cleanup_config(
@@ -172,19 +254,23 @@ impl CommandConfig {
                     process_test.cleanup_complete,
                 )?;
                 let bridge_executable = bridge_executable(&paths, explicit_root)?;
-                Ok(Self::Run(RunConfig {
+                Ok(Self::Run(Box::new(RunConfig {
                     paths,
                     bridge_executable,
                     #[cfg(feature = "process-test-hooks")]
                     process_test_barrier,
                     #[cfg(feature = "process-test-hooks")]
+                    process_test_collector_barrier,
+                    #[cfg(feature = "process-test-hooks")]
+                    process_test_identity,
+                    #[cfg(feature = "process-test-hooks")]
                     process_test_fatal_cleanup,
-                }))
+                })))
             }
             "health" => {
                 #[cfg(feature = "process-test-hooks")]
                 process_test.reject_if_present()?;
-                Ok(Self::Health(paths))
+                Ok(Self::Health(Box::new(paths)))
             }
             "prepare-sleep" => {
                 #[cfg(feature = "process-test-hooks")]
@@ -273,6 +359,7 @@ fn barrier_config(
     paths: &RuntimePaths,
     ready: Option<PathBuf>,
     release: Option<PathBuf>,
+    name: &str,
 ) -> Result<Option<ProcessTestBarrierConfig>, String> {
     match (ready, release) {
         (None, None) => Ok(None),
@@ -284,7 +371,37 @@ fn barrier_config(
         {
             Ok(Some(ProcessTestBarrierConfig { ready, release }))
         }
-        _ => Err("process test barrier requires distinct runtime-root Run siblings".to_owned()),
+        _ => Err(format!(
+            "{name} requires distinct runtime-root Run siblings"
+        )),
+    }
+}
+
+#[cfg(feature = "process-test-hooks")]
+fn identity_config(
+    explicit_root: bool,
+    workspace_id: Option<String>,
+    device_id: Option<String>,
+) -> Result<Option<ProcessTestIdentityConfig>, String> {
+    match (workspace_id, device_id) {
+        (None, None) => Ok(None),
+        (Some(workspace_id), Some(device_id)) if explicit_root => {
+            let workspace_id = Uuid::parse_str(&workspace_id)
+                .map_err(|_| "process test identity requires non-nil UUIDs".to_owned())?;
+            let device_id = Uuid::parse_str(&device_id)
+                .map_err(|_| "process test identity requires non-nil UUIDs".to_owned())?;
+            if workspace_id.is_nil() || device_id.is_nil() {
+                return Err("process test identity requires non-nil UUIDs".to_owned());
+            }
+            Ok(Some(ProcessTestIdentityConfig {
+                workspace_id,
+                device_id,
+            }))
+        }
+        _ => Err(
+            "process test identity requires a paired workspace/device UUID and explicit runtime root"
+                .to_owned(),
+        ),
     }
 }
 
