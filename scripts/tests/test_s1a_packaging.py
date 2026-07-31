@@ -63,6 +63,18 @@ class S1APackagingTests(unittest.TestCase):
         result = self.run_verify()
         self.assertEqual(result.returncode, 0, result.stdout)
 
+    def test_success_reports_machine_readable_candidate_identity(self) -> None:
+        result = self.run_verify()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "S1A_BUNDLE_METADATA version=1.0.0 team_id=ABCDEFGHIJ "
+            "app_cdhash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+            "main_cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+            "agent_cdhash=cccccccccccccccccccccccccccccccccccccccc "
+            "bridge_cdhash=dddddddddddddddddddddddddddddddddddddddd",
+            result.stdout,
+        )
+
     def test_missing_bridge_is_rejected(self) -> None:
         (self.app / "Contents/Resources/bin/PCAPlatformBridge").unlink()
         result = self.run_verify()
@@ -268,6 +280,14 @@ elif [[ "$1" == "-d" ]]; then
   team="${PCA_SYNTHETIC_TEAM_ID:-ABCDEFGHIJ}"
   if [[ "$(basename "$target")" == "${PCA_SYNTHETIC_WRONG_TEAM_TARGET:-}" ]]; then team="ZZZZZZZZZZ"; fi
   echo "TeamIdentifier=$team" >&2
+  case "$(basename "$target")" in
+    *.app) cdhash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+    PersonalComputerAgent) cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+    pca-agentd) cdhash=cccccccccccccccccccccccccccccccccccccccc ;;
+    PCAPlatformBridge) cdhash=dddddddddddddddddddddddddddddddddddddddd ;;
+    *) exit 65 ;;
+  esac
+  echo "CDHash=$cdhash" >&2
 fi
 """,
         )

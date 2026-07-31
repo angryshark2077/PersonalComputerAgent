@@ -75,7 +75,7 @@ jobs:
           CODE_SIGNING_ALLOWED=NO
       - run: python3 scripts/verify_migrations.py .
       - run: python3 scripts/verify_boundaries.py .
-      - run: python3 -m unittest scripts.tests.test_s1a_packaging scripts.tests.test_s1a_live_verification -v
+      - run: python3 -m unittest scripts.tests.test_s1a_packaging scripts.tests.test_s1a_live_verification scripts.tests.test_run_with_timeout -v
 
   contract:
     runs-on: macos-15

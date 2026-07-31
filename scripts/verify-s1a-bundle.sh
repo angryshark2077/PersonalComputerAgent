@@ -20,7 +20,9 @@ mounted=0
 cleanup() {
   if [[ "$mounted" -eq 1 ]]; then
     detach_target=${attached_device:-$mount_point}
-    hdiutil detach "$detach_target" >/dev/null 2>&1 || true
+    if ! hdiutil detach "$detach_target" >/dev/null 2>&1; then
+      echo "S1A bundle verification cleanup warning: could not detach $detach_target" >&2
+    fi
   fi
   if [[ -n "$temporary_directory" && -d "$temporary_directory" ]]; then
     rm -rf "$temporary_directory"
@@ -105,13 +107,18 @@ runtime_directories=$(find "$app" -type d \( -name Data -o -name Run \) -print -
   || fail "could not enumerate bundle for writable runtime directories"
 [[ -z "$runtime_directories" ]] || fail "writable Data or Run directories must not exist inside the bundle"
 
-for signed_target in "$app" "$agent" "$bridge"; do
+metadata=()
+for signed_target in "$app" "$main" "$agent" "$bridge"; do
   codesign --verify --strict --verbose=2 "$signed_target" >/dev/null 2>&1 \
     || fail "signature verification failed for $(basename "$signed_target")"
   signature_details=$(codesign -d --verbose=4 "$signed_target" 2>&1) \
     || fail "could not inspect TeamIdentifier for $(basename "$signed_target")"
   grep -Fxq "TeamIdentifier=$team_id" <<<"$signature_details" \
     || fail "TeamIdentifier mismatch for $(basename "$signed_target")"
+  cdhash=$(sed -n 's/^CDHash=//p' <<<"$signature_details")
+  [[ "$cdhash" =~ ^[0-9A-Fa-f]{40}$ ]] \
+    || fail "invalid CDHash for $(basename "$signed_target")"
+  metadata+=("$cdhash")
 done
 
 if [[ "$mounted" -eq 1 ]]; then
@@ -120,3 +127,4 @@ if [[ "$mounted" -eq 1 ]]; then
 fi
 
 echo "S1A BUNDLE VERIFIED: $version arm64"
+echo "S1A_BUNDLE_METADATA version=$version team_id=$team_id app_cdhash=${metadata[0]} main_cdhash=${metadata[1]} agent_cdhash=${metadata[2]} bridge_cdhash=${metadata[3]}"

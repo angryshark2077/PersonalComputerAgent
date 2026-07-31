@@ -62,6 +62,10 @@ class S1ALiveVerificationTests(unittest.TestCase):
                 "PCA_S1A_LIVE_TEST_DUPLICATE_AGENT": "0",
                 "PCA_S1A_LIVE_TEST_JOB_STATE": "running",
                 "PCA_S1A_LIVE_TEST_JOB_PROGRAM": str(self.agent),
+                "PCA_S1A_LIVE_TEST_ACTIVATE_CANDIDATE": "1",
+                "PCA_S1A_LIVE_TEST_INSTALLED_MAIN": str(self.app / "Contents/MacOS/PersonalComputerAgent"),
+                "PCA_S1A_LIVE_TEST_STATUS_PATH": str(self.status),
+                "PCA_S1A_LIVE_TEST_REFRESH_STATUS": "1",
             }
         )
         if environment_updates:
@@ -98,7 +102,10 @@ class S1ALiveVerificationTests(unittest.TestCase):
         result = self.run_verify(
             "--dmg",
             str(dmg),
-            environment_updates={"PCA_TEAM_ID": "ABCDEFGHIJ"},
+            environment_updates={
+                "PCA_TEAM_ID": "ABCDEFGHIJ",
+                "PCA_S1A_LIVE_TEST_REFRESH_STATUS": "1",
+            },
         )
 
         self.assertEqual(result.returncode, 0, result.stdout)
@@ -106,6 +113,51 @@ class S1ALiveVerificationTests(unittest.TestCase):
         self.assertEqual(lines[0], f"bundle-verifier --team-id ABCDEFGHIJ {dmg}")
         self.assertEqual(lines[1], f"open {dmg}")
         self.assertFalse(any("spctl" in line or "xattr" in line for line in lines))
+
+    def test_dmg_does_not_accept_an_old_healthy_install_without_candidate_activation(self) -> None:
+        dmg = self.temporary_directory / "PersonalComputerAgent-S1A-arm64.dmg"
+        dmg.write_bytes(b"synthetic dmg")
+
+        result = self.run_verify(
+            "--dmg",
+            str(dmg),
+            environment_updates={
+                "PCA_TEAM_ID": "ABCDEFGHIJ",
+                "PCA_S1A_LIVE_TEST_ACTIVATE_CANDIDATE": "0",
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("candidate", result.stdout.lower())
+
+    def test_installed_nested_signature_team_must_match_app(self) -> None:
+        result = self.run_verify(
+            "--installed",
+            environment_updates={"PCA_S1A_LIVE_TEST_WRONG_TEAM_TARGET": "PCAPlatformBridge"},
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("TeamIdentifier", result.stdout)
+
+    def test_sqlite_expected_output_followed_by_nonzero_is_rejected(self) -> None:
+        result = self.run_verify(
+            "--installed",
+            environment_updates={"PCA_S1A_LIVE_TEST_SQLITE_EXIT": "9"},
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("SQLite", result.stdout)
+
+    def test_bundle_walk_error_is_rejected(self) -> None:
+        unreadable = self.app / "Contents/Unreadable"
+        unreadable.mkdir()
+        unreadable.chmod(0)
+        self.addCleanup(lambda: unreadable.chmod(0o700) if unreadable.exists() else None)
+
+        result = self.run_verify("--installed")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("enumerate", result.stdout.lower())
 
     def test_ambiguous_agent_processes_fail_closed(self) -> None:
         result = self.run_verify(
@@ -130,7 +182,10 @@ class S1ALiveVerificationTests(unittest.TestCase):
         payload["heartbeat_at"] = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
         self.status.write_text(json.dumps(payload), encoding="utf-8")
 
-        result = self.run_verify("--installed")
+        result = self.run_verify(
+            "--installed",
+            environment_updates={"PCA_S1A_LIVE_TEST_REFRESH_STATUS": "0"},
+        )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("healthy runtime status", result.stdout)
@@ -308,6 +363,41 @@ set -euo pipefail
 echo ok
 echo 0000:completed
 echo 0001:completed
+exit "${PCA_S1A_LIVE_TEST_SQLITE_EXIT:-0}"
+""",
+        )
+        self._write_tool(
+            "codesign",
+            """#!/usr/bin/env bash
+set -euo pipefail
+target="${!#}"
+if [[ "${PCA_S1A_LIVE_TEST_REFRESH_STATUS:-0}" == "1" ]]; then
+  python3 - "${PCA_S1A_LIVE_TEST_STATUS_PATH:?}" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+path = Path(sys.argv[1])
+if path.exists():
+    value = json.loads(path.read_text())
+    value["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps(value))
+PY
+fi
+if [[ "$1" == "--verify" ]]; then
+  exit 0
+fi
+[[ "$1" == "-d" ]]
+team=ABCDEFGHIJ
+if [[ "$(basename "$target")" == "${PCA_S1A_LIVE_TEST_WRONG_TEAM_TARGET:-}" ]]; then team=ZZZZZZZZZZ; fi
+echo "TeamIdentifier=$team" >&2
+case "$(basename "$target")" in
+  *.app) cdhash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  PersonalComputerAgent) cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+  pca-agentd) cdhash=cccccccccccccccccccccccccccccccccccccccc ;;
+  PCAPlatformBridge) cdhash=dddddddddddddddddddddddddddddddddddddddd ;;
+  *) exit 65 ;;
+esac
+echo "CDHash=$cdhash" >&2
 """,
         )
         self._write_tool(
@@ -316,6 +406,9 @@ echo 0001:completed
 set -euo pipefail
 [[ $# -eq 1 && "$1" == /*.dmg ]]
 echo "open $1" >> "${PCA_S1A_LIVE_TEST_TOOL_LOG:?}"
+if [[ "${PCA_S1A_LIVE_TEST_ACTIVATE_CANDIDATE:-0}" == "1" ]]; then
+  touch "${PCA_S1A_LIVE_TEST_INSTALLED_MAIN:?}"
+fi
 """,
         )
         self._write_tool(
@@ -336,6 +429,7 @@ fi
 set -euo pipefail
 echo "bundle-verifier $*" >> "${PCA_S1A_LIVE_TEST_TOOL_LOG:?}"
 [[ $# -eq 3 && "$1" == "--team-id" && "$2" == "ABCDEFGHIJ" && "$3" == /*.dmg ]]
+echo "S1A_BUNDLE_METADATA version=0.1.0 team_id=ABCDEFGHIJ app_cdhash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa main_cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb agent_cdhash=cccccccccccccccccccccccccccccccccccccccc bridge_cdhash=dddddddddddddddddddddddddddddddddddddddd"
 """,
         )
 
