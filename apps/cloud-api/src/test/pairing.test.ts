@@ -11,6 +11,7 @@ import {
   createTrustedProxyClientAddress,
   type OwnerPrincipal,
 } from "../index.js";
+import { createBetterAuthOwnerAuthenticator } from "../auth.js";
 import { pkceChallenge } from "../pairing.js";
 
 const owner: OwnerPrincipal = {
@@ -282,4 +283,39 @@ test("production signup bootstrap creates one Owner workspace before pairing aut
     body: JSON.stringify({ callback_state: start.callback_state }),
   });
   assert.equal(authorized.status, 302);
+});
+
+test("an authenticated Owner request repairs a failed post-create workspace bootstrap", async () => {
+  const userId = "01983333-7333-8333-8333-333333333335";
+  const repository = new MemoryControlRepository();
+  const failedHook = createOwnerWorkspaceBootstrapHooks({
+    bootstrapOwnerWorkspace: async () => {
+      throw new Error("simulated post-create failure");
+    },
+  });
+  await assert.rejects(() => failedHook.user.create.after({ id: userId }));
+  assert.equal(await repository.resolveOwnerWorkspace(userId), null);
+
+  const ownerAuthenticator = createBetterAuthOwnerAuthenticator(
+    { api: { getSession: async () => ({ user: { id: userId } }) } },
+    repository,
+  );
+  const api = createApp({ repository, ownerAuthenticator });
+  const pairing = await api.request("/v1/device-pairing/sessions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      ...start,
+      device_public_key: "recovered-signup-device-key",
+      code_challenge: pkceChallenge("recovered-signup-verifier"),
+    }),
+  });
+  const { session_id: sessionId } = (await pairing.json()) as { session_id: string };
+  const recovered = await api.request(`/v1/device-pairing/sessions/${sessionId}/authorize`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ callback_state: start.callback_state }),
+  });
+  assert.equal(recovered.status, 302);
+  assert.equal((await repository.listOwnerWorkspaces(userId)).length, 1);
 });

@@ -31,7 +31,11 @@ export function createBetterAuthOwnerAuthenticator(
       return null;
     }
     const workspaceId = await repository.resolveOwnerWorkspace(userId);
-    return workspaceId === null ? null : { userId, workspaceId };
+    const workspace =
+      workspaceId === null
+        ? await repository.bootstrapOwnerWorkspace(userId)
+        : { workspaceId, name: "Personal Computer Agent" };
+    return { userId, workspaceId: workspace.workspaceId };
   };
 }
 
