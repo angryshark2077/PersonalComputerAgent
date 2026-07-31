@@ -30,10 +30,15 @@ class S1ALiveVerificationTests(unittest.TestCase):
         self.socket_path = self.run / "bridge.sock"
         self.database = self.data / "agent.sqlite3"
         self.status = self.run / "runtime-status.json"
+        self.candidate_app = self.temporary_directory / "candidate" / "PersonalComputerAgent.app"
+        self.old_app = self.temporary_directory / "old-installed.app"
+        self.snapshot_parent = self.temporary_directory / "snapshots"
+        self.snapshot_parent.mkdir(mode=0o700)
         self.tools = self.temporary_directory / "tools"
         self.tools.mkdir()
         self.tool_log = self.temporary_directory / "tools.log"
         self._make_layout()
+        shutil.copytree(self.app, self.candidate_app)
         self._make_tools()
 
     def run_verify(
@@ -65,9 +70,16 @@ class S1ALiveVerificationTests(unittest.TestCase):
                 "PCA_S1A_LIVE_TEST_ACTIVATE_CANDIDATE": "1",
                 "PCA_S1A_LIVE_TEST_INSTALLED_MAIN": str(self.app / "Contents/MacOS/PersonalComputerAgent"),
                 "PCA_S1A_LIVE_TEST_STATUS_PATH": str(self.status),
-                "PCA_S1A_LIVE_TEST_REFRESH_STATUS": "1",
+                "PCA_S1A_LIVE_TEST_REFRESH_STATUS": "0" if arguments[:1] == ("--dmg",) else "1",
+                "PCA_S1A_LIVE_TEST_CANDIDATE_APP": str(self.candidate_app),
+                "PCA_S1A_LIVE_TEST_OLD_APP": str(self.old_app),
+                "PCA_S1A_LIVE_TEST_SNAPSHOT_PARENT": str(self.snapshot_parent),
+                "PCA_S1A_LIVE_TEST_SOURCE_DMG": "",
+                "PCA_S1A_LIVE_TEST_PROCESS_INSPECTOR": str(self.tools / "process-inspector"),
             }
         )
+        if arguments[:1] == ("--dmg",):
+            environment["PCA_S1A_LIVE_TEST_SOURCE_DMG"] = arguments[1]
         if environment_updates:
             environment.update(environment_updates)
         return subprocess.run(
@@ -104,15 +116,84 @@ class S1ALiveVerificationTests(unittest.TestCase):
             str(dmg),
             environment_updates={
                 "PCA_TEAM_ID": "ABCDEFGHIJ",
-                "PCA_S1A_LIVE_TEST_REFRESH_STATUS": "1",
             },
         )
 
         self.assertEqual(result.returncode, 0, result.stdout)
         lines = self.tool_log.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[0], f"bundle-verifier --team-id ABCDEFGHIJ {dmg}")
-        self.assertEqual(lines[1], f"open {dmg}")
+        verifier_path = Path(lines[0].split(" ", 3)[3])
+        opened_path = Path(lines[1].split(" ", 1)[1])
+        self.assertNotEqual(verifier_path, dmg)
+        self.assertEqual(opened_path, verifier_path)
         self.assertFalse(any("spctl" in line or "xattr" in line for line in lines))
+        self.assertEqual(list(self.snapshot_parent.iterdir()), [])
+
+    def test_dmg_source_with_symbolic_link_parent_is_rejected(self) -> None:
+        real_parent = self.temporary_directory / "real-source"
+        real_parent.mkdir()
+        (real_parent / "candidate.dmg").write_bytes(b"synthetic dmg")
+        linked_parent = self.temporary_directory / "linked-source"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+        result = self.run_verify(
+            "--dmg", str(linked_parent / "candidate.dmg"),
+            environment_updates={"PCA_TEAM_ID": "ABCDEFGHIJ"},
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("symbolic-link path component", result.stdout)
+
+    def test_dmg_source_replacement_after_verify_does_not_change_opened_snapshot(self) -> None:
+        dmg = self.temporary_directory / "race.dmg"
+        dmg.write_bytes(b"verified bytes")
+        opened_bytes = self.temporary_directory / "opened-bytes"
+
+        result = self.run_verify(
+            "--dmg",
+            str(dmg),
+            environment_updates={
+                "PCA_TEAM_ID": "ABCDEFGHIJ",
+                "PCA_S1A_LIVE_TEST_REPLACE_SOURCE_AFTER_VERIFY": "1",
+                "PCA_S1A_LIVE_TEST_OPEN_CAPTURE": str(opened_bytes),
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(dmg.read_bytes(), b"attacker replacement")
+        self.assertEqual(opened_bytes.read_bytes(), b"verified bytes")
+
+    def test_snapshot_file_or_private_directory_replacement_fails_closed(self) -> None:
+        for attack in ("file", "directory"):
+            with self.subTest(attack=attack):
+                dmg = self.temporary_directory / f"snapshot-{attack}.dmg"
+                dmg.write_bytes(b"verified bytes")
+                result = self.run_verify(
+                    "--dmg",
+                    str(dmg),
+                    environment_updates={
+                        "PCA_TEAM_ID": "ABCDEFGHIJ",
+                        "PCA_S1A_LIVE_TEST_REPLACE_SNAPSHOT": attack,
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("snapshot", result.stdout.lower())
+
+    def test_same_version_tree_replacement_with_old_status_and_process_fails(self) -> None:
+        dmg = self.temporary_directory / "same-version-old-runtime.dmg"
+        dmg.write_bytes(b"synthetic dmg")
+
+        result = self.run_verify(
+            "--dmg",
+            str(dmg),
+            environment_updates={
+                "PCA_TEAM_ID": "ABCDEFGHIJ",
+                "PCA_S1A_LIVE_TEST_KEEP_OLD_RUNTIME": "1",
+                "PCA_S1A_LIVE_TEST_PROCESS_START": "1.0",
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("activation", result.stdout.lower())
 
     def test_dmg_does_not_accept_an_old_healthy_install_without_candidate_activation(self) -> None:
         dmg = self.temporary_directory / "PersonalComputerAgent-S1A-arm64.dmg"
@@ -406,9 +487,43 @@ echo "CDHash=$cdhash" >&2
 set -euo pipefail
 [[ $# -eq 1 && "$1" == /*.dmg ]]
 echo "open $1" >> "${PCA_S1A_LIVE_TEST_TOOL_LOG:?}"
-if [[ "${PCA_S1A_LIVE_TEST_ACTIVATE_CANDIDATE:-0}" == "1" ]]; then
-  touch "${PCA_S1A_LIVE_TEST_INSTALLED_MAIN:?}"
+if [[ -n "${PCA_S1A_LIVE_TEST_OPEN_CAPTURE:-}" ]]; then
+  cp "$1" "$PCA_S1A_LIVE_TEST_OPEN_CAPTURE"
 fi
+if [[ "${PCA_S1A_LIVE_TEST_ACTIVATE_CANDIDATE:-0}" == "1" ]]; then
+  python3 - <<'PY'
+import json, os
+from datetime import datetime, timezone
+from pathlib import Path
+app = Path(os.environ["PCA_S1A_LIVE_TEST_ROOT"]) / "App/PersonalComputerAgent.app"
+candidate = Path(os.environ["PCA_S1A_LIVE_TEST_CANDIDATE_APP"])
+old = Path(os.environ["PCA_S1A_LIVE_TEST_OLD_APP"])
+os.replace(app, old)
+os.replace(candidate, app)
+if os.environ.get("PCA_S1A_LIVE_TEST_KEEP_OLD_RUNTIME") != "1":
+    status = Path(os.environ["PCA_S1A_LIVE_TEST_STATUS_PATH"])
+    value = json.loads(status.read_text())
+    value["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+    status.write_text(json.dumps(value))
+PY
+fi
+""",
+        )
+        self._write_tool(
+            "process-inspector",
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PCA_S1A_LIVE_TEST_DUPLICATE_AGENT:-0}" == "1" ]]; then
+  echo "expected exactly one agent process" >&2
+  exit 1
+fi
+python3 - <<'PY'
+import json, os, time
+print(json.dumps({
+  "agent": {"pid": 4101, "ppid": 1, "uid": int(os.environ["PCA_S1A_LIVE_TEST_AGENT_UID"]), "path": os.environ["PCA_S1A_LIVE_TEST_AGENT_PATH"], "start_time": float(os.environ.get("PCA_S1A_LIVE_TEST_PROCESS_START", time.time()))},
+  "bridge": {"pid": 4102, "ppid": 4101, "uid": int(os.environ["PCA_S1A_LIVE_TEST_BRIDGE_UID"]), "path": os.environ["PCA_S1A_LIVE_TEST_BRIDGE_PATH"], "start_time": float(os.environ.get("PCA_S1A_LIVE_TEST_PROCESS_START", time.time()))},
+}))
+PY
 """,
         )
         self._write_tool(
@@ -430,6 +545,23 @@ set -euo pipefail
 echo "bundle-verifier $*" >> "${PCA_S1A_LIVE_TEST_TOOL_LOG:?}"
 [[ $# -eq 3 && "$1" == "--team-id" && "$2" == "ABCDEFGHIJ" && "$3" == /*.dmg ]]
 echo "S1A_BUNDLE_METADATA version=0.1.0 team_id=ABCDEFGHIJ app_cdhash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa main_cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb agent_cdhash=cccccccccccccccccccccccccccccccccccccccc bridge_cdhash=dddddddddddddddddddddddddddddddddddddddd"
+if [[ "${PCA_S1A_LIVE_TEST_REPLACE_SOURCE_AFTER_VERIFY:-0}" == "1" ]]; then
+  printf 'attacker replacement' > "${PCA_S1A_LIVE_TEST_SOURCE_DMG:?}"
+fi
+case "${PCA_S1A_LIVE_TEST_REPLACE_SNAPSHOT:-}" in
+  file)
+    mv "$3" "$3.original"
+    printf 'replacement snapshot' > "$3"
+    chmod 600 "$3"
+    ;;
+  directory)
+    parent=$(dirname "$3")
+    mv "$parent" "$parent.original"
+    mkdir -m 700 "$parent"
+    printf 'replacement snapshot' > "$parent/candidate.dmg"
+    chmod 600 "$parent/candidate.dmg"
+    ;;
+esac
 """,
         )
 

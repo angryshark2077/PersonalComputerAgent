@@ -33,6 +33,11 @@ user approves it manually in the system UI. The installer opens the relevant
 settings and waits for the decision; it never edits approval databases,
 invokes `launchctl` to bypass `SMAppService`, or simulates approval.
 
+The live verifier does not change installation, service, permission,
+Gatekeeper, TCC, approval-database, or process state. Its `--dmg` mode creates
+only a current-user private temporary DMG snapshot, verifies and opens that
+same identity-checked file, and removes it with bounded cleanup.
+
 Default local uninstall is the installed executable command:
 
 ```bash

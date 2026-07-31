@@ -25,7 +25,11 @@ esac
 
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 timeout_runner="$repository_root/scripts/run-with-timeout.py"
+snapshot_helper="$repository_root/scripts/snapshot-s1a-dmg.py"
+process_inspector="$repository_root/scripts/inspect-s1a-processes.py"
 [[ -x "$timeout_runner" ]] || fail "bounded command runner is unavailable"
+[[ -x "$snapshot_helper" ]] || fail "DMG snapshot helper is unavailable"
+[[ -x "$process_inspector" ]] || fail "macOS process inspector is unavailable"
 
 runtime_root="$HOME/Library/Application Support/PersonalComputerAgent"
 bundle_verifier="$repository_root/scripts/verify-s1a-bundle.sh"
@@ -38,6 +42,8 @@ if [[ "${PCA_S1A_LIVE_TEST_MODE:-0}" == "1" ]]; then
   install_polls=${PCA_S1A_LIVE_TEST_INSTALL_POLLS:-1}
   health_polls=${PCA_S1A_LIVE_TEST_HEALTH_POLLS:-1}
   poll_seconds=${PCA_S1A_LIVE_TEST_POLL_SECONDS:-0}
+  snapshot_parent=${PCA_S1A_LIVE_TEST_SNAPSHOT_PARENT:?PCA_S1A_LIVE_TEST_SNAPSHOT_PARENT is required in test mode}
+  process_inspector=${PCA_S1A_LIVE_TEST_PROCESS_INSPECTOR:-$process_inspector}
 fi
 
 [[ "$runtime_root" == /* && "$runtime_root" != "/" ]] || fail "runtime root must be an absolute non-root path"
@@ -45,7 +51,7 @@ fi
   || fail "invalid bounded poll configuration"
 [[ "$poll_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "invalid poll interval"
 
-for tool in codesign id launchctl plutil ps python3 sqlite3; do
+for tool in codesign id launchctl plutil python3 sqlite3; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing required tool: $tool"
 done
 
@@ -59,6 +65,25 @@ new_deadline() {
   [[ "$rc" -eq 0 && "$output" =~ ^[0-9]+[.][0-9]+$ ]] || fail "could not start bounded verification phase"
   deadline=$output
 }
+
+snapshot_identity=""
+snapshot_cleanup_needed=0
+cleanup_snapshot_on_exit() {
+  local original_status=$? cleanup_output cleanup_status
+  trap - EXIT
+  if [[ "$snapshot_cleanup_needed" -eq 1 ]]; then
+    set +e
+    cleanup_output=$("$timeout_runner" --timeout 3 -- "$snapshot_helper" cleanup --identity-json "$snapshot_identity" 2>&1)
+    cleanup_status=$?
+    set -e
+    if [[ "$cleanup_status" -ne 0 ]]; then
+      echo "S1A live verification failed: private DMG snapshot cleanup failed visibly: $cleanup_output" >&2
+      exit 1
+    fi
+  fi
+  exit "$original_status"
+}
+trap cleanup_snapshot_on_exit EXIT
 
 capture() {
   local variable=$1 output rc
@@ -91,12 +116,13 @@ from pathlib import Path
 app, info, main = map(Path, sys.argv[1:])
 if not app.is_dir() or not info.is_file() or not main.is_file():
     raise SystemExit(3)
-metadata = main.lstat()
+app_metadata = app.lstat()
+main_metadata = main.lstat()
 with info.open("rb") as source:
     version = plistlib.load(source).get("CFBundleShortVersionString")
 if not isinstance(version, str):
     raise SystemExit(4)
-print(f"version={version} dev={metadata.st_dev} inode={metadata.st_ino} mtime_ns={metadata.st_mtime_ns}")
+print(f"version={version} app_dev={app_metadata.st_dev} app_ino={app_metadata.st_ino} main_dev={main_metadata.st_dev} main_ino={main_metadata.st_ino}")
 PY
 }
 
@@ -110,15 +136,30 @@ pre_open_snapshot="<not-installed>"
 
 if [[ "$mode" == "dmg" ]]; then
   command -v open >/dev/null 2>&1 || fail "missing required tool: open"
-  [[ -f "$dmg" && ! -L "$dmg" ]] || fail "DMG must be a regular non-symbolic-link file"
   team_id=${PCA_TEAM_ID:-}
   [[ "$team_id" =~ ^[A-Z0-9]{10}$ ]] \
     || fail "PCA_TEAM_ID must name the 10-character signing Team ID used for this DMG"
   [[ -x "$bundle_verifier" ]] || fail "bundle verifier is unavailable"
 
   new_deadline 300
+  if [[ "${PCA_S1A_LIVE_TEST_MODE:-0}" == "1" ]]; then
+    if ! capture snapshot_identity "$snapshot_helper" create --source "$dmg" --parent "$snapshot_parent"; then
+      fail "could not create private DMG snapshot: $snapshot_identity"
+    fi
+  else
+    if ! capture snapshot_identity "$snapshot_helper" create --source "$dmg"; then
+      fail "could not create private DMG snapshot: $snapshot_identity"
+    fi
+  fi
+  snapshot_cleanup_needed=1
+  if ! capture snapshot_dmg python3 -c 'import json,sys; print(json.loads(sys.argv[1])["file_path"])' "$snapshot_identity"; then
+    fail "could not parse private DMG snapshot identity"
+  fi
+  if ! capture snapshot_check "$snapshot_helper" validate --identity-json "$snapshot_identity"; then
+    fail "private DMG snapshot identity validation failed: $snapshot_check"
+  fi
   if snapshot_install pre_open_snapshot; then :; else pre_open_snapshot="<not-installed>"; fi
-  if ! capture bundle_output "$bundle_verifier" --team-id "$team_id" "$dmg"; then
+  if ! capture bundle_output "$bundle_verifier" --team-id "$team_id" "$snapshot_dmg"; then
     fail "read-only DMG bundle verification failed: $bundle_output"
   fi
   metadata_line=""
@@ -141,15 +182,38 @@ if [[ "$mode" == "dmg" ]]; then
     fail "bundle verifier returned malformed candidate identity"
   fi
   [[ "$candidate_team" == "$team_id" ]] || fail "candidate TeamIdentifier does not match requested team"
-  if ! capture open_output open "$dmg"; then fail "could not open DMG: $open_output"; fi
+  if ! capture snapshot_check "$snapshot_helper" validate --identity-json "$snapshot_identity"; then
+    fail "private DMG snapshot changed between verification and open: $snapshot_check"
+  fi
+  if ! capture activation_bounds python3 -c 'import time; print(f"{time.monotonic():.9f} {time.time():.9f}")'; then
+    fail "could not record candidate activation lower bound"
+  fi
+  read -r activation_monotonic activation_wall <<<"$activation_bounds"
+  if ! capture open_output open "$snapshot_dmg"; then fail "could not open DMG: $open_output"; fi
+  if ! capture snapshot_check "$snapshot_helper" validate --identity-json "$snapshot_identity"; then
+    fail "private DMG snapshot changed while being opened: $snapshot_check"
+  fi
   echo "DMG verified and opened. Complete Gatekeeper and graphical install decisions manually."
 
   candidate_activated=0
   for ((attempt = 1; attempt <= install_polls; attempt++)); do
     current_snapshot=""
-    if snapshot_install current_snapshot && [[ "$current_snapshot" != "$pre_open_snapshot" ]]; then
-      candidate_activated=1
-      break
+    if snapshot_install current_snapshot; then
+      if [[ "$pre_open_snapshot" == "<not-installed>" ]]; then
+        candidate_activated=1
+        break
+      fi
+      if capture transition_check python3 -c '
+import sys
+def parse(value): return dict(field.split("=", 1) for field in value.split())
+before, after = parse(sys.argv[1]), parse(sys.argv[2])
+app_changed = (before["app_dev"], before["app_ino"]) != (after["app_dev"], after["app_ino"])
+main_changed = (before["main_dev"], before["main_ino"]) != (after["main_dev"], after["main_ino"])
+raise SystemExit(0 if app_changed and main_changed else 1)
+' "$pre_open_snapshot" "$current_snapshot"; then
+        candidate_activated=1
+        break
+      fi
     fi
     if (( attempt < install_polls )); then
       if ! capture sleep_output sleep "$poll_seconds"; then fail "candidate install wait exceeded 300 seconds"; fi
@@ -158,7 +222,9 @@ if [[ "$mode" == "dmg" ]]; then
   [[ "$candidate_activated" -eq 1 ]] \
     || fail "verified candidate did not replace or create the installed app within 300 seconds"
 else
-  new_deadline 5
+  activation_monotonic=0
+  activation_wall=0
+  new_deadline 30
 fi
 
 installed=0
@@ -170,7 +236,6 @@ for ((attempt = 1; attempt <= install_polls; attempt++)); do
 done
 [[ "$installed" -eq 1 ]] || fail "installed app did not appear at the exact expected path"
 
-if [[ "$mode" == "dmg" ]]; then new_deadline 5; fi
 if ! capture expected_uid id -u; then fail "could not identify installed user"; fi
 [[ "$expected_uid" =~ ^[0-9]+$ && "$expected_uid" -ne 0 ]] \
   || fail "live verification must run as the non-root installed user"
@@ -284,15 +349,17 @@ if [[ "$mode" == "dmg" ]]; then
     || fail "installed signatures do not match the verified candidate"
 fi
 
+new_deadline 5
 status_pid=""
 for ((attempt = 1; attempt <= health_polls; attempt++)); do
   candidate_pid=""
-  if capture candidate_pid python3 - "$status_file" "$app_version" "$socket_file" "$database_file" "$expected_uid" <<'PY'
+  if capture candidate_pid python3 - "$status_file" "$app_version" "$socket_file" "$database_file" "$expected_uid" "$activation_wall" <<'PY'
 import json, stat, sys
 from datetime import datetime, timezone
 from pathlib import Path
 path, expected_version, socket_path, database_path = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
 expected_uid = int(sys.argv[5])
+activation_lower_bound = float(sys.argv[6])
 for runtime_path, expected_type in ((path, stat.S_ISREG), (database_path, stat.S_ISREG), (socket_path, stat.S_ISSOCK)):
     metadata = runtime_path.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not expected_type(metadata.st_mode): raise SystemExit(1)
@@ -307,6 +374,8 @@ modified_age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
 pid = value["process_id"]
 valid = (value["agent_status"] in {"unpaired", "running"} and value["bridge_status"] == "ready"
          and value["local_healthy"] is True and -5 <= age <= 5 and -5 <= modified_age <= 5
+         and heartbeat.timestamp() >= activation_lower_bound
+         and path.stat().st_mtime >= activation_lower_bound
          and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
          and value["app_version"] == expected_version and value["schema_version"] == 1)
 if not valid: raise SystemExit(1)
@@ -319,7 +388,8 @@ PY
     if ! capture sleep_output sleep "$poll_seconds"; then fail "health wait exceeded five seconds"; fi
   fi
 done
-[[ "$status_pid" =~ ^[1-9][0-9]*$ ]] || fail "healthy runtime status was not observed within five seconds"
+[[ "$status_pid" =~ ^[1-9][0-9]*$ ]] \
+  || fail "healthy runtime status newer than candidate activation was not observed within five seconds"
 
 if ! capture job launchctl print "gui/$expected_uid/com.pca.agentd"; then fail "expected user-level launchd job is not registered"; fi
 [[ "$job" == *"state = running"* ]] || fail "expected launchd job is not running"
@@ -327,36 +397,33 @@ if ! capture job launchctl print "gui/$expected_uid/com.pca.agentd"; then fail "
   || fail "launchd job does not resolve to the exact installed agent"
 [[ "$job" =~ pid\ =\ *$status_pid([^0-9]|$) ]] || fail "launchd job PID does not match runtime status"
 
-if ! capture process_table ps -axo pid=,ppid=,uid=,comm=; then fail "could not inspect processes"; fi
+if ! capture process_document "$process_inspector" --agent-pid "$status_pid" --uid "$expected_uid" \
+  --agent-path "$agent" --bridge-path "$bridge"; then
+  fail "reliable macOS process inspection failed: $process_document"
+fi
 if ! capture process_ids python3 -c '
-import sys
-agent, bridge, uid_text, status_pid_text = sys.argv[1:]
-uid, status_pid = int(uid_text), int(status_pid_text)
-rows = []
-for line in sys.stdin:
-    fields = line.strip().split(maxsplit=3)
-    if len(fields) != 4: continue
-    try: pid, parent, owner = map(int, fields[:3])
-    except ValueError: continue
-    rows.append((pid, parent, owner, fields[3]))
-agents = [row for row in rows if row[3] == agent]
-bridges = [row for row in rows if row[3] == bridge]
-if len(agents) != 1: print("expected exactly one agent process"); raise SystemExit(1)
-if len(bridges) != 1: print("expected exactly one Bridge process"); raise SystemExit(1)
-a, b = agents[0], bridges[0]
-if a[2] != uid or b[2] != uid or uid == 0: print("agent and Bridge must run as the current user, never root"); raise SystemExit(1)
-if a[0] != status_pid: print("agent PID does not match runtime status"); raise SystemExit(1)
-if b[1] != a[0]: print("Bridge is not a child of the exact agent"); raise SystemExit(1)
-print(a[0], b[0])
-' "$agent" "$bridge" "$expected_uid" "$status_pid" <<<"$process_table"; then fail "$process_ids"; fi
+import json, sys
+document = json.loads(sys.argv[1])
+agent_path, bridge_path, uid_text, status_pid_text, lower_text = sys.argv[2:]
+uid, status_pid, lower = int(uid_text), int(status_pid_text), float(lower_text)
+if not isinstance(document, dict) or set(document) != {"agent", "bridge"}: raise SystemExit(1)
+a, b = document["agent"], document["bridge"]
+keys = {"pid", "ppid", "uid", "path", "start_time"}
+if not isinstance(a, dict) or not isinstance(b, dict) or set(a) != keys or set(b) != keys: raise SystemExit(1)
+for item in (a, b):
+    for key in ("pid", "ppid", "uid"):
+        if not isinstance(item[key], int) or isinstance(item[key], bool) or item[key] < 0: raise SystemExit(1)
+if a["pid"] != status_pid or a["uid"] != uid or uid == 0 or a["path"] != agent_path: raise SystemExit(1)
+if b["pid"] <= 0 or b["uid"] != uid or b["path"] != bridge_path or b["ppid"] != a["pid"]: raise SystemExit(1)
+if not isinstance(a["start_time"], (int, float)) or isinstance(a["start_time"], bool): raise SystemExit(1)
+if not isinstance(b["start_time"], (int, float)) or isinstance(b["start_time"], bool): raise SystemExit(1)
+if a["start_time"] < lower or b["start_time"] < lower or b["start_time"] < a["start_time"]: raise SystemExit(1)
+print(a["pid"], b["pid"])
+' "$process_document" "$agent" "$bridge" "$expected_uid" "$status_pid" "$activation_wall"; then
+  fail "Agent/Bridge current user process identity predates or does not match candidate activation"
+fi
 read -r agent_pid bridge_pid <<<"$process_ids"
 [[ "$agent_pid" =~ ^[1-9][0-9]*$ && "$bridge_pid" =~ ^[1-9][0-9]*$ ]] || fail "process inspection returned invalid PIDs"
-
-if ! capture agent_arguments ps -p "$agent_pid" -o args=; then fail "could not inspect agent arguments"; fi
-if ! capture bridge_arguments ps -p "$bridge_pid" -o args=; then fail "could not inspect Bridge arguments"; fi
-[[ "$agent_arguments" == "$agent run" || "$agent_arguments" == "pca-agentd run" ]] || fail "agent arguments are ambiguous"
-[[ "$bridge_arguments" == "$bridge --socket $socket_file" || "$bridge_arguments" == "PCAPlatformBridge --socket $socket_file" ]] \
-  || fail "Bridge is not bound to the exact runtime socket"
 
 if ! capture database_check sqlite3 -readonly "$database_file" <<'SQL'
 PRAGMA query_only=ON;

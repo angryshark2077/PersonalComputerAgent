@@ -6,7 +6,7 @@ This runbook separates automated read-only checks from the decisions and disrupt
 
 Never globally disable Gatekeeper, remove quarantine attributes, edit the Background Items database, approve Login Items by automation, bypass TCC, or run the Agent as root. Do not use `spctl --master-disable`, `xattr -dr com.apple.quarantine`, a root LaunchDaemon, or a privileged helper.
 
-`scripts/verify-s1a-live.sh` is read-only. In `--dmg` mode its only UI action is plain `open <dmg>`; the user still makes every Gatekeeper, install, and Login Items decision. It never registers or unregisters a service, kills a process, deletes data, or changes a permission.
+`scripts/verify-s1a-live.sh` is read-only with respect to installed state and macOS security state: it does not modify the installation, services, permissions, Gatekeeper, TCC, approval databases, or running processes. In `--dmg` mode it makes one current-UID-owned private temporary snapshot (`0700` directory, fixed `0600` regular file), verifies and opens only that exact snapshot, then removes it with bounded identity-checked cleanup. The user still makes every Gatekeeper, install, and Login Items decision. Snapshot cleanup failure is reported as verification failure.
 
 ## 1. Signing preflight and local DMG
 
@@ -40,7 +40,7 @@ PCA_TEAM_ID="$PCA_TEAM_ID" ./scripts/verify-s1a-live.sh \
   --dmg "$PWD/dist/PersonalComputerAgent-S1A-arm64.dmg"
 ```
 
-The script first mounts and verifies the bundle read-only, then opens the DMG and waits boundedly for the exact installed path. In Finder:
+The script first copies the selected DMG into its private temporary snapshot, mounts and verifies that snapshot read-only, revalidates its identity and SHA-256, then opens the same snapshot and waits boundedly for a real App/main replacement. The five-second health wait starts only after candidate activation; the owner may use the separate installation wait for Gatekeeper and installer decisions. In Finder:
 
 1. Open **Install Personal Computer Agent.app**.
 2. If Gatekeeper blocks the unnotarized Development-signed app, use the normal owner-controlled Open Anyway flow in Privacy & Security, or Control-click the app and choose Open when macOS offers it. Do not disable Gatekeeper globally.
