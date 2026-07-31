@@ -1,7 +1,8 @@
 use pca_domain::{
-    AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventEnvelope, Sensitivity,
+    AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventCommit, EventEnvelope,
+    Sensitivity,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 
 #[cfg(feature = "process-test-hooks")]
 use std::{
@@ -15,19 +16,75 @@ use std::{
 use crate::actor::ProcessTestHooks;
 use crate::{migrations::MAX_SUPPORTED_SCHEMA_VERSION, DbError, DbHealth};
 
+struct SerializedEvent<'a> {
+    event: &'a EventEnvelope,
+    payload_json: String,
+    attachment_refs_json: String,
+    outbox_id: String,
+}
+
 pub(crate) fn append_event_with_outbox(
     connection: &mut Connection,
     event: &EventEnvelope,
     #[cfg(feature = "process-test-hooks")] process_test_hooks: Option<&ProcessTestHooks>,
 ) -> Result<(), DbError> {
+    let serialized = serialize_event(event)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start event transaction", error))?;
+    insert_event(&transaction, &serialized)?;
+    #[cfg(feature = "process-test-hooks")]
+    if let Some(hooks) = process_test_hooks {
+        wait_at_process_test_barrier(hooks)?;
+    }
+    insert_stable_outbox(&transaction, &serialized)?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit event transaction", error))
+}
+
+pub(crate) fn commit_events(
+    connection: &mut Connection,
+    commit: &EventCommit,
+) -> Result<(), DbError> {
+    let serialized = commit
+        .events()
+        .iter()
+        .map(serialize_event)
+        .collect::<Result<Vec<_>, _>>()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start Collector transaction", error))?;
+    for event in &serialized {
+        insert_event(&transaction, event)?;
+        insert_stable_outbox(&transaction, event)?;
+    }
+    if let Some(state) = commit.collector_state() {
+        upsert_collector_state_in(&transaction, state)?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit Collector transaction", error))
+}
+
+fn serialize_event(event: &EventEnvelope) -> Result<SerializedEvent<'_>, DbError> {
     let payload_json = serde_json::to_string(&event.payload)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let attachment_refs_json = serde_json::to_string(&event.attachment_refs)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let outbox_id = format!("event:{}", event.event_id);
-    let transaction = connection
-        .transaction()
-        .map_err(|error| DbError::sqlite("start event transaction", error))?;
+    Ok(SerializedEvent {
+        event,
+        payload_json,
+        attachment_refs_json,
+        outbox_id: format!("event:{}", event.event_id),
+    })
+}
+
+fn insert_event(
+    transaction: &Transaction<'_>,
+    serialized: &SerializedEvent<'_>,
+) -> Result<(), DbError> {
+    let event = serialized.event;
     transaction
         .execute(
             "INSERT INTO events_local (
@@ -50,16 +107,19 @@ pub(crate) fn append_event_with_outbox(
                 event.occurred_at,
                 event.created_at,
                 sensitivity_name(event.sensitivity),
-                payload_json,
-                attachment_refs_json,
+                serialized.payload_json,
+                serialized.attachment_refs_json,
                 event.idempotency_key,
             ],
         )
-        .map_err(|error| DbError::sqlite("insert local event", error))?;
-    #[cfg(feature = "process-test-hooks")]
-    if let Some(hooks) = process_test_hooks {
-        wait_at_process_test_barrier(hooks)?;
-    }
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("insert local event", error))
+}
+
+fn insert_stable_outbox(
+    transaction: &Transaction<'_>,
+    serialized: &SerializedEvent<'_>,
+) -> Result<(), DbError> {
     transaction
         .execute(
             "INSERT INTO sync_outbox (outbox_id, event_id, state, created_at_ms)
@@ -67,12 +127,14 @@ pub(crate) fn append_event_with_outbox(
                 ?1, ?2, 'pending',
                 CAST(unixepoch(?3, 'subsec') * 1000 AS INTEGER)
              ) ON CONFLICT DO NOTHING",
-            params![outbox_id, event.event_id, event.created_at],
+            params![
+                serialized.outbox_id,
+                serialized.event.event_id,
+                serialized.event.created_at
+            ],
         )
-        .map_err(|error| DbError::sqlite("insert event outbox", error))?;
-    transaction
-        .commit()
-        .map_err(|error| DbError::sqlite("commit event transaction", error))
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("insert event outbox", error))
 }
 
 #[cfg(feature = "process-test-hooks")]
@@ -251,6 +313,16 @@ pub(crate) fn count_event_and_outbox(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|error| DbError::sqlite("count event and outbox", error))
+}
+
+pub(crate) fn active_outbox_depth(connection: &Connection) -> Result<u64, DbError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sync_outbox WHERE state <> 'acked'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| DbError::sqlite("count active Outbox rows", error))
 }
 
 pub(crate) fn health(connection: &Connection) -> Result<DbHealth, DbError> {

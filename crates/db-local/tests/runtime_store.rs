@@ -10,7 +10,8 @@ use std::{
 
 use pca_db_local::{DbActorHandle, DbError, BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION};
 use pca_domain::{
-    AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventEnvelope, Sensitivity,
+    AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventCommit, EventEnvelope,
+    Sensitivity,
 };
 use rusqlite::Connection;
 use serde_json::{Map, Value};
@@ -68,6 +69,14 @@ fn collector_state(status: CollectorStatus) -> CollectorState {
         created_at_ms: 1_754_013_720_000,
         updated_at_ms: 1_754_013_725_000,
     }
+}
+
+fn collector_commit(event_ids: &[&str], state: CollectorState) -> EventCommit {
+    EventCommit::try_new(
+        event_ids.iter().map(|event_id| event(event_id)).collect(),
+        Some(state),
+    )
+    .expect("valid Collector commit")
 }
 
 fn apply_previous_migration_chain(connection: &Connection) {
@@ -380,6 +389,105 @@ async fn outbox_insert_failure_rolls_back_event() {
             .expect("count rolled back rows"),
         (0, 0)
     );
+}
+
+#[tokio::test]
+async fn collector_commit_persists_event_outbox_and_state_idempotently() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let expected_state = collector_state(CollectorStatus::Running);
+    let event_ids = ["collector-commit-metric", "collector-commit-health"];
+    let commit = collector_commit(&event_ids, expected_state.clone());
+
+    db.commit_events(&commit)
+        .await
+        .expect("first Collector commit");
+    db.commit_events(&commit)
+        .await
+        .expect("idempotent Collector commit");
+
+    for event_id in event_ids {
+        assert_eq!(
+            db.count_event_and_outbox(event_id)
+                .await
+                .expect("count committed rows"),
+            (1, 1)
+        );
+    }
+    assert_eq!(
+        db.load_collector_states().await.expect("load final state"),
+        vec![expected_state]
+    );
+}
+
+#[tokio::test]
+async fn collector_commit_state_failure_rolls_back_events_outbox_and_prior_state() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let prior_state = collector_state(CollectorStatus::Initializing);
+    db.upsert_collector_state(&prior_state)
+        .await
+        .expect("persist prior state");
+    let connection = Connection::open(&path).expect("open failure setup connection");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_collector_state_upsert \
+             BEFORE INSERT ON collector_states \
+             BEGIN SELECT RAISE(ABORT, 'forced Collector state failure'); END;",
+        )
+        .expect("install real SQLite failure trigger");
+    drop(connection);
+    let event_ids = [
+        "collector-commit-rollback-metric",
+        "collector-commit-rollback-health",
+    ];
+    let commit = collector_commit(&event_ids, collector_state(CollectorStatus::Running));
+
+    let result = db.commit_events(&commit).await;
+
+    assert!(matches!(result, Err(DbError::Sqlite { .. })));
+    for event_id in event_ids {
+        assert_eq!(
+            db.count_event_and_outbox(event_id)
+                .await
+                .expect("count rolled back rows"),
+            (0, 0)
+        );
+    }
+    assert_eq!(
+        db.load_collector_states()
+            .await
+            .expect("load preserved prior state"),
+        vec![prior_state]
+    );
+}
+
+#[tokio::test]
+async fn active_depth_excludes_only_acked_rows() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    for state in ["pending", "sending", "acked", "conflict", "dead_letter"] {
+        db.append_event_with_outbox(&event(&format!("outbox-{state}")))
+            .await
+            .expect("seed Outbox row");
+    }
+    let connection = Connection::open(&path).expect("open Outbox setup connection");
+    for state in ["sending", "acked", "conflict", "dead_letter"] {
+        connection
+            .execute(
+                "UPDATE sync_outbox SET state = ?1 WHERE event_id = ?2",
+                (state, format!("outbox-{state}")),
+            )
+            .expect("set Outbox state");
+    }
+
+    assert_eq!(db.active_outbox_depth().await.expect("active depth"), 4);
 }
 
 #[tokio::test]

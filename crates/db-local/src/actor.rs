@@ -3,7 +3,7 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, thread, time::Duration};
 #[cfg(feature = "process-test-hooks")]
 use std::path::PathBuf;
 
-use pca_domain::{AgentStatus, BridgeStatus, CollectorState, EventEnvelope};
+use pca_domain::{AgentStatus, BridgeStatus, CollectorState, EventCommit, EventEnvelope};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
@@ -56,6 +56,10 @@ enum Request {
         event: Box<EventEnvelope>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    CommitEvents {
+        commit: Box<EventCommit>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     SetAgentState {
         agent_status: AgentStatus,
         bridge_status: BridgeStatus,
@@ -80,18 +84,23 @@ enum Request {
         event_id: String,
         response: oneshot::Sender<Result<(u64, u64), DbError>>,
     },
+    ActiveOutboxDepth {
+        response: oneshot::Sender<Result<u64, DbError>>,
+    },
 }
 
 impl Request {
     fn is_cancelled(&self) -> bool {
         match self {
             Self::AppendEvent { response, .. }
+            | Self::CommitEvents { response, .. }
             | Self::SetAgentState { response, .. }
             | Self::UpsertCollectorState { response, .. }
             | Self::Checkpoint { response } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
             Self::Health { response } => response.is_closed(),
             Self::CountEventAndOutbox { response, .. } => response.is_closed(),
+            Self::ActiveOutboxDepth { response } => response.is_closed(),
         }
     }
 }
@@ -200,6 +209,21 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Atomically commits one bounded Event batch, stable Outbox rows, and optional Collector state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, serialization, constraint, lock, or transaction error.
+    pub async fn commit_events(&self, commit: &EventCommit) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::CommitEvents {
+            commit: Box::new(commit.clone()),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Replaces the durable singleton runtime state using canonical domain enums.
     ///
     /// # Errors
@@ -299,6 +323,20 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Counts Outbox rows that have not reached the acknowledged terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or `SQLite` query error.
+    pub async fn active_outbox_depth(&self) -> Result<u64, DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::ActiveOutboxDepth {
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Closes the request queue, waits without blocking the async executor, and joins the owner.
     ///
     /// Requests whose response futures were canceled are skipped before they touch `SQLite`.
@@ -391,6 +429,9 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, option
                     options.process_test_hooks.as_ref(),
                 ));
             }
+            Request::CommitEvents { commit, response } => {
+                let _ = response.send(repository::commit_events(&mut connection, &commit));
+            }
             Request::SetAgentState {
                 agent_status,
                 bridge_status,
@@ -420,6 +461,9 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, option
             }
             Request::CountEventAndOutbox { event_id, response } => {
                 let _ = response.send(repository::count_event_and_outbox(&connection, &event_id));
+            }
+            Request::ActiveOutboxDepth { response } => {
+                let _ = response.send(repository::active_outbox_depth(&connection));
             }
         }
     }
