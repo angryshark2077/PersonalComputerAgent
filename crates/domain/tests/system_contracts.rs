@@ -62,13 +62,13 @@ fn event_commit_exposes_its_validated_members_read_only() {
 }
 
 #[test]
-fn collector_state_uses_canonical_snake_case_status() {
-    let json =
-        serde_json::to_value(state(CollectorStatus::Degraded)).expect("serialize collector state");
+fn collector_status_uses_canonical_snake_case_while_state_keeps_revisions() {
+    let json = serde_json::to_value(CollectorStatus::Degraded).expect("serialize collector status");
+    let persisted = state(CollectorStatus::Degraded);
 
-    assert_eq!(json["status"], "degraded");
-    assert_eq!(json["desired_config_revision"], 0);
-    assert_eq!(json["applied_config_revision"], 0);
+    assert_eq!(json, "degraded");
+    assert_eq!(persisted.desired_config_revision, 0);
+    assert_eq!(persisted.applied_config_revision, 0);
 }
 
 #[test]
@@ -81,13 +81,13 @@ fn cpu_memory_fixture_deserializes_and_round_trips() {
     let SystemMetricSample::CpuMemory(sample) = &parsed else {
         panic!("expected cpu_memory metric group");
     };
-    assert_eq!(sample.sample_window_ms, 30_000);
-    assert_eq!(sample.logical_cpu_count, 8);
-    assert!((sample.host.cpu_usage_percent - 42.5).abs() < f64::EPSILON);
-    assert_eq!(sample.host.memory_total_bytes, 17_179_869_184);
-    assert_eq!(sample.host.memory_used_bytes, 8_589_934_592);
-    assert!((sample.agent.cpu_usage_percent - 2.5).abs() < f64::EPSILON);
-    assert_eq!(sample.agent.memory_resident_bytes, 134_217_728);
+    assert_eq!(sample.sample_window_ms(), 30_000);
+    assert_eq!(sample.logical_cpu_count(), 8);
+    assert!((sample.host().cpu_usage_percent() - 42.5).abs() < f64::EPSILON);
+    assert_eq!(sample.host().memory_total_bytes(), 17_179_869_184);
+    assert_eq!(sample.host().memory_used_bytes(), 8_589_934_592);
+    assert!((sample.agent().cpu_usage_percent() - 2.5).abs() < f64::EPSILON);
+    assert_eq!(sample.agent().memory_resident_bytes(), 134_217_728);
 
     let expected: Value = serde_json::from_str(raw).expect("parse fixture as JSON");
     assert_eq!(
@@ -105,13 +105,13 @@ fn disk_fixture_deserializes_and_round_trips() {
     let SystemMetricSample::Disk(sample) = &parsed else {
         panic!("expected disk metric group");
     };
-    assert_eq!(sample.scope, DiskScope::PcaDataVolume);
-    assert_eq!(sample.total_bytes, 107_374_182_400);
-    assert_eq!(sample.available_bytes, 53_687_091_200);
-    assert!((sample.used_percent - 50.0).abs() < f64::EPSILON);
-    assert!(!sample.low_space);
-    assert_eq!(sample.low_space_threshold_bytes, 2_147_483_648);
-    assert_eq!(sample.warning_code, None);
+    assert_eq!(sample.scope(), DiskScope::PcaDataVolume);
+    assert_eq!(sample.total_bytes(), 107_374_182_400);
+    assert_eq!(sample.available_bytes(), 53_687_091_200);
+    assert!((sample.used_percent() - 50.0).abs() < f64::EPSILON);
+    assert!(!sample.low_space());
+    assert_eq!(sample.low_space_threshold_bytes(), 2_147_483_648);
+    assert_eq!(sample.warning_code(), None);
 
     let serialized = serde_json::to_value(parsed).expect("serialize disk sample");
     assert_eq!(serialized["metric_group"], "disk");
@@ -128,6 +128,31 @@ fn disk_fixture_deserializes_and_round_trips() {
 fn invalid_percentage_fixture_is_rejected_during_deserialization() {
     let raw =
         include_str!("../../../packages/contracts/fixtures/system-metric.invalid-percent.json");
+
+    assert!(serde_json::from_str::<SystemMetricSample>(raw).is_err());
+}
+
+#[test]
+fn nested_cpu_memory_dtos_reject_invalid_deserialization() {
+    let invalid_host = serde_json::json!({
+        "cpu_usage_percent": 100.1,
+        "memory_total_bytes": 16,
+        "memory_used_bytes": 8
+    });
+    let invalid_agent = serde_json::json!({
+        "cpu_usage_percent": -0.1,
+        "memory_resident_bytes": 4
+    });
+
+    assert!(serde_json::from_value::<HostCpuMemory>(invalid_host).is_err());
+    assert!(serde_json::from_value::<AgentCpuMemory>(invalid_agent).is_err());
+}
+
+#[test]
+fn unknown_system_metric_field_is_rejected_during_deserialization() {
+    let raw = include_str!(
+        "../../../packages/contracts/fixtures/system-metric.invalid-unknown-field.json"
+    );
 
     assert!(serde_json::from_str::<SystemMetricSample>(raw).is_err());
 }

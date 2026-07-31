@@ -39,7 +39,30 @@ pub struct CollectorDefinition {
     pub supported_event_types: &'static [&'static str],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// SQLite-facing collector state owned by Agent Core.
+///
+/// This persistence model is deliberately not a Task 1 wire DTO:
+///
+/// ```compile_fail
+/// use pca_domain::{CollectorState, CollectorStatus};
+///
+/// fn requires_wire_serialization<T: serde::Serialize>(_value: &T) {}
+///
+/// let state = CollectorState {
+///     collector_key: "system".to_owned(),
+///     collector_version: "0.1.0".to_owned(),
+///     status: CollectorStatus::Running,
+///     desired_config_revision: 0,
+///     applied_config_revision: 0,
+///     last_event_at_ms: None,
+///     last_health_at_ms: None,
+///     last_error_code: None,
+///     created_at_ms: 0,
+///     updated_at_ms: 0,
+/// };
+/// requires_wire_serialization(&state);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectorState {
     pub collector_key: String,
     pub collector_version: String,
@@ -53,12 +76,25 @@ pub struct CollectorState {
     pub updated_at_ms: i64,
 }
 
+/// A checked host CPU and memory sample.
+///
+/// Construct samples through [`HostCpuMemory::try_new`]:
+///
+/// ```compile_fail
+/// use pca_domain::HostCpuMemory;
+///
+/// let _unchecked = HostCpuMemory {
+///     cpu_usage_percent: 100.1,
+///     memory_total_bytes: 16,
+///     memory_used_bytes: 8,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawHostCpuMemory")]
 pub struct HostCpuMemory {
-    pub cpu_usage_percent: f64,
-    pub memory_total_bytes: u64,
-    pub memory_used_bytes: u64,
+    cpu_usage_percent: f64,
+    memory_total_bytes: u64,
+    memory_used_bytes: u64,
 }
 
 impl HostCpuMemory {
@@ -87,6 +123,21 @@ impl HostCpuMemory {
         })
     }
 
+    #[must_use]
+    pub const fn cpu_usage_percent(&self) -> f64 {
+        self.cpu_usage_percent
+    }
+
+    #[must_use]
+    pub const fn memory_total_bytes(&self) -> u64 {
+        self.memory_total_bytes
+    }
+
+    #[must_use]
+    pub const fn memory_used_bytes(&self) -> u64 {
+        self.memory_used_bytes
+    }
+
     fn validate(&self) -> Result<(), DomainError> {
         validate_percentage(self.cpu_usage_percent, "host cpu usage")?;
         if self.memory_used_bytes > self.memory_total_bytes {
@@ -98,11 +149,43 @@ impl HostCpuMemory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawHostCpuMemory {
+    cpu_usage_percent: f64,
+    memory_total_bytes: u64,
+    memory_used_bytes: u64,
+}
+
+impl TryFrom<RawHostCpuMemory> for HostCpuMemory {
+    type Error = DomainError;
+
+    fn try_from(raw: RawHostCpuMemory) -> Result<Self, Self::Error> {
+        Self::try_new(
+            raw.cpu_usage_percent,
+            raw.memory_total_bytes,
+            raw.memory_used_bytes,
+        )
+    }
+}
+
+/// A checked Agent CPU and resident-memory sample.
+///
+/// Construct samples through [`AgentCpuMemory::try_new`]:
+///
+/// ```compile_fail
+/// use pca_domain::AgentCpuMemory;
+///
+/// let _unchecked = AgentCpuMemory {
+///     cpu_usage_percent: -0.1,
+///     memory_resident_bytes: 4,
+/// };
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawAgentCpuMemory")]
 pub struct AgentCpuMemory {
-    pub cpu_usage_percent: f64,
-    pub memory_resident_bytes: u64,
+    cpu_usage_percent: f64,
+    memory_resident_bytes: u64,
 }
 
 impl AgentCpuMemory {
@@ -122,18 +205,59 @@ impl AgentCpuMemory {
         })
     }
 
+    #[must_use]
+    pub const fn cpu_usage_percent(&self) -> f64 {
+        self.cpu_usage_percent
+    }
+
+    #[must_use]
+    pub const fn memory_resident_bytes(&self) -> u64 {
+        self.memory_resident_bytes
+    }
+
     fn validate(&self) -> Result<(), DomainError> {
         validate_percentage(self.cpu_usage_percent, "agent cpu usage")
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAgentCpuMemory {
+    cpu_usage_percent: f64,
+    memory_resident_bytes: u64,
+}
+
+impl TryFrom<RawAgentCpuMemory> for AgentCpuMemory {
+    type Error = DomainError;
+
+    fn try_from(raw: RawAgentCpuMemory) -> Result<Self, Self::Error> {
+        Self::try_new(raw.cpu_usage_percent, raw.memory_resident_bytes)
+    }
+}
+
+/// A checked CPU and memory metric sample.
+///
+/// Construct samples through [`CpuMemorySample::try_new`]:
+///
+/// ```compile_fail
+/// use pca_domain::{AgentCpuMemory, CpuMemorySample, HostCpuMemory};
+///
+/// let host = HostCpuMemory::try_new(42.5, 16, 8).unwrap();
+/// let agent = AgentCpuMemory::try_new(2.5, 4).unwrap();
+/// let _unchecked = CpuMemorySample {
+///     sample_window_ms: 0,
+///     logical_cpu_count: 8,
+///     host,
+///     agent,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawCpuMemorySample")]
 pub struct CpuMemorySample {
-    pub sample_window_ms: u64,
-    pub logical_cpu_count: u32,
-    pub host: HostCpuMemory,
-    pub agent: AgentCpuMemory,
+    sample_window_ms: u64,
+    logical_cpu_count: u32,
+    host: HostCpuMemory,
+    agent: AgentCpuMemory,
 }
 
 impl CpuMemorySample {
@@ -169,6 +293,26 @@ impl CpuMemorySample {
             agent,
         })
     }
+
+    #[must_use]
+    pub const fn sample_window_ms(&self) -> u64 {
+        self.sample_window_ms
+    }
+
+    #[must_use]
+    pub const fn logical_cpu_count(&self) -> u32 {
+        self.logical_cpu_count
+    }
+
+    #[must_use]
+    pub const fn host(&self) -> &HostCpuMemory {
+        &self.host
+    }
+
+    #[must_use]
+    pub const fn agent(&self) -> &AgentCpuMemory {
+        &self.agent
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,16 +343,33 @@ pub enum DiskScope {
     PcaDataVolume,
 }
 
+/// A checked PCA data-volume disk sample.
+///
+/// Construct samples through [`DiskSample::try_new`]:
+///
+/// ```compile_fail
+/// use pca_domain::{DiskSample, DiskScope};
+///
+/// let _unchecked = DiskSample {
+///     scope: DiskScope::PcaDataVolume,
+///     total_bytes: 100,
+///     available_bytes: 101,
+///     used_percent: 0.0,
+///     low_space: true,
+///     low_space_threshold_bytes: 2_147_483_648,
+///     warning_code: Some("DISK_SPACE_LOW".to_owned()),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawDiskSample")]
 pub struct DiskSample {
-    pub scope: DiskScope,
-    pub total_bytes: u64,
-    pub available_bytes: u64,
-    pub used_percent: f64,
-    pub low_space: bool,
-    pub low_space_threshold_bytes: u64,
-    pub warning_code: Option<String>,
+    scope: DiskScope,
+    total_bytes: u64,
+    available_bytes: u64,
+    used_percent: f64,
+    low_space: bool,
+    low_space_threshold_bytes: u64,
+    warning_code: Option<String>,
 }
 
 impl DiskSample {
@@ -277,6 +438,41 @@ impl DiskSample {
             low_space_threshold_bytes,
             warning_code,
         })
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> DiskScope {
+        self.scope
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    #[must_use]
+    pub const fn available_bytes(&self) -> u64 {
+        self.available_bytes
+    }
+
+    #[must_use]
+    pub const fn used_percent(&self) -> f64 {
+        self.used_percent
+    }
+
+    #[must_use]
+    pub const fn low_space(&self) -> bool {
+        self.low_space
+    }
+
+    #[must_use]
+    pub const fn low_space_threshold_bytes(&self) -> u64 {
+        self.low_space_threshold_bytes
+    }
+
+    #[must_use]
+    pub fn warning_code(&self) -> Option<&str> {
+        self.warning_code.as_deref()
     }
 }
 
