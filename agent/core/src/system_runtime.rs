@@ -7,8 +7,8 @@ use ::time::OffsetDateTime;
 use pca_db_local::{DbActorHandle, DbError};
 use pca_domain::{CollectorState, DomainError, EventCommit, EventSink, SystemMetricSample};
 use pca_system_collector::{
-    start_sampler, start_system_collector, SysinfoMetricsSource, SystemCollectorHandle,
-    SystemMetricsSource, SystemObservation, SystemSampleError, RETRY_DELAYS,
+    start_sampler, start_system_collector_with_suppression, SysinfoMetricsSource,
+    SystemCollectorHandle, SystemMetricsSource, SystemObservation, SystemSampleError, RETRY_DELAYS,
 };
 use std::{
     fmt,
@@ -163,14 +163,23 @@ where
         identity,
         source,
         sink,
-        registry,
-        pending,
+        StartupState {
+            registry,
+            pending,
+            outbox_depth,
+        },
         shutdown_receiver,
     ));
     Ok(SystemRuntimeHandle {
         shutdown: Some(shutdown),
         worker: Some(worker),
     })
+}
+
+struct StartupState {
+    registry: CollectorRegistry,
+    pending: PendingWrite,
+    outbox_depth: u64,
 }
 
 async fn load_system_state(
@@ -192,10 +201,14 @@ async fn run_paired<S: SystemMetricsSource>(
     identity: CollectorIdentity,
     source: S,
     sink: Arc<dyn EventSink>,
-    mut registry: CollectorRegistry,
-    initial: PendingWrite,
+    startup: StartupState,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), SystemRuntimeError> {
+    let StartupState {
+        mut registry,
+        pending: initial,
+        outbox_depth: startup_outbox_depth,
+    } = startup;
     if persist_pending(
         &database,
         &identity,
@@ -211,8 +224,35 @@ async fn run_paired<S: SystemMetricsSource>(
         return Ok(());
     }
 
-    let (collector, mut observations) =
-        start_system_collector(start_sampler(source), OBSERVATION_CAPACITY);
+    let startup_backpressure = registry.apply_outbox_depth(startup_outbox_depth, clock_now_ms()?);
+    if startup_backpressure.transition.is_some() || startup_backpressure.sampling_suppressed {
+        let pending = pending_from_update(
+            &identity,
+            &startup_backpressure,
+            None,
+            startup_backpressure.state.updated_at_ms,
+        )?;
+        if persist_pending(
+            &database,
+            &identity,
+            sink.as_ref(),
+            &mut registry,
+            pending,
+            None,
+            &mut shutdown,
+        )
+        .await?
+            == PersistOutcome::Shutdown
+        {
+            return Ok(());
+        }
+    }
+
+    let (collector, mut observations) = start_system_collector_with_suppression(
+        start_sampler(source),
+        OBSERVATION_CAPACITY,
+        registry.sampling_suppressed(),
+    );
     let mut outbox_monitor = time::interval(OUTBOX_MONITOR_INTERVAL);
     outbox_monitor.set_missed_tick_behavior(MissedTickBehavior::Skip);
     outbox_monitor.tick().await;
@@ -284,7 +324,9 @@ async fn handle_observation(
             (update, None)
         }
     };
-    collector.set_suppressed(update.sampling_suppressed);
+    if update.sampling_suppressed {
+        collector.set_suppressed(true);
+    }
     let occurred_at_ms = sample.as_ref().map_or_else(
         || update.state.updated_at_ms,
         |(_, observed_at_ms)| *observed_at_ms,
@@ -295,7 +337,7 @@ async fn handle_observation(
         sample.as_ref().map(|(sample, _)| sample),
         occurred_at_ms,
     )?;
-    persist_pending(
+    let outcome = persist_pending(
         database,
         identity,
         sink,
@@ -304,7 +346,11 @@ async fn handle_observation(
         Some(collector),
         shutdown,
     )
-    .await
+    .await?;
+    if outcome == PersistOutcome::Persisted {
+        collector.set_suppressed(update.sampling_suppressed);
+    }
+    Ok(outcome)
 }
 
 async fn handle_outbox_monitor(
@@ -325,9 +371,11 @@ async fn handle_outbox_monitor(
     } else {
         registry.record_persistence_failure(clock_now_ms()?)
     };
-    collector.set_suppressed(update.sampling_suppressed);
+    if update.sampling_suppressed {
+        collector.set_suppressed(true);
+    }
     let pending = pending_from_update(identity, &update, None, update.state.updated_at_ms)?;
-    persist_pending(
+    let outcome = persist_pending(
         database,
         identity,
         sink,
@@ -336,7 +384,11 @@ async fn handle_outbox_monitor(
         Some(collector),
         shutdown,
     )
-    .await
+    .await?;
+    if outcome == PersistOutcome::Persisted {
+        collector.set_suppressed(update.sampling_suppressed);
+    }
+    Ok(outcome)
 }
 
 async fn stop_collector(collector: SystemCollectorHandle) -> Result<(), SystemRuntimeError> {
@@ -368,6 +420,7 @@ async fn persist_pending(
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<PersistOutcome, SystemRuntimeError> {
     let mut retry_index = 0_usize;
+    let mut release_after_success = false;
     loop {
         if *shutdown.borrow() {
             return Ok(PersistOutcome::Shutdown);
@@ -376,16 +429,25 @@ async fn persist_pending(
             if registry.persistence_failed() {
                 let recovery = registry.record_persistence_recovery(clock_now_ms()?);
                 if let Some(collector) = collector {
-                    collector.set_suppressed(recovery.sampling_suppressed);
+                    if recovery.sampling_suppressed {
+                        collector.set_suppressed(true);
+                    }
                 }
                 pending =
                     pending_from_update(identity, &recovery, None, recovery.state.updated_at_ms)?;
                 retry_index = 0;
+                release_after_success = !recovery.sampling_suppressed;
                 continue;
+            }
+            if release_after_success {
+                if let Some(collector) = collector {
+                    collector.set_suppressed(false);
+                }
             }
             return Ok(PersistOutcome::Persisted);
         }
 
+        release_after_success = false;
         if !registry.persistence_failed() {
             let failed = registry.record_persistence_failure(clock_now_ms()?);
             if let Some(collector) = collector {
@@ -524,20 +586,21 @@ mod tests {
     use crate::collector_registry::CollectorIdentity;
     use pca_db_local::DbActorHandle;
     use pca_domain::{
-        AgentCpuMemory, CpuMemorySample, DiskSample, DiskScope, DomainError, EventCommit,
-        EventSink, EventSinkFuture, HostCpuMemory,
+        AgentCpuMemory, CollectorState, CollectorStatus, CpuMemorySample, DiskSample, DiskScope,
+        DomainError, EventCommit, EventSink, EventSinkFuture, HostCpuMemory,
     };
     use pca_system_collector::{SystemMetricsSource, SystemSampleError};
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
     use std::{
         path::Path,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::Duration,
     };
     use tempfile::TempDir;
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -635,6 +698,53 @@ mod tests {
         database: Arc<DbActorHandle>,
     }
 
+    struct RecoveryBlockingSink {
+        attempts: AtomicUsize,
+        recovery_failed: AtomicBool,
+        recovery_entered: AtomicBool,
+        release_recovery: Notify,
+    }
+
+    impl RecoveryBlockingSink {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                recovery_failed: AtomicBool::new(false),
+                recovery_entered: AtomicBool::new(false),
+                release_recovery: Notify::new(),
+            }
+        }
+    }
+
+    impl EventSink for RecoveryBlockingSink {
+        fn commit(&self, _commit: EventCommit) -> EventSinkFuture<'_> {
+            Box::pin(async move {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                match attempt {
+                    2 => Err(DomainError::new(
+                        "COLLECTOR_DEGRADED",
+                        "fixture persistence unavailable",
+                        true,
+                    )),
+                    4 => {
+                        self.recovery_failed.store(true, Ordering::SeqCst);
+                        Err(DomainError::new(
+                            "COLLECTOR_DEGRADED",
+                            "fixture recovery persistence unavailable",
+                            true,
+                        ))
+                    }
+                    6 => {
+                        self.recovery_entered.store(true, Ordering::SeqCst);
+                        self.release_recovery.notified().await;
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            })
+        }
+    }
+
     impl EventSink for DirectDbSink {
         fn commit(&self, commit: EventCommit) -> EventSinkFuture<'_> {
             Box::pin(async move {
@@ -721,6 +831,44 @@ mod tests {
         let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
             .await
             .expect("open database");
+        (directory, Arc::new(database))
+    }
+
+    async fn open_database_with_high_outbox() -> (TempDir, Arc<DbActorHandle>) {
+        let (directory, database) = open_database().await;
+        close_database(database).await;
+        let path = directory.path().join("agent.sqlite3");
+        let mut connection = Connection::open(&path).expect("open seed database");
+        let transaction = connection.transaction().expect("start seed transaction");
+        {
+            let mut insert_event = transaction
+                .prepare_cached(
+                    "INSERT INTO events_local (
+                         event_id, workspace_id, device_id, event_type, source,
+                         schema_version, occurred_at_ms, created_at_ms, sensitivity,
+                         payload_json, attachment_refs_json
+                     ) VALUES (?1, 'seed-workspace', 'seed-device', 'seed.event', 'seed',
+                         1, 1, 1, 'normal', '{}', '[]')",
+                )
+                .expect("prepare seed event");
+            let mut insert_outbox = transaction
+                .prepare_cached(
+                    "INSERT INTO sync_outbox (outbox_id, event_id, state, created_at_ms)
+                     VALUES (?1, ?2, 'pending', 1)",
+                )
+                .expect("prepare seed outbox");
+            for index in 0..=10_000_u64 {
+                let event_id = format!("seed-{index}");
+                insert_event.execute([&event_id]).expect("seed event");
+                insert_outbox
+                    .execute(params![format!("event:{event_id}"), event_id])
+                    .expect("seed outbox");
+            }
+        }
+        transaction.commit().expect("commit seed transaction");
+        let database = DbActorHandle::open(&path, "test")
+            .await
+            .expect("reopen database");
         (directory, Arc::new(database))
     }
 
@@ -828,9 +976,44 @@ mod tests {
         assert_eq!(event_count, outbox_count);
     }
 
+    fn status_transitions(connection: &Connection) -> Vec<(String, String)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT
+                     json_extract(payload_json, '$.status'),
+                     json_extract(payload_json, '$.reason')
+                 FROM events_local
+                 WHERE event_type = 'collector.status_changed'
+                 ORDER BY rowid",
+            )
+            .expect("prepare status order");
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query status order")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect status order")
+    }
+
     #[tokio::test(start_paused = true)]
     async fn unpaired_persists_disabled_without_sampling_or_events() {
         let (directory, database) = open_database().await;
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "system".to_owned(),
+                collector_version: "0.0.0".to_owned(),
+                status: CollectorStatus::Running,
+                desired_config_revision: 7,
+                applied_config_revision: 6,
+                last_event_at_ms: Some(11),
+                last_health_at_ms: Some(12),
+                last_error_code: None,
+                created_at_ms: 10,
+                updated_at_ms: 12,
+            })
+            .await
+            .expect("seed paired state");
 
         let runtime =
             SystemRuntimeHandle::start(Arc::clone(&database), None, directory.path().to_path_buf())
@@ -856,12 +1039,13 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT status FROM collector_states WHERE collector_key = 'system'",
+                    "SELECT status || ':' || desired_revision || ':' || applied_revision
+                     FROM collector_states WHERE collector_key = 'system'",
                     [],
                     |row| row.get::<_, String>(0)
                 )
                 .expect("disabled state"),
-            "disabled"
+            "disabled:0:0"
         );
         assert_eq!(
             connection
@@ -923,6 +1107,140 @@ mod tests {
         );
         yield_until(|| controls.cpu_calls() >= 1 && controls.disk_calls() >= 1).await;
 
+        runtime.shutdown().await.expect("shutdown runtime");
+        close_database(database).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistence_recovery_stays_suppressed_until_recovery_commit_succeeds() {
+        let (_directory, database) = open_database().await;
+        let controls = FakeControls::new();
+        let sink = Arc::new(RecoveryBlockingSink::new());
+        let runtime = SystemRuntimeHandle::start_with_source_and_sink(
+            Arc::clone(&database),
+            Some(identity()),
+            controls.source(),
+            sink.clone(),
+        )
+        .await
+        .expect("start paired runtime");
+        yield_until(|| sink.attempts.load(Ordering::SeqCst) == 2).await;
+        let baseline = (controls.cpu_calls(), controls.disk_calls());
+        assert_eq!(baseline, (1, 1));
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        yield_until(|| sink.recovery_failed.load(Ordering::SeqCst)).await;
+        assert_eq!(
+            (controls.cpu_calls(), controls.disk_calls()),
+            baseline,
+            "sampling resumed after a failed persistence_recovered commit"
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        yield_until(|| sink.recovery_entered.load(Ordering::SeqCst)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            (controls.cpu_calls(), controls.disk_calls()),
+            baseline,
+            "sampling resumed before persistence_recovered was durable"
+        );
+
+        sink.release_recovery.notify_one();
+        yield_until(|| controls.cpu_calls() > baseline.0 && controls.disk_calls() > baseline.1)
+            .await;
+        runtime.shutdown().await.expect("shutdown runtime");
+        close_database(database).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn high_water_restart_persists_initializing_then_degraded_before_sampling() {
+        let (directory, database) = open_database_with_high_outbox().await;
+        let controls = FakeControls::new();
+        let runtime = SystemRuntimeHandle::start_with_source_and_sink(
+            Arc::clone(&database),
+            Some(identity()),
+            controls.source(),
+            Arc::new(DirectDbSink {
+                database: Arc::clone(&database),
+            }),
+        )
+        .await
+        .expect("start high-water runtime");
+        let observer =
+            Connection::open(directory.path().join("agent.sqlite3")).expect("open observer");
+        yield_until(|| {
+            observer
+                .query_row(
+                    "SELECT COUNT(*) FROM events_local
+                     WHERE event_type = 'collector.status_changed'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("status count")
+                == 2
+        })
+        .await;
+
+        assert_eq!((controls.cpu_calls(), controls.disk_calls()), (0, 0));
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT COUNT(*) FROM events_local
+                     WHERE event_type = 'system.metric_sampled'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("metric count"),
+            0
+        );
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT status FROM collector_states WHERE collector_key = 'system'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("collector state"),
+            "degraded"
+        );
+        assert_eq!(
+            status_transitions(&observer),
+            vec![
+                ("initializing".to_owned(), "identity_available".to_owned()),
+                ("degraded".to_owned(), "outbox_backpressure".to_owned()),
+            ]
+        );
+
+        observer
+            .execute(
+                "UPDATE sync_outbox SET state = 'acked'
+                 WHERE event_id LIKE 'seed-%'",
+                [],
+            )
+            .expect("ack seed outbox");
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            std::thread::yield_now();
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        yield_until(|| {
+            controls.cpu_calls() == 1
+                && controls.disk_calls() == 1
+                && observer
+                    .query_row(
+                        "SELECT COUNT(*) FROM events_local
+                         WHERE event_type = 'system.metric_sampled'",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .expect("resumed metric count")
+                    == 2
+        })
+        .await;
+
+        drop(observer);
         runtime.shutdown().await.expect("shutdown runtime");
         close_database(database).await;
     }

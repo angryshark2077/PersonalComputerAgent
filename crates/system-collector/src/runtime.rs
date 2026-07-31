@@ -47,9 +47,13 @@ struct ControlState {
 }
 
 impl ControlState {
-    const fn running() -> Self {
+    const fn new(suppressed: bool) -> Self {
         Self {
-            mode: ControlMode::Running,
+            mode: if suppressed {
+                ControlMode::Suppressed
+            } else {
+                ControlMode::Running
+            },
             resume_generation: 0,
         }
     }
@@ -123,12 +127,29 @@ pub fn start_system_collector(
     sampler: SamplerHandle,
     observation_capacity: usize,
 ) -> (SystemCollectorHandle, mpsc::Receiver<SystemObservation>) {
+    start_system_collector_with_suppression(sampler, observation_capacity, false)
+}
+
+/// Starts both metric schedules atomically in either running or suppressed mode.
+///
+/// An initially suppressed collector makes no sampler request until the handle
+/// observes a later resume edge.
+///
+/// # Panics
+///
+/// Panics when `observation_capacity` is zero.
+#[must_use]
+pub fn start_system_collector_with_suppression(
+    sampler: SamplerHandle,
+    observation_capacity: usize,
+    initially_suppressed: bool,
+) -> (SystemCollectorHandle, mpsc::Receiver<SystemObservation>) {
     assert!(
         observation_capacity > 0,
         "observation capacity must be greater than zero"
     );
     let (observations, receiver) = mpsc::channel(observation_capacity);
-    let (control, control_receiver) = watch::channel(ControlState::running());
+    let (control, control_receiver) = watch::channel(ControlState::new(initially_suppressed));
     let supervisor = tokio::spawn(supervise(sampler, observations, control_receiver));
 
     (

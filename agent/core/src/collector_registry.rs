@@ -63,7 +63,7 @@ impl CollectorRegistry {
     pub(crate) fn restore(
         prior: Option<CollectorState>,
         identity_available: bool,
-        outbox_depth: u64,
+        _outbox_depth: u64,
         now_ms: i64,
     ) -> (Self, RegistryUpdate) {
         let previous_status = prior
@@ -88,16 +88,19 @@ impl CollectorRegistry {
         } else {
             CollectorStatus::Disabled
         };
+        if !identity_available {
+            state.desired_config_revision = 0;
+            state.applied_config_revision = 0;
+        }
         state.last_error_code = None;
         state.updated_at_ms = now_ms;
 
-        let backpressure = identity_available && outbox_depth > 10_000;
         let mut registry = Self {
             state,
             identity_available,
             cpu_memory: GroupState::Pending,
             disk: GroupState::Pending,
-            backpressure,
+            backpressure: false,
             persistence_failed: false,
             disk_low: None,
         };
@@ -383,13 +386,13 @@ mod tests {
     }
 
     #[test]
-    fn unpaired_restore_is_disabled_without_transition_and_preserves_revisions() {
+    fn unpaired_restore_is_disabled_without_transition_and_resets_revisions() {
         let (registry, update) =
             CollectorRegistry::restore(Some(prior_state(CollectorStatus::Running)), false, 0, NOW);
 
         assert_eq!(registry.status(), CollectorStatus::Disabled);
-        assert_eq!(update.state.desired_config_revision, 7);
-        assert_eq!(update.state.applied_config_revision, 6);
+        assert_eq!(update.state.desired_config_revision, 0);
+        assert_eq!(update.state.applied_config_revision, 0);
         assert_eq!(update.state.status, CollectorStatus::Disabled);
         assert_eq!(update.state.updated_at_ms, NOW);
         assert!(update.transition.is_none());

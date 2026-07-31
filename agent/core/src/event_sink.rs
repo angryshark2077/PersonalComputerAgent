@@ -25,10 +25,14 @@ where
     tokio::time::timeout(Duration::from_secs(5), future)
         .await
         .map_err(|_| DomainError::new("COLLECTOR_TIMEOUT", "event commit timed out", true))?
-        .map_err(map_database_error)
+        .map_err(|error| map_database_error(&error))
 }
 
-fn map_database_error(_error: DbError) -> DomainError {
+fn map_database_error(error: &DbError) -> DomainError {
+    eprintln!(
+        "pca-agentd: collector persistence unavailable kind={}",
+        database_error_kind(error)
+    );
     DomainError::new(
         "COLLECTOR_DEGRADED",
         "collector persistence unavailable",
@@ -36,9 +40,24 @@ fn map_database_error(_error: DbError) -> DomainError {
     )
 }
 
+fn database_error_kind(error: &DbError) -> &'static str {
+    match error {
+        DbError::Sqlite { .. } => "sqlite",
+        DbError::Serialization(_) => "serialization",
+        DbError::MigrationChecksumMismatch { .. } => "migration_checksum",
+        DbError::IncompleteMigration { .. } => "incomplete_migration",
+        DbError::UnsupportedSchemaVersion { .. } => "unsupported_schema",
+        DbError::InvalidMigrationId(_) => "invalid_migration_id",
+        DbError::IntegrityCheck { .. } => "integrity_check",
+        DbError::ForeignKeyCheck { .. } => "foreign_key_check",
+        DbError::ActorUnavailable => "actor_unavailable",
+        DbError::ActorThreadPanic => "actor_thread_panic",
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{commit_with_deadline, map_database_error};
+    use super::{commit_with_deadline, database_error_kind, map_database_error};
     use pca_db_local::DbError;
     use std::{future::pending, time::Duration};
 
@@ -62,16 +81,23 @@ mod tests {
     #[test]
     fn every_database_error_maps_to_one_redacted_retryable_error() {
         let variants = [
-            DbError::ActorUnavailable,
-            DbError::Serialization("secret database detail".to_owned()),
-            DbError::UnsupportedSchemaVersion {
-                found: 99,
-                max_supported: 2,
-            },
+            (DbError::ActorUnavailable, "actor_unavailable"),
+            (
+                DbError::Serialization("secret database detail".to_owned()),
+                "serialization",
+            ),
+            (
+                DbError::UnsupportedSchemaVersion {
+                    found: 99,
+                    max_supported: 2,
+                },
+                "unsupported_schema",
+            ),
         ];
 
-        for database_error in variants {
-            let mapped = map_database_error(database_error);
+        for (database_error, expected_kind) in variants {
+            assert_eq!(database_error_kind(&database_error), expected_kind);
+            let mapped = map_database_error(&database_error);
             assert_eq!(mapped.code, "COLLECTOR_DEGRADED");
             assert_eq!(mapped.message, "collector persistence unavailable");
             assert!(mapped.retryable);

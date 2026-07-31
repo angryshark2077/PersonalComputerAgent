@@ -2,8 +2,8 @@ use pca_domain::{
     AgentCpuMemory, CpuMemorySample, DiskSample, DiskScope, HostCpuMemory, SystemMetricSample,
 };
 use pca_system_collector::{
-    start_sampler, start_system_collector, MetricGroup, SystemMetricsSource, SystemObservation,
-    SystemSampleError, SystemSampleErrorKind,
+    start_sampler, start_system_collector, start_system_collector_with_suppression, MetricGroup,
+    SystemMetricsSource, SystemObservation, SystemSampleError, SystemSampleErrorKind,
 };
 use std::{
     collections::VecDeque,
@@ -365,6 +365,37 @@ async fn suppression_never_requests_the_sampler_and_resume_samples_fresh() {
     tokio::time::advance(Duration::from_secs(1)).await;
     let _ = next_for_group(&mut observations, MetricGroup::CpuMemory).await;
     assert_eq!((controls.cpu_calls(), controls.disk_calls()), (3, 2));
+    handle.shutdown().await.expect("collector shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_suppression_is_atomic_and_resume_samples_fresh() {
+    let controls = FakeControls::always_succeeds();
+    let sampler = start_sampler(FakeSource {
+        controls: controls.clone(),
+        owner_stopped: None,
+    });
+    let (handle, mut observations) = start_system_collector_with_suppression(sampler, 16, true);
+
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        std::thread::yield_now();
+    }
+    tokio::time::advance(Duration::from_secs(600)).await;
+    tokio::task::yield_now().await;
+    assert_eq!((controls.cpu_calls(), controls.disk_calls()), (0, 0));
+    assert!(drain_groups(&mut observations).is_empty());
+
+    handle.set_suppressed(false);
+    wait_for_calls(&controls, 1, 1).await;
+    assert_initial_groups(&mut observations).await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    tokio::task::yield_now().await;
+    assert_eq!((controls.cpu_calls(), controls.disk_calls()), (1, 1));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let _ = next_for_group(&mut observations, MetricGroup::CpuMemory).await;
+    assert_eq!((controls.cpu_calls(), controls.disk_calls()), (2, 1));
+
     handle.shutdown().await.expect("collector shutdown");
 }
 
