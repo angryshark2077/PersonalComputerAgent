@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/agent-control-snapshot.schema.json",
+  "title": "AgentControlSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "device_id",
+    "workspace_id",
+    "revoked",
+    "configuration_revision",
+    "collectors"
+  ],
+  "properties": {
+    "device_id": { "type": "string", "minLength": 1 },
+    "workspace_id": { "type": "string", "minLength": 1 },
+    "revoked": { "type": "boolean" },
+    "configuration_revision": { "type": "integer", "minimum": 0 },
+    "collectors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "communication.wechat"],
+      "properties": {
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "communication.wechat": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "direction", "message_type", "sync_mode"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "direction": { "const": "outgoing" },
+            "message_type": { "const": "text" },
+            "sync_mode": { "const": "full" }
+          }
+        }
+      }
+    }
+  }
+}

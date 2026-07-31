@@ -177,3 +177,63 @@ test("handshake fixtures never carry the shared secret", () => {
     assert.equal(value.includes("shared_secret"), false);
   }
 });
+
+test("pairing and control contracts accept the approved wire shapes", () => {
+  assert.equal(
+    validateContract("device-pairing", fixture("pairing-start.valid.json")).valid,
+    true,
+  );
+  assert.equal(
+    validateContract("device-pairing", fixture("pairing-exchange.valid.json")).valid,
+    true,
+  );
+  assert.equal(
+    validateContract(
+      "agent-control-snapshot",
+      fixture("agent-control-snapshot.valid.json"),
+    ).valid,
+    true,
+  );
+});
+
+test("pairing and control contracts reject broadened inputs", () => {
+  assert.equal(
+    validateContract(
+      "device-pairing",
+      fixture("pairing-start.invalid-callback.json"),
+    ).valid,
+    false,
+  );
+
+  assert.equal(
+    validateContract(
+      "device-pairing",
+      fixture("pairing-exchange.invalid-session.json"),
+    ).valid,
+    false,
+  );
+
+  const unknownScope = fixture("agent-control-snapshot.valid.json") as {
+    collectors: Record<string, unknown>;
+  };
+  unknownScope.collectors.screen = { enabled: true };
+  assert.equal(validateContract("agent-control-snapshot", unknownScope).valid, false);
+
+  const negativeRevision = fixture("agent-control-snapshot.valid.json") as {
+    configuration_revision: number;
+  };
+  negativeRevision.configuration_revision = -1;
+  assert.equal(
+    validateContract("agent-control-snapshot", negativeRevision).valid,
+    false,
+  );
+
+  const broadenedWechatScope = fixture("agent-control-snapshot.valid.json") as {
+    collectors: { "communication.wechat": { direction: string } };
+  };
+  broadenedWechatScope.collectors["communication.wechat"].direction = "incoming";
+  assert.equal(
+    validateContract("agent-control-snapshot", broadenedWechatScope).valid,
+    false,
+  );
+});

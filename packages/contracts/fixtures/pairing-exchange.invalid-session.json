@@ -1,0 +1,5 @@
+{
+  "session_id": "not-a-uuid",
+  "authorization_code": "synthetic_authorization_code",
+  "code_verifier": "synthetic_pkce_verifier"
+}

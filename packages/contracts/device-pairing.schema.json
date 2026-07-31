@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/device-pairing.schema.json",
+  "title": "DevicePairing",
+  "oneOf": [
+    {
+      "title": "DevicePairingStart",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_public_key", "code_challenge", "callback_uri"],
+      "properties": {
+        "device_public_key": { "type": "string", "minLength": 1 },
+        "code_challenge": { "type": "string", "minLength": 1 },
+        "callback_uri": {
+          "type": "string",
+          "pattern": "^http://127\\.0\\.0\\.1:(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])/pca/pair/callback$"
+        }
+      }
+    },
+    {
+      "title": "DevicePairingExchange",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "authorization_code", "code_verifier"],
+      "properties": {
+        "session_id": { "type": "string", "format": "uuid" },
+        "authorization_code": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "code_verifier": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        }
+      }
+    }
+  ]
+}

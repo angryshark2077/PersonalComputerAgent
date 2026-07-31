@@ -138,3 +138,31 @@ export interface SystemHealthChangedPayload {
   available_bytes: number;
   threshold_bytes: 2147483648;
 }
+
+export interface DevicePairingStart {
+  device_public_key: string;
+  code_challenge: string;
+  callback_uri: string;
+}
+
+export interface DevicePairingExchange {
+  session_id: string;
+  authorization_code: string;
+  code_verifier: string;
+}
+
+export interface AgentControlSnapshot {
+  device_id: string;
+  workspace_id: string;
+  revoked: boolean;
+  configuration_revision: number;
+  collectors: {
+    network: { enabled: boolean };
+    "communication.wechat": {
+      enabled: boolean;
+      direction: "outgoing";
+      message_type: "text";
+      sync_mode: "full";
+    };
+  };
+}

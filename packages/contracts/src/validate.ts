@@ -15,7 +15,9 @@ export type ContractSchemaName =
   | "system-health-changed"
   | "sync-batch-request"
   | "sync-batch-response"
-  | "wechat-provider-state";
+  | "wechat-provider-state"
+  | "device-pairing"
+  | "agent-control-snapshot";
 
 export interface ValidationResult {
   valid: boolean;
@@ -35,6 +37,8 @@ const schemaNames: ContractSchemaName[] = [
   "sync-batch-request",
   "sync-batch-response",
   "wechat-provider-state",
+  "device-pairing",
+  "agent-control-snapshot",
 ];
 
 const ajv = new Ajv2020({

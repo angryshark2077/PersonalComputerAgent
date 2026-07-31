@@ -1,0 +1,15 @@
+{
+  "device_id": "device-test-001",
+  "workspace_id": "workspace-test-001",
+  "revoked": false,
+  "configuration_revision": 3,
+  "collectors": {
+    "network": { "enabled": true },
+    "communication.wechat": {
+      "enabled": false,
+      "direction": "outgoing",
+      "message_type": "text",
+      "sync_mode": "full"
+    }
+  }
+}

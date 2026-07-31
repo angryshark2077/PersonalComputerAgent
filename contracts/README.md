@@ -24,3 +24,5 @@
 - `system-metric-sampled.schema.json`
 - `collector-status-changed.schema.json`
 - `system-health-changed.schema.json`
+- `device-pairing.schema.json`
+- `agent-control-snapshot.schema.json`
