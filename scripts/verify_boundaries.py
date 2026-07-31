@@ -66,10 +66,29 @@ def main() -> int:
     for collector in (repository_root / "crates").glob("*collector*"):
         targets = path_dependency_targets(collector)
         symbols = rust_symbols(collector)
-        if any("cloud-client" in target for target in targets) or any(
-            symbol.startswith("pca_cloud_client") for symbol in symbols
-        ):
-            violations.append(f"forbidden dependency: {collector.relative_to(repository_root)} -> cloud-client")
+        forbidden_dependencies = (
+            (
+                "cloud-client",
+                any("cloud-client" in target for target in targets)
+                or any(symbol.startswith("pca_cloud_client") for symbol in symbols),
+            ),
+            (
+                "db-local",
+                any("db-local" in target for target in targets)
+                or any(symbol.startswith("pca_db_local") for symbol in symbols),
+            ),
+            (
+                "agent/core",
+                any(target.endswith("/agent/core") for target in targets)
+                or any(symbol.startswith("pca_agentd") for symbol in symbols),
+            ),
+        )
+        for dependency, is_forbidden in forbidden_dependencies:
+            if is_forbidden:
+                violations.append(
+                    f"forbidden dependency: {collector.relative_to(repository_root)}"
+                    f" -> {dependency}"
+                )
 
     web_root = repository_root / "apps/web-dashboard"
     web_imports = typescript_imports(web_root)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -76,6 +78,69 @@ class EngineeringGateTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("crates/domain -> platform", result.stderr)
+
+    def test_system_collector_forbidden_dependencies_are_rejected(self) -> None:
+        for dependency_name, dependency_path, expected_boundary in (
+            ("pca-cloud-client", "../cloud-client", "cloud-client"),
+            ("pca-db-local", "../db-local", "db-local"),
+            ("pca-agentd", "../../agent/core", "agent/core"),
+        ):
+            with self.subTest(dependency=dependency_name):
+                root = self.make_repo()
+                self.write(
+                    root / "crates/system-collector/Cargo.toml",
+                    f"""
+[package]
+name = "pca-system-collector"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+pca-forbidden = {{ package = "{dependency_name}", path = "{dependency_path}" }}
+""",
+                )
+
+                result = self.run_gate("verify_boundaries.py", root)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "forbidden dependency: "
+                    f"crates/system-collector -> {expected_boundary}",
+                    result.stderr,
+                )
+
+    def test_system_collector_sysinfo_features_are_minimal_and_pinned(self) -> None:
+        cargo = shutil.which("cargo") or "/opt/homebrew/opt/rustup/bin/cargo"
+        result = subprocess.run(
+            [
+                cargo,
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--manifest-path",
+                str(REPOSITORY_ROOT / "crates/system-collector/Cargo.toml"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = json.loads(result.stdout)
+        package = next(
+            package
+            for package in metadata["packages"]
+            if package["name"] == "pca-system-collector"
+        )
+        dependency = next(
+            dependency
+            for dependency in package["dependencies"]
+            if dependency["name"] == "sysinfo"
+        )
+
+        self.assertEqual(dependency["req"], "=0.33.1")
+        self.assertIs(dependency["uses_default_features"], False)
+        self.assertEqual(dependency["features"], ["system", "disk"])
 
 
 if __name__ == "__main__":

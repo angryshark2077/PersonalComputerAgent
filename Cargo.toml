@@ -7,6 +7,7 @@ members = [
   "crates/domain",
   "crates/keychain",
   "crates/provider-contracts",
+  "crates/system-collector",
   "crates/test-contracts",
 ]
 resolver = "2"
