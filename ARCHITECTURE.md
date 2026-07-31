@@ -147,6 +147,7 @@ SQLite transaction:
   Event Store
   Projection mutation
   Sync Outbox
+  Collector State
         ↓
 Sync Worker
         ↓
@@ -160,11 +161,18 @@ Dashboard query projections
 不变量：
 
 - Collector 不调用 Cloud。
-- Event 与 Outbox 在同一事务提交。
+- Collector 结果的 Event、Outbox 与 CollectorState 在 DbActor 的同一事务提交。
 - Event ID 由设备生成并全局幂等。
 - Attachment 先创建本地引用，再走预签名上传和 complete。
 - ACK 只有在服务端业务事务提交后返回。
 - 重试不产生重复副作用。
+
+System Collector 纵切使用独立 `crates/system-collector` crate。`sysinfo = 0.33.1`
+关闭默认 feature，仅开启 `system`、`disk`；一个有界 blocking sampler actor 串行拥有
+`sysinfo` 状态，CPU/Memory 与 Disk 调度分别每 30 秒和 5 分钟采样并在启动时立即采样。
+Agent Core 持有身份、Registry、EventSink 与 DbActor。Outbox 活跃深度大于 10,000 时
+抑制 System 采样，只有低于 8,000 才恢复，恢复不补采。Disk Event 只包含 PCA Data
+所在卷的容量聚合，不包含 mount path、卷名或文件系统。
 
 ## 5. WeChat Provider
 

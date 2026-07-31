@@ -20,6 +20,10 @@ done
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test -p pca-agentd --features process-test-hooks \
+  --test process_lifecycle \
+  --test system_collector_process \
+  --test collector_commit_kill
 swift build --package-path platform/macos
 swift run --package-path platform/macos BridgeContractVerifier
 pnpm install --frozen-lockfile

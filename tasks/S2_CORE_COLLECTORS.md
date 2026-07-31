@@ -47,3 +47,14 @@ Implement Activity, System and Screenshot vertical slices through Event Store an
 - 2h offline no loss/no duplicate.
 - permission revoke stops within 5 seconds.
 - idle CPU and memory remain inside budget.
+
+## 2026-07-31 · System vertical slice complete
+
+Completed only the first System slice: Collector Registry and durable state, host and
+Agent CPU/memory, PCA data-volume disk metrics, atomic Event/Outbox/CollectorState
+commit, deterministic scheduling/retry, and exact 10,000/8,000 backpressure hysteresis.
+
+The overall S2 objective and exit gate remain open. Battery/Power and Network are
+deferred to the next System increment. Activity, Screenshot, permission revocation,
+privacy exclusions beyond this System payload, Attachment staging, and full S2
+acceptance are not marked complete.

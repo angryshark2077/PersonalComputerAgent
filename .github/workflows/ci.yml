@@ -37,6 +37,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
+      - run: >-
+          cargo test -p pca-agentd --features process-test-hooks
+          --test process_lifecycle
+          --test system_collector_process
+          --test collector_commit_kill
       - run: swift build --package-path platform/macos
       - name: Swift package tests except process-signal cases
         run: >-
@@ -49,6 +54,13 @@ jobs:
       - name: Swift delayed-start signal test in an isolated runner
         run: swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
       - run: swift run --package-path platform/macos BridgeContractVerifier
+
+  rust-msrv:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - run: cargo check --workspace --all-targets
 
   s1a-macos:
     runs-on: macos-15

@@ -1047,13 +1047,17 @@ AND extension_reports_active_tab</th>
 
 ## 14.5 System Collector
 
-| **指标**        | **频率**   | **来源/说明**                                |
-|-----------------|------------|----------------------------------------------|
-| Agent heartbeat | 15 秒      | 版本、状态、Collector 摘要、Outbox 数量。    |
-| CPU/Memory      | 30 秒      | 主机总体与 Agent 自身分开。                  |
-| Disk            | 5 分钟     | 应用数据卷可用空间、截图目录占用。           |
-| Battery/Power   | 60 秒/变化 | 电量、充电、低电量。                         |
-| Network         | 变化事件   | online/offline/interface，不记录 SSID 默认。 |
+本轮仅完成 System CPU/Memory 与 Disk 纵向切片；Battery/Power、Network 留待后续。
+
+| **指标**        | **频率**            | **Event / payload**                                                                                                                                                                                                 |
+|-----------------|---------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Agent heartbeat | 15 秒               | 版本、状态、Collector 摘要、Outbox 数量。                                                                                                                                                                            |
+| CPU/Memory      | 启动立即一次，30 秒 | `system.metric_sampled`，`metric_group=cpu_memory`；`sample_window_ms`、`logical_cpu_count`，以及 host 的 `cpu_usage_percent`、`memory_total_bytes`、`memory_used_bytes` 和 Agent 的 `cpu_usage_percent`、`memory_resident_bytes`。 |
+| Disk            | 启动立即一次，5 分钟 | `system.metric_sampled`，`metric_group=disk`；`scope=pca_data_volume`、`total_bytes`、`available_bytes`、`used_percent`、`low_space`、`low_space_threshold_bytes=2147483648`、`warning_code`。                               |
+
+主机和 Agent CPU 都归一化为 0–100。Disk 只定位 PCA Data 所在卷；Event 不输出路径、卷名、文件系统、进程 PID、命令行、环境变量、SSID、电池或网络数据。低空间状态变化使用 `system.health_changed`，正常采样不中断。
+
+实现固定使用 `sysinfo = 0.33.1`，`default-features = false`，仅启用 `system` 与 `disk`；所有阻塞刷新收口到单一有界 sampler actor，不占用 async executor 线程。
 
 # 15. Browser、File 与 Location Collector
 
@@ -2251,15 +2255,20 @@ rustfmt、clippy -D warnings、cargo nextest、Rust/Swift/TypeScript 编译、Br
 
 **collector_states · 公共字段：LOCAL_ROW**
 
-| **字段**         | **类型** | **约束/默认**   | **说明**         |
-|------------------|----------|-----------------|------------------|
-| collector_key    | TEXT     | UNIQUE NOT NULL | Collector        |
-| status           | TEXT     | NOT NULL        | collector_status |
-| version          | TEXT     | NOT NULL        | 版本             |
-| desired_revision | INTEGER  | DEFAULT 0       | 期望配置         |
-| applied_revision | INTEGER  | DEFAULT 0       | 已应用           |
-| last_event_at_ms | INTEGER  | NULL            | 最后事件         |
-| last_error_code  | TEXT     | NULL            | 错误             |
+| **字段**         | **类型** | **约束/默认**   | **说明**                    |
+|------------------|----------|-----------------|-----------------------------|
+| collector_key    | TEXT     | PRIMARY KEY     | Collector                   |
+| status           | TEXT     | NOT NULL        | collector_status            |
+| version          | TEXT     | NOT NULL        | 版本                        |
+| desired_revision | INTEGER  | DEFAULT 0       | 期望配置                    |
+| applied_revision | INTEGER  | DEFAULT 0       | 已应用                      |
+| last_event_at_ms | INTEGER  | NULL            | 最后成功 Event，UTC epoch ms |
+| last_health_at_ms | INTEGER | NULL            | 最后健康观测，UTC epoch ms  |
+| last_error_code  | TEXT     | NULL            | 错误                        |
+| created_at_ms    | INTEGER  | NOT NULL        | 创建时间，UTC epoch ms      |
+| updated_at_ms    | INTEGER  | NOT NULL        | 更新时间，UTC epoch ms      |
+
+`collector_key` 主键已覆盖状态读取，本切片不增加额外索引。每个 Collector 结果的 Event、对应 Sync Outbox 行和最新 `collector_states` 必须在 DbActor 的同一 SQLite 事务中提交；任一写入失败则全部回滚。
 
 **agent_commands_local · 公共字段：LOCAL_ROW**
 

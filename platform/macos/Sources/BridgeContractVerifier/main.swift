@@ -62,7 +62,7 @@ do {
           runtimeStatus.heartbeatAt == "2026-07-31T00:00:00Z",
           runtimeStatus.processID == 4242,
           runtimeStatus.appVersion == "0.0.0-s1a",
-          runtimeStatus.schemaVersion == 1 else {
+          runtimeStatus.schemaVersion == 2 else {
         fail("runtime status fixture does not match the canonical fields")
     }
 
