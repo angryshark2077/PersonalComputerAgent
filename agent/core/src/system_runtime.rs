@@ -163,11 +163,7 @@ where
         identity,
         source,
         sink,
-        StartupState {
-            registry,
-            pending,
-            outbox_depth,
-        },
+        StartupState { registry, pending },
         shutdown_receiver,
     ));
     Ok(SystemRuntimeHandle {
@@ -179,7 +175,6 @@ where
 struct StartupState {
     registry: CollectorRegistry,
     pending: PendingWrite,
-    outbox_depth: u64,
 }
 
 async fn load_system_state(
@@ -207,7 +202,6 @@ async fn run_paired<S: SystemMetricsSource>(
     let StartupState {
         mut registry,
         pending: initial,
-        outbox_depth: startup_outbox_depth,
     } = startup;
     if persist_pending(
         &database,
@@ -224,6 +218,10 @@ async fn run_paired<S: SystemMetricsSource>(
         return Ok(());
     }
 
+    let startup_outbox_depth = database
+        .active_outbox_depth()
+        .await
+        .map_err(SystemRuntimeError::Database)?;
     let startup_backpressure = registry.apply_outbox_depth(startup_outbox_depth, clock_now_ms()?);
     if startup_backpressure.transition.is_some() || startup_backpressure.sampling_suppressed {
         let pending = pending_from_update(
@@ -835,6 +833,10 @@ mod tests {
     }
 
     async fn open_database_with_high_outbox() -> (TempDir, Arc<DbActorHandle>) {
+        open_database_with_outbox_depth(10_001).await
+    }
+
+    async fn open_database_with_outbox_depth(depth: u64) -> (TempDir, Arc<DbActorHandle>) {
         let (directory, database) = open_database().await;
         close_database(database).await;
         let path = directory.path().join("agent.sqlite3");
@@ -857,7 +859,7 @@ mod tests {
                      VALUES (?1, ?2, 'pending', 1)",
                 )
                 .expect("prepare seed outbox");
-            for index in 0..=10_000_u64 {
+            for index in 0..depth {
                 let event_id = format!("seed-{index}");
                 insert_event.execute([&event_id]).expect("seed event");
                 insert_outbox
@@ -1239,6 +1241,69 @@ mod tests {
                     == 2
         })
         .await;
+
+        drop(observer);
+        runtime.shutdown().await.expect("shutdown runtime");
+        close_database(database).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initializing_commit_crossing_high_water_suppresses_before_sampler_start() {
+        let (directory, database) = open_database_with_outbox_depth(10_000).await;
+        let controls = FakeControls::new();
+        let runtime = SystemRuntimeHandle::start_with_source_and_sink(
+            Arc::clone(&database),
+            Some(identity()),
+            controls.source(),
+            Arc::new(DirectDbSink {
+                database: Arc::clone(&database),
+            }),
+        )
+        .await
+        .expect("start boundary runtime");
+        let observer =
+            Connection::open(directory.path().join("agent.sqlite3")).expect("open observer");
+        yield_until(|| status_transitions(&observer).len() == 2).await;
+
+        assert_eq!((controls.cpu_calls(), controls.disk_calls()), (0, 0));
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT COUNT(*) FROM events_local
+                     WHERE event_type = 'system.metric_sampled'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("metric count"),
+            0
+        );
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT status FROM collector_states WHERE collector_key = 'system'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("collector state"),
+            "degraded"
+        );
+        assert_eq!(
+            status_transitions(&observer),
+            vec![
+                ("initializing".to_owned(), "identity_available".to_owned()),
+                ("degraded".to_owned(), "outbox_backpressure".to_owned()),
+            ]
+        );
+
+        observer
+            .execute(
+                "UPDATE sync_outbox SET state = 'acked'
+                 WHERE event_id LIKE 'seed-%' AND rowid <= 2_003",
+                [],
+            )
+            .expect("lower outbox below low water");
+        tokio::time::advance(Duration::from_secs(30)).await;
+        yield_until(|| controls.cpu_calls() == 1 && controls.disk_calls() == 1).await;
 
         drop(observer);
         runtime.shutdown().await.expect("shutdown runtime");

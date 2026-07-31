@@ -268,7 +268,7 @@ async fn run_group(
             continue;
         }
 
-        let succeeded = result.is_ok();
+        let error_kind = result.as_ref().err().map(|error| error.kind);
         let observation = match result {
             Ok(sample) => SystemObservation::Sampled {
                 sample,
@@ -286,13 +286,17 @@ async fn run_group(
             WaitOutcome::ReceiverClosed => return,
         }
 
-        if succeeded {
-            retry_index = 0;
-            retry_delay = None;
-            schedule = normal_schedule(period);
-        } else {
-            retry_delay = Some(RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)]);
-            retry_index = retry_index.saturating_add(1);
+        match error_kind {
+            None => {
+                retry_index = 0;
+                retry_delay = None;
+                schedule = normal_schedule(period);
+            }
+            Some(SystemSampleErrorKind::Retryable) => {
+                retry_delay = Some(RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)]);
+                retry_index = retry_index.saturating_add(1);
+            }
+            Some(SystemSampleErrorKind::Unsupported | SystemSampleErrorKind::Fatal) => return,
         }
         sample_now = false;
     }

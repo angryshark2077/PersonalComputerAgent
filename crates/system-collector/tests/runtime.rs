@@ -97,6 +97,14 @@ fn retryable_error() -> SystemSampleError {
     }
 }
 
+fn terminal_error(kind: SystemSampleErrorKind) -> SystemSampleError {
+    SystemSampleError {
+        kind,
+        code: "SYSTEM_TEST_TERMINAL",
+        message: "stop the deterministic metric group".to_owned(),
+    }
+}
+
 fn cpu_sample() -> CpuMemorySample {
     CpuMemorySample::try_new(
         200,
@@ -340,6 +348,59 @@ async fn successful_retry_resets_backoff_without_changing_disk_schedule() {
     });
     assert_eq!(groups, [MetricGroup::CpuMemory, MetricGroup::Disk]);
     assert_eq!((controls.cpu_calls(), controls.disk_calls()), (6, 2));
+    handle.shutdown().await.expect("collector shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsupported_error_stops_only_its_metric_group_until_shutdown() {
+    let controls =
+        FakeControls::cpu_script([Err(terminal_error(SystemSampleErrorKind::Unsupported))]);
+    let (handle, mut observations) = test_runtime(&controls, 16);
+    let observation = next_for_group(&mut observations, MetricGroup::CpuMemory).await;
+    assert!(matches!(
+        observation,
+        SystemObservation::Failed {
+            error: SystemSampleError {
+                kind: SystemSampleErrorKind::Unsupported,
+                ..
+            },
+            ..
+        }
+    ));
+    let _ = next_for_group(&mut observations, MetricGroup::Disk).await;
+
+    tokio::time::advance(Duration::from_secs(900)).await;
+    wait_for_calls(&controls, 1, 2).await;
+    assert_eq!(controls.cpu_calls(), 1);
+    let _ = next_for_group(&mut observations, MetricGroup::Disk).await;
+    assert!(drain_groups(&mut observations).is_empty());
+
+    handle.shutdown().await.expect("collector shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn fatal_error_stops_only_its_metric_group_until_shutdown() {
+    let controls = FakeControls::cpu_script([Err(terminal_error(SystemSampleErrorKind::Fatal))]);
+    let (handle, mut observations) = test_runtime(&controls, 16);
+    let observation = next_for_group(&mut observations, MetricGroup::CpuMemory).await;
+    assert!(matches!(
+        observation,
+        SystemObservation::Failed {
+            error: SystemSampleError {
+                kind: SystemSampleErrorKind::Fatal,
+                ..
+            },
+            ..
+        }
+    ));
+    let _ = next_for_group(&mut observations, MetricGroup::Disk).await;
+
+    tokio::time::advance(Duration::from_secs(900)).await;
+    wait_for_calls(&controls, 1, 2).await;
+    assert_eq!(controls.cpu_calls(), 1);
+    let _ = next_for_group(&mut observations, MetricGroup::Disk).await;
+    assert!(drain_groups(&mut observations).is_empty());
+
     handle.shutdown().await.expect("collector shutdown");
 }
 
