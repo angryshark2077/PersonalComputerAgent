@@ -1,5 +1,21 @@
 {
   "name": "@pca/db-cloud",
   "private": true,
-  "version": "0.0.0"
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pca/contracts": "workspace:*",
+    "drizzle-orm": "0.45.2",
+    "pg": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "drizzle-kit": "0.31.10",
+    "tsx": "4.23.1",
+    "typescript": "5.9.3"
+  }
 }

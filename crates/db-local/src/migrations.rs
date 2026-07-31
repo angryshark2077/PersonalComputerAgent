@@ -5,14 +5,14 @@ use sha2::{Digest, Sha256};
 
 use crate::error::DbError;
 
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 3;
 
 struct Migration {
     id: &'static str,
     sql: &'static str,
 }
 
-const MIGRATIONS: [Migration; 3] = [
+const MIGRATIONS: [Migration; 4] = [
     Migration {
         id: "0000",
         sql: crate::BASELINE_MIGRATION,
@@ -24,6 +24,10 @@ const MIGRATIONS: [Migration; 3] = [
     Migration {
         id: "0002",
         sql: crate::S2_COLLECTOR_STATE_MIGRATION,
+    },
+    Migration {
+        id: "0003",
+        sql: crate::S1B_PAIRING_STATE_MIGRATION,
     },
 ];
 

@@ -1,0 +1,683 @@
+import type { AgentControlSnapshot } from "@pca/contracts/src/types.js";
+import { and, eq, gt, isNull } from "drizzle-orm";
+import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+
+import {
+  cloudSchema,
+  collectorConfigAudit,
+  collectorConfigs,
+  deviceCredentialGenerations,
+  deviceHeartbeats,
+  devices,
+  pairingAuthorizationCodes,
+  pairingSessions,
+  type StoredCollectorConfig,
+} from "./schema.js";
+
+export type ControlRepositoryErrorCode =
+  | "CONFLICT"
+  | "CREDENTIAL_INVALID"
+  | "DEVICE_NOT_FOUND"
+  | "DEVICE_REVOKED"
+  | "PAIRING_EXPIRED"
+  | "PAIRING_REPLAYED"
+  | "PKCE_INVALID"
+  | "WORKSPACE_FORBIDDEN";
+
+export class ControlRepositoryError extends Error {
+  constructor(readonly code: ControlRepositoryErrorCode) {
+    super(code);
+    this.name = "ControlRepositoryError";
+  }
+}
+
+export interface PairingSessionInput {
+  sessionIdHash: string;
+  devicePublicKeyHash: string;
+  codeChallenge: string;
+  callbackUri: string;
+  expiresAt: Date;
+  createdAt: Date;
+}
+
+export interface PairingSession extends PairingSessionInput {
+  authorizedAt: Date | null;
+}
+
+export interface AuthorizePairingSessionInput {
+  sessionIdHash: string;
+  authorizationCodeHash: string;
+  workspaceId: string;
+  ownerUserId: string;
+  callbackStateHash: string;
+  expiresAt: Date;
+  now: Date;
+}
+
+export interface CodeExchangeInput {
+  sessionIdHash: string;
+  authorizationCodeHash: string;
+  codeChallenge: string;
+  deviceId: string;
+  accessTokenHash: string;
+  refreshTokenHash: string;
+  accessExpiresAt: Date;
+  refreshExpiresAt: Date;
+  now: Date;
+}
+
+export interface CredentialRotationInput {
+  workspaceId: string;
+  deviceId: string;
+  currentRefreshTokenHash: string;
+  newAccessTokenHash: string;
+  newRefreshTokenHash: string;
+  accessExpiresAt: Date;
+  refreshExpiresAt: Date;
+  now: Date;
+}
+
+export interface DeviceCredentialGrant {
+  workspaceId: string;
+  deviceId: string;
+  credentialGeneration: number;
+  accessExpiresAt: Date;
+  refreshExpiresAt: Date;
+}
+
+export interface HeartbeatInput {
+  heartbeatId: string;
+  workspaceId: string;
+  deviceId: string;
+  receivedAt: Date;
+  agentVersion: string;
+  presence: "online" | "stale" | "offline" | "sleeping";
+  outboxDepth: number;
+}
+
+export interface ConfigAuditInput {
+  auditId: string;
+  actorUserId: string;
+  workspaceId: string;
+  deviceId: string;
+  config: StoredCollectorConfig;
+  now: Date;
+}
+
+export interface ControlRepository {
+  createPairingSession(input: PairingSessionInput): Promise<PairingSession>;
+  authorizePairingSession(input: AuthorizePairingSessionInput): Promise<void>;
+  consumeAuthorizationCode(input: CodeExchangeInput): Promise<DeviceCredentialGrant>;
+  rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialGrant>;
+  loadControlSnapshot(deviceId: string, workspaceId: string): Promise<AgentControlSnapshot>;
+  recordHeartbeat(input: HeartbeatInput): Promise<void>;
+  appendConfigAudit(input: ConfigAuditInput): Promise<number>;
+}
+
+interface AuthorizationCodeRecord extends AuthorizePairingSessionInput {
+  consumedAt: Date | null;
+}
+
+interface DeviceRecord {
+  id: string;
+  workspaceId: string;
+  ownerUserId: string;
+  devicePublicKeyHash: string;
+  revokedAt: Date | null;
+}
+
+interface CredentialRecord extends DeviceCredentialGrant {
+  accessTokenHash: string;
+  refreshTokenHash: string;
+  revokedAt: Date | null;
+}
+
+interface ConfigRecord extends StoredCollectorConfig {
+  configurationRevision: number;
+}
+
+export class MemoryControlRepository implements ControlRepository {
+  readonly #sessions = new Map<string, PairingSession>();
+  readonly #authorizationCodes = new Map<string, AuthorizationCodeRecord>();
+  readonly #devices = new Map<string, DeviceRecord>();
+  readonly #credentials = new Map<string, CredentialRecord[]>();
+  readonly #configs = new Map<string, ConfigRecord>();
+  readonly #heartbeatIds = new Set<string>();
+  readonly #auditIds = new Set<string>();
+
+  async createPairingSession(input: PairingSessionInput): Promise<PairingSession> {
+    if (this.#sessions.has(input.sessionIdHash)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    const session = { ...input, authorizedAt: null };
+    this.#sessions.set(input.sessionIdHash, session);
+    return { ...session };
+  }
+
+  async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<void> {
+    const session = this.#sessions.get(input.sessionIdHash);
+    if (session === undefined || session.expiresAt <= input.now) {
+      throw new ControlRepositoryError("PAIRING_EXPIRED");
+    }
+    if (session.authorizedAt !== null || this.#authorizationCodes.has(input.authorizationCodeHash)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    session.authorizedAt = input.now;
+    this.#authorizationCodes.set(input.authorizationCodeHash, {
+      ...input,
+      consumedAt: null,
+    });
+  }
+
+  async consumeAuthorizationCode(input: CodeExchangeInput): Promise<DeviceCredentialGrant> {
+    const code = this.#authorizationCodes.get(input.authorizationCodeHash);
+    const session = this.#sessions.get(input.sessionIdHash);
+    if (
+      code === undefined ||
+      session === undefined ||
+      code.sessionIdHash !== input.sessionIdHash ||
+      code.expiresAt <= input.now ||
+      session.expiresAt <= input.now
+    ) {
+      throw new ControlRepositoryError("PAIRING_EXPIRED");
+    }
+    if (code.consumedAt !== null) {
+      throw new ControlRepositoryError("PAIRING_REPLAYED");
+    }
+    if (session.codeChallenge !== input.codeChallenge) {
+      throw new ControlRepositoryError("PKCE_INVALID");
+    }
+    if (this.#devices.has(input.deviceId)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+
+    const grant: DeviceCredentialGrant = {
+      workspaceId: code.workspaceId,
+      deviceId: input.deviceId,
+      credentialGeneration: 1,
+      accessExpiresAt: input.accessExpiresAt,
+      refreshExpiresAt: input.refreshExpiresAt,
+    };
+    code.consumedAt = input.now;
+    this.#devices.set(input.deviceId, {
+      id: input.deviceId,
+      workspaceId: code.workspaceId,
+      ownerUserId: code.ownerUserId,
+      devicePublicKeyHash: session.devicePublicKeyHash,
+      revokedAt: null,
+    });
+    this.#credentials.set(input.deviceId, [
+      {
+        ...grant,
+        accessTokenHash: input.accessTokenHash,
+        refreshTokenHash: input.refreshTokenHash,
+        revokedAt: null,
+      },
+    ]);
+    this.#configs.set(configKey(code.workspaceId, input.deviceId), {
+      configurationRevision: 0,
+      networkEnabled: false,
+      wechatEnabled: false,
+    });
+    return grant;
+  }
+
+  async rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialGrant> {
+    const device = this.#requireDevice(input.deviceId, input.workspaceId, false);
+    if (device.revokedAt !== null) {
+      throw new ControlRepositoryError("DEVICE_REVOKED");
+    }
+    const records = this.#credentials.get(input.deviceId) ?? [];
+    const current = records.find(
+      (record) =>
+        record.refreshTokenHash === input.currentRefreshTokenHash &&
+        record.revokedAt === null &&
+        record.refreshExpiresAt > input.now,
+    );
+    if (current === undefined) {
+      throw new ControlRepositoryError("CREDENTIAL_INVALID");
+    }
+    current.revokedAt = input.now;
+    const grant: DeviceCredentialGrant = {
+      workspaceId: input.workspaceId,
+      deviceId: input.deviceId,
+      credentialGeneration: current.credentialGeneration + 1,
+      accessExpiresAt: input.accessExpiresAt,
+      refreshExpiresAt: input.refreshExpiresAt,
+    };
+    records.push({
+      ...grant,
+      accessTokenHash: input.newAccessTokenHash,
+      refreshTokenHash: input.newRefreshTokenHash,
+      revokedAt: null,
+    });
+    return grant;
+  }
+
+  async loadControlSnapshot(
+    deviceId: string,
+    workspaceId: string,
+  ): Promise<AgentControlSnapshot> {
+    const device = this.#requireDevice(deviceId, workspaceId, true);
+    const config = this.#configs.get(configKey(workspaceId, deviceId)) ?? {
+      configurationRevision: 0,
+      networkEnabled: false,
+      wechatEnabled: false,
+    };
+    return snapshot(device, config);
+  }
+
+  async recordHeartbeat(input: HeartbeatInput): Promise<void> {
+    this.#requireDevice(input.deviceId, input.workspaceId, false);
+    if (this.#heartbeatIds.has(input.heartbeatId)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    this.#heartbeatIds.add(input.heartbeatId);
+  }
+
+  async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
+    this.#requireDevice(input.deviceId, input.workspaceId, false);
+    if (this.#auditIds.has(input.auditId)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    const key = configKey(input.workspaceId, input.deviceId);
+    const current = this.#configs.get(key) ?? {
+      configurationRevision: 0,
+      networkEnabled: false,
+      wechatEnabled: false,
+    };
+    const revision = current.configurationRevision + 1;
+    this.#configs.set(key, { ...input.config, configurationRevision: revision });
+    this.#auditIds.add(input.auditId);
+    return revision;
+  }
+
+  #requireDevice(deviceId: string, workspaceId: string, allowRevoked: boolean): DeviceRecord {
+    const device = this.#devices.get(deviceId);
+    if (device === undefined) {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    if (device.workspaceId !== workspaceId) {
+      throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+    }
+    if (!allowRevoked && device.revokedAt !== null) {
+      throw new ControlRepositoryError("DEVICE_REVOKED");
+    }
+    return device;
+  }
+}
+
+export class DrizzleControlRepository implements ControlRepository {
+  constructor(private readonly database: NodePgDatabase<typeof cloudSchema>) {}
+
+  async createPairingSession(input: PairingSessionInput): Promise<PairingSession> {
+    try {
+      const [created] = await this.database
+        .insert(pairingSessions)
+        .values({ ...input, authorizedAt: null })
+        .returning();
+      if (created === undefined) {
+        throw new ControlRepositoryError("CONFLICT");
+      }
+      return created;
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<void> {
+    try {
+      await this.database.transaction(async (transaction) => {
+        const [authorized] = await transaction
+          .update(pairingSessions)
+          .set({ authorizedAt: input.now })
+          .where(
+            and(
+              eq(pairingSessions.sessionIdHash, input.sessionIdHash),
+              isNull(pairingSessions.authorizedAt),
+              gt(pairingSessions.expiresAt, input.now),
+            ),
+          )
+          .returning({ sessionIdHash: pairingSessions.sessionIdHash });
+        if (authorized === undefined) {
+          throw new ControlRepositoryError("PAIRING_EXPIRED");
+        }
+        await transaction.insert(pairingAuthorizationCodes).values({
+          authorizationCodeHash: input.authorizationCodeHash,
+          sessionIdHash: input.sessionIdHash,
+          workspaceId: input.workspaceId,
+          ownerUserId: input.ownerUserId,
+          callbackStateHash: input.callbackStateHash,
+          expiresAt: input.expiresAt,
+          createdAt: input.now,
+          consumedAt: null,
+        });
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async consumeAuthorizationCode(input: CodeExchangeInput): Promise<DeviceCredentialGrant> {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        const [binding] = await transaction
+          .select({
+            workspaceId: pairingAuthorizationCodes.workspaceId,
+            ownerUserId: pairingAuthorizationCodes.ownerUserId,
+            consumedAt: pairingAuthorizationCodes.consumedAt,
+            codeExpiresAt: pairingAuthorizationCodes.expiresAt,
+            sessionExpiresAt: pairingSessions.expiresAt,
+            codeChallenge: pairingSessions.codeChallenge,
+            devicePublicKeyHash: pairingSessions.devicePublicKeyHash,
+          })
+          .from(pairingAuthorizationCodes)
+          .innerJoin(
+            pairingSessions,
+            eq(pairingSessions.sessionIdHash, pairingAuthorizationCodes.sessionIdHash),
+          )
+          .where(
+            and(
+              eq(pairingAuthorizationCodes.authorizationCodeHash, input.authorizationCodeHash),
+              eq(pairingAuthorizationCodes.sessionIdHash, input.sessionIdHash),
+            ),
+          )
+          .limit(1);
+        if (
+          binding === undefined ||
+          binding.codeExpiresAt <= input.now ||
+          binding.sessionExpiresAt <= input.now
+        ) {
+          throw new ControlRepositoryError("PAIRING_EXPIRED");
+        }
+        if (binding.consumedAt !== null) {
+          throw new ControlRepositoryError("PAIRING_REPLAYED");
+        }
+        if (binding.codeChallenge !== input.codeChallenge) {
+          throw new ControlRepositoryError("PKCE_INVALID");
+        }
+        const [consumed] = await transaction
+          .update(pairingAuthorizationCodes)
+          .set({ consumedAt: input.now })
+          .where(
+            and(
+              eq(pairingAuthorizationCodes.authorizationCodeHash, input.authorizationCodeHash),
+              isNull(pairingAuthorizationCodes.consumedAt),
+              gt(pairingAuthorizationCodes.expiresAt, input.now),
+            ),
+          )
+          .returning({ authorizationCodeHash: pairingAuthorizationCodes.authorizationCodeHash });
+        if (consumed === undefined) {
+          throw new ControlRepositoryError("PAIRING_REPLAYED");
+        }
+
+        await transaction.insert(devices).values({
+          id: input.deviceId,
+          workspaceId: binding.workspaceId,
+          ownerUserId: binding.ownerUserId,
+          devicePublicKeyHash: binding.devicePublicKeyHash,
+          platform: "macos",
+          createdAt: input.now,
+          revokedAt: null,
+        });
+        await transaction.insert(deviceCredentialGenerations).values({
+          workspaceId: binding.workspaceId,
+          deviceId: input.deviceId,
+          generation: 1,
+          accessTokenHash: input.accessTokenHash,
+          refreshTokenHash: input.refreshTokenHash,
+          accessExpiresAt: input.accessExpiresAt,
+          refreshExpiresAt: input.refreshExpiresAt,
+          createdAt: input.now,
+          revokedAt: null,
+        });
+        await transaction.insert(collectorConfigs).values({
+          workspaceId: binding.workspaceId,
+          deviceId: input.deviceId,
+          configurationRevision: 0,
+          networkEnabled: false,
+          wechatEnabled: false,
+          updatedAt: input.now,
+        });
+        return {
+          workspaceId: binding.workspaceId,
+          deviceId: input.deviceId,
+          credentialGeneration: 1,
+          accessExpiresAt: input.accessExpiresAt,
+          refreshExpiresAt: input.refreshExpiresAt,
+        };
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialGrant> {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        await requireDatabaseDevice(transaction, input.deviceId, input.workspaceId, false);
+        const [current] = await transaction
+          .select({ generation: deviceCredentialGenerations.generation })
+          .from(deviceCredentialGenerations)
+          .where(
+            and(
+              eq(deviceCredentialGenerations.workspaceId, input.workspaceId),
+              eq(deviceCredentialGenerations.deviceId, input.deviceId),
+              eq(deviceCredentialGenerations.refreshTokenHash, input.currentRefreshTokenHash),
+              isNull(deviceCredentialGenerations.revokedAt),
+              gt(deviceCredentialGenerations.refreshExpiresAt, input.now),
+            ),
+          )
+          .limit(1);
+        if (current === undefined) {
+          throw new ControlRepositoryError("CREDENTIAL_INVALID");
+        }
+        const [revoked] = await transaction
+          .update(deviceCredentialGenerations)
+          .set({ revokedAt: input.now })
+          .where(
+            and(
+              eq(deviceCredentialGenerations.deviceId, input.deviceId),
+              eq(deviceCredentialGenerations.generation, current.generation),
+              isNull(deviceCredentialGenerations.revokedAt),
+            ),
+          )
+          .returning({ generation: deviceCredentialGenerations.generation });
+        if (revoked === undefined) {
+          throw new ControlRepositoryError("CREDENTIAL_INVALID");
+        }
+        const generation = current.generation + 1;
+        await transaction.insert(deviceCredentialGenerations).values({
+          workspaceId: input.workspaceId,
+          deviceId: input.deviceId,
+          generation,
+          accessTokenHash: input.newAccessTokenHash,
+          refreshTokenHash: input.newRefreshTokenHash,
+          accessExpiresAt: input.accessExpiresAt,
+          refreshExpiresAt: input.refreshExpiresAt,
+          createdAt: input.now,
+          revokedAt: null,
+        });
+        return {
+          workspaceId: input.workspaceId,
+          deviceId: input.deviceId,
+          credentialGeneration: generation,
+          accessExpiresAt: input.accessExpiresAt,
+          refreshExpiresAt: input.refreshExpiresAt,
+        };
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async loadControlSnapshot(
+    deviceId: string,
+    workspaceId: string,
+  ): Promise<AgentControlSnapshot> {
+    try {
+      const device = await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const [config] = await this.database
+        .select()
+        .from(collectorConfigs)
+        .where(
+          and(
+            eq(collectorConfigs.workspaceId, workspaceId),
+            eq(collectorConfigs.deviceId, deviceId),
+          ),
+        )
+        .limit(1);
+      return snapshot(device, {
+        configurationRevision: config?.configurationRevision ?? 0,
+        networkEnabled: config?.networkEnabled ?? false,
+        wechatEnabled: config?.wechatEnabled ?? false,
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async recordHeartbeat(input: HeartbeatInput): Promise<void> {
+    try {
+      await requireDatabaseDevice(this.database, input.deviceId, input.workspaceId, false);
+      await this.database.insert(deviceHeartbeats).values({
+        id: input.heartbeatId,
+        workspaceId: input.workspaceId,
+        deviceId: input.deviceId,
+        receivedAt: input.receivedAt,
+        agentVersion: input.agentVersion,
+        presence: input.presence,
+        outboxDepth: input.outboxDepth,
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        await requireDatabaseDevice(transaction, input.deviceId, input.workspaceId, false);
+        const [current] = await transaction
+          .select()
+          .from(collectorConfigs)
+          .where(
+            and(
+              eq(collectorConfigs.workspaceId, input.workspaceId),
+              eq(collectorConfigs.deviceId, input.deviceId),
+            ),
+          )
+          .limit(1);
+        const oldConfig: StoredCollectorConfig = {
+          networkEnabled: current?.networkEnabled ?? false,
+          wechatEnabled: current?.wechatEnabled ?? false,
+        };
+        const revision = (current?.configurationRevision ?? 0) + 1;
+        if (current === undefined) {
+          await transaction.insert(collectorConfigs).values({
+            workspaceId: input.workspaceId,
+            deviceId: input.deviceId,
+            configurationRevision: revision,
+            ...input.config,
+            updatedAt: input.now,
+          });
+        } else {
+          const [updated] = await transaction
+            .update(collectorConfigs)
+            .set({
+              configurationRevision: revision,
+              ...input.config,
+              updatedAt: input.now,
+            })
+            .where(
+              and(
+                eq(collectorConfigs.workspaceId, input.workspaceId),
+                eq(collectorConfigs.deviceId, input.deviceId),
+                eq(collectorConfigs.configurationRevision, current.configurationRevision),
+              ),
+            )
+            .returning({ revision: collectorConfigs.configurationRevision });
+          if (updated === undefined) {
+            throw new ControlRepositoryError("CONFLICT");
+          }
+        }
+        await transaction.insert(collectorConfigAudit).values({
+          id: input.auditId,
+          workspaceId: input.workspaceId,
+          deviceId: input.deviceId,
+          actorUserId: input.actorUserId,
+          configurationRevision: revision,
+          oldConfig,
+          newConfig: input.config,
+          createdAt: input.now,
+        });
+        return revision;
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+}
+
+type DatabaseExecutor = Pick<NodePgDatabase<typeof cloudSchema>, "select">;
+
+async function requireDatabaseDevice(
+  database: DatabaseExecutor,
+  deviceId: string,
+  workspaceId: string,
+  allowRevoked: boolean,
+): Promise<DeviceRecord> {
+  const [device] = await database
+    .select({
+      id: devices.id,
+      workspaceId: devices.workspaceId,
+      ownerUserId: devices.ownerUserId,
+      devicePublicKeyHash: devices.devicePublicKeyHash,
+      revokedAt: devices.revokedAt,
+    })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+  if (device === undefined) {
+    throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+  }
+  if (device.workspaceId !== workspaceId) {
+    throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+  }
+  if (!allowRevoked && device.revokedAt !== null) {
+    throw new ControlRepositoryError("DEVICE_REVOKED");
+  }
+  return device;
+}
+
+function configKey(workspaceId: string, deviceId: string): string {
+  return `${workspaceId}:${deviceId}`;
+}
+
+function snapshot(device: DeviceRecord, config: ConfigRecord): AgentControlSnapshot {
+  return {
+    device_id: device.id,
+    workspace_id: device.workspaceId,
+    revoked: device.revokedAt !== null,
+    configuration_revision: config.configurationRevision,
+    collectors: {
+      network: { enabled: config.networkEnabled },
+      "communication.wechat": {
+        enabled: config.wechatEnabled,
+        direction: "outgoing",
+        message_type: "text",
+        sync_mode: "full",
+      },
+    },
+  };
+}
+
+function repositoryError(error: unknown): ControlRepositoryError {
+  if (error instanceof ControlRepositoryError) {
+    return error;
+  }
+  if (typeof error === "object" && error !== null && "code" in error && error.code === "23505") {
+    return new ControlRepositoryError("CONFLICT");
+  }
+  throw error;
+}

@@ -155,7 +155,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 2);
+    assert_eq!(health.schema_version, 3);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -174,6 +174,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
             "diagnostic_events",
             "events_local",
             "local_meta",
+            "pairing_state",
             "schema_migrations",
             "sync_outbox",
         ]
@@ -202,7 +203,7 @@ async fn collector_state_survives_reopen_but_runtime_status_is_data_not_policy()
 }
 
 #[tokio::test]
-async fn opening_previous_schema_adds_collector_state_without_changing_event_or_outbox() {
+async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or_outbox() {
     let (_directory, path) = database_path();
     let connection = Connection::open(&path).expect("open previous database");
     apply_previous_migration_chain(&connection);
@@ -235,7 +236,7 @@ async fn opening_previous_schema_adds_collector_state_without_changing_event_or_
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        2
+        3
     );
     db.shutdown().await.expect("close upgraded database");
 
@@ -249,6 +250,16 @@ async fn opening_previous_schema_adds_collector_state_without_changing_event_or_
                 |row| row.get::<_, u64>(0),
             )
             .expect("count S2 migration"),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE id = '0003'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("count S1B migration"),
         1
     );
 }
@@ -784,7 +795,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0003', 'future', '9.0.0', 1, 1, 'completed')",
+             VALUES ('0004', 'future', '9.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -795,8 +806,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 3,
-            max_supported: 2
+            found: 4,
+            max_supported: 3
         })
     ));
 }
@@ -819,7 +830,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 2);
+    assert_eq!(health.schema_version, 3);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(

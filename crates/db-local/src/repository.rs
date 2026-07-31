@@ -2,7 +2,7 @@ use pca_domain::{
     AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventCommit, EventEnvelope,
     Sensitivity,
 };
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 #[cfg(feature = "process-test-hooks")]
 use std::{
@@ -14,7 +14,7 @@ use std::{
 
 #[cfg(feature = "process-test-hooks")]
 use crate::actor::{ProcessTestBarrier, ProcessTestHooks};
-use crate::{migrations::MAX_SUPPORTED_SCHEMA_VERSION, DbError, DbHealth};
+use crate::{migrations::MAX_SUPPORTED_SCHEMA_VERSION, DbError, DbHealth, PairingState};
 
 struct SerializedEvent<'a> {
     event: &'a EventEnvelope,
@@ -407,6 +407,87 @@ pub(crate) fn upsert_collector_state_in(
         .map_err(|error| DbError::sqlite("upsert Collector state", error))
 }
 
+pub(crate) fn load_pairing_state(connection: &Connection) -> Result<Option<PairingState>, DbError> {
+    connection
+        .query_row(
+            "SELECT device_id, workspace_id, credential_ref, credential_generation,
+                    applied_control_revision, paired_at_ms
+             FROM pairing_state WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok(PairingState {
+                    device_id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    credential_ref: row.get(2)?,
+                    credential_generation: row.get(3)?,
+                    applied_control_revision: row.get(4)?,
+                    paired_at_ms: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| DbError::sqlite("load pairing state", error))
+}
+
+pub(crate) fn save_pairing_state(
+    connection: &Connection,
+    state: &PairingState,
+) -> Result<(), DbError> {
+    connection
+        .execute(
+            "INSERT INTO pairing_state (
+                singleton_id, device_id, workspace_id, credential_ref,
+                credential_generation, applied_control_revision, paired_at_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(singleton_id) DO UPDATE SET
+                device_id = excluded.device_id,
+                workspace_id = excluded.workspace_id,
+                credential_ref = excluded.credential_ref,
+                credential_generation = excluded.credential_generation,
+                applied_control_revision = excluded.applied_control_revision,
+                paired_at_ms = excluded.paired_at_ms",
+            params![
+                state.device_id,
+                state.workspace_id,
+                state.credential_ref,
+                state.credential_generation,
+                state.applied_control_revision,
+                state.paired_at_ms,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("save pairing state", error))
+}
+
+pub(crate) fn save_control_revision(
+    connection: &Connection,
+    applied_control_revision: u64,
+) -> Result<(), DbError> {
+    let updated = connection
+        .execute(
+            "UPDATE pairing_state
+             SET applied_control_revision = MAX(applied_control_revision, ?1)
+             WHERE singleton_id = 1",
+            [applied_control_revision],
+        )
+        .map_err(|error| DbError::sqlite("save applied control revision", error))?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "save applied control revision",
+            "pairing state is absent",
+        ))
+    }
+}
+
+pub(crate) fn clear_pairing_state(connection: &Connection) -> Result<(), DbError> {
+    connection
+        .execute("DELETE FROM pairing_state WHERE singleton_id = 1", [])
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("clear pairing state", error))
+}
+
 pub(crate) fn count_event_and_outbox(
     connection: &Connection,
     event_id: &str,
@@ -475,6 +556,9 @@ pub(crate) fn smoke_queries(connection: &Connection) -> Result<(), DbError> {
                 last_event_at_ms, last_health_at_ms, last_error_code,
                 created_at_ms, updated_at_ms
          FROM collector_states LIMIT 1",
+        "SELECT singleton_id, device_id, workspace_id, credential_ref,
+                credential_generation, applied_control_revision, paired_at_ms
+         FROM pairing_state LIMIT 1",
         "SELECT event_id, workspace_id, device_id, event_type, source, schema_version,
                 occurred_at_ms, created_at_ms, sensitivity, payload_json,
                 attachment_refs_json, idempotency_key

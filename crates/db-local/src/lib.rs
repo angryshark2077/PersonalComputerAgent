@@ -22,6 +22,50 @@ pub const S1A_RUNTIME_MIGRATION: &str = include_str!("../migrations/0001_s1a_run
 /// The immutable S2 Collector-state database migration.
 pub const S2_COLLECTOR_STATE_MIGRATION: &str =
     include_str!("../migrations/0002_s2_collector_state.sql");
+/// The immutable S1B pairing-state database migration.
+pub const S1B_PAIRING_STATE_MIGRATION: &str =
+    include_str!("../migrations/0003_s1b_pairing_state.sql");
+
+/// Non-secret local pointer to an Agent credential validated in Keychain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingState {
+    /// Cloud-assigned device identifier.
+    pub device_id: String,
+    /// Cloud Workspace that owns the device.
+    pub workspace_id: String,
+    /// Keychain reference; never credential material.
+    pub credential_ref: String,
+    /// Current server-side credential generation.
+    pub credential_generation: u64,
+    /// Highest complete control revision applied locally.
+    pub applied_control_revision: u64,
+    /// Time the validated credential reference was saved, in Unix milliseconds.
+    pub paired_at_ms: i64,
+}
+
+impl PairingState {
+    /// Builds state after the caller has validated the referenced Keychain credential.
+    #[must_use]
+    pub fn paired(
+        device_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        credential_ref: impl Into<String>,
+        credential_generation: u64,
+    ) -> Self {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let paired_at_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+        Self {
+            device_id: device_id.into(),
+            workspace_id: workspace_id.into(),
+            credential_ref: credential_ref.into(),
+            credential_generation,
+            applied_control_revision: 0,
+            paired_at_ms,
+        }
+    }
+}
 
 /// Results of fresh `SQLite` health checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +80,10 @@ pub struct DbHealth {
 
 #[cfg(test)]
 mod tests {
-    use super::{BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION, S2_COLLECTOR_STATE_MIGRATION};
+    use super::{
+        BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION, S1B_PAIRING_STATE_MIGRATION,
+        S2_COLLECTOR_STATE_MIGRATION,
+    };
 
     #[test]
     fn baseline_creates_only_the_migration_ledger() {
@@ -57,5 +104,16 @@ mod tests {
             1
         );
         assert!(!S2_COLLECTOR_STATE_MIGRATION.contains("CREATE INDEX"));
+    }
+
+    #[test]
+    fn s1b_pairing_state_migration_has_only_the_non_secret_singleton() {
+        assert_eq!(
+            S1B_PAIRING_STATE_MIGRATION.matches("CREATE TABLE").count(),
+            1
+        );
+        assert!(!S1B_PAIRING_STATE_MIGRATION.contains("CREATE INDEX"));
+        assert!(!S1B_PAIRING_STATE_MIGRATION.contains("token"));
+        assert!(!S1B_PAIRING_STATE_MIGRATION.contains("secret"));
     }
 }

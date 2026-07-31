@@ -7,7 +7,7 @@ use pca_domain::{AgentStatus, BridgeStatus, CollectorState, EventCommit, EventEn
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{migrations, repository, DbError, DbHealth};
+use crate::{migrations, repository, DbError, DbHealth, PairingState};
 
 const REQUEST_CAPACITY: usize = 64;
 
@@ -117,6 +117,20 @@ enum Request {
         state: Box<CollectorState>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    LoadPairingState {
+        response: oneshot::Sender<Result<Option<PairingState>, DbError>>,
+    },
+    SavePairingState {
+        state: Box<PairingState>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    SaveControlRevision {
+        applied_control_revision: u64,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    ClearPairingState {
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     Health {
         response: oneshot::Sender<Result<DbHealth, DbError>>,
     },
@@ -139,8 +153,12 @@ impl Request {
             | Self::CommitEvents { response, .. }
             | Self::SetAgentState { response, .. }
             | Self::UpsertCollectorState { response, .. }
+            | Self::SavePairingState { response, .. }
+            | Self::SaveControlRevision { response, .. }
+            | Self::ClearPairingState { response }
             | Self::Checkpoint { response } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
+            Self::LoadPairingState { response } => response.is_closed(),
             Self::Health { response } => response.is_closed(),
             Self::CountEventAndOutbox { response, .. } => response.is_closed(),
             Self::ActiveOutboxDepth { response } => response.is_closed(),
@@ -317,6 +335,67 @@ impl DbActorHandle {
         let (response_sender, response_receiver) = oneshot::channel();
         self.send(Request::UpsertCollectorState {
             state: Box::new(state.clone()),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Loads the non-secret pairing pointer, or `None` while unpaired.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, decoding, or `SQLite` query error.
+    pub async fn load_pairing_state(&self) -> Result<Option<PairingState>, DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::LoadPairingState {
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Saves a reference only after the caller has validated the Keychain credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, constraint, conversion, or `SQLite` write error.
+    pub async fn save_pairing_state(&self, state: &PairingState) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::SavePairingState {
+            state: Box::new(state.clone()),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Persists a complete applied control revision without allowing rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, conversion, or `SQLite` write error.
+    pub async fn save_control_revision(
+        &self,
+        applied_control_revision: u64,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::SaveControlRevision {
+            applied_control_revision,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Deletes the local pairing pointer while leaving all credential deletion to Keychain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or `SQLite` write error.
+    pub async fn clear_pairing_state(&self) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::ClearPairingState {
             response: response_sender,
         })
         .await?;
@@ -500,6 +579,24 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, option
             }
             Request::UpsertCollectorState { state, response } => {
                 let _ = response.send(repository::upsert_collector_state_in(&connection, &state));
+            }
+            Request::LoadPairingState { response } => {
+                let _ = response.send(repository::load_pairing_state(&connection));
+            }
+            Request::SavePairingState { state, response } => {
+                let _ = response.send(repository::save_pairing_state(&connection, &state));
+            }
+            Request::SaveControlRevision {
+                applied_control_revision,
+                response,
+            } => {
+                let _ = response.send(repository::save_control_revision(
+                    &connection,
+                    applied_control_revision,
+                ));
+            }
+            Request::ClearPairingState { response } => {
+                let _ = response.send(repository::clear_pairing_state(&connection));
             }
             Request::Health { response } => {
                 let _ = response.send(repository::health(&connection));
