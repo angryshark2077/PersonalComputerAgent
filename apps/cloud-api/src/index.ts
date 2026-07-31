@@ -1,3 +1,6 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
+
 import { Hono } from "hono";
 import { betterAuth } from "better-auth/minimal";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
@@ -243,6 +246,7 @@ export interface ProductionEnvironment {
   DATABASE_URL?: string;
   BETTER_AUTH_SECRET?: string;
   BETTER_AUTH_URL?: string;
+  TRUSTED_PROXY_CLIENT_IP_HMAC_SECRET?: string;
 }
 
 export function createProductionApp(environment: ProductionEnvironment = process.env): Hono {
@@ -268,9 +272,33 @@ export function createProductionApp(environment: ProductionEnvironment = process
   const app = createApp({
     repository,
     ownerAuthenticator: createBetterAuthOwnerAuthenticator(auth, repository),
+    clientAddress: createTrustedProxyClientAddress(environment),
   });
   app.all("/api/auth/*", (context) => auth.handler(context.req.raw));
   return app;
+}
+
+/**
+ * A public origin ignores all forwarding headers. A configured trusted proxy may
+ * instead send the literal client IP in `x-pca-client-ip` and an HMAC-SHA256
+ * base64url signature in `x-pca-client-ip-signature`. The proxy secret must not
+ * be available to clients. Invalid, unsigned, or non-IP values are unattributed.
+ */
+export function createTrustedProxyClientAddress(
+  environment: Pick<ProductionEnvironment, "TRUSTED_PROXY_CLIENT_IP_HMAC_SECRET">,
+): (request: Request) => string | undefined {
+  const secret = environment.TRUSTED_PROXY_CLIENT_IP_HMAC_SECRET;
+  return (request) => {
+    if (secret === undefined || secret.length === 0) return undefined;
+    const clientIp = request.headers.get("x-pca-client-ip");
+    const signature = request.headers.get("x-pca-client-ip-signature");
+    if (clientIp === null || signature === null || isIP(clientIp) === 0) return undefined;
+    const expected = createHmac("sha256", secret).update(clientIp).digest();
+    const received = Buffer.from(signature, "base64url");
+    return received.length === expected.length && timingSafeEqual(received, expected)
+      ? clientIp
+      : undefined;
+  };
 }
 
 function parseCallbackState(value: unknown): string | null {

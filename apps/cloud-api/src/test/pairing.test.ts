@@ -1,9 +1,15 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import test from "node:test";
 
 import { MemoryControlRepository } from "@pca/db-cloud/src/repository.js";
 
-import { createApp, createProductionApp, type OwnerPrincipal } from "../index.js";
+import {
+  createApp,
+  createProductionApp,
+  createTrustedProxyClientAddress,
+  type OwnerPrincipal,
+} from "../index.js";
 import { pkceChallenge } from "../pairing.js";
 
 const owner: OwnerPrincipal = {
@@ -224,4 +230,23 @@ test("production composition wires persistent PostgreSQL and Better Auth", () =>
     BETTER_AUTH_URL: "http://localhost:3000",
   });
   assert.ok(api);
+});
+
+test("production source IP accepts only an explicitly configured signed proxy header", () => {
+  const secret = "trusted-proxy-test-secret";
+  const ip = "203.0.113.42";
+  const signature = createHmac("sha256", secret).update(ip).digest("base64url");
+  const address = createTrustedProxyClientAddress({ TRUSTED_PROXY_CLIENT_IP_HMAC_SECRET: secret });
+  assert.equal(
+    address(
+      new Request("http://localhost", {
+        headers: { "x-pca-client-ip": ip, "x-pca-client-ip-signature": signature },
+      }),
+    ),
+    ip,
+  );
+  assert.equal(
+    address(new Request("http://localhost", { headers: { "x-forwarded-for": ip } })),
+    undefined,
+  );
 });
