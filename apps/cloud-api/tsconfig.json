@@ -1,5 +1,5 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": {"rootDir": "src"},
+  "compilerOptions": {"rootDir": "src", "skipLibCheck": true, "types": ["node"]},
   "include": ["src/**/*.ts"]
 }

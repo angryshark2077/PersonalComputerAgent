@@ -9,6 +9,7 @@ import {
   deviceCredentialGenerations,
   deviceHeartbeats,
   devices,
+  deviceRevocationAudit,
   pairingAuthorizationCodes,
   pairingSessions,
   workspaceMembers,
@@ -105,14 +106,36 @@ export interface ConfigAuditInput {
   now: Date;
 }
 
+export interface DeviceCredentialAuthentication {
+  workspaceId: string;
+  deviceId: string;
+}
+
+export interface DeviceRevocationInput {
+  auditId: string;
+  actorUserId: string;
+  workspaceId: string;
+  deviceId: string;
+  now: Date;
+}
+
 export interface ControlRepository {
   createPairingSession(input: PairingSessionInput): Promise<PairingSession>;
-  authorizePairingSession(input: AuthorizePairingSessionInput): Promise<void>;
+  authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string>;
   consumeAuthorizationCode(input: CodeExchangeInput): Promise<DeviceCredentialGrant>;
   rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialGrant>;
+  authenticateDeviceAccess(
+    accessTokenHash: string,
+    now: Date,
+  ): Promise<DeviceCredentialAuthentication>;
+  authenticateDeviceRefresh(
+    refreshTokenHash: string,
+    now: Date,
+  ): Promise<DeviceCredentialAuthentication>;
   loadControlSnapshot(deviceId: string, workspaceId: string): Promise<AgentControlSnapshot>;
   recordHeartbeat(input: HeartbeatInput): Promise<void>;
   appendConfigAudit(input: ConfigAuditInput): Promise<number>;
+  revokeDevice(input: DeviceRevocationInput): Promise<void>;
 }
 
 export interface OwnerMembership {
@@ -154,6 +177,7 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #devicePublicKeyHashes = new Set<string>();
   readonly #accessTokenHashes = new Set<string>();
   readonly #refreshTokenHashes = new Set<string>();
+  readonly #revocationAuditIds = new Set<string>();
 
   constructor(memberships: readonly OwnerMembership[] = []) {
     for (const membership of memberships) {
@@ -170,7 +194,7 @@ export class MemoryControlRepository implements ControlRepository {
     return { ...session };
   }
 
-  async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<void> {
+  async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string> {
     this.#requireOwnerMembership(input.workspaceId, input.ownerUserId);
     const session = this.#sessions.get(input.sessionIdHash);
     if (session === undefined || session.expiresAt <= input.now) {
@@ -184,6 +208,7 @@ export class MemoryControlRepository implements ControlRepository {
       ...input,
       consumedAt: null,
     });
+    return session.callbackUri;
   }
 
   async consumeAuthorizationCode(input: CodeExchangeInput): Promise<DeviceCredentialGrant> {
@@ -289,6 +314,20 @@ export class MemoryControlRepository implements ControlRepository {
     return grant;
   }
 
+  async authenticateDeviceAccess(
+    accessTokenHash: string,
+    now: Date,
+  ): Promise<DeviceCredentialAuthentication> {
+    return this.#authenticateCredential(accessTokenHash, now, "accessTokenHash", "accessExpiresAt");
+  }
+
+  async authenticateDeviceRefresh(
+    refreshTokenHash: string,
+    now: Date,
+  ): Promise<DeviceCredentialAuthentication> {
+    return this.#authenticateCredential(refreshTokenHash, now, "refreshTokenHash", "refreshExpiresAt");
+  }
+
   async loadControlSnapshot(
     deviceId: string,
     workspaceId: string,
@@ -328,6 +367,50 @@ export class MemoryControlRepository implements ControlRepository {
     return revision;
   }
 
+  async revokeDevice(input: DeviceRevocationInput): Promise<void> {
+    this.#requireOwnerMembership(input.workspaceId, input.actorUserId);
+    const device = this.#requireDevice(input.deviceId, input.workspaceId, true);
+    if (device.revokedAt !== null) {
+      throw new ControlRepositoryError("DEVICE_REVOKED");
+    }
+    if (this.#revocationAuditIds.has(input.auditId)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    device.revokedAt = input.now;
+    for (const credential of this.#credentials.get(input.deviceId) ?? []) {
+      if (credential.revokedAt === null) {
+        credential.revokedAt = input.now;
+      }
+    }
+    this.#revocationAuditIds.add(input.auditId);
+  }
+
+  #authenticateCredential(
+    credentialHash: string,
+    now: Date,
+    hashField: "accessTokenHash" | "refreshTokenHash",
+    expiresField: "accessExpiresAt" | "refreshExpiresAt",
+  ): DeviceCredentialAuthentication {
+    for (const [deviceId, credentials] of this.#credentials) {
+      const credential = credentials.find((record) => record[hashField] === credentialHash);
+      if (credential === undefined || credential[expiresField] <= now) {
+        continue;
+      }
+      const device = this.#devices.get(deviceId);
+      if (device === undefined) {
+        throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      }
+      if (device.revokedAt !== null) {
+        throw new ControlRepositoryError("DEVICE_REVOKED");
+      }
+      if (credential.revokedAt !== null) {
+        throw new ControlRepositoryError("CREDENTIAL_INVALID");
+      }
+      return { workspaceId: device.workspaceId, deviceId: device.id };
+    }
+    throw new ControlRepositoryError("CREDENTIAL_INVALID");
+  }
+
   #requireDevice(deviceId: string, workspaceId: string, allowRevoked: boolean): DeviceRecord {
     const device = this.#devices.get(deviceId);
     if (device === undefined) {
@@ -347,6 +430,7 @@ export class MemoryControlRepository implements ControlRepository {
       throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
     }
   }
+
 }
 
 export class DrizzleControlRepository implements ControlRepository {
@@ -367,9 +451,9 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
-  async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<void> {
+  async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string> {
     try {
-      await this.database.transaction(async (transaction) => {
+      return await this.database.transaction(async (transaction) => {
         await requireDatabaseOwnerMembership(
           transaction,
           input.workspaceId,
@@ -385,7 +469,7 @@ export class DrizzleControlRepository implements ControlRepository {
               gt(pairingSessions.expiresAt, input.now),
             ),
           )
-          .returning({ sessionIdHash: pairingSessions.sessionIdHash });
+          .returning({ callbackUri: pairingSessions.callbackUri });
         if (authorized === undefined) {
           throw new ControlRepositoryError("PAIRING_EXPIRED");
         }
@@ -399,6 +483,7 @@ export class DrizzleControlRepository implements ControlRepository {
           createdAt: input.now,
           consumedAt: null,
         });
+        return authorized.callbackUri;
       });
     } catch (error) {
       throw repositoryError(error);
@@ -558,6 +643,20 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
+  async authenticateDeviceAccess(
+    accessTokenHash: string,
+    now: Date,
+  ): Promise<DeviceCredentialAuthentication> {
+    return this.#authenticateDatabaseCredential(accessTokenHash, now, "access");
+  }
+
+  async authenticateDeviceRefresh(
+    refreshTokenHash: string,
+    now: Date,
+  ): Promise<DeviceCredentialAuthentication> {
+    return this.#authenticateDatabaseCredential(refreshTokenHash, now, "refresh");
+  }
+
   async loadControlSnapshot(
     deviceId: string,
     workspaceId: string,
@@ -665,6 +764,84 @@ export class DrizzleControlRepository implements ControlRepository {
         });
         return revision;
       });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async revokeDevice(input: DeviceRevocationInput): Promise<void> {
+    try {
+      await this.database.transaction(async (transaction) => {
+        await requireDatabaseOwnerMembership(transaction, input.workspaceId, input.actorUserId);
+        const device = await requireDatabaseDevice(transaction, input.deviceId, input.workspaceId, true);
+        if (device.revokedAt !== null) {
+          throw new ControlRepositoryError("DEVICE_REVOKED");
+        }
+        const [revoked] = await transaction
+          .update(devices)
+          .set({ revokedAt: input.now })
+          .where(and(eq(devices.id, input.deviceId), isNull(devices.revokedAt)))
+          .returning({ id: devices.id });
+        if (revoked === undefined) {
+          throw new ControlRepositoryError("DEVICE_REVOKED");
+        }
+        await transaction
+          .update(deviceCredentialGenerations)
+          .set({ revokedAt: input.now })
+          .where(
+            and(
+              eq(deviceCredentialGenerations.deviceId, input.deviceId),
+              isNull(deviceCredentialGenerations.revokedAt),
+            ),
+          );
+        await transaction.insert(deviceRevocationAudit).values({
+          id: input.auditId,
+          workspaceId: input.workspaceId,
+          deviceId: input.deviceId,
+          actorUserId: input.actorUserId,
+          revokedAt: input.now,
+        });
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async #authenticateDatabaseCredential(
+    credentialHash: string,
+    now: Date,
+    kind: "access" | "refresh",
+  ): Promise<DeviceCredentialAuthentication> {
+    const hashColumn =
+      kind === "access"
+        ? deviceCredentialGenerations.accessTokenHash
+        : deviceCredentialGenerations.refreshTokenHash;
+    const expiryColumn =
+      kind === "access"
+        ? deviceCredentialGenerations.accessExpiresAt
+        : deviceCredentialGenerations.refreshExpiresAt;
+    try {
+      const [credential] = await this.database
+        .select({
+          workspaceId: deviceCredentialGenerations.workspaceId,
+          deviceId: deviceCredentialGenerations.deviceId,
+          credentialRevokedAt: deviceCredentialGenerations.revokedAt,
+          deviceRevokedAt: devices.revokedAt,
+        })
+        .from(deviceCredentialGenerations)
+        .innerJoin(devices, eq(devices.id, deviceCredentialGenerations.deviceId))
+        .where(and(eq(hashColumn, credentialHash), gt(expiryColumn, now)))
+        .limit(1);
+      if (credential === undefined) {
+        throw new ControlRepositoryError("CREDENTIAL_INVALID");
+      }
+      if (credential.deviceRevokedAt !== null) {
+        throw new ControlRepositoryError("DEVICE_REVOKED");
+      }
+      if (credential.credentialRevokedAt !== null) {
+        throw new ControlRepositoryError("CREDENTIAL_INVALID");
+      }
+      return { workspaceId: credential.workspaceId, deviceId: credential.deviceId };
     } catch (error) {
       throw repositoryError(error);
     }

@@ -312,6 +312,33 @@ export const deviceHeartbeats = pgTable(
   ],
 );
 
+export const deviceRevocationAudit = pgTable(
+  "device_revocation_audit",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    actorUserId: uuid("actor_user_id").notNull(),
+    revokedAt: timestampColumn("revoked_at").notNull(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "device_revocation_audit_actor_membership_fk",
+      columns: [table.workspaceId, table.actorUserId],
+      foreignColumns: [workspaceMembers.workspaceId, workspaceMembers.userId],
+    }).onDelete("restrict"),
+    index("idx_device_revocation_audit_chronology").on(
+      table.workspaceId,
+      table.deviceId,
+      table.revokedAt.desc(),
+    ),
+  ],
+);
+
 export const cloudSchema = {
   authUsers,
   authSessions,
@@ -325,4 +352,5 @@ export const cloudSchema = {
   collectorConfigs,
   collectorConfigAudit,
   deviceHeartbeats,
+  deviceRevocationAudit,
 };

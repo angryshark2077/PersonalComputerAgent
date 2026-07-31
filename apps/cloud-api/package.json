@@ -5,13 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test 'src/test/*.test.ts'"
   },
   "dependencies": {
+    "@pca/contracts": "workspace:*",
+    "@pca/db-cloud": "workspace:*",
     "hono": "^4.0.0",
     "zod": "^3.0.0"
   },
   "devDependencies": {
+    "@types/node": "22.20.1",
     "tsx": "^4.0.0",
     "typescript": "^5.0.0"
   }
