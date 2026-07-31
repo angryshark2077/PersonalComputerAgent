@@ -4,7 +4,7 @@
 
 **Goal:** Pair a self-use macOS installation through a Setup-only localhost callback, keep device credentials in Keychain, and let the authenticated Owner Workspace audit and deliver Network and WeChat-outbound Collector configuration without S1B business Event sync.
 
-**Architecture:** Cloud API owns pairing-session issuance, authorization-code exchange, device credential rotation/revocation, control revisions, and presence. Swift Setup/Repair owns the one-time localhost listener, browser launch, and Keychain write; Rust Agent Core reads those credentials and runs a bounded 30-second heartbeat/control loop. Cloud configuration is the only remote input and is applied by Agent Core, never by a Collector or PlatformBridge.
+**Architecture:** Cloud API owns pairing-session issuance, authorization-code exchange, device credential rotation/revocation, control revisions, and presence. Swift Setup/Repair owns only the one-time localhost listener and browser launch; it hands the one-time callback result to Rust Agent Core over narrowly typed local IPC. Rust Agent Core creates pairing sessions, performs the Cloud exchange, writes the Keychain device record, and runs a bounded 30-second heartbeat/control loop. Cloud configuration is the only remote input and is applied by Agent Core, never by a Collector or PlatformBridge.
 
 **Tech Stack:** Rust 1.82/Tokio/Serde, Swift 6/SwiftUI/Foundation/Security, Hono/Zod/Better Auth, PostgreSQL/Drizzle, Next.js/React, JSON Schema Draft 2020-12, pnpm, SQLite WAL, macOS Keychain.
 
@@ -12,6 +12,7 @@
 
 - Approved designs: `docs/superpowers/specs/2026-07-31-s1b-network-control-plane-design.md`, `docs/superpowers/specs/2026-07-31-wechat-outbound-message-collector-design.md`, ADR-0006, and ADR-0007.
 - Setup/Repair is the only browser launcher and the only local HTTP listener; `agentd` never opens a browser or binds loopback HTTP.
+- PlatformBridge/Swift never calls Cloud endpoints. It may only exchange one-time pairing callback data with Agent Core through local IPC; Agent Core owns Cloud session creation, exchange, and device-credential persistence.
 - The callback binds only `127.0.0.1`, accepts one callback for at most five minutes, validates exact path/state/PKCE, and carries no long-lived credential in the URL.
 - Access/refresh credentials, device key material, Bridge secret, and WeChat KeyMaterial stay in Keychain/Cloud secret storage only. They must never reach SQLite payloads, Event payloads, diagnostics, tests, or ordinary logs.
 - S1B adds no business Event sync, Collector source, attachment/R2 transfer, remote command, Network location inference, or WeChat database access.
@@ -431,13 +432,13 @@ the device credential in `pairing_state` or an Event.
 - [ ] **Step 4: Implement the one-time listener and exchange**
 
 `PairingCallbackServer` must bind `NWListener`/`Network` only to IPv4
-loopback, generate an unpredictable port and state, accept only
-`GET /pca/pair/callback?code=...&state=...`, return a static success page, and
-close on the first terminal result. `PairingCoordinator` creates an Ed25519
-device key pair and PKCE verifier, POSTs the session request, calls
-`NSWorkspace.shared.open`, validates the callback, exchanges the code over
-`URLSession`, writes the Keychain record, and asks the installed Agent to
-restart. Log only stage/error code/request ID.
+loopback, accept only `GET /pca/pair/callback?code=...&state=...`, return a
+static success page, and close on the first terminal result. `PairingCoordinator`
+opens the Agent-provided authorization URL, validates and one-time-hands the
+callback `{session_id, code, state}` to Agent Core through local IPC, then
+reports the Agent-provided completion result. Agent Core, not Swift, owns the
+Ed25519 key pair, PKCE verifier, Cloud session request/exchange, Keychain write,
+and restart signal. Log only stage/error code/request ID.
 
 - [ ] **Step 5: Wire pairing into the existing Setup UI and verify**
 
@@ -495,7 +496,11 @@ Expected: missing runtime/client and no production credential load path.
 - [ ] **Step 3: Implement the smallest control client and state transitions**
 
 Add `reqwest` with `default-features = false` and rustls TLS only; record its
-license and Rust-1.82 compatibility. Read credentials from Keychain at startup.
+license and Rust-1.82 compatibility. Add the narrowly typed local pairing IPC:
+Agent Core creates the session/key/PKCE proof, returns only browser URL,
+session ID, and callback state to Setup, then consumes its one-time callback
+handoff to exchange credentials and write the Keychain record. Read credentials
+from Keychain at startup.
 If absent/corrupt, retain `unpaired`; if valid, persist only the reference and
 non-secret IDs/revision, set Agent state to `running` or `degraded` according
 to local capabilities, and run an immediate control request followed by
