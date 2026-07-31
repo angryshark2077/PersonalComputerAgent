@@ -109,7 +109,7 @@ pca-forbidden = {{ package = "{dependency_name}", path = "{dependency_path}" }}
                     result.stderr,
                 )
 
-    def test_system_collector_sysinfo_features_are_minimal_and_pinned(self) -> None:
+    def test_system_collector_manifest_pins_sysinfo_and_inherits_msrv(self) -> None:
         cargo = shutil.which("cargo") or "/opt/homebrew/opt/rustup/bin/cargo"
         result = subprocess.run(
             [
@@ -138,6 +138,7 @@ pca-forbidden = {{ package = "{dependency_name}", path = "{dependency_path}" }}
             if dependency["name"] == "sysinfo"
         )
 
+        self.assertEqual(package["rust_version"], "1.82")
         self.assertEqual(dependency["req"], "=0.33.1")
         self.assertIs(dependency["uses_default_features"], False)
         self.assertEqual(dependency["features"], ["system", "disk"])
