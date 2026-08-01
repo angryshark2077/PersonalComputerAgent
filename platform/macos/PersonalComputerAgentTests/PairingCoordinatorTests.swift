@@ -97,6 +97,32 @@ final class PairingCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinator.listenerIsClosed)
         XCTAssertEqual(agent.cancelledSessionID, agent.sessionID)
     }
+
+    func testCancelPairingStopsTheActiveSessionImmediately() async throws {
+        let agent = ExpiringPairingAgent()
+        let pairing = PairingCoordinator(
+            agent: agent,
+            browser: SuccessfulPairingBrowser(),
+            callbackTimeout: .seconds(10)
+        )
+        let model = InstallerViewModel(
+            coordinator: ImmediateInstallCoordinator(),
+            sourceBundle: URL(fileURLWithPath: "/tmp/source.app"),
+            pairingCoordinator: pairing,
+            terminator: TestTerminator()
+        )
+
+        model.repairPairing()
+        try await waitForPairing { agent.didBegin && model.isPairing }
+        model.cancelPairing()
+
+        try await waitForPairing { !model.isPairing }
+        XCTAssertTrue(pairing.listenerIsClosed)
+        XCTAssertEqual(agent.cancelledSessionID, agent.sessionID)
+        guard case .repair = model.state else {
+            return XCTFail("cancelled pairing must return to repair")
+        }
+    }
 }
 
 private struct TestBeginPayload: Encodable, Sendable {
@@ -113,11 +139,13 @@ private struct TestBeginPayload: Encodable, Sendable {
 private final class ExpiringPairingAgent: PairingAgentHandingOff {
     let sessionID = "01982222-7222-8222-8222-222222222222"
     private(set) var cancelledSessionID: String?
+    private(set) var didBegin = false
 
     func isPaired() async throws -> Bool { false }
 
     func beginPairing(_: PairingStartHandoff) async throws -> PairingSessionHandoff {
-        PairingSessionHandoff(
+        didBegin = true
+        return PairingSessionHandoff(
             sessionID: sessionID,
             authorizationURL: URL(string: "https://pca-dashboard-production.up.railway.app/pair")!,
             callbackState: String(repeating: "s", count: 43)
@@ -137,4 +165,33 @@ private final class ExpiringPairingAgent: PairingAgentHandingOff {
 @MainActor
 private final class SuccessfulPairingBrowser: PairingBrowserOpening {
     func open(_: URL) -> Bool { true }
+}
+
+@MainActor
+private final class ImmediateInstallCoordinator: InstallCoordinating {
+    func installOrFinish(
+        from _: URL,
+        onState: @escaping @MainActor (InstallerState) -> Void
+    ) async throws -> InstallResult {
+        .success(version: "0.1.10")
+    }
+}
+
+@MainActor
+private final class TestTerminator: ApplicationTerminating {
+    func terminate() {}
+}
+
+@MainActor
+private func waitForPairing(
+    timeout: Duration = .seconds(1),
+    condition: @escaping @MainActor () -> Bool
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if condition() { return }
+        try await Task.sleep(for: .milliseconds(2))
+    }
+    XCTFail("timed out waiting for pairing state")
 }

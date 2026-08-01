@@ -23,6 +23,10 @@ struct InstallerView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
             }
+            if model.isPairing {
+                Button("Cancel Pairing") { model.cancelPairing() }
+                    .buttonStyle(.bordered)
+            }
         }
         .padding(28)
         .frame(width: 520, height: 310)
@@ -43,7 +47,7 @@ struct InstallerView: View {
         case .starting:
             progress("Starting the local runtime…")
         case .pairing:
-            progress("Opening the secure pairing flow…")
+            progress("Complete the secure pairing flow in your browser…")
         case let .repair(message):
             VStack(alignment: .leading, spacing: 8) {
                 Label(message, systemImage: "exclamationmark.triangle.fill")

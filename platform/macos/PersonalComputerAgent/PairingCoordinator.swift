@@ -105,7 +105,7 @@ final class PairingCoordinator {
 
     private func closeListener() {
         callbackServer?.cancel()
-        listenerWasClosed = callbackServer != nil
+        listenerWasClosed = listenerWasClosed || callbackServer != nil
         callbackServer = nil
         expectedState = nil
     }

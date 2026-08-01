@@ -126,6 +126,12 @@ final class InstallerViewModel: ObservableObject {
         startPairing(repair: true)
     }
 
+    func cancelPairing() {
+        guard activePairing != nil, let pairingCoordinator else { return }
+        activePairing?.cancel()
+        Task { await pairingCoordinator.cancel() }
+    }
+
     private func startPairing(repair: Bool) {
         guard activePairing == nil, let pairingCoordinator else { return }
         state = .pairing
