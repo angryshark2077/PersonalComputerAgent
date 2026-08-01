@@ -74,16 +74,18 @@ impl CredentialStore for MacOSKeychainStore {
                 set_generic_password(service, account, secret)
                     .map_err(|error| map_keychain_error(error.code()))
             }),
-            CredentialIdentity::Device => store_device_for_identity(service, account, secret, || {
-                match get_generic_password(service, account) {
-                    Ok(_) => set_generic_password(service, account, secret)
-                        .map_err(|error| map_keychain_error(error.code())),
-                    Err(error) if error.code() == ITEM_NOT_FOUND_STATUS => {
-                        Err(CredentialError::OperationFailed)
+            CredentialIdentity::Device => {
+                store_device_for_identity(service, account, secret, || {
+                    match get_generic_password(service, account) {
+                        Ok(_) => set_generic_password(service, account, secret)
+                            .map_err(|error| map_keychain_error(error.code())),
+                        Err(error) if error.code() == ITEM_NOT_FOUND_STATUS => {
+                            Err(CredentialError::OperationFailed)
+                        }
+                        Err(error) => Err(map_keychain_error(error.code())),
                     }
-                    Err(error) => Err(map_keychain_error(error.code())),
-                }
-            }),
+                })
+            }
         }
     }
 

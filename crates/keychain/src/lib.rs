@@ -67,7 +67,7 @@ pub trait CredentialStore: Send + Sync {
 
 /// The versioned device credential payload kept in the dedicated macOS Keychain item.
 ///
-/// The value is intentionally opaque to SQLite, Events, and logs. Task 6 must add the Agent
+/// The value is intentionally opaque to `SQLite`, Events, and logs. Task 6 must add the Agent
 /// local-IPC Keychain adapter that creates this item with an ACL for the installed Setup app and
 /// `agentd`; this crate deliberately supplies only the versioned codec and fixed identity.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -86,6 +86,11 @@ pub struct DeviceCredential {
 impl DeviceCredential {
     /// Creates a validated credential with initial generation and expiry metadata.
     /// Call [`Self::with_metadata`] with the exchange values before persisting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] when either identifier, credential, or
+    /// initial expiry metadata is invalid.
     pub fn new(
         device_id: String,
         workspace_id: String,
@@ -150,14 +155,23 @@ impl DeviceCredential {
     }
 
     /// Serializes the record only after all schema and content checks succeed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] when validation or serialization fails.
     pub fn encode(&self) -> Result<Vec<u8>, CredentialError> {
         self.validate()?;
         serde_json::to_vec(self).map_err(|_| CredentialError::InvalidCredential)
     }
 
     /// Decodes a versioned record without exposing its contents through an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] when the record is malformed or invalid.
     pub fn decode(value: &[u8]) -> Result<Self, CredentialError> {
-        let credential: Self = serde_json::from_slice(value).map_err(|_| CredentialError::InvalidCredential)?;
+        let credential: Self =
+            serde_json::from_slice(value).map_err(|_| CredentialError::InvalidCredential)?;
         credential.validate()?;
         Ok(credential)
     }
@@ -181,6 +195,11 @@ impl DeviceCredential {
 }
 
 /// Loads and validates the device credential at `com.pca.device/current-v1`.
+///
+/// # Errors
+///
+/// Returns a safe backing-store error or [`CredentialError::InvalidCredential`] for a corrupt
+/// stored record.
 pub fn load_device_credential(
     store: &dyn CredentialStore,
 ) -> Result<Option<DeviceCredential>, CredentialError> {
@@ -191,6 +210,11 @@ pub fn load_device_credential(
 }
 
 /// Stores a fully validated device credential at `com.pca.device/current-v1`.
+///
+/// # Errors
+///
+/// Returns [`CredentialError::InvalidCredential`] when the credential cannot be encoded, or a
+/// safe backing-store error.
 pub fn store_device_credential(
     store: &dyn CredentialStore,
     credential: &DeviceCredential,
@@ -203,6 +227,10 @@ pub fn store_device_credential(
 }
 
 /// Deletes the device credential when it is present.
+///
+/// # Errors
+///
+/// Returns a safe backing-store error.
 pub fn delete_device_credential(store: &dyn CredentialStore) -> Result<(), CredentialError> {
     store.delete(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT)
 }

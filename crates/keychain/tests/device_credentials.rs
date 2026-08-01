@@ -78,7 +78,8 @@ fn device_credentials_use_the_versioned_identity_and_round_trip_without_bridge_o
 
 #[test]
 fn device_credential_errors_do_not_include_secret_material() {
-    let error = DeviceCredential::new(device_id(), workspace_id(), "access-secret", "").unwrap_err();
+    let error =
+        DeviceCredential::new(device_id(), workspace_id(), "access-secret", "").unwrap_err();
     assert!(!error.to_string().contains("access-secret"));
     assert!(!format!("{error:?}").contains("access-secret"));
 }

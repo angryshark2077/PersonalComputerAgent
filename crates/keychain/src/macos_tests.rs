@@ -1,7 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
-    macos::{delete_for_supported_identity, load_for_identity, load_for_supported_identity, store_device_for_identity, store_for_identity},
+    macos::{
+        delete_for_supported_identity, load_for_identity, load_for_supported_identity,
+        store_device_for_identity, store_for_identity,
+    },
     CredentialError, DeviceCredential, BRIDGE_CREDENTIAL_ACCOUNT, BRIDGE_CREDENTIAL_SERVICE,
     BRIDGE_SHARED_SECRET_LENGTH, DEVICE_CREDENTIAL_ACCOUNT, DEVICE_CREDENTIAL_SERVICE,
 };
