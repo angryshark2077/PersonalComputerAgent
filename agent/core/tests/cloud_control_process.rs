@@ -139,6 +139,7 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
             credentials.credential().workspace_id(),
             "keychain://pca/device/current",
             1,
+            "https://pca-cloud-api-production.up.railway.app",
         ))
         .await
         .unwrap();
@@ -192,6 +193,7 @@ async fn corrupt_startup_credential_clears_pairing_and_disables_sensitive_collec
             credential.credential().workspace_id(),
             "keychain://pca/device/current",
             1,
+            "https://pca-cloud-api-production.up.railway.app",
         ))
         .await
         .unwrap();
@@ -235,6 +237,7 @@ async fn failed_keychain_delete_still_disables_sensitive_collectors() {
             credentials.credential().workspace_id(),
             "keychain://pca/device/current",
             1,
+            "https://pca-cloud-api-production.up.railway.app",
         ))
         .await
         .unwrap();

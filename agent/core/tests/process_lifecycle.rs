@@ -488,6 +488,10 @@ fn fatal_failure_after_bridge_start_reaps_child_and_shuts_down_database_owner() 
         live_probe.status.success(),
         "fake Bridge must be live immediately before fatal cleanup"
     );
+    assert!(
+        paths.pairing_socket_file.exists(),
+        "agent must expose the private Setup pairing socket while running"
+    );
     fs::write(&fatal_release, b"release\n").expect("release fatal cleanup injection");
     assert_eq!(child.wait_bounded().code(), Some(5));
     let mut stderr = String::new();
@@ -510,6 +514,7 @@ fn fatal_failure_after_bridge_start_reaps_child_and_shuts_down_database_owner() 
         .expect("probe fake Bridge pid");
     assert!(!bridge_probe.status.success(), "fake Bridge child leaked");
     assert!(!paths.socket_file.exists(), "Bridge socket leaked");
+    assert!(!paths.pairing_socket_file.exists(), "pairing socket leaked");
     assert_eq!(
         marker_members(&paths).len(),
         1,

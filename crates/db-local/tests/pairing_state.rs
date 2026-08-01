@@ -35,6 +35,10 @@ fn workspace_id() -> &'static str {
     "01982222-7222-8222-8222-222222222222"
 }
 
+fn cloud_api_origin() -> &'static str {
+    "https://pca-cloud-api-production.up.railway.app"
+}
+
 #[tokio::test]
 async fn pairing_state_is_absent_until_validated_credentials_are_saved() {
     let (_directory, path) = database_path();
@@ -46,7 +50,7 @@ async fn pairing_state_is_absent_until_validated_credentials_are_saved() {
     assert!(db.save_control_revision(1).await.is_err());
     assert_eq!(
         db.health().await.expect("database health").schema_version,
-        3
+        4
     );
 }
 
@@ -61,6 +65,7 @@ async fn pairing_state_never_persists_token_material() {
         workspace_id(),
         "keychain://pca/device/current",
         7,
+        cloud_api_origin(),
     ))
     .await
     .expect("save state");
@@ -74,6 +79,7 @@ async fn pairing_state_never_persists_token_material() {
     assert_eq!(state.workspace_id, workspace_id());
     assert_eq!(state.credential_ref, "keychain://pca/device/current");
     assert_eq!(state.credential_generation, 7);
+    assert_eq!(state.cloud_api_origin, cloud_api_origin());
     assert_eq!(state.applied_control_revision, 0);
 
     db.shutdown().await.expect("close database");
@@ -95,6 +101,7 @@ async fn pairing_state_never_persists_token_material() {
             "credential_generation",
             "applied_control_revision",
             "paired_at_ms",
+            "cloud_api_origin",
         ]
     );
     let database_bytes = std::fs::read(path).expect("read database bytes");
@@ -112,6 +119,7 @@ async fn control_revision_is_monotonic_and_clear_removes_the_pairing() {
         workspace_id(),
         "keychain://pca/device/current",
         2,
+        cloud_api_origin(),
     ))
     .await
     .expect("save state");
@@ -150,6 +158,7 @@ async fn pairing_state_rejects_non_uuid_identifiers_and_non_keychain_references(
         workspace_id(),
         "keychain://pca/device/current",
         1,
+        cloud_api_origin(),
     );
     assert!(db.save_pairing_state(&invalid_id).await.is_err());
 
@@ -158,9 +167,16 @@ async fn pairing_state_rejects_non_uuid_identifiers_and_non_keychain_references(
         workspace_id(),
         "keychain://pca/device/current",
         1,
+        cloud_api_origin(),
     );
     assert!(db.save_pairing_state(&misplaced_hyphen).await.is_err());
 
-    let inline_credential = PairingState::paired(device_id(), workspace_id(), "secret-body", 1);
+    let inline_credential = PairingState::paired(
+        device_id(),
+        workspace_id(),
+        "secret-body",
+        1,
+        cloud_api_origin(),
+    );
     assert!(db.save_pairing_state(&inline_credential).await.is_err());
 }

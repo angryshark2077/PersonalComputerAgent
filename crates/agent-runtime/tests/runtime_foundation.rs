@@ -75,6 +75,10 @@ fn runtime_paths_create_the_fixed_secure_layout() {
     );
     assert_eq!(paths.lock_file, paths.run_dir.join("agent.lock"));
     assert_eq!(paths.socket_file, paths.run_dir.join("bridge.sock"));
+    assert_eq!(
+        paths.pairing_socket_file,
+        paths.run_dir.join("pairing.sock")
+    );
     assert_eq!(paths.status_file, paths.run_dir.join("runtime-status.json"));
     assert_eq!(mode(&paths.root) & 0o777, 0o700);
     assert_eq!(mode(&paths.data_dir) & 0o777, 0o700);

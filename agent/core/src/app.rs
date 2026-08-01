@@ -7,7 +7,10 @@ use pca_agent_runtime::{
     CrashMarkerGuard, LocalHeartbeatWriter, RuntimeError, RuntimePaths, RuntimeStateMachine,
     SingleInstanceGuard,
 };
-use pca_agentd::cloud_control::synchronize_pairing_state;
+use pca_agentd::{
+    cloud_control::synchronize_pairing_state,
+    pairing_ipc::{PairingIpcServer, PairingIpcServerError, PairingSocket},
+};
 use pca_bridge_client::supervisor::{
     BridgeSupervisor, BridgeSupervisorConfig, BridgeSupervisorError,
 };
@@ -75,6 +78,7 @@ enum FailureStage {
     SystemCollector,
     Heartbeat,
     Signal,
+    PairingConfiguration,
     #[cfg(feature = "process-test-hooks")]
     BridgeConfiguration,
     #[cfg(feature = "process-test-hooks")]
@@ -82,6 +86,7 @@ enum FailureStage {
     LifecycleCleanup,
     SystemCollectorCleanup,
     BridgeCleanup,
+    PairingCleanup,
     Checkpoint,
     FinalStatus,
     DatabaseOwnership,
@@ -102,6 +107,7 @@ impl FailureStage {
             Self::SystemCollector => "system_collector",
             Self::Heartbeat => "heartbeat",
             Self::Signal => "signal",
+            Self::PairingConfiguration => "pairing_configuration",
             #[cfg(feature = "process-test-hooks")]
             Self::BridgeConfiguration => "bridge_configuration",
             #[cfg(feature = "process-test-hooks")]
@@ -109,6 +115,7 @@ impl FailureStage {
             Self::LifecycleCleanup => "lifecycle_cleanup",
             Self::SystemCollectorCleanup => "system_collector_cleanup",
             Self::BridgeCleanup => "bridge_cleanup",
+            Self::PairingCleanup => "pairing_cleanup",
             Self::Checkpoint => "checkpoint",
             Self::FinalStatus => "final_status",
             Self::DatabaseOwnership => "database_ownership",
@@ -164,6 +171,8 @@ struct RuntimeResources {
     system_runtime: Option<SystemRuntimeHandle>,
     bridge_shutdown: Option<watch::Sender<bool>>,
     bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
+    pairing_shutdown: Option<watch::Sender<bool>>,
+    pairing_task: Option<JoinHandle<Result<(), PairingIpcServerError>>>,
     heartbeat: Option<LocalHeartbeatWriter>,
     state: RuntimeStateMachine,
     schema_version: Option<u32>,
@@ -177,6 +186,8 @@ impl RuntimeResources {
             system_runtime: None,
             bridge_shutdown: None,
             bridge_task: None,
+            pairing_shutdown: None,
+            pairing_task: None,
             heartbeat: None,
             state: RuntimeStateMachine::starting(),
             schema_version: None,
@@ -224,7 +235,7 @@ impl RuntimeResources {
         let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
         let bridge_task = start_bridge(
             config,
-            credential_store,
+            Arc::clone(&credential_store),
             bridge_status_sender.clone(),
             bridge_shutdown_receiver,
         );
@@ -234,6 +245,21 @@ impl RuntimeResources {
         }
         self.bridge_task = bridge_task.ok();
         self.bridge_shutdown = Some(bridge_shutdown_sender);
+        let (pairing_shutdown_sender, pairing_shutdown_receiver) = watch::channel(false);
+        self.pairing_task = Some(
+            start_pairing_server(
+                config,
+                Arc::clone(
+                    self.database
+                        .as_ref()
+                        .expect("database exists until cleanup"),
+                ),
+                credential_store,
+                pairing_shutdown_receiver,
+            )
+            .await?,
+        );
+        self.pairing_shutdown = Some(pairing_shutdown_sender);
 
         self.state
             .transition_agent(if pairing_valid {
@@ -367,6 +393,13 @@ impl RuntimeResources {
         }
         if stop_bridge(self.bridge_task.take()).await.is_err() {
             failures.push(FailureStage::BridgeCleanup);
+        }
+
+        if let Some(shutdown) = self.pairing_shutdown.take() {
+            shutdown.send_replace(true);
+        }
+        if stop_pairing_server(self.pairing_task.take()).await.is_err() {
+            failures.push(FailureStage::PairingCleanup);
         }
 
         if self.database().checkpoint().await.is_err() {
@@ -552,6 +585,30 @@ async fn stop_bridge(
         task.await
             .map_err(|_| FailureStage::BridgeCleanup)?
             .map_err(|_| FailureStage::BridgeCleanup)?;
+    }
+    Ok(())
+}
+
+async fn start_pairing_server(
+    config: &RunConfig,
+    database: Arc<DbActorHandle>,
+    credential_store: Arc<dyn CredentialStore>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<JoinHandle<Result<(), PairingIpcServerError>>, FailureStage> {
+    let socket = PairingSocket::bind(&config.paths.pairing_socket_file)
+        .await
+        .map_err(|_| FailureStage::PairingConfiguration)?;
+    let server = PairingIpcServer::new(socket, database, credential_store);
+    Ok(tokio::spawn(server.serve(shutdown)))
+}
+
+async fn stop_pairing_server(
+    pairing_task: Option<JoinHandle<Result<(), PairingIpcServerError>>>,
+) -> Result<(), FailureStage> {
+    if let Some(task) = pairing_task {
+        task.await
+            .map_err(|_| FailureStage::PairingCleanup)?
+            .map_err(|_| FailureStage::PairingCleanup)?;
     }
     Ok(())
 }

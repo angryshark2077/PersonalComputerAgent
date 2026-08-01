@@ -25,6 +25,9 @@ pub const S2_COLLECTOR_STATE_MIGRATION: &str =
 /// The immutable S1B pairing-state database migration.
 pub const S1B_PAIRING_STATE_MIGRATION: &str =
     include_str!("../migrations/0003_s1b_pairing_state.sql");
+/// The immutable S1B Cloud API origin migration.
+pub const S1B_CLOUD_API_ORIGIN_MIGRATION: &str =
+    include_str!("../migrations/0004_s1b_cloud_api_origin.sql");
 
 /// Non-secret local pointer to an Agent credential validated in Keychain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +40,8 @@ pub struct PairingState {
     pub credential_ref: String,
     /// Current server-side credential generation.
     pub credential_generation: u64,
+    /// Non-secret HTTPS Cloud API origin used for authenticated control after restart.
+    pub cloud_api_origin: String,
     /// Highest complete control revision applied locally.
     pub applied_control_revision: u64,
     /// Time the validated credential reference was saved, in Unix milliseconds.
@@ -51,6 +56,7 @@ impl PairingState {
         workspace_id: impl Into<String>,
         credential_ref: impl Into<String>,
         credential_generation: u64,
+        cloud_api_origin: impl Into<String>,
     ) -> Self {
         let elapsed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -61,6 +67,7 @@ impl PairingState {
             workspace_id: workspace_id.into(),
             credential_ref: credential_ref.into(),
             credential_generation,
+            cloud_api_origin: cloud_api_origin.into(),
             applied_control_revision: 0,
             paired_at_ms,
         }
@@ -81,8 +88,8 @@ pub struct DbHealth {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION, S1B_PAIRING_STATE_MIGRATION,
-        S2_COLLECTOR_STATE_MIGRATION,
+        BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION, S1B_CLOUD_API_ORIGIN_MIGRATION,
+        S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION,
     };
 
     #[test]
@@ -115,5 +122,12 @@ mod tests {
         assert!(!S1B_PAIRING_STATE_MIGRATION.contains("CREATE INDEX"));
         assert!(!S1B_PAIRING_STATE_MIGRATION.contains("token"));
         assert!(!S1B_PAIRING_STATE_MIGRATION.contains("secret"));
+    }
+
+    #[test]
+    fn s1b_cloud_origin_migration_has_no_secret_columns() {
+        assert!(S1B_CLOUD_API_ORIGIN_MIGRATION.contains("cloud_api_origin"));
+        assert!(!S1B_CLOUD_API_ORIGIN_MIGRATION.contains("token"));
+        assert!(!S1B_CLOUD_API_ORIGIN_MIGRATION.contains("secret"));
     }
 }

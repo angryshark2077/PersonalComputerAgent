@@ -411,7 +411,7 @@ pub(crate) fn load_pairing_state(connection: &Connection) -> Result<Option<Pairi
     connection
         .query_row(
             "SELECT device_id, workspace_id, credential_ref, credential_generation,
-                    applied_control_revision, paired_at_ms
+                    cloud_api_origin, applied_control_revision, paired_at_ms
              FROM pairing_state WHERE singleton_id = 1",
             [],
             |row| {
@@ -420,8 +420,9 @@ pub(crate) fn load_pairing_state(connection: &Connection) -> Result<Option<Pairi
                     workspace_id: row.get(1)?,
                     credential_ref: row.get(2)?,
                     credential_generation: row.get(3)?,
-                    applied_control_revision: row.get(4)?,
-                    paired_at_ms: row.get(5)?,
+                    cloud_api_origin: row.get(4)?,
+                    applied_control_revision: row.get(5)?,
+                    paired_at_ms: row.get(6)?,
                 })
             },
         )
@@ -437,13 +438,14 @@ pub(crate) fn save_pairing_state(
         .execute(
             "INSERT INTO pairing_state (
                 singleton_id, device_id, workspace_id, credential_ref,
-                credential_generation, applied_control_revision, paired_at_ms
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                credential_generation, cloud_api_origin, applied_control_revision, paired_at_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(singleton_id) DO UPDATE SET
                 device_id = excluded.device_id,
                 workspace_id = excluded.workspace_id,
                 credential_ref = excluded.credential_ref,
                 credential_generation = excluded.credential_generation,
+                cloud_api_origin = excluded.cloud_api_origin,
                 applied_control_revision = excluded.applied_control_revision,
                 paired_at_ms = excluded.paired_at_ms",
             params![
@@ -451,6 +453,7 @@ pub(crate) fn save_pairing_state(
                 state.workspace_id,
                 state.credential_ref,
                 state.credential_generation,
+                state.cloud_api_origin,
                 state.applied_control_revision,
                 state.paired_at_ms,
             ],
@@ -596,7 +599,7 @@ pub(crate) fn smoke_queries(connection: &Connection) -> Result<(), DbError> {
                 created_at_ms, updated_at_ms
          FROM collector_states LIMIT 1",
         "SELECT singleton_id, device_id, workspace_id, credential_ref,
-                credential_generation, applied_control_revision, paired_at_ms
+                credential_generation, cloud_api_origin, applied_control_revision, paired_at_ms
          FROM pairing_state LIMIT 1",
         "SELECT event_id, workspace_id, device_id, event_type, source, schema_version,
                 occurred_at_ms, created_at_ms, sensitivity, payload_json,

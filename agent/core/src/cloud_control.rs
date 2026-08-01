@@ -20,6 +20,7 @@ use uuid::Uuid;
 const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
+const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.up.railway.app";
 
 /// Future returned by the small Cloud-control port.
 pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlError>> + Send + 'a>>;
@@ -82,7 +83,7 @@ pub struct PairingCallbackHandoff {
     pub authorization_code: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PairingSessionRequest {
     pub device_public_key: String,
     pub code_challenge: String,
@@ -90,13 +91,13 @@ pub struct PairingSessionRequest {
     pub callback_state: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct PairingSessionResponse {
     pub session_id: String,
     pub authorization_url: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PairingExchangeRequest {
     pub session_id: String,
     pub authorization_code: String,
@@ -517,6 +518,7 @@ async fn ensure_pairing_state(
         credentials.workspace_id(),
         CREDENTIAL_REF,
         credentials.credential_generation(),
+        PRODUCTION_CLOUD_API_ORIGIN,
     );
     state.applied_control_revision = revision;
     database.save_pairing_state(&state).await?;
@@ -671,7 +673,15 @@ impl HttpControlClient {
     /// Returns [`ControlError::Contract`] for a non-HTTPS URL and [`ControlError::Transient`]
     /// when the HTTPS client cannot be initialized.
     pub fn new(base_url: Url) -> Result<Self, ControlError> {
-        if base_url.scheme() != "https" {
+        if base_url.scheme() != "https"
+            || base_url.host_str() != Some("pca-cloud-api-production.up.railway.app")
+            || base_url.port().is_some()
+            || base_url.path() != "/"
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+            || !base_url.username().is_empty()
+            || base_url.password().is_some()
+        {
             return Err(ControlError::Contract);
         }
         let client = Client::builder()
@@ -743,6 +753,52 @@ impl ControlClient for HttpControlClient {
             parse_response::<ControlResponse>(response)
                 .await
                 .map(|response| response.snapshot)
+        })
+    }
+}
+
+impl PairingClient for HttpControlClient {
+    fn create_pairing_session<'a>(
+        &'a self,
+        request: &'a PairingSessionRequest,
+    ) -> ControlFuture<'a, PairingSessionResponse> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .post(self.endpoint("v1/device-pairing/sessions")?)
+                .json(request)
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            parse_response(response).await
+        })
+    }
+
+    fn exchange_pairing_callback<'a>(
+        &'a self,
+        request: &'a PairingExchangeRequest,
+    ) -> ControlFuture<'a, DeviceCredential> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .post(self.endpoint("v1/device-pairing/exchange")?)
+                .json(request)
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            let grant = parse_response::<CredentialGrant>(response).await?;
+            let access_expires_at_ms = parse_time_ms(&grant.access_expires_at)?;
+            let refresh_expires_at_ms = parse_time_ms(&grant.refresh_expires_at)?;
+            DeviceCredential::new(
+                grant.device_id,
+                grant.workspace_id,
+                &grant.device_access_token,
+                &grant.refresh_token,
+            )
+            .map(|credential| {
+                credential.with_metadata(0, access_expires_at_ms, refresh_expires_at_ms)
+            })
+            .map_err(|_| ControlError::Contract)
         })
     }
 }
@@ -824,7 +880,8 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{retry_delay, CONTROL_INTERVAL, MAX_BACKOFF};
+    use super::{retry_delay, ControlError, HttpControlClient, CONTROL_INTERVAL, MAX_BACKOFF};
+    use reqwest::Url;
     use std::time::Duration;
 
     #[test]
@@ -832,5 +889,19 @@ mod tests {
         assert_ne!(retry_delay(1), Duration::from_secs(1));
         assert!(retry_delay(20) <= MAX_BACKOFF);
         assert_eq!(CONTROL_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn production_cloud_origin_rejects_paths_queries_and_fragments() {
+        for value in [
+            "https://pca-cloud-api-production.up.railway.app/internal",
+            "https://pca-cloud-api-production.up.railway.app/?redirect=other",
+            "https://pca-cloud-api-production.up.railway.app/#fragment",
+        ] {
+            assert!(matches!(
+                HttpControlClient::new(Url::parse(value).expect("valid URL")),
+                Err(ControlError::Contract)
+            ));
+        }
     }
 }
