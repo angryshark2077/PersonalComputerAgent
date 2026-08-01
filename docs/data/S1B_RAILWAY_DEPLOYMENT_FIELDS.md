@@ -56,11 +56,15 @@ Keychain material.
 The local full gate runs the offline deployment-verifier test plus a synthetic
 shared-Cloud process acceptance. In that acceptance, one loopback HTTP service
 owns the generated pairing code, credential hashes, device/config revision,
-audit and revocation; the real Rust helper exchanges and sends control through
-that service while Dashboard clients mutate and read the same state. It scans
-runtime canaries across process output, non-credential JSON/status, temporary
-SQLite/WAL/SHM and fixture sources. It does not contact Railway or prove
-production auth, TLS, PostgreSQL, signed local IPC or macOS Keychain ACLs.
+audit and revocation. One live Rust helper generates a PKCE verifier, sends its
+challenge with a distinct callback state, retains the verifier through the real
+exchange, and receives only the callback code from the Node driver. Dashboard
+clients mutate and read the same shared service state. One test-only
+non-credential JSON response carries the message canary, and the paired helper
+scans live SQLite main/WAL/SHM before its final checkpoint; post-revoke scans
+retain the existing process/status/SQLite/fixture coverage. This remains local
+synthetic acceptance: it does not contact Railway or prove production auth,
+TLS, PostgreSQL, signed local IPC or macOS Keychain ACLs.
 
 The operator must complete
 `docs/runbooks/S1B_RAILWAY_DEPLOYMENT.md`, then the pairing/revoke checks in

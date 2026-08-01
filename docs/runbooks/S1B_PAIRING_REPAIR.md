@@ -107,18 +107,24 @@ CLOUD_API_INTERNAL_ORIGIN=http://pca-cloud-api.railway.internal:8080 ./scripts/v
 The S1B process acceptance inside this gate starts one synthetic Cloud service
 on loopback HTTP. That service alone owns the pairing session and generated
 authorization code, exchange-issued credentials, device configuration revision,
-audit row and revocation. The Rust acceptance Agent receives only the local API
-origin plus callback metadata, exchanges and sends control over real HTTP, writes
-the returned synthetic credential to a file-backed Keychain double, and uses a
-temporary SQLite database. Dashboard clients authorize, read, configure and
-revoke through the same service. Runtime-generated canaries are checked against
-Agent stdout/stderr, non-credential JSON responses and status files,
-SQLite/WAL/SHM, and fixture sources.
+audit row and revocation. One live Rust acceptance Agent receives the local API
+origin, generates and retains its own PKCE verifier, sends only its derived
+challenge and distinct callback state to the shared Cloud session endpoint, then
+receives only the callback code from the Node driver before exchanging through
+the real endpoint. It sends control over real HTTP, writes the returned synthetic
+credential to a file-backed Keychain double, and uses a temporary SQLite
+database. Dashboard clients authorize, read, configure and revoke through the
+same service. A test-only non-credential JSON response carries the generated
+message canary exactly once. Before its final checkpoint, the paired helper scans
+its live SQLite main/WAL/SHM files for the callback code, verifier and issued
+credentials; the parent retains the final post-revoke scans across process
+streams, JSON status, SQLite artifacts and fixture sources.
 
-This proves the local callback-to-revocation state transition and secret-storage
-boundary. It does not use production HTTPS, Better Auth, PostgreSQL, a signed
-Setup-to-Agent transport, the macOS Keychain ACL, or Railway networking, and is
-not evidence that a deployed installation paired successfully.
+This proves the local callback-to-revocation state transition, Agent-owned PKCE
+continuity and pre-checkpoint temporary-SQLite canary boundary. It does not use
+production HTTPS, Better Auth, PostgreSQL, a signed Setup-to-Agent transport, the
+macOS Keychain ACL, or Railway networking, and is not evidence that a deployed
+installation paired successfully.
 
 For a future live deployment, separately record the deployed API origin,
 database migration version, Better Auth login result, one successful callback,

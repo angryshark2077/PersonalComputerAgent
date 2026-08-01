@@ -24,13 +24,18 @@ export interface S1bAcceptanceInspection {
   exchangeCount: number;
   controlRequests: Array<{ deviceId: string | null; status: number }>;
   nonCredentialJson: readonly Buffer[];
+  pkce: {
+    pairingStarts: number;
+    verifierDiffersFromCallbackState: boolean;
+    challengeMatched: boolean;
+  };
   sensitiveValues: readonly string[];
 }
 
 export interface S1bAcceptanceCloud {
   origin: string;
   owner: OwnerPrincipal;
-  startPairing(): Promise<S1bPairingHandoff>;
+  waitForPairingStart(): Promise<S1bPairingHandoff>;
   acceptCallback(redirect: string, callbackState: string): Promise<string>;
   waitForExchange(): Promise<S1bExchangedDevice>;
   inspect(): S1bAcceptanceInspection;
@@ -42,6 +47,15 @@ interface CredentialGrant {
   device_id: string;
   device_access_token: string;
   refresh_token: string;
+}
+
+interface PairingStartRequest {
+  callback_state: string;
+  code_challenge: string;
+}
+
+interface PairingExchangeRequest {
+  code_verifier: string;
 }
 
 export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
@@ -57,6 +71,17 @@ export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
   const nonCredentialJson: Buffer[] = [];
   const messageCanary = `accept-canary-${randomBytes(24).toString("base64url")}`;
   const sensitiveValues = new Set<string>([messageCanary]);
+  let pairingStarts = 0;
+  let pairingCallbackState: string | null = null;
+  let pairingCodeChallenge: string | null = null;
+  let verifierDiffersFromCallbackState = false;
+  let challengeMatched = false;
+  let resolvePairingStart: (handoff: S1bPairingHandoff) => void;
+  let rejectPairingStart: (error: Error) => void;
+  const pairingStarted = new Promise<S1bPairingHandoff>((resolve, reject) => {
+    resolvePairingStart = resolve;
+    rejectPairingStart = reject;
+  });
   let exchangeCount = 0;
   let resolveExchange: (device: S1bExchangedDevice) => void;
   let rejectExchange: (error: Error) => void;
@@ -79,6 +104,9 @@ export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
     sensitiveValues.add(code);
     return context.text("Pairing callback accepted.");
   });
+  app.get("/test/s1b/non-credential-canary", (context) =>
+    context.json({ message_canary: messageCanary })
+  );
 
   let origin = "";
   const server = await new Promise<ServerType>((resolve, reject) => {
@@ -89,9 +117,46 @@ export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
         fetch: async (request) => {
           const url = new URL(request.url);
           if (url.pathname === "/v1/agent/control") await configured;
+          const pairingStart = url.pathname === "/v1/device-pairing/sessions"
+            && request.method === "POST"
+            ? await request.clone().json().catch(() => null) as PairingStartRequest | null
+            : null;
+          const pairingExchange = url.pathname === "/v1/device-pairing/exchange"
+            && request.method === "POST"
+            ? await request.clone().json().catch(() => null) as PairingExchangeRequest | null
+            : null;
           const response = await app.fetch(request);
           const contentType = response.headers.get("content-type") ?? "";
 
+          if (pairingStart !== null) {
+            if (response.status === 201
+              && typeof pairingStart.callback_state === "string"
+              && typeof pairingStart.code_challenge === "string") {
+              try {
+                const body = (await response.clone().json()) as { session_id: string };
+                pairingStarts += 1;
+                pairingCallbackState = pairingStart.callback_state;
+                pairingCodeChallenge = pairingStart.code_challenge;
+                sensitiveValues.add(pairingStart.callback_state);
+                resolvePairingStart({
+                  sessionId: body.session_id,
+                  callbackState: pairingStart.callback_state,
+                });
+              } catch (error) {
+                rejectPairingStart(
+                  error instanceof Error ? error : new Error("invalid pairing session response"),
+                );
+              }
+            } else if (!response.ok) {
+              rejectPairingStart(new Error(`pairing start returned ${response.status}`));
+            }
+          }
+          if (pairingExchange !== null && pairingCallbackState !== null && pairingCodeChallenge !== null) {
+            verifierDiffersFromCallbackState =
+              pairingExchange.code_verifier !== pairingCallbackState;
+            challengeMatched =
+              pkceChallenge(pairingExchange.code_verifier) === pairingCodeChallenge;
+          }
           if (url.pathname === "/v1/device-pairing/exchange" && response.ok) {
             try {
               const grant = (await response.clone().json()) as CredentialGrant;
@@ -117,13 +182,6 @@ export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
               deviceId: token === null ? null : credentialByAccessToken.get(token)?.deviceId ?? null,
               status: response.status,
             });
-            const headers = new Headers(response.headers);
-            headers.set("x-pca-sensitive-canary", messageCanary);
-            return new Response(response.body, {
-              status: response.status,
-              statusText: response.statusText,
-              headers,
-            });
           }
           return response;
         },
@@ -139,23 +197,7 @@ export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
   return {
     origin,
     owner,
-    async startPairing() {
-      const callbackState = randomBytes(32).toString("base64url");
-      sensitiveValues.add(callbackState);
-      const response = await fetch(`${origin}/v1/device-pairing/sessions`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          device_public_key: randomBytes(32).toString("base64url"),
-          code_challenge: pkceChallenge(callbackState),
-          callback_uri: `${origin}/pca/pair/callback`,
-          callback_state: callbackState,
-        }),
-      });
-      if (response.status !== 201) throw new Error(`pairing start returned ${response.status}`);
-      const body = (await response.json()) as { session_id: string };
-      return { sessionId: body.session_id, callbackState };
-    },
+    waitForPairingStart: () => pairingStarted,
     async acceptCallback(redirect, callbackState) {
       const response = await fetch(redirect);
       if (!response.ok) throw new Error(`pairing callback returned ${response.status}`);
@@ -168,6 +210,11 @@ export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
       exchangeCount,
       controlRequests: controlRequests.map((request) => ({ ...request })),
       nonCredentialJson: nonCredentialJson.map((value) => Buffer.from(value)),
+      pkce: {
+        pairingStarts,
+        verifierDiffersFromCallbackState,
+        challengeMatched,
+      },
       sensitiveValues: [...sensitiveValues],
     }),
     close: () => new Promise((resolve, reject) => {

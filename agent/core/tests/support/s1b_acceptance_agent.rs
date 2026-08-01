@@ -5,13 +5,14 @@ use std::{
     env,
     error::Error,
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, BufRead, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use pca_agentd::cloud_control::{
     AgentControlSnapshot, CloudControlRuntime, ControlClient, ControlError, ControlFuture,
     LoadedDeviceCredentials,
@@ -24,6 +25,7 @@ use pca_keychain::{
 };
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
 
@@ -31,10 +33,13 @@ type HarnessResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HarnessInput {
+struct StartInput {
     api_origin: String,
-    session_id: String,
-    callback_state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CallbackInput {
     callback_code: String,
 }
 
@@ -46,6 +51,8 @@ struct HarnessStatus<'a> {
     applied_control_revision: Option<u64>,
     device_id: &'a str,
     workspace_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paired_state_canary_checked: Option<bool>,
 }
 
 struct FileCredentialStore {
@@ -138,14 +145,41 @@ impl AcceptanceHttpClient {
         self.base_url.join(path).map_err(|_| ControlError::Contract)
     }
 
-    async fn exchange(&self, input: &HarnessInput) -> Result<DeviceCredential, ControlError> {
+    async fn start_pairing(
+        &self,
+        device_public_key: &str,
+        code_challenge: &str,
+        callback_state: &str,
+    ) -> Result<PairingSessionResponse, ControlError> {
+        let callback_uri = self.endpoint("pca/pair/callback")?.to_string();
+        let response = self
+            .client
+            .post(self.endpoint("v1/device-pairing/sessions")?)
+            .json(&PairingSessionRequest {
+                device_public_key,
+                code_challenge,
+                callback_uri: &callback_uri,
+                callback_state,
+            })
+            .send()
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        parse_response(response).await
+    }
+
+    async fn exchange(
+        &self,
+        session_id: &str,
+        callback_code: &str,
+        verifier: &str,
+    ) -> Result<DeviceCredential, ControlError> {
         let response = self
             .client
             .post(self.endpoint("v1/device-pairing/exchange")?)
             .json(&PairingExchangeRequest {
-                session_id: &input.session_id,
-                authorization_code: &input.callback_code,
-                code_verifier: &input.callback_state,
+                session_id,
+                authorization_code: callback_code,
+                code_verifier: verifier,
             })
             .send()
             .await
@@ -203,6 +237,20 @@ impl ControlClient for AcceptanceHttpClient {
 }
 
 #[derive(Serialize)]
+struct PairingSessionRequest<'a> {
+    device_public_key: &'a str,
+    code_challenge: &'a str,
+    callback_uri: &'a str,
+    callback_state: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairingSessionResponse {
+    session_id: String,
+}
+
+#[derive(Serialize)]
 struct PairingExchangeRequest<'a> {
     session_id: &'a str,
     authorization_code: &'a str,
@@ -255,7 +303,7 @@ struct ErrorBody {
 #[tokio::main]
 async fn main() -> HarnessResult<()> {
     let arguments = parse_arguments()?;
-    let input = read_input()?;
+    let input = read_input_line::<StartInput>()?;
     let runtime_root = PathBuf::from(required_argument(&arguments, "--runtime-root")?);
     let status_file = PathBuf::from(required_argument(&arguments, "--status-file")?);
     let phase = required_argument(&arguments, "--phase")?;
@@ -269,7 +317,9 @@ async fn main() -> HarnessResult<()> {
     );
 
     match phase {
-        "pair-control" => pair_and_apply(&database, &store, client, &input, &status_file).await?,
+        "pair-control" => {
+            pair_and_apply(&database, &store, client, &runtime_root, &status_file).await?
+        }
         "revoke" => revoke(&database, &store, client, &status_file).await?,
         _ => return Err("unsupported acceptance phase".into()),
     }
@@ -287,15 +337,30 @@ async fn pair_and_apply(
     database: &Arc<DbActorHandle>,
     store: &Arc<FileCredentialStore>,
     client: Arc<AcceptanceHttpClient>,
-    input: &HarnessInput,
+    runtime_root: &Path,
     status_file: &Path,
 ) -> HarnessResult<()> {
+    let verifier = random_base64url();
+    let callback_state = loop {
+        let candidate = random_base64url();
+        if candidate != verifier {
+            break candidate;
+        }
+    };
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let session = client
+        .start_pairing(&random_base64url(), &challenge, &callback_state)
+        .await
+        .map_err(|error| control_failure("pairing start failed", error))?;
+    let callback = read_input_line::<CallbackInput>()?;
     let credential = client
-        .exchange(input)
+        .exchange(&session.session_id, &callback.callback_code, &verifier)
         .await
         .map_err(|error| control_failure("pairing exchange failed", error))?;
     let device_id = credential.device_id().to_owned();
     let workspace_id = credential.workspace_id().to_owned();
+    let access_token = credential.access_credential().to_owned();
+    let refresh_token = credential.refresh_credential().to_owned();
     store_device_credential(store.as_ref(), &credential)?;
     let runtime = CloudControlRuntime::start(
         Arc::clone(database),
@@ -312,6 +377,15 @@ async fn pair_and_apply(
     if pairing_state.applied_control_revision != revision {
         return Err("control revision was not durable".into());
     }
+    scan_paired_sqlite(
+        runtime_root,
+        [
+            callback.callback_code.as_str(),
+            verifier.as_str(),
+            access_token.as_str(),
+            refresh_token.as_str(),
+        ],
+    )?;
     write_status(
         status_file,
         &HarnessStatus {
@@ -321,6 +395,7 @@ async fn pair_and_apply(
             applied_control_revision: Some(revision),
             device_id: &device_id,
             workspace_id: &workspace_id,
+            paired_state_canary_checked: Some(true),
         },
     )
 }
@@ -390,6 +465,7 @@ async fn revoke(
             applied_control_revision: None,
             device_id: &device_id,
             workspace_id: &workspace_id,
+            paired_state_canary_checked: None,
         },
     )
 }
@@ -487,10 +563,57 @@ fn write_status(path: &Path, status: &HarnessStatus<'_>) -> HarnessResult<()> {
     Ok(())
 }
 
-fn read_input() -> HarnessResult<HarnessInput> {
-    let mut input = Vec::new();
-    io::stdin().read_to_end(&mut input)?;
-    Ok(serde_json::from_slice(&input)?)
+fn scan_paired_sqlite<'a>(
+    runtime_root: &Path,
+    sensitive_values: impl IntoIterator<Item = &'a str>,
+) -> HarnessResult<()> {
+    let sensitive_values = sensitive_values
+        .into_iter()
+        .map(str::as_bytes)
+        .collect::<Vec<_>>();
+    for name in ["agent.sqlite", "agent.sqlite-wal", "agent.sqlite-shm"] {
+        let path = runtime_root.join(name);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if sensitive_values
+            .iter()
+            .any(|sensitive| contains_bytes(&bytes, sensitive))
+        {
+            return Err(format!(
+                "paired-state SQLite artifact {name} contained sensitive material"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn contains_bytes(value: &[u8], candidate: &[u8]) -> bool {
+    !candidate.is_empty()
+        && value
+            .windows(candidate.len())
+            .any(|window| window == candidate)
+}
+
+fn random_base64url() -> String {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut bytes = [0_u8; 32];
+    bytes[..16].copy_from_slice(first.as_bytes());
+    bytes[16..].copy_from_slice(second.as_bytes());
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn read_input_line<T: for<'de> Deserialize<'de>>() -> HarnessResult<T> {
+    let mut input = String::new();
+    let bytes_read = io::stdin().lock().read_line(&mut input)?;
+    if bytes_read == 0 {
+        return Err("missing acceptance input".into());
+    }
+    Ok(serde_json::from_str(&input)?)
 }
 
 fn parse_arguments() -> HarnessResult<BTreeMap<String, String>> {
