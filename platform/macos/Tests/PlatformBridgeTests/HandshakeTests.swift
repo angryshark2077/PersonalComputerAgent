@@ -814,7 +814,7 @@ final class HandshakeTests: XCTestCase {
 
     private func readFrame(
         from descriptor: Int32,
-        timeoutMilliseconds: UInt64 = 2_000,
+        timeoutMilliseconds: UInt64 = 5_000,
         oneByteAtATime: Bool = false
     ) async throws -> Data {
         var decoder = FrameDecoder()

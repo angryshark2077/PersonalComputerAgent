@@ -1145,7 +1145,12 @@ mod tests {
         )
         .await
         .expect("start paired runtime");
-        yield_until(|| sink.attempts.load(Ordering::SeqCst) == 2).await;
+        yield_until(|| {
+            sink.attempts.load(Ordering::SeqCst) == 2
+                && controls.cpu_calls() == 1
+                && controls.disk_calls() == 1
+        })
+        .await;
         let baseline = (controls.cpu_calls(), controls.disk_calls());
         assert_eq!(baseline, (1, 1));
 
