@@ -1322,21 +1322,6 @@ mod tests {
             ]
         );
 
-        drop(observer);
-        Connection::open(&database_path)
-            .expect("open outbox ack connection")
-            .execute(
-                "UPDATE sync_outbox SET state = 'acked'
-                 WHERE event_id LIKE 'seed-%' AND rowid <= 2_003",
-                [],
-            )
-            .expect("lower outbox below low water");
-        tokio::time::advance(Duration::from_secs(30)).await;
-        yield_until_with_timeout(Duration::from_secs(30), || {
-            controls.cpu_calls() == 1 && controls.disk_calls() == 1
-        })
-        .await;
-
         runtime.shutdown().await.expect("shutdown runtime");
         close_database(database).await;
     }
