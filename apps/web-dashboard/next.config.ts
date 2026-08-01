@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import { PHASE_PRODUCTION_BUILD } from "next/constants.js";
 
 import {
   requireBuildProxyOrigin,
@@ -11,6 +12,9 @@ export function createNextConfig(
 ): NextConfig {
   const origin = validateInternalOrigin(internalOrigin);
   return {
+    env: {
+      DASHBOARD_BUILD_PROXY_ORIGIN: origin,
+    },
     async rewrites() {
       return [
         { source: "/api/auth/:path*", destination: `${origin}/api/auth/:path*` },
@@ -22,7 +26,10 @@ export function createNextConfig(
 
 validateDashboardEnvironment(process.env);
 
-const buildProxyOrigin =
-  process.env.NODE_ENV === "production" ? requireBuildProxyOrigin(process.env) : undefined;
+export default function dashboardConfig(phase: string): NextConfig {
+  if (phase !== PHASE_PRODUCTION_BUILD) {
+    return {};
+  }
 
-export default buildProxyOrigin === undefined ? {} : createNextConfig(buildProxyOrigin);
+  return createNextConfig(requireBuildProxyOrigin(process.env));
+}

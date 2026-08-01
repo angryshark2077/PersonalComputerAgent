@@ -11,8 +11,13 @@ export function validateDashboardEnvironment(environment: DashboardEnvironment):
 
 export function validateInternalOrigin(
   internalOrigin: string,
-  privateHosts: readonly string[] = [],
 ): string {
+  const privateOrigin = /^http:\/\/[a-z0-9-]+\.railway\.internal:([1-9]\d{0,4})$/i.exec(internalOrigin);
+  const port = privateOrigin === null ? undefined : Number(privateOrigin[1]);
+  if (port === undefined || port > 65535) {
+    throw new Error("CLOUD_API_INTERNAL_ORIGIN must be an HTTP Railway private origin with an explicit valid port.");
+  }
+
   let url: URL;
   try {
     url = new URL(internalOrigin);
@@ -23,12 +28,13 @@ export function validateInternalOrigin(
   if (
     url.protocol !== "http:" ||
     url.hostname.length === 0 ||
-    (!url.hostname.endsWith(".railway.internal") && !privateHosts.includes(url.hostname)) ||
+    url.username.length > 0 ||
+    url.password.length > 0 ||
     url.pathname !== "/" ||
     url.search.length > 0 ||
     url.hash.length > 0
   ) {
-    throw new Error("CLOUD_API_INTERNAL_ORIGIN must be an HTTP private origin without a path, query, or fragment.");
+    throw new Error("CLOUD_API_INTERNAL_ORIGIN must be an HTTP Railway private origin with an explicit valid port.");
   }
 
   return url.origin;
@@ -42,10 +48,9 @@ export function requireBuildProxyOrigin(environment: NodeJS.ProcessEnv): string 
   return validateInternalOrigin(environment.CLOUD_API_INTERNAL_ORIGIN);
 }
 
-export const dashboardBuildProxyOrigin =
-  process.env.NODE_ENV === "production" ? requireBuildProxyOrigin(process.env) : undefined;
+export const dashboardBuildProxyOrigin = process.env.DASHBOARD_BUILD_PROXY_ORIGIN;
 
-export const dashboardBuildReadiness = { ready: true } as const;
+export const dashboardBuildReadiness = { ready: dashboardBuildProxyOrigin !== undefined } as const;
 
 export function dashboardHealthResponse(): Response {
   return Response.json({ status: "ok" });
