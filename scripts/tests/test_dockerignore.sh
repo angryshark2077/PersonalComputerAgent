@@ -9,7 +9,21 @@ dockerignore="$repository_root/.dockerignore"
   exit 1
 }
 
-for required_pattern in '.env*' 'node_modules' '.next' 'dist' '.worktrees' '.git'; do
+for required_pattern in \
+  '.env*' \
+  'node_modules' \
+  '.next' \
+  'dist' \
+  '.worktrees' \
+  '.git' \
+  '.superpowers' \
+  'target' \
+  'platform/macos/.build' \
+  '*.db' \
+  '*.db-wal' \
+  '*.db-shm' \
+  '*.log'
+do
   if ! grep -Fqx "$required_pattern" "$dockerignore"; then
     echo "missing .dockerignore pattern: $required_pattern" >&2
     exit 1

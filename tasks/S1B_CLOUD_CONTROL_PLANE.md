@@ -44,6 +44,12 @@ pairing is claimed by this task.
   user LaunchAgent recovery.
 - S2 collector work and S3 full batch sync remain separate subsequent slices.
 
+The full repository gate includes a process acceptance harness using a
+loopback Setup callback double, in-memory Cloud API, file-backed test Keychain,
+temporary SQLite, and the real Dashboard API client. It verifies revision-1
+audit delivery and revoke cleanup while scanning stdout, JSON status, SQLite,
+and repository fixtures for runtime credential and message-body canaries.
+
 The authoritative operational procedure is
 `docs/runbooks/S1B_PAIRING_REPAIR.md`; field, index, retention and secret
 boundaries are in `docs/data/s1b-control-plane.md`.

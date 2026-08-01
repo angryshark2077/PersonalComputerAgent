@@ -44,7 +44,9 @@ Railway Variables UI.
    to `pnpm --filter @pca/cloud-api migrate`. In each service's health-check
    setting, use `/healthz`.
 4. Deploy `pca-cloud-api` first. Confirm its migration/pre-deploy phase and
-   `/healthz` complete successfully. Then deploy `pca-dashboard`.
+   `/healthz` complete successfully. Then deploy `pca-dashboard`. Its
+   `/healthz` remains `503 not_ready` until the private API origin is present
+   and valid; do not bypass that readiness failure.
 
 ## Public verification and acceptance
 

@@ -4,3 +4,10 @@ node_modules
 dist
 .worktrees
 .git
+.superpowers
+target
+platform/macos/.build
+*.db
+*.db-wal
+*.db-shm
+*.log

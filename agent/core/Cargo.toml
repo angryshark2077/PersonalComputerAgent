@@ -13,6 +13,11 @@ name = "pca-test-bridge"
 path = "tests/support/fake_bridge.rs"
 required-features = ["process-test-hooks"]
 
+[[bin]]
+name = "pca-s1b-acceptance-agent"
+path = "tests/support/s1b_acceptance_agent.rs"
+required-features = ["process-test-hooks"]
+
 [dependencies]
 base64 = "=0.22.1"
 pca-agent-runtime = { path = "../../crates/agent-runtime" }

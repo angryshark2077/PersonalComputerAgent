@@ -89,7 +89,8 @@ Secret 永不进入 Event Payload、SQLite 普通表、日志、诊断包或对�
   `BETTER_AUTH_SECRET` exist only as Railway Variables; `BETTER_AUTH_URL` is
   the Dashboard HTTPS origin. The Dashboard's server-only
   `CLOUD_API_INTERNAL_ORIGIN` points to the API private HTTP origin, and no
-  `NEXT_PUBLIC_` API-origin variable is permitted.
+  `NEXT_PUBLIC_` API-origin variable is permitted. Dashboard runtime health
+  returns `503 not_ready` if that private origin is missing or invalid.
 - The local Railway verifier checks only public `/healthz` fixtures and rejects
   response wording that exposes database URLs, tokens, or Keychain data. It is
   not evidence of a live Railway deployment, signed local handoff, or Keychain

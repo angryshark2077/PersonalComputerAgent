@@ -36,9 +36,12 @@ Keychain material.
 
 ## Health and migration behavior
 
-- Both public services expose `/healthz` with exactly `{ "status": "ok" }`.
-  `scripts/verify-railway-deployment.sh` requires public HTTPS origins and
-  rejects health bodies containing `DATABASE_URL`, token, or Keychain wording.
+- Both public services expose `/healthz` with exactly `{ "status": "ok" }`
+  when ready. The Dashboard returns `503` with `{ "status": "not_ready" }`
+  when `CLOUD_API_INTERNAL_ORIGIN` is missing or invalid, so Railway cannot
+  admit a runtime that has no private API route. `scripts/verify-railway-deployment.sh`
+  requires public HTTPS origins and rejects health bodies containing
+  `DATABASE_URL`, token, or Keychain wording.
 - The API pre-deploy command is `pnpm --filter @pca/cloud-api migrate`.
   The migration runner uses a transaction-scoped PostgreSQL advisory lock and
   records SHA-256 checksums in `_pca_migrations` only after each SQL migration
