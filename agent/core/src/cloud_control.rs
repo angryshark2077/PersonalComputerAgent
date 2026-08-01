@@ -401,7 +401,9 @@ pub async fn synchronize_pairing_state(
             Ok(true)
         }
         Ok(None) | Err(CredentialError::InvalidCredential) => {
-            database.clear_pairing_state().await?;
+            database
+                .clear_pairing_state_and_disable_sensitive_collectors()
+                .await?;
             Ok(false)
         }
         Err(error) => Err(error.into()),
@@ -584,10 +586,11 @@ async fn revoke(
         state.unpaired = true;
         state.applied_revision = None;
     }
-    delete_device_credential(credentials.store.as_ref())?;
+    let keychain_result = delete_device_credential(credentials.store.as_ref());
     database
         .clear_pairing_state_and_disable_sensitive_collectors()
         .await?;
+    keychain_result?;
     Ok(())
 }
 

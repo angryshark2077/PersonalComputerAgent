@@ -28,3 +28,16 @@ The deterministic control test proves a revoked response removes both local pair
 
 1. No approved production Cloud API origin/configuration source exists in this repository. `HttpControlClient` accepts only an HTTPS URL, but Agent startup does not invent one or send a request; it remains `degraded` rather than silently targeting an arbitrary service.
 2. No approved authenticated 0600 UDS transport and installed-app Keychain ACL creation binding exists between Swift Setup and Agent Core. The typed Swift and Rust handoff ports are ready and `UnavailablePairingAgentBridge` remains fail-closed; the current macOS Keychain adapter refuses to create an unrestricted device item. Consequently this task does not claim a live Setup-to-Agent-to-Cloud pairing flow.
+
+## Fix round 1 (base `5d315f3`)
+
+- Missing or corrupt Keychain startup now calls the same atomic local operation as revocation: it clears pairing state and disables both `network` and `communication.wechat` durable Collector states. It no longer leaves an enabled sensitive configuration behind.
+- Revocation now attempts Keychain deletion, always performs the atomic SQLite cleanup, and only then returns the Keychain error. A failed deletion therefore remains observable without allowing a stale pairing or enabled sensitive Collector state to survive.
+- Focused verification exited `0`:
+
+```bash
+PATH=/Users/jacob/.rustup/toolchains/1.82.0-aarch64-apple-darwin/bin:/opt/homebrew/bin:/usr/bin:/bin cargo test -p pca-agentd --test cloud_control_process
+git diff --check
+```
+
+The focused test file now has explicit regressions for corrupt startup records and injected Keychain deletion failures; both assert no pairing state remains and both sensitive Collector keys are `disabled`.
