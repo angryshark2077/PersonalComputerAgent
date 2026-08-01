@@ -1,5 +1,6 @@
 use std::{
     fs,
+    fs::File,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     thread,
@@ -575,6 +576,23 @@ impl DbActorHandle {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("communication-spool")
+    }
+
+    /// Opens one deterministic communication spool file without following a replaced root or
+    /// final-component symlink. Callers must verify the returned bytes against their manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-canonical names, unsafe roots, missing files, symlinks, or other
+    /// filesystem failures.
+    pub fn open_communication_spool_file(
+        database_path: &Path,
+        file_name: &str,
+    ) -> Result<File, DbError> {
+        repository::open_communication_spool_file(
+            &Self::communication_spool_root(database_path),
+            file_name,
+        )
     }
 
     /// Atomically stores one communication Event, its local projection, Cursor, private spool

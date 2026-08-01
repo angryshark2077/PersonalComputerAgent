@@ -14,8 +14,6 @@ pub use actor::DbActorHandle;
 #[cfg(feature = "process-test-hooks")]
 pub use actor::ProcessTestHooks;
 pub use error::DbError;
-use std::path::PathBuf;
-
 use pca_domain::{CommunicationMessageRecorded, EventEnvelope};
 
 /// The initial local database migration.
@@ -33,6 +31,9 @@ pub const S1B_CLOUD_API_ORIGIN_MIGRATION: &str =
     include_str!("../migrations/0004_s1b_cloud_api_origin.sql");
 /// The immutable S3 communication-message local storage migration.
 pub const WECHAT_MESSAGES_MIGRATION: &str = include_str!("../migrations/0005_wechat_messages.sql");
+/// The immutable Task 4 fix migration for deterministic attachment spool names.
+pub const HARDEN_ATTACHMENT_SPOOL_MIGRATION: &str =
+    include_str!("../migrations/0006_harden_attachment_spool.sql");
 
 /// A private spool-file reference corresponding to one validated media manifest.
 ///
@@ -41,7 +42,8 @@ pub const WECHAT_MESSAGES_MIGRATION: &str = include_str!("../migrations/0005_wec
 #[derive(Clone, PartialEq, Eq)]
 pub struct CommunicationAttachmentSpoolReference {
     pub attachment_id: String,
-    pub path: PathBuf,
+    /// Fixed lower-case SHA-256 filename, stored directly below the private spool root.
+    pub file_name: String,
 }
 
 /// The complete local atomic-write input for one eligible communication message.
@@ -117,8 +119,9 @@ pub struct DbHealth {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION, S1B_CLOUD_API_ORIGIN_MIGRATION,
-        S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION, WECHAT_MESSAGES_MIGRATION,
+        BASELINE_MIGRATION, HARDEN_ATTACHMENT_SPOOL_MIGRATION, S1A_RUNTIME_MIGRATION,
+        S1B_CLOUD_API_ORIGIN_MIGRATION, S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION,
+        WECHAT_MESSAGES_MIGRATION,
     };
 
     #[test]
@@ -166,5 +169,10 @@ mod tests {
         assert!(WECHAT_MESSAGES_MIGRATION.contains("attachment_spool"));
         assert!(!WECHAT_MESSAGES_MIGRATION.contains("key_material"));
         assert!(!WECHAT_MESSAGES_MIGRATION.contains("credential"));
+    }
+
+    #[test]
+    fn attachment_spool_fix_requires_the_sha256_filename() {
+        assert!(HARDEN_ATTACHMENT_SPOOL_MIGRATION.contains("spool_relative_path <> NEW.sha256"));
     }
 }

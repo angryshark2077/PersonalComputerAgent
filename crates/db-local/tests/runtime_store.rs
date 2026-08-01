@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pca_db_local::{DbActorHandle, DbError, BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION};
+use pca_db_local::{
+    DbActorHandle, DbError, BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION,
+    S1B_CLOUD_API_ORIGIN_MIGRATION, S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION,
+};
 use pca_domain::{
     AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventCommit, EventEnvelope,
     Sensitivity,
@@ -119,6 +122,9 @@ fn apply_previous_migration_chain(connection: &Connection) {
     for (id, sql) in [
         ("0000", BASELINE_MIGRATION),
         ("0001", S1A_RUNTIME_MIGRATION),
+        ("0002", S2_COLLECTOR_STATE_MIGRATION),
+        ("0003", S1B_PAIRING_STATE_MIGRATION),
+        ("0004", S1B_CLOUD_API_ORIGIN_MIGRATION),
     ] {
         connection.execute_batch(sql).expect("apply old migration");
         let checksum = format!("{:x}", Sha256::digest(sql.as_bytes()));
@@ -168,6 +174,50 @@ fn event_and_outbox_rows(connection: &Connection) -> (Vec<Vec<String>>, Vec<Vec<
     (events, outbox)
 }
 
+type PairingSnapshot = (String, String, String, u64, String, u64, i64);
+
+fn insert_previous_pairing_state(connection: &Connection) {
+    connection
+        .execute(
+            "INSERT INTO pairing_state (
+                singleton_id, device_id, workspace_id, credential_ref, credential_generation,
+                cloud_api_origin, applied_control_revision, paired_at_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                "01981111-7111-8111-8111-111111111111",
+                "01982222-7222-8222-8222-222222222222",
+                "keychain://pca/device/current",
+                7_u64,
+                "https://pca-cloud-api-production.up.railway.app",
+                9_u64,
+                1_754_000_000_000_i64,
+            ),
+        )
+        .expect("insert previous pairing state");
+}
+
+fn pairing_snapshot(connection: &Connection) -> PairingSnapshot {
+    connection
+        .query_row(
+            "SELECT device_id, workspace_id, credential_ref, credential_generation,
+                    cloud_api_origin, applied_control_revision, paired_at_ms
+             FROM pairing_state WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .expect("read pairing state")
+}
+
 fn schema(connection: &Connection) -> Vec<(String, String, String)> {
     let mut statement = connection
         .prepare(
@@ -191,7 +241,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 5);
+    assert_eq!(health.schema_version, 6);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -269,6 +319,8 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
             [],
         )
         .expect("insert previous Outbox");
+    insert_previous_pairing_state(&connection);
+    let pairing_before = pairing_snapshot(&connection);
     let before = event_and_outbox_rows(&connection);
     drop(connection);
 
@@ -277,12 +329,14 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        5
+        6
     );
     db.shutdown().await.expect("close upgraded database");
 
     let connection = Connection::open(&path).expect("inspect upgraded database");
     assert_eq!(event_and_outbox_rows(&connection), before);
+    let pairing_after = pairing_snapshot(&connection);
+    assert_eq!(pairing_after, pairing_before);
     assert_eq!(
         connection
             .query_row(
@@ -846,7 +900,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0006', 'future', '9.0.0', 1, 1, 'completed')",
+             VALUES ('0007', 'future', '9.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -857,8 +911,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 6,
-            max_supported: 5
+            found: 7,
+            max_supported: 6
         })
     ));
 }
@@ -881,7 +935,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 5);
+    assert_eq!(health.schema_version, 6);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(

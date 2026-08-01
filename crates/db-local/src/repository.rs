@@ -1,8 +1,4 @@
-use std::{
-    collections::HashSet,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, fs::File, os::unix::fs::MetadataExt, path::Path};
 
 use pca_domain::{
     AgentStatus, BridgeStatus, CollectorState, CollectorStatus, CommunicationAttachment,
@@ -35,7 +31,6 @@ struct SerializedEvent<'a> {
 
 struct ValidatedSpoolReference<'a> {
     attachment: &'a CommunicationAttachment,
-    relative_path: PathBuf,
 }
 
 pub(crate) fn append_event_with_outbox(
@@ -113,6 +108,7 @@ pub(crate) fn commit_communication_message(
     if communication_message_exists(&transaction, commit)? {
         validate_existing_event(&transaction, &serialized)?;
         validate_existing_outbox(&transaction, &serialized)?;
+        validate_existing_attachment_spool(&transaction, commit)?;
         return Ok(());
     }
 
@@ -173,17 +169,6 @@ fn validate_spool_references<'a>(
     spool_root: &Path,
     commit: &'a CommunicationMessageCommit,
 ) -> Result<Vec<ValidatedSpoolReference<'a>>, DbError> {
-    let canonical_root = fs::canonicalize(spool_root)
-        .map_err(|error| DbError::sqlite("validate communication spool root", error))?;
-    let root_metadata = fs::metadata(&canonical_root)
-        .map_err(|error| DbError::sqlite("validate communication spool root", error))?;
-    if !root_metadata.is_dir() {
-        return Err(DbError::sqlite(
-            "validate communication spool root",
-            "communication spool root is not a directory",
-        ));
-    }
-
     if commit.message.attachments().len() != commit.attachment_spool.len() {
         return Err(DbError::sqlite(
             "validate communication spool references",
@@ -228,32 +213,14 @@ fn validate_spool_references<'a>(
             ));
         }
 
-        let metadata = fs::symlink_metadata(&reference.path)
-            .map_err(|error| DbError::sqlite("validate communication spool path", error))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if reference.file_name != attachment.sha256() {
             return Err(DbError::sqlite(
                 "validate communication spool path",
-                "attachment spool path must be a regular private file",
+                "attachment spool filename must equal its manifest SHA-256",
             ));
         }
-        let canonical_path = fs::canonicalize(&reference.path)
-            .map_err(|error| DbError::sqlite("validate communication spool path", error))?;
-        let relative_path = canonical_path.strip_prefix(&canonical_root).map_err(|_| {
-            DbError::sqlite(
-                "validate communication spool path",
-                "attachment spool path escapes the private spool root",
-            )
-        })?;
-        if relative_path.as_os_str().is_empty() {
-            return Err(DbError::sqlite(
-                "validate communication spool path",
-                "attachment spool path must name a file below the private spool root",
-            ));
-        }
-        validated.push(ValidatedSpoolReference {
-            attachment,
-            relative_path: relative_path.to_owned(),
-        });
+        let _file = open_communication_spool_file(spool_root, &reference.file_name)?;
+        validated.push(ValidatedSpoolReference { attachment });
     }
     if !remaining.is_empty() {
         return Err(DbError::sqlite(
@@ -298,6 +265,82 @@ fn communication_message_exists(
             "source key conflicts with a different immutable communication message",
         ))
     }
+}
+
+fn validate_existing_attachment_spool(
+    transaction: &Transaction<'_>,
+    commit: &CommunicationMessageCommit,
+) -> Result<(), DbError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT s.attachment_id, s.kind, s.sha256, s.size_bytes, s.mime_type,
+                    s.spool_relative_path
+             FROM attachment_spool AS s
+             INNER JOIN communication_messages AS m ON m.local_message_id = s.local_message_id
+             WHERE m.account_id = ?1 AND m.source_key = ?2",
+        )
+        .map_err(|error| DbError::sqlite("prepare existing attachment spool query", error))?;
+    let rows = statement
+        .query_map(
+            params![commit.account_id, commit.message.source_key()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .map_err(|error| DbError::sqlite("query existing attachment spool", error))?;
+    let persisted = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| DbError::sqlite("read existing attachment spool", error))?;
+    if persisted.len() != commit.attachment_spool.len() {
+        return Err(DbError::sqlite(
+            "validate existing attachment spool",
+            "source key conflicts with a different attachment spool count",
+        ));
+    }
+
+    for reference in &commit.attachment_spool {
+        let attachment = commit
+            .message
+            .attachments()
+            .iter()
+            .find(|attachment| attachment.attachment_id() == reference.attachment_id)
+            .ok_or_else(|| {
+                DbError::sqlite(
+                    "validate existing attachment spool",
+                    "attachment spool reference has no matching manifest",
+                )
+            })?;
+        let expected_size = i64::try_from(attachment.size_bytes()).map_err(|_| {
+            DbError::sqlite(
+                "validate existing attachment spool",
+                "attachment byte length exceeds SQLite integer range",
+            )
+        })?;
+        let matches = persisted.iter().any(
+            |(attachment_id, kind, sha256, size_bytes, mime_type, spool_relative_path)| {
+                attachment_id == &reference.attachment_id
+                    && kind == message_kind_name(attachment.kind())
+                    && sha256 == attachment.sha256()
+                    && *size_bytes == expected_size
+                    && mime_type == attachment.mime_type()
+                    && spool_relative_path == &reference.file_name
+            },
+        );
+        if !matches {
+            return Err(DbError::sqlite(
+                "validate existing attachment spool",
+                "source key conflicts with different immutable attachment spool metadata",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn upsert_communication_conversation(
@@ -366,12 +409,6 @@ fn insert_attachment_spool(
     local_message_id: i64,
     reference: &ValidatedSpoolReference<'_>,
 ) -> Result<(), DbError> {
-    let relative_path = reference.relative_path.to_str().ok_or_else(|| {
-        DbError::sqlite(
-            "insert attachment spool",
-            "private spool path is not valid UTF-8",
-        )
-    })?;
     let size_bytes = i64::try_from(reference.attachment.size_bytes()).map_err(|_| {
         DbError::sqlite(
             "insert attachment spool",
@@ -392,11 +429,68 @@ fn insert_attachment_spool(
                 reference.attachment.sha256(),
                 size_bytes,
                 reference.attachment.mime_type(),
-                relative_path,
+                reference.attachment.sha256(),
             ],
         )
         .map(|_| ())
         .map_err(|error| DbError::sqlite("insert attachment spool", error))
+}
+
+pub(crate) fn open_communication_spool_file(
+    spool_root: &Path,
+    file_name: &str,
+) -> Result<File, DbError> {
+    validate_spool_file_name(file_name)?;
+    let directory = rustix::fs::open(
+        spool_root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| DbError::sqlite("open communication spool root", error))?;
+    let root_metadata = directory
+        .metadata()
+        .map_err(|error| DbError::sqlite("inspect communication spool root", error))?;
+    if !root_metadata.is_dir() || root_metadata.mode() & 0o077 != 0 {
+        return Err(DbError::sqlite(
+            "inspect communication spool root",
+            "communication spool root is not owner-private",
+        ));
+    }
+
+    let file = rustix::fs::openat(
+        &directory,
+        file_name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| DbError::sqlite("open communication spool file", error))?;
+    if !file
+        .metadata()
+        .map_err(|error| DbError::sqlite("inspect communication spool file", error))?
+        .is_file()
+    {
+        return Err(DbError::sqlite(
+            "inspect communication spool file",
+            "communication spool entry must be a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn validate_spool_file_name(file_name: &str) -> Result<(), DbError> {
+    if is_lowercase_sha256(file_name) {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "validate communication spool path",
+            "attachment spool filename must be one lowercase SHA-256 component",
+        ))
+    }
 }
 
 fn advance_communication_cursor(
