@@ -155,6 +155,13 @@ pca-forbidden = {{ package = "{dependency_name}", path = "{dependency_path}" }}
         self.assertIs(dependency["uses_default_features"], False)
         self.assertEqual(dependency["features"], ["system", "disk"])
 
+    def test_contract_gate_installs_postgresql_for_cloud_integration_tests(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn("brew install postgresql@17", workflow)
+        self.assertIn("brew --prefix postgresql@17", workflow)
+        self.assertLess(workflow.index("brew install postgresql@17"), workflow.index("pnpm test"))
+
 
 if __name__ == "__main__":
     unittest.main()

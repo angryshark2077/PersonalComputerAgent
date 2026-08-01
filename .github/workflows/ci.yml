@@ -101,6 +101,10 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - name: Install PostgreSQL test tools
+        run: |
+          brew install postgresql@17
+          echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
 

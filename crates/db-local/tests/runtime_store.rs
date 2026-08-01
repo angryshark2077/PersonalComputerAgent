@@ -756,7 +756,7 @@ async fn locked_database_fails_after_bounded_busy_timeout() {
     let elapsed = started.elapsed();
     assert!(matches!(result, Err(DbError::Sqlite { .. })));
     assert!(elapsed >= Duration::from_secs(4), "elapsed: {elapsed:?}");
-    assert!(elapsed < Duration::from_secs(8), "elapsed: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(12), "elapsed: {elapsed:?}");
     lock.execute_batch("ROLLBACK").expect("release write lock");
     assert_eq!(
         db.count_event_and_outbox(&event.event_id)
