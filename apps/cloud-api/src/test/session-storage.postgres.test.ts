@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
 import test from "node:test";
 
@@ -20,9 +21,11 @@ import {
 } from "@pca/db-cloud/src/schema.js";
 
 import { createHashedSessionAdapter } from "../index.js";
+import { runCloudMigrations } from "../migrate.js";
 import { hashSecret } from "../pairing.js";
 
 const postgresUser = "pca_session_test";
+const testDirectory = dirname(fileURLToPath(import.meta.url));
 
 test("PostgreSQL stores only hashes while raw signed cookies still resolve and revoke sessions", async () => {
   const postgres = await startTemporaryPostgres();
@@ -170,10 +173,7 @@ async function startTemporaryPostgres() {
     ]);
     started = true;
     const connectionString = `postgresql://${postgresUser}@127.0.0.1:${port}/postgres`;
-    const migrations = await readdir(resolve(process.cwd(), "../../packages/db-cloud/migrations"));
-    for (const migration of migrations.filter((file) => file.endsWith(".sql")).sort()) {
-      run("psql", ["-X", "-v", "ON_ERROR_STOP=1", connectionString, "-f", resolve(process.cwd(), "../../packages/db-cloud/migrations", migration)]);
-    }
+    await runCloudMigrations(connectionString, resolve(testDirectory, "../../../../packages/db-cloud/migrations"));
     return {
       connectionString,
       stop: async () => {

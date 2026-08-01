@@ -53,6 +53,7 @@ export function createApp(options: CreateAppOptions): Hono {
   const pairingRateLimiter = options.pairingRateLimiter ?? new PairingRateLimiter();
   const app = new Hono();
 
+  app.get("/healthz", (context) => context.json({ status: "ok" }));
   app.get("/health", (context) => context.json({ ready: true, service: "pca-cloud-api" }));
 
   app.post("/v1/device-pairing/sessions", async (context) => {
