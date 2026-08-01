@@ -363,6 +363,8 @@ git commit -m "feat: sync communication events separately"
 - Modify: `packages/db-cloud/src/repository.ts`
 - Modify: `packages/db-cloud/tests/repository.test.ts`
 - Modify: `apps/cloud-api/src/index.ts`
+- Modify: `apps/cloud-api/src/control.ts`
+- Modify: `apps/cloud-api/src/test/control.test.ts`
 - Create: `apps/cloud-api/src/test/communication.test.ts`
 - Modify: `apps/cloud-api/src/migrate.ts`
 - Modify: `scripts/verify_migrations.py`
@@ -390,7 +392,9 @@ Expected: FAIL because the migration, repository and routes do not exist.
 
 - [ ] **Step 3: Implement immutable, indexed projections**
 
-Create tables for conversations, messages, message attachments, objects and tombstones. Enforce
+Create tables for conversations, messages, message attachments, objects and tombstones. Add a new
+immutable migration for the exact v2 `communication.wechat` fields, backfill existing devices to
+`enabled=false`, and reject every persisted shape other than the v2 fixed scope. Enforce
 device/workspace composite foreign keys, source-key uniqueness, permitted direction/type values,
 attachment manifest hashes and no body/blob in object records. Add endpoint-level schema validation,
 device credential auth for ingest, Owner session auth for reads, and `limit` bounds. Store only R2
@@ -467,6 +471,8 @@ git commit -m "feat: add private r2 communication objects"
 - Modify: `agent/core/src/communication.rs`
 - Modify: `crates/db-local/src/actor.rs`
 - Modify: `crates/db-local/src/repository.rs`
+- Modify: `apps/cloud-api/src/index.ts`
+- Modify: `apps/cloud-api/src/test/communication.test.ts`
 - Create: `agent/core/tests/attachment_upload.rs`
 - Create: `crates/db-local/tests/attachment_spool.rs`
 
@@ -497,7 +503,10 @@ For each accepted event, request a prepare URL, stream the spool file with a tim
 limit, then call complete. Persist `prepared`, `uploading`, `completed`, and retry metadata in
 SQLite; retry only retryable network failures with the existing bounded policy. Revalidate file
 size and SHA-256 before upload. Delete a spool file only after Cloud completion and only when it is
-not otherwise retained. A VPN/proxy switch creates a fresh request path on retry.
+not otherwise retained. A VPN/proxy switch creates a fresh request path on retry. Before each
+pending event and attachment batch, fetch Owner-authorized Communication Tombstones from the Cloud
+endpoint and atomically mark matching local source keys terminal; tombstoned content must never be
+prepared, uploaded or re-synced.
 
 - [ ] **Step 4: Run GREEN**
 
@@ -547,8 +556,9 @@ Expected: FAIL because the Worker and expiration service do not exist.
 
 Create a Worker-owned retention service with injected clock, repository and object-store port.
 It selects due records in bounded pages, removes them from query eligibility, writes a Tombstone,
-deletes R2 with retries, and clears Cloud message body/display fields/search copies. Local cleanup
-deletes due body/spool data and applies downloaded Tombstones before attempting sync. A device
+deletes R2 with retries, and clears Cloud message body/display fields/search copies. Expose a
+device-authenticated, cursor-paginated Tombstone endpoint from Cloud API. Local cleanup deletes
+due body/spool data; the Agent applies fetched Tombstones before attempting sync. A device
 receiving a Tombstone must mark matching Outbox/message source keys terminal and must not upload.
 
 - [ ] **Step 4: Run GREEN**
