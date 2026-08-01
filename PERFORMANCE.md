@@ -24,6 +24,10 @@
 - These are implementation bounds. A live start-to-heartbeat measurement is a
   deployment acceptance check after a real HTTPS origin is configured; it is
   not claimed by the current in-memory/temporary-PostgreSQL gates.
+- The local Railway preparation gate validates the offline public-health
+  verifier and migration/build contracts only. It does not measure a live
+  Singapore Railway API, Dashboard proxy, PostgreSQL migration, or
+  Setup-to-Agent handoff; those remain operator-run acceptance measurements.
 
 ## Mandatory implementation rules
 

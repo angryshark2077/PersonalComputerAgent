@@ -17,6 +17,7 @@ for required_tool in cargo rustc swift pnpm python3; do
 done
 
 ./scripts/verify-structural.sh
+bash scripts/tests/test_verify_railway_deployment.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace

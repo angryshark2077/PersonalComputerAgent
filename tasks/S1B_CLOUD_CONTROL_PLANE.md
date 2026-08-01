@@ -47,3 +47,14 @@ pairing is claimed by this task.
 The authoritative operational procedure is
 `docs/runbooks/S1B_PAIRING_REPAIR.md`; field, index, retention and secret
 boundaries are in `docs/data/s1b-control-plane.md`.
+
+## Railway preparation boundary
+
+The local release gate includes the offline Railway deployment-verifier test.
+It verifies preparation for `pca-cloud-api` and `pca-dashboard`, private
+Railway PostgreSQL, same-origin Dashboard proxying, and immutable Cloud
+migrations. It does not create Railway resources or prove generated domains,
+Variables, migration execution, browser authentication, or Setup-to-Agent
+pairing. Follow `docs/runbooks/S1B_RAILWAY_DEPLOYMENT.md` before claiming live
+deployment or pairing; the exact deployment fields and secret boundary are in
+`docs/data/S1B_RAILWAY_DEPLOYMENT_FIELDS.md`.

@@ -125,6 +125,23 @@ IPC binding or production Cloud origin, so its unavailable bridge fails closed.
 This is an explicit deployment prerequisite, not a local fallback that may
 create credentials or launch a browser.
 
+### S1B Railway deployment boundary
+
+The deployable S1B topology is three Singapore Railway services: private
+PostgreSQL, `pca-cloud-api`, and `pca-dashboard`. The Dashboard is the public
+browser origin and proxies `/api/auth/*` and `/v1/*` on the server to the API's
+private HTTP `CLOUD_API_INTERNAL_ORIGIN`; browser code has no public API-origin
+variable. The API's public HTTPS origin is reserved for the installed Agent.
+`DATABASE_URL`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, the Dashboard private
+origin and Railway's `PORT` are deployment inputs, never repository values.
+
+Local build, migration replay, and public-health verifier fixtures establish
+deployment preparation only. No Railway service, domain, secret, database, or
+live Setup-to-Agent pairing/handoff has been exercised; the missing signed
+local transport and restricted Keychain ACL keep live pairing fail-closed.
+See `docs/data/S1B_RAILWAY_DEPLOYMENT_FIELDS.md` and
+`docs/runbooks/S1B_RAILWAY_DEPLOYMENT.md`.
+
 ## 3. Local IPC
 
 固定合同字段：

@@ -13,3 +13,8 @@ Execution order:
 9. `S6_PRIVACY_UPDATE_BETA.md`
 
 Do not move deferred V1/V2 features into these cards.
+
+S1B deployment preparation is locally verified only. Railway service setup,
+secret Variables, public HTTPS domains, migration execution, and the signed
+Setup-to-Agent/Keychain-ACL pairing handoff remain operator acceptance work;
+they are not complete merely because the repository gate passes.
