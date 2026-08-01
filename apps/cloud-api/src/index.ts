@@ -91,7 +91,7 @@ export function createApp(options: CreateAppOptions): Hono {
   app.post("/v1/device-pairing/sessions/:sessionId/authorize", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
-    const callbackState = parseCallbackState(await context.req.json().catch(() => null));
+    const callbackState = await parseCallbackStateRequest(context.req.raw);
     if (callbackState === null) {
       return errorResponse(context, 400, "REQUEST_INVALID", "Invalid callback state.");
     }
@@ -509,6 +509,21 @@ function parseCallbackState(value: unknown): string | null {
   return Object.keys(body).length === 1 && typeof body.callback_state === "string" && /^[A-Za-z0-9_-]{43,}$/.test(body.callback_state)
     ? body.callback_state
     : null;
+}
+
+async function parseCallbackStateRequest(request: Request): Promise<string | null> {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (contentType.startsWith("application/json")) {
+    return parseCallbackState(await request.json().catch(() => null));
+  }
+  if (contentType.startsWith("application/x-www-form-urlencoded")) {
+    const parameters = new URLSearchParams(await request.text().catch(() => ""));
+    const entries = [...parameters.entries()];
+    return entries.length === 1 && entries[0]?.[0] === "callback_state"
+      ? parseCallbackState({ callback_state: entries[0][1] })
+      : null;
+  }
+  return null;
 }
 
 function ownerDeviceSummaryResponse(device: {

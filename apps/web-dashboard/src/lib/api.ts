@@ -53,32 +53,6 @@ export class DashboardApiError extends Error {
 
 export type DashboardFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
-export async function authorizePairing(
-  fetcher: DashboardFetch,
-  cloudApiOrigin: string,
-  sessionId: string,
-  callbackState: string,
-): Promise<string> {
-  const response = await fetcher(pairingAuthorizeUrl(cloudApiOrigin, sessionId), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ callback_state: callbackState }),
-    redirect: "manual",
-    credentials: "include",
-  });
-  if (response.status !== 302) {
-    throw await apiError(response);
-  }
-  const redirect = response.headers.get("location");
-  if (redirect === null || !isPairingCallback(redirect)) {
-    throw new DashboardApiError("PAIRING_CALLBACK_INVALID", "Invalid pairing callback.");
-  }
-  if (new URL(redirect).searchParams.get("state") !== callbackState) {
-    throw new DashboardApiError("PAIRING_CALLBACK_INVALID", "Pairing callback state mismatch.");
-  }
-  return redirect;
-}
-
 export async function getDevice(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,
@@ -152,32 +126,12 @@ export function cloudApiOrigin(): string {
   return process.env.NEXT_PUBLIC_CLOUD_API_ORIGIN ?? "";
 }
 
-function pairingAuthorizeUrl(cloudApiOrigin: string, sessionId: string): string {
-  return apiUrl(cloudApiOrigin, `/v1/device-pairing/sessions/${encodeURIComponent(sessionId)}/authorize`);
+export function pairingAuthorizePath(sessionId: string): string {
+  return `/v1/device-pairing/sessions/${encodeURIComponent(sessionId)}/authorize`;
 }
 
 function apiUrl(cloudApiOrigin: string, path: string): string {
   return cloudApiOrigin.length === 0 ? path : new URL(path, cloudApiOrigin).toString();
-}
-
-function isPairingCallback(value: string): boolean {
-  try {
-    const callback = new URL(value);
-    const parameters = [...callback.searchParams.keys()].sort();
-    return (
-      callback.protocol === "http:" &&
-      callback.hostname === "127.0.0.1" &&
-      callback.port.length > 0 &&
-      callback.pathname === "/pca/pair/callback" &&
-      parameters.length === 2 &&
-      parameters[0] === "code" &&
-      parameters[1] === "state" &&
-      callback.searchParams.get("code") !== null &&
-      callback.searchParams.get("state") !== null
-    );
-  } catch {
-    return false;
-  }
 }
 
 async function jsonRequest<T>(

@@ -3,7 +3,7 @@
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 
-import { DashboardApiError, authorizePairing, cloudApiOrigin } from "../../lib/api";
+import { cloudApiOrigin, pairingAuthorizePath } from "../../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../../lib/auth";
 import { parsePairingHandoff } from "../../lib/pairing-state";
 
@@ -32,22 +32,8 @@ function PairScreen() {
     })();
   }, []);
 
-  async function authorize(): Promise<void> {
-    if (handoff === null) return;
+  function authorize() {
     setAuthorized(true);
-    setError(null);
-    try {
-      const redirect = await authorizePairing(
-        window.fetch,
-        cloudApiOrigin(),
-        handoff.sessionId,
-        handoff.callbackState,
-      );
-      window.location.assign(redirect);
-    } catch (cause) {
-      setAuthorized(false);
-      setError(cause instanceof DashboardApiError ? cause.message : "Unable to authorize pairing.");
-    }
   }
 
   return (
@@ -55,9 +41,14 @@ function PairScreen() {
       <h1>Pair this Mac</h1>
       <p>Your sole Owner Workspace will be bound to this device.</p>
       {error !== null ? <p role="alert">{error}</p> : null}
-      <button type="button" disabled={authorized || !sessionReady || handoff === null} onClick={() => void authorize()}>
-        {authorized ? "Authorizing…" : "Authorize this Mac"}
-      </button>
+      {handoff !== null ? (
+        <form method="post" action={pairingAuthorizePath(handoff.sessionId)} onSubmit={authorize}>
+          <input type="hidden" name="callback_state" value={handoff.callbackState} />
+          <button type="submit" disabled={authorized || !sessionReady}>
+            {authorized ? "Authorizing…" : "Authorize this Mac"}
+          </button>
+        </form>
+      ) : null}
     </main>
   );
 }

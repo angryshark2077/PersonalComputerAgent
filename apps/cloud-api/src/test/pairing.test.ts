@@ -128,6 +128,28 @@ test("a pairing code is single use and PKCE bound", async () => {
   assert.equal((await successfulExchange()).status, 409);
 });
 
+test("pairing authorization accepts a native Dashboard form submission", async () => {
+  const api = app();
+  const sessionResponse = await api.request("/v1/device-pairing/sessions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(start),
+  });
+  const { session_id: sessionId } = (await sessionResponse.json()) as { session_id: string };
+
+  const authorized = await api.request(`/v1/device-pairing/sessions/${sessionId}/authorize`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ callback_state: start.callback_state }).toString(),
+  });
+
+  assert.equal(authorized.status, 302);
+  const callback = new URL(authorized.headers.get("location") ?? "");
+  assert.equal(callback.hostname, "127.0.0.1");
+  assert.equal(callback.pathname, "/pca/pair/callback");
+  assert.equal(callback.searchParams.get("state"), start.callback_state);
+});
+
 test("expired pairing sessions and unauthenticated authorization are rejected", async () => {
   const repository = new MemoryControlRepository([
     { workspaceId: owner.workspaceId, userId: owner.userId },
