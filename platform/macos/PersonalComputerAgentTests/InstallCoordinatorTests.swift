@@ -769,6 +769,23 @@ final class RuntimeHealthCheckerTests: XCTestCase {
         XCTAssertTrue(healthy)
     }
 
+    func testFreshCandidateWithCurrentDatabaseSchemaIsAccepted() async throws {
+        let fixture = try HealthFixture()
+        let attempt = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 1)
+        fixture.processInspector.identity = fixture.validIdentity(startedAt: attempt)
+        try fixture.writeStatus(version: "2.0.0", pid: 321, heartbeat: attempt, schema: 4)
+        try FileManager.default.setAttributes([.modificationDate: attempt], ofItemAtPath: fixture.statusURL.path)
+
+        let healthy = try await fixture.checker.waitForHealthy(
+            paths: fixture.paths,
+            expectedVersion: "2.0.0",
+            notBefore: attempt,
+            timeout: .milliseconds(20)
+        )
+
+        XCTAssertTrue(healthy)
+    }
+
     func testRustMicrosecondHeartbeatWireValueIsParsedAndComparedForFreshness() async throws {
         let fixture = try HealthFixture()
         let heartbeat = "2026-07-30T22:26:16.944668Z"

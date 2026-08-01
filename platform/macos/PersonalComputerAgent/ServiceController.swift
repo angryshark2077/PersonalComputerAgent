@@ -188,7 +188,7 @@ final class RuntimeHealthChecker: HealthChecking {
                let status = try? JSONDecoder().decode(RuntimeStatus.self, from: data),
                let heartbeat = Self.parseRFC3339(status.heartbeatAt),
                heartbeat >= notBefore,
-               status.schemaVersion == 1,
+               status.schemaVersion > 0,
                status.appVersion == expectedVersion,
                status.localHealthy,
                ["unpaired", "running", "degraded"].contains(status.agentStatus),
