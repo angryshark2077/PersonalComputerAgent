@@ -153,6 +153,7 @@ final class RuntimeHealthChecker: HealthChecking {
         paths: InstallPaths,
         expectedVersion: String,
         notBefore: Date,
+        requiringFreshProcess: Bool = true,
         timeout: Duration
     ) async throws -> Bool {
         struct RuntimeStatus: Decodable {
@@ -197,7 +198,7 @@ final class RuntimeHealthChecker: HealthChecking {
                let process = processInspector.inspect(processID: status.processID),
                process.userID == geteuid(),
                process.executableURL.standardizedFileURL.path == expectedExecutable,
-               process.startedAt >= notBefore {
+               (!requiringFreshProcess || process.startedAt >= notBefore) {
                 return true
             }
             try await Task.sleep(for: pollInterval)

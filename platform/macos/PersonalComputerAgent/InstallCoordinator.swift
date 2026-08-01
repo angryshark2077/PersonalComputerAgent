@@ -275,7 +275,13 @@ protocol ServiceControlling: AnyObject {
 
 @MainActor
 protocol HealthChecking: AnyObject {
-    func waitForHealthy(paths: InstallPaths, expectedVersion: String, notBefore: Date, timeout: Duration) async throws -> Bool
+    func waitForHealthy(
+        paths: InstallPaths,
+        expectedVersion: String,
+        notBefore: Date,
+        requiringFreshProcess: Bool,
+        timeout: Duration
+    ) async throws -> Bool
 }
 
 @MainActor
@@ -730,15 +736,18 @@ final class InstallCoordinator: InstallCoordinating {
             throw (error as? InstallError) ?? InstallError.credentialProvisioningFailed
         }
         let attemptStartedAt = Date()
+        let existingRuntimeIsEnabled = service.status() == .enabled
         onState(.starting)
-        do {
-            try await service.registerAndWaitForApproval { onState(.waitingApproval) }
-        } catch {
-            if let transaction {
-                let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
-                throw InstallError.transactionFailed(primary: .registration, recovery: recovery)
+        if !existingRuntimeIsEnabled {
+            do {
+                try await service.registerAndWaitForApproval { onState(.waitingApproval) }
+            } catch {
+                if let transaction {
+                    let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
+                    throw InstallError.transactionFailed(primary: .registration, recovery: recovery)
+                }
+                throw (error as? InstallError) ?? InstallError.serviceRegistrationFailed
             }
-            throw (error as? InstallError) ?? InstallError.serviceRegistrationFailed
         }
 
         let healthy: Bool
@@ -746,7 +755,10 @@ final class InstallCoordinator: InstallCoordinating {
             healthy = try await health.waitForHealthy(
                 paths: paths,
                 expectedVersion: installedVersion,
-                notBefore: attemptStartedAt,
+                notBefore: existingRuntimeIsEnabled
+                    ? attemptStartedAt.addingTimeInterval(-60)
+                    : attemptStartedAt,
+                requiringFreshProcess: !existingRuntimeIsEnabled,
                 timeout: .seconds(5)
             )
         } catch {

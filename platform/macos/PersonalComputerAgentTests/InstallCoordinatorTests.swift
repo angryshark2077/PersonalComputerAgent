@@ -48,6 +48,18 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertTrue(fixture.relauncher.urls.isEmpty)
     }
 
+    func testHealthyExistingRuntimeSkipsReregistrationWhenReopeningInstalledSetup() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
+        fixture.service.currentState = .enabled
+
+        let result = try await fixture.coordinator.finishInstalledSetup()
+
+        XCTAssertEqual(result, .success(version: "1.0.0"))
+        XCTAssertEqual(fixture.service.registerCount, 0)
+        XCTAssertEqual(fixture.health.checkCount, 1)
+        XCTAssertEqual(fixture.health.freshProcessRequirements, [false])
+    }
+
     func testCredentialProvisioningFailureUsesRollbackFunnelBeforeServiceRegistration() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
         fixture.service.currentState = .enabled
@@ -581,14 +593,17 @@ private final class FakeHealthChecker: HealthChecking {
     var results: [Bool] = []
     var checkCount = 0
     var expectedVersions: [String] = []
+    var freshProcessRequirements: [Bool] = []
     func waitForHealthy(
         paths: InstallPaths,
         expectedVersion: String,
         notBefore: Date,
+        requiringFreshProcess: Bool,
         timeout: Duration
     ) async throws -> Bool {
         checkCount += 1
         expectedVersions.append(expectedVersion)
+        freshProcessRequirements.append(requiringFreshProcess)
         return results.isEmpty ? isHealthy : results.removeFirst()
     }
 }
@@ -759,6 +774,24 @@ final class RuntimeHealthCheckerTests: XCTestCase {
             paths: fixture.paths,
             expectedVersion: "2.0.0",
             notBefore: attempt,
+            timeout: .milliseconds(20)
+        )
+
+        XCTAssertTrue(healthy)
+    }
+
+    func testFreshExistingRuntimeMayReuseAnOlderMatchingProcess() async throws {
+        let fixture = try HealthFixture()
+        let attempt = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 1)
+        fixture.processInspector.identity = fixture.validIdentity(startedAt: attempt.addingTimeInterval(-60))
+        try fixture.writeStatus(version: "2.0.0", pid: 321, heartbeat: attempt)
+        try FileManager.default.setAttributes([.modificationDate: attempt], ofItemAtPath: fixture.statusURL.path)
+
+        let healthy = try await fixture.checker.waitForHealthy(
+            paths: fixture.paths,
+            expectedVersion: "2.0.0",
+            notBefore: attempt,
+            requiringFreshProcess: false,
             timeout: .milliseconds(20)
         )
 
