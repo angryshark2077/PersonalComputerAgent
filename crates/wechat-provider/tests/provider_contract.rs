@@ -1,9 +1,9 @@
 use pca_domain::{ConversationScope, Direction, MessageKind};
 use pca_wechat_provider::fixtures::{
     fixture_provider, group_with_member_count, group_with_unknown_member_count,
-    incoming_small_group_video, incomplete_video, missing_local_account_proof,
-    outgoing_direct_text, outgoing_draft, outgoing_failed, unknown_direction,
-    unknown_source_record, unsupported_type,
+    group_with_unverified_member_count, incoming_small_group_video, incomplete_video,
+    missing_local_account_proof, outgoing_direct_text, outgoing_draft, outgoing_failed,
+    unknown_direction, unknown_source_record, unsupported_type,
 };
 
 #[tokio::test]
@@ -40,4 +40,16 @@ async fn emits_only_confirmed_direct_or_small_group_records() {
     assert!(emitted
         .iter()
         .all(|message| message.conversation().is_allowed()));
+}
+
+#[tokio::test]
+async fn rejects_an_unverified_present_group_member_count() {
+    let mut provider = fixture_provider([group_with_unverified_member_count(4)]);
+
+    let emitted = provider
+        .poll_once()
+        .await
+        .expect("fixture source must read");
+
+    assert!(emitted.is_empty());
 }

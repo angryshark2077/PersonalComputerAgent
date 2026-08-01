@@ -66,7 +66,16 @@ pub enum SourceMessageKind {
 #[derive(Clone, PartialEq, Eq)]
 pub enum SourceConversation {
     Direct,
-    Group { member_count: Option<u8> },
+    Group { membership: GroupMembershipEvidence },
+    Unknown,
+}
+
+/// Evidence for a source-reported group size.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GroupMembershipEvidence {
+    Verified(u8),
+    Unverified(u8),
+    Missing,
     Unknown,
 }
 

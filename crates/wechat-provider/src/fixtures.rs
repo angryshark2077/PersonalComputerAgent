@@ -2,9 +2,9 @@ use pca_domain::{CommunicationAttachment, MessageKind};
 
 use crate::{
     source::{
-        LocalAccountProof, SourceCapabilities, SourceConversation, SourceCursor, SourceDirection,
-        SourceFinality, SourceMessageKind, SourceMessageRecord, SourcePayload, SourceProbeFuture,
-        SourceReadFuture, SourceRecord, WechatSource,
+        GroupMembershipEvidence, LocalAccountProof, SourceCapabilities, SourceConversation,
+        SourceCursor, SourceDirection, SourceFinality, SourceMessageKind, SourceMessageRecord,
+        SourcePayload, SourceProbeFuture, SourceReadFuture, SourceRecord, WechatSource,
     },
     WechatProvider,
 };
@@ -50,7 +50,7 @@ pub fn incoming_small_group_video(member_count: u8) -> SourceRecord {
         SourceDirection::Incoming,
         SourceMessageKind::Video,
         SourceConversation::Group {
-            member_count: Some(member_count),
+            membership: GroupMembershipEvidence::Verified(member_count),
         },
         SourceFinality::IncomingPersisted,
         SourcePayload::Media {
@@ -115,7 +115,9 @@ pub fn group_with_unknown_member_count() -> SourceRecord {
     let SourceRecord::Message(message) = &mut record else {
         unreachable!()
     };
-    message.conversation = SourceConversation::Group { member_count: None };
+    message.conversation = SourceConversation::Group {
+        membership: GroupMembershipEvidence::Unknown,
+    };
     record
 }
 
@@ -126,7 +128,19 @@ pub fn group_with_member_count(member_count: u8) -> SourceRecord {
         unreachable!()
     };
     message.conversation = SourceConversation::Group {
-        member_count: Some(member_count),
+        membership: GroupMembershipEvidence::Verified(member_count),
+    };
+    record
+}
+
+#[must_use]
+pub fn group_with_unverified_member_count(member_count: u8) -> SourceRecord {
+    let mut record = outgoing_direct_text();
+    let SourceRecord::Message(message) = &mut record else {
+        unreachable!()
+    };
+    message.conversation = SourceConversation::Group {
+        membership: GroupMembershipEvidence::Unverified(member_count),
     };
     record
 }

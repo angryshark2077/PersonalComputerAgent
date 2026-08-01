@@ -4,8 +4,8 @@ use pca_domain::{
 };
 
 use crate::source::{
-    LocalAccountProof, SourceConversation, SourceDirection, SourceFinality, SourceMessageKind,
-    SourcePayload, SourceRecord,
+    GroupMembershipEvidence, LocalAccountProof, SourceConversation, SourceDirection,
+    SourceFinality, SourceMessageKind, SourcePayload, SourceRecord,
 };
 
 pub(crate) fn eligible_message(record: SourceRecord) -> Option<CommunicationMessageRecorded> {
@@ -30,7 +30,7 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<CommunicationMess
     let conversation = match record.conversation {
         SourceConversation::Direct => ConversationScope::Direct,
         SourceConversation::Group {
-            member_count: Some(member_count),
+            membership: GroupMembershipEvidence::Verified(member_count),
         } if (1..=8).contains(&member_count) => ConversationScope::Group { member_count },
         _ => return None,
     };
