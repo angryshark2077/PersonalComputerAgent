@@ -110,6 +110,21 @@ part of S1A.
 - 直接连接本地 Agent
 - 推断本地权限已经生效
 
+### S1B Cloud control plane
+
+S1B introduces a narrow control path before Event Sync: Setup/Repair alone
+opens the browser and hosts a five-minute, one-use `127.0.0.1` callback;
+Agent Core owns PKCE, pairing exchange, Keychain-backed credentials, the
+non-secret SQLite pointer, immediate control and 30-second polling. Cloud
+owns Workspace-scoped device state, credential hashes, desired revisions,
+presence and immutable Owner audits. Swift PlatformBridge never calls Cloud or
+SQLite; the Dashboard never connects directly to an Agent.
+
+The currently installed Setup implementation has no signed 0600 Setup-to-Agent
+IPC binding or production Cloud origin, so its unavailable bridge fails closed.
+This is an explicit deployment prerequisite, not a local fallback that may
+create credentials or launch a browser.
+
 ## 3. Local IPC
 
 固定合同字段：

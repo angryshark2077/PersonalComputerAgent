@@ -26,10 +26,16 @@ cargo test -p pca-agentd --features process-test-hooks \
   --test collector_commit_kill
 swift build --package-path platform/macos
 swift run --package-path platform/macos BridgeContractVerifier
+xcodebuild test \
+  -project platform/macos/PersonalComputerAgent.xcodeproj \
+  -scheme PersonalComputerAgent \
+  -only-testing:PersonalComputerAgentTests/PairingCoordinatorTests \
+  -derivedDataPath /tmp/pca-verify-full-pairing
 pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm test
 python3 scripts/verify_migrations.py .
+python3 scripts/verify_cloud_migrations.py .
 python3 scripts/verify_boundaries.py .
 
 echo "FULL VERIFICATION PASSED"

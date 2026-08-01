@@ -12,6 +12,19 @@
 | Timeline 24h API | p95 < 300 ms | APM |
 | Web Timeline | 10k items virtualized without obvious jank | Playwright performance |
 
+## S1B control-plane budget
+
+- A paired Agent attempts control immediately at startup and every 30 seconds
+  while healthy; each HTTPS request has a 15-second timeout.
+- Transient failure uses bounded jittered exponential retry, capped at five
+  minutes. It must not block local S1A startup or create a retry queue.
+- Pairing callback lifetime is five minutes and has exactly one terminal
+  result. No periodic S1B sampling or Event upload is introduced by this
+  slice.
+- These are implementation bounds. A live start-to-heartbeat measurement is a
+  deployment acceptance check after a real HTTPS origin is configured; it is
+  not claimed by the current in-memory/temporary-PostgreSQL gates.
+
 ## Mandatory implementation rules
 
 - SQLite writes go through one DbActor/owned writer.

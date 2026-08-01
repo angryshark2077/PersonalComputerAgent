@@ -6,11 +6,17 @@
 - `tasks/S1A_LOCAL_RUNTIME_INSTALLER.md`
 - Spec §6, §11.3, §18-22, §24-25
 
-## Objective
+## Objective and implementation status
 
 Add the minimum cloud control plane to an already healthy S1A local runtime:
 one-time device pairing, Keychain-backed device credentials, Cloud API,
 PostgreSQL device state, real heartbeat, and Dashboard online/offline state.
+
+The S1B repository slice is implemented and covered by contract, API, local
+state, revocation and migration-replay gates. It remains deliberately
+fail-closed until an HTTPS Cloud origin and the signed Swift Setup-to-Agent
+handoff/Keychain ACL bootstrap are deployed. That means no live production
+pairing is claimed by this task.
 
 ## Boundaries
 
@@ -37,3 +43,7 @@ PostgreSQL device state, real heartbeat, and Dashboard online/offline state.
 - Cloud failure never prevents S1A local startup, lifecycle persistence, or
   user LaunchAgent recovery.
 - S2 collector work and S3 full batch sync remain separate subsequent slices.
+
+The authoritative operational procedure is
+`docs/runbooks/S1B_PAIRING_REPAIR.md`; field, index, retention and secret
+boundaries are in `docs/data/s1b-control-plane.md`.

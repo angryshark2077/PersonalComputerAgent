@@ -68,3 +68,20 @@ Secret 永不进入 Event Payload、SQLite 普通表、日志、诊断包或对�
 - diagnostic redaction
 - provider process timeout
 - permission revoke within 5 seconds
+
+## 8. S1B pairing and Cloud control
+
+- Pairing accepts only one callback at the exact loopback path within five
+  minutes; state, PKCE and one-use code validation fail closed.
+- A callback URL contains code and state only. Access/refresh credentials and
+  device key material remain in Keychain/Cloud secret handling, never SQLite,
+  Event payloads, diagnostics, JSON status, fixtures or ordinary logs.
+- Cloud stores SHA-256 credential/code/session values and enforces composite
+  Workspace/Owner membership foreign keys for pairing, devices and audits.
+- A confirmed revocation clears the local pairing pointer and disables the two
+  sensitive S1B configuration keys even if local Keychain deletion reports an
+  error. Cloud outage alone does not erase a valid pairing.
+- A production pairing requires a configured HTTPS origin and a signed
+  Setup-to-Agent local transport with a restricted Keychain ACL. Until those
+  are deployed, the Setup bridge remains unavailable and does not launch a
+  browser or write credentials.
