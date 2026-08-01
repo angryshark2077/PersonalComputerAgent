@@ -45,13 +45,17 @@ The fixed WeChat Keychain read uses an explicit `SecItemCopyMatching` search wit
 `kSecUseAuthenticationUI = kSecUseAuthenticationUISkip`; an ACL/authentication requirement
 therefore fails closed without showing macOS authentication UI and no database probe starts.
 
-The probe has one two-second wall-clock budget beginning before the Keychain read. Probes are
-serialized, so a stale earlier success cannot restore proof after a later failure. The source path
-must resolve to a regular file on a local, non-FUSE filesystem. Before SQLite opens anything, the
-probe copies only the source DB and optional WAL through read-only, `O_NOFOLLOW` file descriptors
-into a private temporary directory. SQLite opens only that private snapshot, so its WAL VFS may
-create or update SHM only outside the WeChat source directory. Source DB/WAL metadata is checked
-before and after copying, and any concurrent source change fails closed.
+The probe has one two-second wall-clock budget beginning before the Keychain read. One source-owned
+worker performs the complete Keychain, snapshot, and SQLCipher operation. The caller waits only on
+the coordinator's bounded result channel and returns `WECHAT_PROBE_TIMEOUT` at its deadline even if
+the worker is blocked in an operating-system call. Coordinator generations exclusively control
+proof: a timeout or newer probe invalidates the in-flight generation, and a late result can never
+restore success. The source path must resolve to a regular file on a local, non-FUSE filesystem.
+Before SQLite opens anything, the worker copies only the source DB and optional WAL through
+read-only, `O_NOFOLLOW` file descriptors into a private temporary directory. SQLite opens only that
+private snapshot, so its WAL VFS may create or update SHM only outside the WeChat source directory.
+Source DB/WAL metadata is checked before and after copying, and any concurrent source change fails
+closed.
 
 SQLite uses `query_only` plus an authorizer that permits only `SELECT` and `READ`, and accepts only
 bounded single-`SELECT` proof queries. Failure clears prior proof and returns an explicit redacted
@@ -61,11 +65,13 @@ state: `WECHAT_WAITING_SOURCE`,
 `WECHAT_ACCOUNT_UNVERIFIED`. Errors and ordinary diagnostics never include KeyMaterial, account
 proofs, message bodies, conversation names, or source paths.
 
-macOS does not provide safe cancellation for an individual in-flight local filesystem syscall.
-The probe therefore does not spawn a detachable timeout thread: it rejects network/FUSE targets,
-uses nonblocking open flags, and checks the shared deadline around each OS call and copy chunk. A
-kernel or hardware stall may delay the timeout error itself, but a result is never accepted after
-the deadline and no unbounded worker remains alive.
+macOS does not provide safe cancellation for an individual in-flight local filesystem syscall. A
+permanently stuck worker therefore quarantines that source until the Agent process restarts. While
+it is stuck, later probes fail closed without queueing another job or spawning another thread. The
+request and result channels each have capacity one, and the source never replaces its worker, so
+retries cannot cause unbounded thread, task, or queue growth. Dropping the source closes its
+channels; a worker that eventually returns exits, while a permanently blocked syscall is reclaimed
+by process restart.
 
 ## Native dependency decision
 

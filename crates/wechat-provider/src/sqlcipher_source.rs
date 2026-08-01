@@ -1,6 +1,10 @@
 use std::{
     path::PathBuf,
-    sync::{Condvar, Mutex},
+    sync::{
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
+        Mutex,
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -117,33 +121,143 @@ pub trait ReadOnlySqlcipherProbe: Send + Sync {
 pub struct RusqliteReadOnlyProbe;
 
 /// A source that returns records only after Keychain, `SQLCipher`, schema, and account proof pass.
-pub struct SqlcipherWechatSource<K, P> {
-    key_store: K,
-    probe: P,
-    target: SqlcipherProbeTarget,
-    probe_state: Mutex<ProbeState>,
-    probe_ready: Condvar,
+pub struct SqlcipherWechatSource {
+    request_sender: SyncSender<WorkerCommand>,
+    result_receiver: Mutex<Receiver<WorkerResult>>,
+    coordinator: Mutex<CoordinatorState>,
+    worker_thread: Option<JoinHandle<()>>,
+    probe_timeout: Duration,
 }
 
 #[derive(Default)]
-struct ProbeState {
-    running: bool,
-    succeeded: bool,
+struct CoordinatorState {
+    next_generation: u64,
+    in_flight: Option<InFlightProbe>,
+    proven_generation: Option<u64>,
+    worker_available: bool,
 }
 
-impl<K, P> SqlcipherWechatSource<K, P>
+#[derive(Clone, Copy)]
+struct InFlightProbe {
+    generation: u64,
+    waiter_active: bool,
+    authoritative: bool,
+}
+
+enum WorkerCommand {
+    Probe { generation: u64, deadline: Instant },
+    Shutdown,
+}
+
+struct WorkerResult {
+    generation: u64,
+    outcome: Result<SourceCapabilities, DomainError>,
+}
+
+struct ProbeWorker<K, P> {
+    key_store: K,
+    probe: P,
+    target: SqlcipherProbeTarget,
+    request_receiver: Receiver<WorkerCommand>,
+    result_sender: SyncSender<WorkerResult>,
+}
+
+impl<K, P> ProbeWorker<K, P>
 where
     K: CredentialStore,
     P: ReadOnlySqlcipherProbe,
 {
-    #[must_use]
-    pub fn with_dependencies(key_store: K, probe: P, target: SqlcipherProbeTarget) -> Self {
-        Self {
+    fn run(self) {
+        let Self {
             key_store,
             probe,
             target,
-            probe_state: Mutex::new(ProbeState::default()),
-            probe_ready: Condvar::new(),
+            request_receiver,
+            result_sender,
+        } = self;
+        while let Ok(command) = request_receiver.recv() {
+            match command {
+                WorkerCommand::Probe {
+                    generation,
+                    deadline,
+                } => {
+                    let outcome = run_worker_probe(&key_store, &probe, &target, deadline);
+                    if result_sender
+                        .send(WorkerResult {
+                            generation,
+                            outcome,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                WorkerCommand::Shutdown => break,
+            }
+        }
+    }
+}
+
+impl SqlcipherWechatSource {
+    #[must_use]
+    pub fn with_dependencies<K, P>(key_store: K, probe: P, target: SqlcipherProbeTarget) -> Self
+    where
+        K: CredentialStore + 'static,
+        P: ReadOnlySqlcipherProbe + 'static,
+    {
+        Self::build(key_store, probe, target, DEFAULT_PROBE_TIMEOUT)
+    }
+
+    #[cfg(test)]
+    fn with_dependencies_and_timeout<K, P>(
+        key_store: K,
+        probe: P,
+        target: SqlcipherProbeTarget,
+        probe_timeout: Duration,
+    ) -> Self
+    where
+        K: CredentialStore + 'static,
+        P: ReadOnlySqlcipherProbe + 'static,
+    {
+        Self::build(key_store, probe, target, probe_timeout)
+    }
+
+    fn build<K, P>(
+        key_store: K,
+        probe: P,
+        target: SqlcipherProbeTarget,
+        probe_timeout: Duration,
+    ) -> Self
+    where
+        K: CredentialStore + 'static,
+        P: ReadOnlySqlcipherProbe + 'static,
+    {
+        let (request_sender, request_receiver) = mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let worker_thread = thread::Builder::new()
+            .name("pca-wechat-probe".to_owned())
+            .spawn(move || {
+                ProbeWorker {
+                    key_store,
+                    probe,
+                    target,
+                    request_receiver,
+                    result_sender,
+                }
+                .run();
+            })
+            .ok();
+        let worker_available = worker_thread.is_some();
+
+        Self {
+            request_sender,
+            result_receiver: Mutex::new(result_receiver),
+            coordinator: Mutex::new(CoordinatorState {
+                worker_available,
+                ..CoordinatorState::default()
+            }),
+            worker_thread,
+            probe_timeout,
         }
     }
 
@@ -154,70 +268,172 @@ where
     /// Returns only explicit, redacted `WECHAT_*` errors.
     pub fn probe_blocking(&self) -> Result<SourceCapabilities, DomainError> {
         let deadline = Instant::now()
-            .checked_add(DEFAULT_PROBE_TIMEOUT)
+            .checked_add(self.probe_timeout)
             .ok_or_else(|| map_probe_failure(SqlcipherProbeFailure::TimedOut))?;
-        self.begin_probe(deadline)?;
+        let generation = self.start_probe(deadline)?;
 
-        let result = (|| {
-            let key_material = load_wechat_key_material(&self.key_store)
-                .map_err(map_credential_error)?
-                .ok_or_else(waiting_source)?;
-            let capabilities = self
-                .probe
-                .probe(&self.target, &key_material, remaining_probe_time(deadline)?)
-                .map_err(map_probe_failure)?;
-            remaining_probe_time(deadline)?;
-            Ok(capabilities)
-        })();
-
-        self.finish_probe(result.is_ok());
-        result
-    }
-
-    fn begin_probe(&self, deadline: Instant) -> Result<(), DomainError> {
-        let mut state = self
-            .probe_state
-            .lock()
-            .map_err(|_| capability_unavailable())?;
-        while state.running {
-            let remaining = remaining_probe_time(deadline)?;
-            let (next_state, wait) = self
-                .probe_ready
-                .wait_timeout(state, remaining)
-                .map_err(|_| capability_unavailable())?;
-            state = next_state;
-            if wait.timed_out() && state.running {
-                return Err(map_probe_failure(SqlcipherProbeFailure::TimedOut));
+        loop {
+            let received = self
+                .result_receiver
+                .lock()
+                .map_err(|_| capability_unavailable())?
+                .recv_timeout(remaining_probe_time(deadline)?);
+            match received {
+                Ok(result) if result.generation == generation => {
+                    if remaining_probe_time(deadline).is_err() {
+                        self.timeout_probe(generation);
+                        return Err(map_probe_failure(SqlcipherProbeFailure::TimedOut));
+                    }
+                    return self.accept_worker_result(result);
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    self.timeout_probe(generation);
+                    return Err(map_probe_failure(SqlcipherProbeFailure::TimedOut));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.disconnect_worker(generation);
+                    return Err(capability_unavailable());
+                }
             }
         }
-        state.running = true;
-        state.succeeded = false;
-        Ok(())
     }
 
-    fn finish_probe(&self, succeeded: bool) {
-        let mut state = match self.probe_state.lock() {
+    fn start_probe(&self, deadline: Instant) -> Result<u64, DomainError> {
+        let mut state = self
+            .coordinator
+            .lock()
+            .map_err(|_| capability_unavailable())?;
+        state.proven_generation = None;
+        if !state.worker_available {
+            return Err(capability_unavailable());
+        }
+
+        if let Some(mut in_flight) = state.in_flight {
+            in_flight.authoritative = false;
+            state.in_flight = Some(in_flight);
+            if in_flight.waiter_active {
+                return Err(map_probe_failure(SqlcipherProbeFailure::TimedOut));
+            }
+
+            let stale_result = self
+                .result_receiver
+                .lock()
+                .map_err(|_| capability_unavailable())?
+                .try_recv();
+            match stale_result {
+                Ok(result) if result.generation == in_flight.generation => {
+                    state.in_flight = None;
+                }
+                Ok(_) => return Err(capability_unavailable()),
+                Err(TryRecvError::Empty) => {
+                    return Err(map_probe_failure(SqlcipherProbeFailure::TimedOut));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    state.in_flight = None;
+                    state.worker_available = false;
+                    return Err(capability_unavailable());
+                }
+            }
+        }
+
+        remaining_probe_time(deadline)?;
+        state.next_generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(capability_unavailable)?;
+        let generation = state.next_generation;
+        state.in_flight = Some(InFlightProbe {
+            generation,
+            waiter_active: true,
+            authoritative: true,
+        });
+        drop(state);
+
+        match self.request_sender.try_send(WorkerCommand::Probe {
+            generation,
+            deadline,
+        }) {
+            Ok(()) => Ok(generation),
+            Err(TrySendError::Full(_)) => {
+                self.timeout_probe(generation);
+                Err(map_probe_failure(SqlcipherProbeFailure::TimedOut))
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.disconnect_worker(generation);
+                Err(capability_unavailable())
+            }
+        }
+    }
+
+    fn accept_worker_result(
+        &self,
+        result: WorkerResult,
+    ) -> Result<SourceCapabilities, DomainError> {
+        let mut state = self
+            .coordinator
+            .lock()
+            .map_err(|_| capability_unavailable())?;
+        let Some(in_flight) = state.in_flight else {
+            return Err(map_probe_failure(SqlcipherProbeFailure::TimedOut));
+        };
+        if in_flight.generation != result.generation
+            || !in_flight.waiter_active
+            || !in_flight.authoritative
+        {
+            if in_flight.generation == result.generation {
+                state.in_flight = None;
+            }
+            state.proven_generation = None;
+            return Err(map_probe_failure(SqlcipherProbeFailure::TimedOut));
+        }
+
+        state.in_flight = None;
+        state.proven_generation = result.outcome.as_ref().ok().map(|_| result.generation);
+        result.outcome
+    }
+
+    fn timeout_probe(&self, generation: u64) {
+        let mut state = match self.coordinator.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.succeeded = succeeded;
-        state.running = false;
-        self.probe_ready.notify_all();
+        state.proven_generation = None;
+        if let Some(in_flight) = state.in_flight.as_mut() {
+            if in_flight.generation == generation {
+                in_flight.waiter_active = false;
+                in_flight.authoritative = false;
+            }
+        }
+    }
+
+    fn disconnect_worker(&self, generation: u64) {
+        let mut state = match self.coordinator.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.proven_generation = None;
+        if state
+            .in_flight
+            .is_some_and(|in_flight| in_flight.generation == generation)
+        {
+            state.in_flight = None;
+        }
+        state.worker_available = false;
     }
 }
 
-impl<K, P> WechatSource for SqlcipherWechatSource<K, P>
-where
-    K: CredentialStore,
-    P: ReadOnlySqlcipherProbe,
-{
+impl WechatSource for SqlcipherWechatSource {
     fn probe(&self) -> SourceProbeFuture<'_> {
         Box::pin(async move { self.probe_blocking() })
     }
 
     fn read_after(&self, _: &SourceCursor) -> SourceReadFuture<'_> {
         Box::pin(async move {
-            let probe_succeeded = self.probe_state.lock().is_ok_and(|state| state.succeeded);
+            let probe_succeeded = self
+                .coordinator
+                .lock()
+                .is_ok_and(|state| state.proven_generation.is_some());
             if probe_succeeded {
                 // Message extraction belongs to the later source-schema task. Returning an empty
                 // batch here proves this capability gate cannot leak a record by itself.
@@ -227,6 +443,42 @@ where
             }
         })
     }
+}
+
+impl Drop for SqlcipherWechatSource {
+    fn drop(&mut self) {
+        let _ = self.request_sender.try_send(WorkerCommand::Shutdown);
+        if self
+            .worker_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(worker_thread) = self.worker_thread.take() {
+                let _ = worker_thread.join();
+            }
+        }
+    }
+}
+
+fn run_worker_probe<K, P>(
+    key_store: &K,
+    probe: &P,
+    target: &SqlcipherProbeTarget,
+    deadline: Instant,
+) -> Result<SourceCapabilities, DomainError>
+where
+    K: CredentialStore,
+    P: ReadOnlySqlcipherProbe,
+{
+    remaining_probe_time(deadline)?;
+    let key_material = load_wechat_key_material(key_store)
+        .map_err(map_credential_error)?
+        .ok_or_else(waiting_source)?;
+    let capabilities = probe
+        .probe(target, &key_material, remaining_probe_time(deadline)?)
+        .map_err(map_probe_failure)?;
+    remaining_probe_time(deadline)?;
+    Ok(capabilities)
 }
 
 fn remaining_probe_time(deadline: Instant) -> Result<Duration, DomainError> {
@@ -414,11 +666,11 @@ mod macos {
     /// `WeChat` source directory. The source files are opened only read-only with `O_NOFOLLOW` and
     /// must be regular files on a local, non-FUSE filesystem.
     ///
-    /// macOS cannot cancel an individual in-flight local filesystem syscall. To avoid leaking a
-    /// detached worker, the probe stays on the caller thread, uses nonblocking open flags, rejects
-    /// network/FUSE sources before `SQLite` sees them, and checks the shared wall-clock deadline
-    /// before and after every syscall and copy chunk. A kernel or hardware stall can delay the
-    /// error return, but no result is accepted after the two-second deadline.
+    /// macOS cannot cancel an individual in-flight local filesystem syscall. All Keychain,
+    /// snapshot, and `SQLCipher` work therefore stays on the source's single owned worker. The
+    /// coordinator returns the timeout independently, rejects more work while that worker is
+    /// occupied, and never accepts a late result. Nonblocking open flags, local/non-FUSE policy,
+    /// and deadline checks still bound every normally returning operation.
     struct PrivateSourceSnapshot {
         _directory: TempDir,
         database_path: PathBuf,
@@ -703,5 +955,269 @@ impl ReadOnlySqlcipherProbe for RusqliteReadOnlyProbe {
         _: Duration,
     ) -> Result<SourceCapabilities, SqlcipherProbeFailure> {
         Err(SqlcipherProbeFailure::CapabilityUnavailable)
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use std::{
+        path::PathBuf,
+        sync::{mpsc, Arc, Condvar, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use pca_keychain::{
+        CredentialError, CredentialStore, WechatKeyMaterial, WECHAT_CREDENTIAL_ACCOUNT,
+        WECHAT_CREDENTIAL_SERVICE,
+    };
+
+    use super::{
+        ReadOnlySqlcipherProbe, SourceCapabilities, SourceCursor, SqlcipherProbeFailure,
+        SqlcipherProbeTarget, SqlcipherWechatSource,
+    };
+    use crate::source::WechatSource;
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(50);
+    const ASSERTION_TIMEOUT: Duration = Duration::from_millis(500);
+
+    #[derive(Default)]
+    struct BlockingGate {
+        state: Mutex<BlockingState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct BlockingState {
+        entered: bool,
+        released: bool,
+        completed: bool,
+        calls: usize,
+    }
+
+    impl BlockingGate {
+        fn enter_and_wait(&self) {
+            let mut state = self.state.lock().expect("blocking gate lock");
+            state.calls += 1;
+            state.entered = true;
+            self.changed.notify_all();
+            while !state.released {
+                state = self.changed.wait(state).expect("blocking gate wait");
+            }
+            state.completed = true;
+            self.changed.notify_all();
+        }
+
+        fn wait_until_entered(&self) {
+            let mut state = self.state.lock().expect("blocking gate lock");
+            while !state.entered {
+                state = self.changed.wait(state).expect("blocking gate wait");
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().expect("blocking gate lock");
+            state.released = true;
+            self.changed.notify_all();
+        }
+
+        fn wait_until_completed(&self) {
+            let mut state = self.state.lock().expect("blocking gate lock");
+            while !state.completed {
+                state = self.changed.wait(state).expect("blocking gate wait");
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.state.lock().expect("blocking gate lock").calls
+        }
+    }
+
+    struct BlockingKeyStore {
+        gate: Arc<BlockingGate>,
+        material: Vec<u8>,
+    }
+
+    impl CredentialStore for BlockingKeyStore {
+        fn load(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+            assert_eq!(service, WECHAT_CREDENTIAL_SERVICE);
+            assert_eq!(account, WECHAT_CREDENTIAL_ACCOUNT);
+            self.gate.enter_and_wait();
+            Ok(Some(self.material.clone()))
+        }
+
+        fn store(&self, _: &str, _: &str, _: &[u8]) -> Result<(), CredentialError> {
+            Err(CredentialError::UnsupportedIdentity)
+        }
+
+        fn delete(&self, _: &str, _: &str) -> Result<(), CredentialError> {
+            Err(CredentialError::UnsupportedIdentity)
+        }
+    }
+
+    struct ImmediateKeyStore(Vec<u8>);
+
+    impl CredentialStore for ImmediateKeyStore {
+        fn load(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+            assert_eq!(service, WECHAT_CREDENTIAL_SERVICE);
+            assert_eq!(account, WECHAT_CREDENTIAL_ACCOUNT);
+            Ok(Some(self.0.clone()))
+        }
+
+        fn store(&self, _: &str, _: &str, _: &[u8]) -> Result<(), CredentialError> {
+            Err(CredentialError::UnsupportedIdentity)
+        }
+
+        fn delete(&self, _: &str, _: &str) -> Result<(), CredentialError> {
+            Err(CredentialError::UnsupportedIdentity)
+        }
+    }
+
+    struct SuccessfulProbe;
+
+    impl ReadOnlySqlcipherProbe for SuccessfulProbe {
+        fn probe(
+            &self,
+            _: &SqlcipherProbeTarget,
+            _: &WechatKeyMaterial,
+            _: Duration,
+        ) -> Result<SourceCapabilities, SqlcipherProbeFailure> {
+            Ok(test_capabilities())
+        }
+    }
+
+    struct BlockingSuccessfulProbe {
+        gate: Arc<BlockingGate>,
+    }
+
+    impl ReadOnlySqlcipherProbe for BlockingSuccessfulProbe {
+        fn probe(
+            &self,
+            _: &SqlcipherProbeTarget,
+            _: &WechatKeyMaterial,
+            _: Duration,
+        ) -> Result<SourceCapabilities, SqlcipherProbeFailure> {
+            self.gate.enter_and_wait();
+            Ok(test_capabilities())
+        }
+    }
+
+    #[test]
+    fn blocking_keychain_does_not_extend_the_caller_deadline() {
+        let gate = Arc::new(BlockingGate::default());
+        let source = Arc::new(SqlcipherWechatSource::with_dependencies_and_timeout(
+            BlockingKeyStore {
+                gate: Arc::clone(&gate),
+                material: encoded_material(),
+            },
+            SuccessfulProbe,
+            test_target(),
+            TEST_TIMEOUT,
+        ));
+        let (result_sender, result_receiver) = mpsc::channel();
+        let caller_source = Arc::clone(&source);
+        let caller = thread::spawn(move || {
+            result_sender
+                .send(caller_source.probe_blocking())
+                .expect("send probe result");
+        });
+        gate.wait_until_entered();
+
+        let result = result_receiver.recv_timeout(ASSERTION_TIMEOUT);
+        gate.release();
+        caller.join().expect("probe caller");
+        let error = result
+            .expect("caller must return while Keychain work remains blocked")
+            .expect_err("blocked Keychain probe must time out");
+
+        assert_eq!(error.code, "WECHAT_PROBE_TIMEOUT");
+    }
+
+    #[test]
+    fn a_stuck_worker_rejects_further_probes_without_queueing_work() {
+        let gate = Arc::new(BlockingGate::default());
+        let source = Arc::new(SqlcipherWechatSource::with_dependencies_and_timeout(
+            ImmediateKeyStore(encoded_material()),
+            BlockingSuccessfulProbe {
+                gate: Arc::clone(&gate),
+            },
+            test_target(),
+            TEST_TIMEOUT,
+        ));
+        let first_source = Arc::clone(&source);
+        let first = thread::spawn(move || first_source.probe_blocking());
+        gate.wait_until_entered();
+        let first_error = first
+            .join()
+            .expect("first probe caller")
+            .expect_err("first probe must time out");
+
+        let started_at = Instant::now();
+        let second_error = source
+            .probe_blocking()
+            .expect_err("stuck worker must reject a later probe");
+        let second_elapsed = started_at.elapsed();
+        gate.release();
+
+        assert_eq!(first_error.code, "WECHAT_PROBE_TIMEOUT");
+        assert_eq!(second_error.code, "WECHAT_PROBE_TIMEOUT");
+        assert!(second_elapsed < TEST_TIMEOUT);
+        assert_eq!(gate.call_count(), 1, "no second job may be queued");
+    }
+
+    #[tokio::test]
+    async fn a_late_success_after_timeout_never_restores_source_proof() {
+        let gate = Arc::new(BlockingGate::default());
+        let source = Arc::new(SqlcipherWechatSource::with_dependencies_and_timeout(
+            ImmediateKeyStore(encoded_material()),
+            BlockingSuccessfulProbe {
+                gate: Arc::clone(&gate),
+            },
+            test_target(),
+            TEST_TIMEOUT,
+        ));
+        let caller_source = Arc::clone(&source);
+        let caller = thread::spawn(move || caller_source.probe_blocking());
+        gate.wait_until_entered();
+        let error = caller
+            .join()
+            .expect("probe caller")
+            .expect_err("blocked probe must time out");
+
+        gate.release();
+        gate.wait_until_completed();
+        let Err(read_error) = source.read_after(&SourceCursor).await else {
+            panic!("late success must not restore proof");
+        };
+
+        assert_eq!(error.code, "WECHAT_PROBE_TIMEOUT");
+        assert_eq!(read_error.code, "WECHAT_WAITING_SOURCE");
+    }
+
+    fn encoded_material() -> Vec<u8> {
+        WechatKeyMaterial::new("test-account-proof", [0x2a; 32])
+            .expect("valid test material")
+            .encode()
+            .expect("encoded test material")
+    }
+
+    fn test_target() -> SqlcipherProbeTarget {
+        SqlcipherProbeTarget::new(
+            PathBuf::from("unused-test-source.db"),
+            "test-version",
+            1,
+            1,
+            "SELECT source_version",
+            "SELECT schema_version",
+            "SELECT account_id",
+        )
+        .expect("valid test target")
+    }
+
+    fn test_capabilities() -> SourceCapabilities {
+        SourceCapabilities {
+            source_version: "test-version".to_owned(),
+            schema_version: 1,
+        }
     }
 }

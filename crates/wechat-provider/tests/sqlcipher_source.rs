@@ -242,7 +242,7 @@ fn keychain_work_that_exhausts_the_total_deadline_never_starts_the_database_prob
 }
 
 #[tokio::test]
-async fn overlapping_probes_are_serialized_and_the_later_failure_clears_success() {
+async fn a_newer_probe_invalidates_inflight_success_and_later_failure_clears_proof() {
     let probe = SequencedProbe::default();
     let source = Arc::new(SqlcipherWechatSource::with_dependencies(
         EncodedKeyStore(encoded_material("local-account-proof", [0x2a; 32])),
@@ -254,25 +254,25 @@ async fn overlapping_probes_are_serialized_and_the_later_failure_clears_success(
     let first = thread::spawn(move || first_source.probe_blocking());
     probe.wait_for_first_call();
 
-    let second_source = Arc::clone(&source);
-    let second = thread::spawn(move || second_source.probe_blocking());
-    thread::sleep(Duration::from_millis(50));
+    let overlapping_error = source
+        .probe_blocking()
+        .expect_err("newer probe must fail closed while the worker is occupied");
     assert_eq!(
         probe.call_count(),
         1,
         "only one probe may execute at a time"
     );
+    assert_eq!(overlapping_error.code, "WECHAT_PROBE_TIMEOUT");
 
     probe.release_first();
-    first
+    let first_error = first
         .join()
         .expect("first probe thread")
-        .expect("first probe succeeds");
-    let second_error = second
-        .join()
-        .expect("second probe thread")
-        .expect_err("later probe fails");
-    assert_eq!(second_error.code, "WECHAT_ACCOUNT_UNVERIFIED");
+        .expect_err("newer generation invalidates the first success");
+    assert_eq!(first_error.code, "WECHAT_PROBE_TIMEOUT");
+
+    let later_error = source.probe_blocking().expect_err("later probe fails");
+    assert_eq!(later_error.code, "WECHAT_ACCOUNT_UNVERIFIED");
 
     let Err(read_error) = source.read_after(&SourceCursor).await else {
         panic!("later failure must clear prior proof");
