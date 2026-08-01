@@ -21,6 +21,14 @@ echo "fixture Railway deployment verifier executed"
 EOF
 chmod +x "$fixture_directory/scripts/tests/test_verify_railway_deployment.sh"
 
+cat >"$fixture_directory/scripts/tests/railway_dashboard_build_contract.test.mjs" <<'EOF'
+import test from "node:test";
+
+test("fixture Dashboard Railway build contract", () => {
+  console.log("fixture Dashboard Railway build contract executed");
+});
+EOF
+
 for tool in rustc swift python3 xcodebuild; do
   cat >"$fixture_directory/bin/$tool" <<'EOF'
 #!/usr/bin/env bash
@@ -57,12 +65,17 @@ output=$(cd "$fixture_directory" && \
   ./scripts/verify-full.sh)
 
 deployment_line=$(printf '%s\n' "$output" | grep -n 'fixture Railway deployment verifier executed' | cut -d: -f1)
+dashboard_build_contract_line=$(printf '%s\n' "$output" | grep -n 'fixture Dashboard Railway build contract executed' | cut -d: -f1)
 acceptance_build_line=$(printf '%s\n' "$output" | grep -n 'fixture S1B acceptance Agent built' | cut -d: -f1)
 acceptance_line=$(printf '%s\n' "$output" | grep -n 'fixture S1B shared process acceptance executed' | cut -d: -f1)
 success_line=$(printf '%s\n' "$output" | grep -n '^FULL VERIFICATION PASSED$' | cut -d: -f1)
 
 [[ -n "$deployment_line" ]] || {
   echo "expected Railway deployment verifier to execute" >&2
+  exit 1
+}
+[[ -n "$dashboard_build_contract_line" ]] || {
+  echo "expected Dashboard Railway build contract test to execute" >&2
   exit 1
 }
 [[ -n "$success_line" ]] || {
@@ -75,6 +88,10 @@ success_line=$(printf '%s\n' "$output" | grep -n '^FULL VERIFICATION PASSED$' | 
 }
 [[ "$deployment_line" -lt "$success_line" ]] || {
   echo "expected Railway deployment verifier before final success" >&2
+  exit 1
+}
+[[ "$deployment_line" -lt "$dashboard_build_contract_line" && "$dashboard_build_contract_line" -lt "$success_line" ]] || {
+  echo "expected Dashboard Railway build contract after deployment verifier and before final success" >&2
   exit 1
 }
 [[ "$acceptance_build_line" -lt "$acceptance_line" && "$acceptance_line" -lt "$success_line" ]] || {

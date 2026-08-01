@@ -132,7 +132,19 @@ async function main(): Promise<void> {
       { deviceId: exchangedDevice.deviceId, status: 200 },
       { deviceId: exchangedDevice.deviceId, status: 401 },
     ]);
-    assert.ok(inspection.sensitiveValues.length >= 5);
+    assert.deepEqual(Object.keys(inspection).sort(), [
+      "controlRequests",
+      "exchangeCount",
+      "nonCredentialJson",
+      "pkce",
+      "sensitiveValues",
+    ]);
+    assert.equal(
+      inspection.sensitiveValues.length,
+      6,
+      "parent sensitive scans must include the live verifier without a dedicated field",
+    );
+    assertSensitiveInjectionIsRejected(inspection.sensitiveValues);
     const messageCanary = inspection.sensitiveValues.find((value) =>
       value.startsWith("accept-canary-")
     );
@@ -164,6 +176,19 @@ async function main(): Promise<void> {
     pairingAgent?.stop();
     await cloud.close();
     await rm(runtimeRoot, { recursive: true, force: true });
+  }
+}
+
+function assertSensitiveInjectionIsRejected(sensitiveValues: readonly string[]): void {
+  for (const sensitive of sensitiveValues) {
+    assert.throws(
+      () => assertNoSensitiveBytes(
+        "injected parent-scanned status plane",
+        Buffer.from(`status-prefix:${sensitive}:status-suffix`),
+        sensitiveValues,
+      ),
+      /contained sensitive material/,
+    );
   }
 }
 

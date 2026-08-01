@@ -9,7 +9,7 @@ if [[ "${PCA_DISABLE_TOOLCHAIN_FALLBACK:-0}" != "1" ]] && [[ -d "/opt/homebrew/o
   export PATH
 fi
 
-for required_tool in cargo rustc swift pnpm python3; do
+for required_tool in cargo rustc swift node pnpm python3; do
   if ! command -v "$required_tool" >/dev/null 2>&1; then
     echo "missing required tool: $required_tool" >&2
     exit 1
@@ -19,6 +19,7 @@ done
 pnpm install --frozen-lockfile
 ./scripts/verify-structural.sh
 bash scripts/tests/test_verify_railway_deployment.sh
+node --test scripts/tests/railway_dashboard_build_contract.test.mjs
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace

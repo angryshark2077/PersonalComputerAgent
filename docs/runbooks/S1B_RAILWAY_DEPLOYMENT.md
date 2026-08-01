@@ -13,40 +13,46 @@ Railway Variables UI.
   service. Use Singapore (Southeast Asia) for every service in this procedure.
 - Keep the repository root directory as `/` for both application services.
 
-## Create the application services
+## Create the application services without starting Dashboard build
 
 1. In the Railway project, select **New** → **GitHub Repo**, choose the private
-   repository, and create the first service. Rename it to `pca-cloud-api`, set
-   its region to Singapore, and leave **Root Directory** as `/`.
-2. In that service's **Variables** tab, set
-   `RAILWAY_DOCKERFILE_PATH` to `/deploy/railway/Dockerfile.cloud-api`.
-3. Repeat **New** → **GitHub Repo** for a second service. Rename it to
-   `pca-dashboard`, set its region to Singapore, and leave **Root Directory**
-   as `/`.
-4. Set its `RAILWAY_DOCKERFILE_PATH` to
-   `/deploy/railway/Dockerfile.dashboard`.
-5. Wait for each initial build to succeed before selecting **Settings** →
-   **Networking** → **Generate Domain**. Generate one public domain per
-   service only after that service has a successful build.
+   repository, and create `pca-cloud-api`. Set its region to Singapore, leave
+   **Root Directory** as `/`, and set `RAILWAY_DOCKERFILE_PATH` to
+   `/deploy/railway/Dockerfile.cloud-api`.
+2. Create `pca-dashboard` as an empty service with no GitHub source connected.
+   Set its region to Singapore and keep **Root Directory** as `/`. Reserve its
+   public HTTPS domain for `BETTER_AUTH_URL`, but do not start a Dashboard build.
+3. On the empty Dashboard service, set `RAILWAY_DOCKERFILE_PATH` to
+   `/deploy/railway/Dockerfile.dashboard`. Leave
+   `NEXT_PUBLIC_CLOUD_API_ORIGIN` unset; it is forbidden.
 
-## Configure variables and deploy order
+## Configure Cloud and the required first-build order
 
-1. In `pca-cloud-api` → **Variables**, add
-   `DATABASE_URL=${{Postgres.DATABASE_URL}}` using Railway's PostgreSQL
-   reference. Enter `BETTER_AUTH_SECRET` directly in the UI and seal it; never
-   copy it into the repository, terminal history, logs, or this runbook. Set
-   `BETTER_AUTH_URL` to the generated Dashboard HTTPS domain.
-2. In `pca-dashboard` → **Variables**, add `CLOUD_API_INTERNAL_ORIGIN` with
-   Railway's variable autocomplete: select the API service's private-domain
-   reference and port, forming its private HTTP origin. Do not create any
-   browser-facing API-origin variable, especially no `NEXT_PUBLIC_` API origin.
-3. In `pca-cloud-api` → **Settings** → **Deploy**, set the pre-deploy command
-   to `pnpm --filter @pca/cloud-api migrate`. In each service's health-check
-   setting, use `/healthz`.
-4. Deploy `pca-cloud-api` first. Confirm its migration/pre-deploy phase and
-   `/healthz` complete successfully. Then deploy `pca-dashboard`. Its
-   `/healthz` remains `503 not_ready` until the private API origin is present
-   and valid; do not bypass that readiness failure.
+In `pca-cloud-api` → **Variables**, add
+`DATABASE_URL=${{Postgres.DATABASE_URL}}` using Railway's PostgreSQL reference.
+Enter `BETTER_AUTH_SECRET` directly in the UI and seal it; never copy it into
+the repository, terminal history, logs, or this runbook. Set `BETTER_AUTH_URL`
+to the reserved Dashboard HTTPS domain. In **Settings** → **Deploy**, set the
+pre-deploy command to `pnpm --filter @pca/cloud-api migrate` and the health
+check to `/healthz`.
+
+1. Deploy `pca-cloud-api` and confirm `/healthz` succeeds.
+2. Expose the API Railway private domain and record its private HTTP origin with port.
+3. Set `CLOUD_API_INTERNAL_ORIGIN` on the undeployed `pca-dashboard` service.
+4. Only now connect the Dashboard source and allow its first build to start.
+
+For step 2, use the Cloud service's Railway private-domain reference and its
+listening port, forming a root `http://<service>.railway.internal:<port>`
+origin. For step 3, select that reference through Railway variable autocomplete;
+do not type or copy a secret. Railway supplies the declared Docker build arg to
+`next build`, where the existing private-origin validation rejects missing or
+invalid values and rejects any configured `NEXT_PUBLIC_CLOUD_API_ORIGIN`.
+
+After the Dashboard first build succeeds, set its health check to `/healthz`
+and generate/confirm the API public HTTPS domain for the installed Agent. If the
+private origin was absent at build time, the build must fail; setting it only as
+a later runtime variable cannot repair that image, so correct the variable and
+rebuild.
 
 ## Public verification and acceptance
 
@@ -76,10 +82,15 @@ Before an operator deploys, run:
 
 ```bash
 bash scripts/tests/test_verify_railway_deployment.sh
+node --test scripts/tests/railway_dashboard_build_contract.test.mjs
 docker build -f deploy/railway/Dockerfile.cloud-api -t pca-cloud-api:verify .
-docker build -f deploy/railway/Dockerfile.dashboard -t pca-dashboard:verify .
+docker build \
+  --build-arg CLOUD_API_INTERNAL_ORIGIN=http://pca-cloud-api.railway.internal:8080 \
+  --build-arg NEXT_PUBLIC_CLOUD_API_ORIGIN= \
+  -f deploy/railway/Dockerfile.dashboard -t pca-dashboard:verify .
 pnpm --filter @pca/cloud-api build
-pnpm --filter @pca/web-dashboard build
+CLOUD_API_INTERNAL_ORIGIN=http://pca-cloud-api.railway.internal:8080 \
+  env -u NEXT_PUBLIC_CLOUD_API_ORIGIN pnpm --filter @pca/web-dashboard build
 git diff --check
 ```
 
@@ -89,13 +100,14 @@ builds and verifier test still need to run locally.
 
 ### 2026-08-01 local result
 
-Docker was unavailable in the preparation environment, so image builds remain
-unverified. The exact attempted commands and errors were:
+Docker was unavailable in the preparation environment, so neither corrected
+image build above executed and both image builds remain unverified. The local
+availability check returned:
 
 ```text
-docker build -f deploy/railway/Dockerfile.cloud-api -t pca-cloud-api:verify .
-zsh: command not found: docker
-
-docker build -f deploy/railway/Dockerfile.dashboard -t pca-dashboard:verify .
-zsh: command not found: docker
+docker: command not found
 ```
+
+The commands in **Local verification record** are the authoritative commands
+to run when Docker becomes available; do not convert this fixture-only contract
+proof into an image-build claim.

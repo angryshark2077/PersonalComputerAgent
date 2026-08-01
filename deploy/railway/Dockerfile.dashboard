@@ -5,6 +5,11 @@ WORKDIR /app
 COPY . .
 
 RUN corepack enable && pnpm install --frozen-lockfile
+
+ARG CLOUD_API_INTERNAL_ORIGIN
+ARG NEXT_PUBLIC_CLOUD_API_ORIGIN
+ENV CLOUD_API_INTERNAL_ORIGIN=${CLOUD_API_INTERNAL_ORIGIN}
+ENV NEXT_PUBLIC_CLOUD_API_ORIGIN=${NEXT_PUBLIC_CLOUD_API_ORIGIN}
 RUN pnpm --filter @pca/web-dashboard build
 
 CMD ["pnpm", "--filter", "@pca/web-dashboard", "start"]

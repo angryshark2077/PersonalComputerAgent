@@ -151,11 +151,15 @@ export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
               rejectPairingStart(new Error(`pairing start returned ${response.status}`));
             }
           }
-          if (pairingExchange !== null && pairingCallbackState !== null && pairingCodeChallenge !== null) {
+          if (pairingExchange !== null
+            && typeof pairingExchange.code_verifier === "string"
+            && pairingCallbackState !== null
+            && pairingCodeChallenge !== null) {
             verifierDiffersFromCallbackState =
               pairingExchange.code_verifier !== pairingCallbackState;
             challengeMatched =
               pkceChallenge(pairingExchange.code_verifier) === pairingCodeChallenge;
+            sensitiveValues.add(pairingExchange.code_verifier);
           }
           if (url.pathname === "/v1/device-pairing/exchange" && response.ok) {
             try {
