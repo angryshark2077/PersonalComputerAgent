@@ -758,7 +758,7 @@ impl TryFrom<RawCommunicationAttachment> for CommunicationAttachment {
 }
 
 /// Input to the pure message-record validator. It has no source, storage, or network handles.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommunicationMessageRecordedInput {
     pub message_id: String,
     pub conversation_id: String,
@@ -771,8 +771,21 @@ pub struct CommunicationMessageRecordedInput {
     pub attachments: Vec<CommunicationAttachment>,
 }
 
+impl fmt::Debug for CommunicationMessageRecordedInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommunicationMessageRecordedInput")
+            .field("direction", &self.direction)
+            .field("kind", &self.kind)
+            .field("conversation", &self.conversation)
+            .field("has_text", &self.text.is_some())
+            .field("attachment_count", &self.attachments.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// A validated, eligible communication message record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawCommunicationMessageRecorded")]
 pub struct CommunicationMessageRecorded {
     message_id: String,
@@ -786,6 +799,19 @@ pub struct CommunicationMessageRecorded {
     text: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<CommunicationAttachment>,
+}
+
+impl fmt::Debug for CommunicationMessageRecorded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommunicationMessageRecorded")
+            .field("direction", &self.direction)
+            .field("kind", &self.kind)
+            .field("conversation", &self.conversation)
+            .field("has_text", &self.text.is_some())
+            .field("attachment_count", &self.attachments.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CommunicationMessageRecorded {
