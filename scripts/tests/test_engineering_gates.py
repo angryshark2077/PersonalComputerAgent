@@ -61,6 +61,9 @@ class EngineeringGateTests(unittest.TestCase):
             "crates/db-local/migrations/0003_s1b_pairing_state.sql",
             "packages/db-cloud/migrations/0000_baseline.sql",
             "packages/db-cloud/migrations/0001_s1b_control_plane.sql",
+            "packages/db-cloud/migrations/0002_s1b_device_revocation_audit.sql",
+            "packages/db-cloud/migrations/0003_s1b_pairing_state_and_better_auth_session.sql",
+            "packages/db-cloud/migrations/0004_s1b_hash_better_auth_sessions.sql",
         ):
             source = REPOSITORY_ROOT / relative_path
             self.write(root / relative_path, source.read_text(encoding="utf-8"))
@@ -73,6 +76,9 @@ class EngineeringGateTests(unittest.TestCase):
         self.assertIn("0002_s2_collector_state.sql sha256=", result.stdout)
         self.assertIn("0003_s1b_pairing_state.sql sha256=", result.stdout)
         self.assertIn("0001_s1b_control_plane.sql sha256=", result.stdout)
+        self.assertIn("0002_s1b_device_revocation_audit.sql sha256=", result.stdout)
+        self.assertIn("0003_s1b_pairing_state_and_better_auth_session.sql sha256=", result.stdout)
+        self.assertIn("0004_s1b_hash_better_auth_sessions.sql sha256=", result.stdout)
 
     def test_domain_to_platform_import_is_rejected(self) -> None:
         root = self.make_repo()

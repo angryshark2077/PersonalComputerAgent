@@ -20,7 +20,13 @@ EXPECTED_MIGRATIONS = {
         "0002_s2_collector_state.sql",
         "0003_s1b_pairing_state.sql",
     ],
-    MIGRATION_ROOTS[1]: ["0000_baseline.sql", "0001_s1b_control_plane.sql"],
+    MIGRATION_ROOTS[1]: [
+        "0000_baseline.sql",
+        "0001_s1b_control_plane.sql",
+        "0002_s1b_device_revocation_audit.sql",
+        "0003_s1b_pairing_state_and_better_auth_session.sql",
+        "0004_s1b_hash_better_auth_sessions.sql",
+    ],
 }
 
 
@@ -153,6 +159,7 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "pairing_authorization_codes",
         "collector_configs",
         "collector_config_audit",
+        "device_revocation_audit",
         "device_heartbeats",
     }
     actual_tables = set(
@@ -171,13 +178,19 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
     )
     if not required_indexes.issubset(actual_indexes):
         return f"missing S1B Cloud indexes: {sorted(required_indexes - actual_indexes)}"
-    plaintext_names = re.findall(
-        r"\b(access_token|refresh_token|authorization_code|session_token)\b",
-        sql,
+    remediation = files[-1].read_text(encoding="utf-8")
+    if not re.search(
+        r"ALTER\s+TABLE\s+auth_sessions\s+DROP\s+COLUMN\s+IF\s+EXISTS\s+session_token",
+        remediation,
         flags=re.IGNORECASE,
-    )
-    if plaintext_names:
-        return f"Cloud migration contains plaintext credential columns: {plaintext_names}"
+    ):
+        return "Cloud session-token remediation must drop the immutable 0003 raw column"
+    if not re.search(
+        r"ALTER\s+COLUMN\s+session_token_hash\s+SET\s+NOT\s+NULL",
+        remediation,
+        flags=re.IGNORECASE,
+    ):
+        return "Cloud session-token remediation must require session_token_hash"
     return None
 
 

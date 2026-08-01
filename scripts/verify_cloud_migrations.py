@@ -18,6 +18,7 @@ EXPECTED_TABLES = [
     "collector_configs",
     "device_credential_generations",
     "device_heartbeats",
+    "device_revocation_audit",
     "devices",
     "pairing_authorization_codes",
     "pairing_sessions",
@@ -243,10 +244,33 @@ def verify_owner_constraints(postgres: TemporaryPostgres, database: str) -> None
         raise VerificationFailure("config-audit actor membership FK was not enforced")
 
 
+def verify_session_secret_remediation(postgres: TemporaryPostgres, database: str) -> None:
+    columns = postgres.psql(
+        database,
+        "-Atc",
+        "SELECT column_name || ':' || is_nullable "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'auth_sessions' "
+        "ORDER BY column_name",
+    ).stdout.splitlines()
+    if any(column.startswith("session_token:") for column in columns):
+        raise VerificationFailure("raw auth session token column survived remediation")
+    if "session_token_hash:NO" not in columns:
+        raise VerificationFailure("auth session hash must be required after remediation")
+    if postgres.psql(database, "-Atc", "SELECT COUNT(*) FROM auth_sessions").stdout.strip() != "0":
+        raise VerificationFailure("legacy raw auth sessions were not invalidated")
+
+
 def verify(repository_root: Path) -> None:
-    baseline = repository_root / "packages/db-cloud/migrations/0000_baseline.sql"
-    control_plane = repository_root / "packages/db-cloud/migrations/0001_s1b_control_plane.sql"
-    for migration in (baseline, control_plane):
+    migrations = [
+        repository_root / "packages/db-cloud/migrations/0000_baseline.sql",
+        repository_root / "packages/db-cloud/migrations/0001_s1b_control_plane.sql",
+        repository_root / "packages/db-cloud/migrations/0002_s1b_device_revocation_audit.sql",
+        repository_root
+        / "packages/db-cloud/migrations/0003_s1b_pairing_state_and_better_auth_session.sql",
+        repository_root / "packages/db-cloud/migrations/0004_s1b_hash_better_auth_sessions.sql",
+    ]
+    for migration in migrations:
         if not migration.is_file():
             raise VerificationFailure(f"missing Cloud migration: {migration}")
 
@@ -258,15 +282,16 @@ def verify(repository_root: Path) -> None:
             postgres.psql("postgres", "-c", "CREATE DATABASE pca_fresh")
             postgres.psql("postgres", "-c", "CREATE DATABASE pca_upgrade")
 
-            apply(postgres, "pca_fresh", baseline)
-            apply(postgres, "pca_fresh", control_plane)
+            for migration in migrations:
+                apply(postgres, "pca_fresh", migration)
+            verify_session_secret_remediation(postgres, "pca_fresh")
             fresh_before = table_names(postgres, "pca_fresh")
-            apply(postgres, "pca_fresh", baseline)
-            apply(postgres, "pca_fresh", control_plane)
+            for migration in migrations:
+                apply(postgres, "pca_fresh", migration)
             if table_names(postgres, "pca_fresh") != fresh_before:
                 raise VerificationFailure("fresh Cloud migration replay changed the table set")
 
-            apply(postgres, "pca_upgrade", baseline)
+            apply(postgres, "pca_upgrade", migrations[0])
             postgres.psql(
                 "pca_upgrade",
                 "-c",
@@ -274,8 +299,25 @@ def verify(repository_root: Path) -> None:
                 "(id, checksum, app_version, started_at, completed_at, status) VALUES "
                 "('0000', 'sentinel', '0.0.0', now(), now(), 'completed')",
             )
-            apply(postgres, "pca_upgrade", control_plane)
-            apply(postgres, "pca_upgrade", control_plane)
+            for migration in migrations[1:-1]:
+                apply(postgres, "pca_upgrade", migration)
+            postgres.psql(
+                "pca_upgrade",
+                "-c",
+                """
+                INSERT INTO auth_users (id, name, email, created_at, updated_at)
+                  VALUES ('01980000-7000-8000-8000-000000000001', 'Legacy', 'legacy@example.invalid', now(), now());
+                INSERT INTO auth_sessions (
+                  id, user_id, session_token_hash, session_token, expires_at, created_at, updated_at
+                ) VALUES (
+                  '01980000-7000-8000-8000-000000000002', '01980000-7000-8000-8000-000000000001',
+                  NULL, 'legacy-raw-session-token', now() + interval '1 day', now(), now()
+                );
+                """,
+            )
+            apply(postgres, "pca_upgrade", migrations[-1])
+            for migration in migrations[1:]:
+                apply(postgres, "pca_upgrade", migration)
             if table_names(postgres, "pca_upgrade") != EXPECTED_TABLES:
                 raise VerificationFailure("upgrade Cloud migration produced an unexpected table set")
             ledger = postgres.psql(
@@ -285,6 +327,7 @@ def verify(repository_root: Path) -> None:
             ).stdout.strip()
             if ledger != "sentinel":
                 raise VerificationFailure("Cloud upgrade changed the previous migration ledger")
+            verify_session_secret_remediation(postgres, "pca_upgrade")
             verify_owner_constraints(postgres, "pca_upgrade")
             print(f"PostgreSQL {version} fresh, replay, upgrade, and Owner FK checks passed")
         finally:

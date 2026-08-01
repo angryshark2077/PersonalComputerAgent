@@ -337,9 +337,12 @@ export function createProductionApp(environment: ProductionEnvironment = process
     secret,
     emailAndPassword: { enabled: true },
     user: { fields: { image: "imageUrl" } },
-    session: { fields: { token: "sessionToken" } },
+    session: { fields: { token: "sessionTokenHash" } },
     account: { fields: { password: "passwordHash" } },
-    databaseHooks: createOwnerWorkspaceBootstrapHooks(repository),
+    databaseHooks: {
+      ...createOwnerWorkspaceBootstrapHooks(repository),
+      ...createHashedSessionHooks(),
+    },
   });
   const app = createApp({
     repository,
@@ -360,6 +363,22 @@ export function createOwnerWorkspaceBootstrapHooks(
         after: async (user: { id: string }) => {
           await repository.bootstrapOwnerWorkspace(user.id);
         },
+      },
+    },
+  };
+}
+
+/**
+ * Better Auth keeps the resulting token in its signed browser cookie. Persist
+ * only its SHA-256 form so PostgreSQL never receives the raw generated token.
+ */
+export function createHashedSessionHooks() {
+  return {
+    session: {
+      create: {
+        before: async (session: { token: string }) => ({
+          data: { token: hashSecret(session.token) },
+        }),
       },
     },
   };

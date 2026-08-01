@@ -46,8 +46,7 @@ export const authSessions = pgTable(
     userId: uuid("user_id")
       .notNull()
       .references(() => authUsers.id, { onDelete: "cascade" }),
-    sessionTokenHash: char("session_token_hash", { length: 64 }),
-    sessionToken: text("session_token"),
+    sessionTokenHash: char("session_token_hash", { length: 64 }).notNull(),
     expiresAt: timestampColumn("expires_at").notNull(),
     ipAddress: inet("ip_address"),
     userAgent: text("user_agent"),
@@ -56,12 +55,9 @@ export const authSessions = pgTable(
   },
   (table) => [
     uniqueIndex("auth_sessions_token_hash_unique").on(table.sessionTokenHash),
-    uniqueIndex("auth_sessions_session_token_unique")
-      .on(table.sessionToken)
-      .where(sql`${table.sessionToken} IS NOT NULL`),
     check(
       "auth_sessions_token_hash_hex",
-      sql`${table.sessionTokenHash} IS NULL OR ${table.sessionTokenHash} ~ '^[0-9a-f]{64}$'`,
+      sql`${table.sessionTokenHash} ~ '^[0-9a-f]{64}$'`,
     ),
   ],
 );

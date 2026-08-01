@@ -2,17 +2,21 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
 
+import { memoryAdapter } from "better-auth/adapters/memory";
+import { betterAuth } from "better-auth/minimal";
+
 import { MemoryControlRepository } from "@pca/db-cloud/src/repository.js";
 
 import {
   createApp,
   createProductionApp,
   createOwnerWorkspaceBootstrapHooks,
+  createHashedSessionHooks,
   createTrustedProxyClientAddress,
   type OwnerPrincipal,
 } from "../index.js";
 import { createBetterAuthOwnerAuthenticator } from "../auth.js";
-import { pkceChallenge } from "../pairing.js";
+import { hashSecret, pkceChallenge } from "../pairing.js";
 
 const owner: OwnerPrincipal = {
   userId: "01983333-7333-8333-8333-333333333333",
@@ -251,6 +255,41 @@ test("production source IP accepts only an explicitly configured signed proxy he
     address(new Request("http://localhost", { headers: { "x-forwarded-for": ip } })),
     undefined,
   );
+});
+
+test("production session hook persists only a hash of the generated Better Auth token", async () => {
+  const token = "session-token-that-must-never-reach-postgresql";
+  const result = await createHashedSessionHooks().session.create.before({ token });
+  assert.deepEqual(result, { data: { token: hashSecret(token) } });
+  assert.notEqual(result.data.token, token);
+});
+
+test("hashed Better Auth sessions still resolve through a signed cookie", async () => {
+  const database = { user: [], session: [], account: [] };
+  const auth = betterAuth({
+    database: memoryAdapter(database),
+    secret: "test-secret-that-is-long-enough-to-be-valid",
+    baseURL: "http://localhost:3000",
+    emailAndPassword: { enabled: true },
+    session: { fields: { token: "sessionTokenHash" } },
+    databaseHooks: createHashedSessionHooks(),
+  });
+  const signup = await auth.handler(
+    new Request("http://localhost:3000/api/auth/sign-up/email", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Session Test", email: "session@example.invalid", password: "password123" }),
+    }),
+  );
+  assert.equal(signup.status, 200);
+  const sessionToken = ((await signup.json()) as { token: string }).token;
+  const persisted = database.session[0] as Record<string, unknown> | undefined;
+  assert.equal(persisted?.sessionTokenHash, sessionToken);
+  assert.equal("token" in (persisted ?? {}), false);
+  const cookie = signup.headers.get("set-cookie")?.split(";", 1)[0];
+  if (cookie === undefined) assert.fail("sign-up did not set a session cookie");
+  const session = await auth.api.getSession({ headers: new Headers({ cookie }) });
+  assert.equal(session?.user.email, "session@example.invalid");
 });
 
 test("production signup bootstrap creates one Owner workspace before pairing authorization", async () => {
