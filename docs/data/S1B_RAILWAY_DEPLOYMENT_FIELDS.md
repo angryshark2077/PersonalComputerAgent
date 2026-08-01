@@ -13,10 +13,11 @@ live Setup-to-Agent pairing has been created or verified from this repository.
 | Dashboard | `pca-dashboard`; public browser service | The browser's same-origin `/api/auth/*` and `/v1/*` paths |
 | Dashboard-to-API | private Railway network | Dashboard server rewrites to API private HTTP origin; browser code never receives it |
 
-All three services are configured in Railway Singapore (Southeast Asia). The
-operator keeps root directory `/` and selects the Dockerfile path through the
-service Variable `RAILWAY_DOCKERFILE_PATH`: `/deploy/railway/Dockerfile.cloud-api`
-or `/deploy/railway/Dockerfile.dashboard`.
+The operator must configure all three services in Railway Singapore (Southeast
+Asia) when following the deployment runbook. The operator keeps root directory
+`/` and selects the Dockerfile path through the service Variable
+`RAILWAY_DOCKERFILE_PATH`: `/deploy/railway/Dockerfile.cloud-api` or
+`/deploy/railway/Dockerfile.dashboard`.
 
 ## Deployment variables
 
