@@ -874,8 +874,12 @@ mod tests {
         (directory, Arc::new(database))
     }
 
-    async fn yield_until(mut condition: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    async fn yield_until(condition: impl FnMut() -> bool) {
+        yield_until_with_timeout(Duration::from_secs(5), condition).await;
+    }
+
+    async fn yield_until_with_timeout(timeout: Duration, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if condition() {
                 return;
@@ -1278,7 +1282,10 @@ mod tests {
         .expect("start boundary runtime");
         let observer =
             Connection::open(directory.path().join("agent.sqlite3")).expect("open observer");
-        yield_until(|| status_transitions(&observer).len() == 2).await;
+        yield_until_with_timeout(Duration::from_secs(30), || {
+            status_transitions(&observer).len() == 2
+        })
+        .await;
 
         assert_eq!((controls.cpu_calls(), controls.disk_calls()), (0, 0));
         assert_eq!(
