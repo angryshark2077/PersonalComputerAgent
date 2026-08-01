@@ -46,9 +46,9 @@ class ProcessInspectorTests(unittest.TestCase):
                         sys.executable, str(INSPECTOR), "--agent-pid", str(parent.pid), "--uid", str(os.geteuid()),
                         "--agent-path", str(executable), "--bridge-path", str(executable),
                     ],
-                    check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
-                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(result.stdout.strip(), "process inspector succeeded without JSON output")
                 document = json.loads(result.stdout)
                 self.assertEqual(document["agent"]["pid"], parent.pid)
