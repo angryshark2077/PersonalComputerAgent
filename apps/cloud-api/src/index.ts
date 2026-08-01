@@ -42,6 +42,8 @@ import {
 
 export type { OwnerPrincipal } from "./auth.js";
 
+const productionDashboardOrigin = "https://pca-dashboard-production.up.railway.app";
+
 export interface CreateAppOptions {
   repository: ControlRepository;
   ownerAuthenticator?: OwnerAuthenticator;
@@ -80,7 +82,10 @@ export function createApp(options: CreateAppOptions): Hono {
       expiresAt: new Date(now.getTime() + pairingSessionLifetimeMs),
       createdAt: now,
     });
-    return context.json({ session_id: sessionId }, 201);
+    return context.json({
+      session_id: sessionId,
+      authorization_url: pairingAuthorizationURL(sessionId, input.callback_state),
+    }, 201);
   });
 
   app.post("/v1/device-pairing/sessions/:sessionId/authorize", async (context) => {
@@ -312,6 +317,12 @@ export function createApp(options: CreateAppOptions): Hono {
   });
 
   return app;
+}
+
+function pairingAuthorizationURL(sessionId: string, callbackState: string): string {
+  const url = new URL("/pair", productionDashboardOrigin);
+  url.search = new URLSearchParams({ session_id: sessionId, callback_state: callbackState }).toString();
+  return url.toString();
 }
 
 export interface ProductionEnvironment {

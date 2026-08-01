@@ -34,6 +34,27 @@ function app() {
   });
 }
 
+test("pairing session returns the fixed Dashboard authorization URL", async () => {
+  const api = app();
+  const response = await api.request("/v1/device-pairing/sessions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(start),
+  });
+
+  assert.equal(response.status, 201);
+  const handoff = (await response.json()) as {
+    session_id: string;
+    authorization_url: string;
+  };
+  const authorization = new URL(handoff.authorization_url);
+  assert.equal(authorization.origin, "https://pca-dashboard-production.up.railway.app");
+  assert.equal(authorization.pathname, "/pair");
+  assert.deepEqual([...authorization.searchParams.keys()].sort(), ["callback_state", "session_id"]);
+  assert.equal(authorization.searchParams.get("session_id"), handoff.session_id);
+  assert.equal(authorization.searchParams.get("callback_state"), start.callback_state);
+});
+
 test("a pairing code is single use and PKCE bound", async () => {
   const api = app();
   const sessionResponse = await api.request("/v1/device-pairing/sessions", {
