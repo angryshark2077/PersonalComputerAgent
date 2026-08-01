@@ -41,3 +41,38 @@ git diff --check
 ```
 
 The focused test file now has explicit regressions for corrupt startup records and injected Keychain deletion failures; both assert no pairing state remains and both sensitive Collector keys are `disabled`.
+
+## Final build-quality verification (2026-08-01)
+
+This verification pass made no runtime, authentication, Cloud, Collector, or
+deployment change. The existing public `pca-keychain` APIs already contain the
+required error documentation: the focused strict lint passed, so no API
+documentation edit was necessary or made.
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `cargo fmt --all --check` | 0 | passed with Rust stable 1.97.1 |
+| `cargo build --workspace` | 0 | passed with Rust stable 1.97.1 |
+| `cargo test --workspace` | 0 | passed with Rust stable 1.97.1; includes the S1B control and Keychain tests |
+| `PATH=/Users/jacob/.rustup/toolchains/1.82.0-aarch64-apple-darwin/bin:$PATH cargo test --workspace` | 0 | passed with the declared minimum Rust 1.82.0 toolchain |
+| `cargo clippy -p pca-keychain --all-targets -- -D warnings` | 0 | focused strict lint passed with Rust stable 1.97.1 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 101 | **blocked/failing**: `clippy::doc_markdown` requires backticks around `WeChat` in `crates/db-local/src/actor.rs:411`; this file is outside the permitted `pca-keychain` public-API documentation-only edit scope |
+| `cargo test -p pca-agentd --features process-test-hooks --test process_lifecycle --test system_collector_process --test collector_commit_kill` | 0 | 12 process tests passed |
+| `swift build --package-path platform/macos` | 0 | passed (Swift 6.3.3) |
+| `swift run --package-path platform/macos BridgeContractVerifier` | 0 | Bridge contract fixture passed |
+| `xcodebuild test -project platform/macos/PersonalComputerAgent.xcodeproj -scheme PersonalComputerAgent -only-testing:PersonalComputerAgentTests/PairingCoordinatorTests -derivedDataPath /tmp/pca-verify-full-pairing` | 0 | 2 pairing callback tests passed |
+| `pnpm install --frozen-lockfile` | 0 | lockfile current |
+| `pnpm typecheck` | 0 | all five TypeScript workspace projects passed |
+| `pnpm test` | 0 | Dashboard 11, contracts 15, db-cloud 8, and cloud-api 16 tests passed; domain package has 0 tests |
+| `python3 scripts/verify_migrations.py .` | 0 | local and Cloud migration chains passed |
+| `python3 scripts/verify_cloud_migrations.py .` | 0 | PostgreSQL 17.10 fresh, replay, upgrade, and Owner-FK checks passed |
+| `python3 scripts/verify_boundaries.py .` | 0 | dependency boundaries passed |
+| `git diff --check` | 0 | no whitespace errors before this report update |
+
+The repository-standard `./scripts/verify-full.sh` was run with the available
+stable Rust toolchain and reached the same workspace-clippy failure after its
+structural gate passed. It therefore does not pass as a whole and S1B must not
+be declared fully verified until the documented `pca-db-local` lint finding is
+addressed by the owner of that file. The installed Rust 1.82.0 toolchain has
+`cargo` and `rustc`, but lacks the `rustfmt` and `clippy` components; that is a
+toolchain-component limitation, not a passing 1.82 lint result.
