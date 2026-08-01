@@ -280,12 +280,7 @@ impl RuntimeResources {
         );
         self.pairing_shutdown = Some(pairing_shutdown_sender);
 
-        self.state
-            .transition_agent(if pairing_valid {
-                AgentStatus::Running
-            } else {
-                AgentStatus::Unpaired
-            })
+        transition_startup_agent_state(&mut self.state, pairing_valid)
             .map_err(|_| FailureStage::State)?;
         if self.bridge_task.is_none() {
             set_bridge_status(&mut self.state, BridgeStatus::Degraded)
@@ -641,6 +636,17 @@ async fn start_paired_control(
     .map_err(|_| FailureStage::ControlConfiguration)
 }
 
+fn transition_startup_agent_state(
+    state: &mut RuntimeStateMachine,
+    pairing_valid: bool,
+) -> Result<(), RuntimeError> {
+    state.transition_agent(AgentStatus::Unpaired)?;
+    if pairing_valid {
+        state.transition_agent(AgentStatus::Running)?;
+    }
+    Ok(())
+}
+
 async fn stop_pairing_server(
     pairing_task: Option<JoinHandle<Result<(), PairingIpcServerError>>>,
 ) -> Result<(), FailureStage> {
@@ -823,4 +829,18 @@ fn write_process_test_file(path: &Path, contents: &[u8]) -> Result<(), ()> {
     file.write_all(contents)
         .and_then(|()| file.sync_all())
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paired_startup_transitions_through_unpaired_before_running() {
+        let mut state = RuntimeStateMachine::starting();
+
+        transition_startup_agent_state(&mut state, true).expect("paired startup is legal");
+
+        assert_eq!(state.agent_status(), AgentStatus::Running);
+    }
 }
