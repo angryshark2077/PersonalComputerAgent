@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use pca_domain::{DomainError, EventSink};
+use std::{future::Future, pin::Pin};
+
+use pca_domain::{CommunicationMessageRecorded, DomainError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderStatus {
@@ -29,6 +31,13 @@ pub enum CommunicationSyncMode {
     LocalOnly,
 }
 
+pub type CommunicationProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), DomainError>> + Send + 'a>>;
+
+pub type CommunicationPollFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Vec<CommunicationMessageRecorded>, DomainError>> + Send + 'a>,
+>;
+
 pub trait CommunicationProvider: Send {
     fn key(&self) -> &'static str;
     fn status(&self) -> ProviderStatus;
@@ -38,14 +47,15 @@ pub trait CommunicationProvider: Send {
     /// # Errors
     ///
     /// Returns a domain error when capability or source discovery fails.
-    fn discover(&mut self) -> Result<(), DomainError>;
+    fn discover(&mut self) -> CommunicationProviderFuture<'_>;
 
-    /// Starts producing normalized communication events through the supplied sink.
+    /// Reads one bounded batch of normalized communication records from the source.
     ///
     /// # Errors
     ///
-    /// Returns a domain error when provider startup or event delivery fails.
-    fn start(&mut self, sink: &dyn EventSink) -> Result<(), DomainError>;
+    /// Returns a domain error when the source cannot be read. The provider does not persist or
+    /// upload returned records.
+    fn poll_once(&mut self) -> CommunicationPollFuture<'_>;
 
     /// Stops the provider and releases its resources.
     ///

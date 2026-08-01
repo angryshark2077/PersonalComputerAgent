@@ -619,6 +619,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pca-wechat-provider"
+version = "0.0.0"
+dependencies = [
+ "pca-domain",
+ "pca-provider-contracts",
+ "tokio",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

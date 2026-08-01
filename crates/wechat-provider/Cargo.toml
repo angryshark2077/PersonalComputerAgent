@@ -1,0 +1,15 @@
+[package]
+name = "pca-wechat-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pca-domain = { path = "../domain" }
+pca-provider-contracts = { path = "../provider-contracts" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true
