@@ -815,67 +815,38 @@ final class InstallCoordinator: InstallCoordinating {
             var transaction = transaction
             let recovery: RollbackRecovery
             if let previousVersion = transaction.previousVersion {
+                try await service.stopAndUnregister()
+                try restorePreviousBundle(previousVersion, layoutIdentity: layoutIdentity)
                 if transaction.rollbackPhase == nil {
-                    try await service.stopAndUnregister()
-                    try restorePreviousBundle(previousVersion, layoutIdentity: layoutIdentity)
                     transaction = transaction.advancingRollback(to: .oldBundleRestored)
                     try fileSystem.writeTransaction(
                         transaction,
                         paths: paths,
                         layoutIdentity: layoutIdentity
                     )
-                } else {
-                    try restorePreviousBundle(previousVersion, layoutIdentity: layoutIdentity)
                 }
+
+                let rolledBack = transaction.advancing(to: .rolledBack)
+                try fileSystem.writeTransaction(rolledBack, paths: paths, layoutIdentity: layoutIdentity)
+                do { try cleanupRolledBack(rolledBack, layoutIdentity: layoutIdentity) }
+                catch {
+                    return .restoredInactiveCleanupPending
+                }
+
                 if transaction.priorServiceState == .enabled {
-                    if transaction.rollbackAttemptStartedAt == nil {
-                        transaction = transaction.startingRollbackAttempt(at: Date())
-                        try fileSystem.writeTransaction(
-                            transaction,
-                            paths: paths,
-                            layoutIdentity: layoutIdentity
-                        )
-                    }
-                    guard let attempt = transaction.rollbackAttemptStartedAt else { return .failed }
-                    if transaction.rollbackPhase == .oldBundleRestored {
-                        if service.status() != .enabled {
-                            try await service.registerAndWaitForApproval {}
-                        }
-                        transaction = transaction.advancingRollback(to: .oldServiceRegistered)
-                        try fileSystem.writeTransaction(
-                            transaction,
-                            paths: paths,
-                            layoutIdentity: layoutIdentity
-                        )
-                    }
-                    if transaction.rollbackPhase == .oldServiceRegistered {
-                        if !relauncher.isRunning(
+                    do {
+                        try relauncher.relaunch(
                             executable: paths.installedExecutableURL,
-                            startedAtOrAfter: attempt
-                        ) {
-                            try relauncher.relaunch(
-                                executable: paths.installedExecutableURL,
-                                arguments: ["--setup-installed", "--rollback-recovered"]
-                            )
-                        }
-                        transaction = transaction.advancingRollback(to: .oldAppRelaunched)
-                        try fileSystem.writeTransaction(
-                            transaction,
-                            paths: paths,
-                            layoutIdentity: layoutIdentity
+                            arguments: ["--setup-installed"]
                         )
+                        recovery = .restoredAndRelaunched
+                    } catch {
+                        recovery = .restoredInactive
                     }
-                    guard transaction.rollbackPhase == .oldAppRelaunched else { return .failed }
-                    guard try await health.waitForHealthy(
-                        paths: paths,
-                        expectedVersion: previousVersion,
-                        notBefore: attempt,
-                        timeout: .seconds(5)
-                    ) else { return .failed }
-                    recovery = .restoredAndRelaunched
                 } else {
                     recovery = .restoredInactive
                 }
+                return recovery
             } else {
                 try await service.stopAndUnregister()
                 if fileSystem.exists(paths.installedBundleURL) {

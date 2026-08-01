@@ -60,7 +60,7 @@ final class InstallCoordinatorTests: XCTestCase {
             }
         }
 
-        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
     }
 
@@ -119,6 +119,24 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.relauncher.urls.last, fixture.paths.installedExecutableURL)
     }
 
+    func testFailedUpgradeCleansJournalBeforeRelaunchingPreviousApp() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
+        fixture.service.currentState = .enabled
+        _ = try await fixture.coordinator.prepareInstallation(from: fixture.candidate)
+        fixture.health.results = [false]
+
+        await XCTAssertThrowsErrorAsync(try await fixture.coordinator.finishInstalledSetup()) { error in
+            XCTAssertEqual(
+                error as? InstallError,
+                .transactionFailed(primary: .health, recovery: .restoredAndRelaunched)
+            )
+        }
+
+        XCTAssertFalse(fixture.fileSystem.exists(fixture.paths.transactionURL))
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.relauncher.arguments.last, ["--setup-installed"])
+    }
+
     func testSuccessfulUpgradeRemovesRollbackOnlyAfterHealth() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
         _ = try await fixture.coordinator.prepareInstallation(from: fixture.candidate)
@@ -151,8 +169,8 @@ final class InstallCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
-        XCTAssertEqual(fixture.relauncher.arguments.last, ["--setup-installed", "--rollback-recovered"])
-        XCTAssertEqual(fixture.health.expectedVersions.last, "1.0.0")
+        XCTAssertEqual(fixture.relauncher.arguments.last, ["--setup-installed"])
+        XCTAssertTrue(fixture.health.expectedVersions.isEmpty)
     }
 
     func testRegistrationFailureUsesRollbackFunnelAndRestoresOldService() async throws {
@@ -169,7 +187,7 @@ final class InstallCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
         XCTAssertGreaterThanOrEqual(fixture.service.stopCount, 2)
-        XCTAssertEqual(fixture.health.expectedVersions.last, "1.0.0")
+        XCTAssertTrue(fixture.health.expectedVersions.isEmpty)
     }
 
     func testFirstInstallHealthFailureRemovesAppAndRunButPreservesData() async throws {
@@ -202,7 +220,7 @@ final class InstallCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
-        XCTAssertEqual(fixture.relauncher.arguments.last, ["--setup-installed", "--rollback-recovered"])
+        XCTAssertEqual(fixture.relauncher.arguments.last, ["--setup-installed"])
     }
 
     func testInstallLayoutDoesNotCreateOrChmodData() throws {
@@ -271,7 +289,7 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertEqual(transaction?.priorServiceState, .enabled)
     }
 
-    func testOldMovedCrashRecoveryRestoresOldActiveServiceAndIsIdempotent() async throws {
+    func testOldMovedCrashRecoveryRelaunchesOldAppAndDefersServiceRegistration() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
         try fixture.simulateCrash(phase: .oldMoved, priorServiceState: .enabled)
 
@@ -279,8 +297,10 @@ final class InstallCoordinatorTests: XCTestCase {
         _ = try await fixture.coordinator.recoverPendingInstallation()
 
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
-        XCTAssertEqual(fixture.service.currentState, .enabled)
-        XCTAssertEqual(fixture.health.expectedVersions, ["1.0.0"])
+        XCTAssertEqual(fixture.service.currentState, .notRegistered)
+        XCTAssertEqual(fixture.service.registerCount, 0)
+        XCTAssertTrue(fixture.health.expectedVersions.isEmpty)
+        XCTAssertEqual(fixture.relauncher.arguments, [["--setup-installed"]])
         XCTAssertFalse(fixture.fileSystem.exists(fixture.paths.transactionURL))
     }
 
@@ -341,70 +361,46 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertFalse(fixture.fileSystem.exists(fixture.paths.transactionURL))
     }
 
-    func testRollbackCleanupFailureReportsRelaunchedCleanupPendingAndRetriesIdempotently() async throws {
+    func testRollbackCleanupFailureReportsInactiveCleanupPendingAndRetriesIdempotently() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
         try fixture.simulateCrash(phase: .newActivated, priorServiceState: .enabled)
         fixture.fileSystem.failDeletionTarget = fixture.paths.transactionURL.lastPathComponent
 
         let recovery = try await fixture.coordinator.recoverPendingInstallation()
 
-        XCTAssertEqual(recovery, .restoredAndRelaunchedCleanupPending)
+        XCTAssertEqual(recovery, .restoredInactiveCleanupPending)
         XCTAssertEqual(
             try fixture.fileSystem.readTransaction(paths: fixture.paths, layoutIdentity: fixture.layoutIdentity)?.phase,
             .rolledBack
         )
         fixture.fileSystem.failDeletionTarget = nil
         _ = try await fixture.coordinator.recoverPendingInstallation()
-        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertFalse(fixture.fileSystem.exists(fixture.paths.transactionURL))
     }
 
-    func testCrashAfterOldServiceRegistrationDoesNotRegisterOrRestoreTwice() async throws {
+    func testCrashBeforeRollbackJournalDoesNotRegisterOrRelaunchTwice() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
         try fixture.simulateCrash(phase: .newActivated, priorServiceState: .enabled)
-        fixture.fileSystem.crashBeforePersistingRollbackPhase = .oldServiceRegistered
+        fixture.fileSystem.crashBeforePersistingRollbackPhase = .oldBundleRestored
 
         let firstRecovery = try await fixture.coordinator.recoverPendingInstallation()
         XCTAssertEqual(firstRecovery, .failed)
-        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertEqual(fixture.relauncher.urls.count, 0)
         XCTAssertEqual(
             try fixture.fileSystem.readTransaction(
                 paths: fixture.paths,
                 layoutIdentity: fixture.layoutIdentity
             )?.rollbackPhase,
-            .oldBundleRestored
+            nil
         )
 
         let retriedRecovery = try await fixture.coordinator.recoverPendingInstallation()
         XCTAssertEqual(retriedRecovery, .restoredAndRelaunched)
-        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertEqual(fixture.relauncher.urls.count, 1)
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
-    }
-
-    func testCrashAfterOldAppRelaunchDoesNotRegisterOrRelaunchTwice() async throws {
-        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "2.0.0")
-        try fixture.simulateCrash(phase: .newActivated, priorServiceState: .enabled)
-        fixture.fileSystem.crashBeforePersistingRollbackPhase = .oldAppRelaunched
-
-        let firstRecovery = try await fixture.coordinator.recoverPendingInstallation()
-        XCTAssertEqual(firstRecovery, .failed)
-        XCTAssertEqual(fixture.service.registerCount, 1)
-        XCTAssertEqual(fixture.relauncher.urls.count, 1)
-        XCTAssertEqual(
-            try fixture.fileSystem.readTransaction(
-                paths: fixture.paths,
-                layoutIdentity: fixture.layoutIdentity
-            )?.rollbackPhase,
-            .oldServiceRegistered
-        )
-
-        let retriedRecovery = try await fixture.coordinator.recoverPendingInstallation()
-        XCTAssertEqual(retriedRecovery, .restoredAndRelaunched)
-        XCTAssertEqual(fixture.service.registerCount, 1)
-        XCTAssertEqual(fixture.relauncher.urls.count, 1)
-        XCTAssertEqual(fixture.health.expectedVersions, ["1.0.0"])
     }
 
     func testAppDirectoryReplacementBeforeStagingCopyFailsClosed() async throws {
