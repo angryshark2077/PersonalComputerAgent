@@ -5,7 +5,7 @@ import Foundation
 import Security
 
 struct PairingIPCConfiguration: Sendable {
-    static let productionCloudAPIOrigin = URL(string: "https://pca-cloud-api-production.up.railway.app/")!
+    static let productionCloudAPIOrigin = URL(string: "https://pca-cloud-api-production.up.railway.app")!
 
     let socketURL: URL
     let cloudAPIOrigin: URL

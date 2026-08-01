@@ -11,7 +11,7 @@ final class PairingCoordinatorTests: XCTestCase {
         XCTAssertEqual(configuration.socketURL.path, root.appendingPathComponent("Run/pairing.sock").path)
         XCTAssertEqual(
             configuration.cloudAPIOrigin.absoluteString,
-            "https://pca-cloud-api-production.up.railway.app/"
+            "https://pca-cloud-api-production.up.railway.app"
         )
     }
 
@@ -31,7 +31,7 @@ final class PairingCoordinatorTests: XCTestCase {
             operation: .begin,
             payload: TestBeginPayload(
                 callbackURI: "http://127.0.0.1:49152/pca/pair/callback",
-                cloudAPIOrigin: "https://pca-cloud-api-production.up.railway.app/"
+                cloudAPIOrigin: "https://pca-cloud-api-production.up.railway.app"
             ),
             secret: Data(repeating: 0x42, count: 32),
             nonce: Data(repeating: 0x24, count: 32),
@@ -46,7 +46,7 @@ final class PairingCoordinatorTests: XCTestCase {
         XCTAssertEqual(envelope["proof"] as? String, "ehqKwu3rkOVCMnCS/1DV2Tutdi63kFKVxuhqDqUaVS0=")
         XCTAssertEqual(
             (envelope["payload"] as? [String: String])?["cloud_api_origin"],
-            "https://pca-cloud-api-production.up.railway.app/"
+            "https://pca-cloud-api-production.up.railway.app"
         )
     }
 
