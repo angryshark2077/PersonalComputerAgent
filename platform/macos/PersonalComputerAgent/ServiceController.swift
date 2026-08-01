@@ -13,9 +13,13 @@ protocol ServiceBackend: AnyObject {
 
 @MainActor
 private final class SMServiceBackend: ServiceBackend {
+    private nonisolated let plistName: String
     private let service: SMAppService
 
-    init(plistName: String) { service = SMAppService.agent(plistName: plistName) }
+    init(plistName: String) {
+        self.plistName = plistName
+        service = SMAppService.agent(plistName: plistName)
+    }
 
     func status() -> ServiceState {
         switch service.status {
@@ -28,7 +32,9 @@ private final class SMServiceBackend: ServiceBackend {
     }
 
     func register() throws { try service.register() }
-    func unregister() async throws { try await service.unregister() }
+    nonisolated func unregister() async throws {
+        try await SMAppService.agent(plistName: plistName).unregister()
+    }
     func openSystemSettingsLoginItems() { SMAppService.openSystemSettingsLoginItems() }
 }
 
