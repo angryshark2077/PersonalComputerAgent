@@ -1,5 +1,6 @@
-use security_framework::passwords::{
-    delete_generic_password, get_generic_password, set_generic_password,
+use security_framework::{
+    item::{ItemClass, ItemSearchOptions, SearchResult},
+    passwords::{delete_generic_password, get_generic_password, set_generic_password},
 };
 
 use crate::{
@@ -60,13 +61,22 @@ impl MacOSKeychainStore {
 
 impl CredentialStore for MacOSKeychainStore {
     fn load(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
-        load_for_supported_identity(service, account, || {
-            match get_generic_password(service, account) {
-                Ok(secret) => Ok(Some(secret)),
-                Err(error) if error.code() == ITEM_NOT_FOUND_STATUS => Ok(None),
-                Err(error) => Err(map_keychain_error(error.code())),
+        match identity(service, account)? {
+            CredentialIdentity::Wechat => load_wechat_non_interactively(
+                service,
+                account,
+                get_generic_password_without_authentication_ui,
+            ),
+            CredentialIdentity::Bridge | CredentialIdentity::Device => {
+                load_for_supported_identity(service, account, || {
+                    match get_generic_password(service, account) {
+                        Ok(secret) => Ok(Some(secret)),
+                        Err(error) if error.code() == ITEM_NOT_FOUND_STATUS => Ok(None),
+                        Err(error) => Err(map_keychain_error(error.code())),
+                    }
+                })
             }
-        })
+        }
     }
 
     fn store(&self, service: &str, account: &str, secret: &[u8]) -> Result<(), CredentialError> {
@@ -112,6 +122,48 @@ enum CredentialIdentity {
     Bridge,
     Device,
     Wechat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuthenticationUiPolicy {
+    Skip,
+}
+
+pub(crate) fn load_wechat_non_interactively<F>(
+    service: &str,
+    account: &str,
+    backend: F,
+) -> Result<Option<Vec<u8>>, CredentialError>
+where
+    F: FnOnce(&str, &str, AuthenticationUiPolicy) -> Result<Option<Vec<u8>>, CredentialError>,
+{
+    load_wechat_for_identity(service, account, || {
+        backend(service, account, AuthenticationUiPolicy::Skip)
+    })
+}
+
+fn get_generic_password_without_authentication_ui(
+    service: &str,
+    account: &str,
+    policy: AuthenticationUiPolicy,
+) -> Result<Option<Vec<u8>>, CredentialError> {
+    let mut query = ItemSearchOptions::new();
+    query
+        .class(ItemClass::generic_password())
+        .service(service)
+        .account(account)
+        .load_data(true)
+        .skip_authenticated_items(matches!(policy, AuthenticationUiPolicy::Skip));
+
+    match query.search() {
+        Ok(results) => match results.into_iter().next() {
+            Some(SearchResult::Data(secret)) => Ok(Some(secret)),
+            None => Ok(None),
+            Some(_) => Err(CredentialError::OperationFailed),
+        },
+        Err(error) if error.code() == ITEM_NOT_FOUND_STATUS => Ok(None),
+        Err(error) => Err(map_keychain_error(error.code())),
+    }
 }
 
 fn identity(service: &str, account: &str) -> Result<CredentialIdentity, CredentialError> {

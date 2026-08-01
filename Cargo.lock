@@ -645,10 +645,13 @@ dependencies = [
 name = "pca-wechat-provider"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "pca-domain",
  "pca-keychain",
  "pca-provider-contracts",
  "rusqlite",
+ "rustix",
+ "tempfile",
  "tokio",
 ]
 

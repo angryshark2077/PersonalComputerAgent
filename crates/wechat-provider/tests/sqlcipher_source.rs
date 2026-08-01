@@ -1,7 +1,14 @@
 use std::{
+    collections::BTreeMap,
+    fs::Metadata,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread,
+    time::{Duration, SystemTime},
 };
 
 use pca_domain::DomainError;
@@ -25,6 +32,42 @@ struct EmptyKeyStore;
 impl CredentialStore for EmptyKeyStore {
     fn load(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, CredentialError> {
         Ok(None)
+    }
+
+    fn store(&self, _: &str, _: &str, _: &[u8]) -> Result<(), CredentialError> {
+        Err(CredentialError::UnsupportedIdentity)
+    }
+
+    fn delete(&self, _: &str, _: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::UnsupportedIdentity)
+    }
+}
+
+struct UnavailableKeyStore;
+
+impl CredentialStore for UnavailableKeyStore {
+    fn load(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+        Err(CredentialError::Unavailable)
+    }
+
+    fn store(&self, _: &str, _: &str, _: &[u8]) -> Result<(), CredentialError> {
+        Err(CredentialError::UnsupportedIdentity)
+    }
+
+    fn delete(&self, _: &str, _: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::UnsupportedIdentity)
+    }
+}
+
+struct SlowKeyStore {
+    delay: Duration,
+    material: Vec<u8>,
+}
+
+impl CredentialStore for SlowKeyStore {
+    fn load(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+        thread::sleep(self.delay);
+        Ok(Some(self.material.clone()))
     }
 
     fn store(&self, _: &str, _: &str, _: &[u8]) -> Result<(), CredentialError> {
@@ -82,6 +125,77 @@ impl ReadOnlySqlcipherProbe for FixedProbe {
     }
 }
 
+#[derive(Default)]
+struct SequencedProbeState {
+    calls: usize,
+    release_first: bool,
+}
+
+#[derive(Clone, Default)]
+struct SequencedProbe {
+    inner: Arc<SequencedProbeInner>,
+}
+
+#[derive(Default)]
+struct SequencedProbeInner {
+    state: Mutex<SequencedProbeState>,
+    changed: Condvar,
+}
+
+impl SequencedProbe {
+    fn wait_for_first_call(&self) {
+        let mut state = self.inner.state.lock().expect("sequenced probe lock");
+        while state.calls == 0 {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .expect("wait for first probe");
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.inner.state.lock().expect("sequenced probe lock").calls
+    }
+
+    fn release_first(&self) {
+        let mut state = self.inner.state.lock().expect("sequenced probe lock");
+        state.release_first = true;
+        self.inner.changed.notify_all();
+    }
+}
+
+impl ReadOnlySqlcipherProbe for SequencedProbe {
+    fn probe(
+        &self,
+        _: &SqlcipherProbeTarget,
+        _: &WechatKeyMaterial,
+        _: Duration,
+    ) -> Result<SourceCapabilities, SqlcipherProbeFailure> {
+        let mut state = self.inner.state.lock().expect("sequenced probe lock");
+        state.calls += 1;
+        let call = state.calls;
+        self.inner.changed.notify_all();
+        while call == 1 && !state.release_first {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .expect("wait to release probe");
+        }
+        drop(state);
+
+        if call == 1 {
+            Ok(SourceCapabilities {
+                source_version: "4.1.12".to_owned(),
+                schema_version: 7,
+            })
+        } else {
+            Err(SqlcipherProbeFailure::AccountUnverified)
+        }
+    }
+}
+
 #[test]
 fn missing_key_material_returns_waiting_state_without_probing_a_database() {
     let source = SqlcipherWechatSource::with_dependencies(
@@ -94,6 +208,76 @@ fn missing_key_material_returns_waiting_state_without_probing_a_database() {
 
     assert_eq!(error.code, "WECHAT_WAITING_SOURCE");
     assert!(error.retryable);
+}
+
+#[test]
+fn noninteractive_keychain_failure_returns_capability_state_without_probing_a_database() {
+    let source = SqlcipherWechatSource::with_dependencies(
+        UnavailableKeyStore,
+        MustNotProbe,
+        fixture_target(PathBuf::from("unused-encrypted-source.db")),
+    );
+
+    let error = source.probe_blocking().unwrap_err();
+
+    assert_eq!(error.code, "WECHAT_CAPABILITY_UNAVAILABLE");
+    assert!(error.retryable);
+}
+
+#[test]
+fn keychain_work_that_exhausts_the_total_deadline_never_starts_the_database_probe() {
+    let source = SqlcipherWechatSource::with_dependencies(
+        SlowKeyStore {
+            delay: Duration::from_millis(2_050),
+            material: encoded_material("local-account-proof", [0x2a; 32]),
+        },
+        MustNotProbe,
+        fixture_target(PathBuf::from("unused-encrypted-source.db")),
+    );
+
+    let error = source.probe_blocking().unwrap_err();
+
+    assert_eq!(error.code, "WECHAT_PROBE_TIMEOUT");
+    assert!(error.retryable);
+}
+
+#[tokio::test]
+async fn overlapping_probes_are_serialized_and_the_later_failure_clears_success() {
+    let probe = SequencedProbe::default();
+    let source = Arc::new(SqlcipherWechatSource::with_dependencies(
+        EncodedKeyStore(encoded_material("local-account-proof", [0x2a; 32])),
+        probe.clone(),
+        fixture_target(PathBuf::from("unused-encrypted-source.db")),
+    ));
+
+    let first_source = Arc::clone(&source);
+    let first = thread::spawn(move || first_source.probe_blocking());
+    probe.wait_for_first_call();
+
+    let second_source = Arc::clone(&source);
+    let second = thread::spawn(move || second_source.probe_blocking());
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        probe.call_count(),
+        1,
+        "only one probe may execute at a time"
+    );
+
+    probe.release_first();
+    first
+        .join()
+        .expect("first probe thread")
+        .expect("first probe succeeds");
+    let second_error = second
+        .join()
+        .expect("second probe thread")
+        .expect_err("later probe fails");
+    assert_eq!(second_error.code, "WECHAT_ACCOUNT_UNVERIFIED");
+
+    let Err(read_error) = source.read_after(&SourceCursor).await else {
+        panic!("later failure must clear prior proof");
+    };
+    assert_eq!(read_error.code, "WECHAT_WAITING_SOURCE");
 }
 
 #[tokio::test]
@@ -175,6 +359,26 @@ async fn encrypted_fixture_proves_read_only_sqlcipher_version_schema_and_account
     assert_eq!(capabilities.schema_version, 7);
     assert!(records.is_empty());
     assert_eq!(fixture.metadata_row_count(), 1);
+}
+
+#[tokio::test]
+async fn wal_source_probe_creates_or_modifies_nothing_in_the_source_directory() {
+    let fixture = WalEncryptedFixture::new([0x6d; 32]);
+    let before = DirectorySnapshot::capture(fixture.source_directory());
+    let source = SqlcipherWechatSource::with_dependencies(
+        EncodedKeyStore(encoded_material("fixture-local-account", [0x6d; 32])),
+        RusqliteReadOnlyProbe,
+        fixture_target(fixture.database_path().to_path_buf()),
+    );
+
+    let capabilities = source.probe().await.expect("WAL fixture probe");
+    let after = DirectorySnapshot::capture(fixture.source_directory());
+
+    assert_eq!(capabilities.schema_version, 7);
+    assert_eq!(
+        after, before,
+        "source directory must remain byte-for-byte and metadata unchanged"
+    );
 }
 
 #[test]
@@ -303,6 +507,136 @@ impl EncryptedFixture {
 impl Drop for EncryptedFixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.directory).expect("remove owned fixture directory");
+    }
+}
+
+struct WalEncryptedFixture {
+    root: PathBuf,
+    source_directory: PathBuf,
+    database: PathBuf,
+    _writer: Connection,
+}
+
+impl WalEncryptedFixture {
+    fn new(key: [u8; 32]) -> Self {
+        let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "pca-wechat-wal-fixture-{}-{suffix}",
+            std::process::id()
+        ));
+        let staging = root.join("staging");
+        let source_directory = root.join("source");
+        std::fs::create_dir_all(&staging).expect("create WAL staging directory");
+        std::fs::create_dir(&source_directory).expect("create WAL source directory");
+        let staging_database = staging.join("source.db");
+        let writer = Connection::open(&staging_database).expect("create WAL SQLCipher fixture");
+        apply_raw_key(&writer, &key).expect("set WAL fixture SQLCipher key");
+        writer
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("enable WAL mode");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable fixture auto-checkpoint");
+        writer
+            .execute_batch(
+                "CREATE TABLE source_probe_metadata (\
+                    source_version TEXT NOT NULL, \
+                    schema_version INTEGER NOT NULL, \
+                    account_id TEXT NOT NULL\
+                 );\
+                 INSERT INTO source_probe_metadata VALUES ('4.1.12', 7, 'fixture-local-account');",
+            )
+            .expect("create WAL encrypted fixture schema");
+
+        let database = source_directory.join("source.db");
+        std::fs::copy(&staging_database, &database).expect("snapshot WAL fixture database");
+        std::fs::copy(
+            staging_database.with_file_name("source.db-wal"),
+            source_directory.join("source.db-wal"),
+        )
+        .expect("snapshot WAL fixture log without SHM");
+
+        Self {
+            root,
+            source_directory,
+            database,
+            _writer: writer,
+        }
+    }
+
+    fn source_directory(&self) -> &Path {
+        &self.source_directory
+    }
+
+    fn database_path(&self) -> &Path {
+        &self.database
+    }
+}
+
+impl Drop for WalEncryptedFixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.root).expect("remove owned WAL fixture directory");
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DirectorySnapshot {
+    directory: MetadataSnapshot,
+    entries: BTreeMap<String, FileSnapshot>,
+}
+
+impl DirectorySnapshot {
+    fn capture(directory: &Path) -> Self {
+        let mut entries = BTreeMap::new();
+        for entry in std::fs::read_dir(directory).expect("read fixture source directory") {
+            let entry = entry.expect("fixture directory entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let contents = std::fs::read(entry.path()).expect("read fixture source entry");
+            let metadata = entry.metadata().expect("fixture source entry metadata");
+            entries.insert(
+                name,
+                FileSnapshot {
+                    metadata: MetadataSnapshot::from(&metadata),
+                    contents,
+                },
+            );
+        }
+        let directory_metadata = std::fs::metadata(directory).expect("fixture directory metadata");
+        Self {
+            directory: MetadataSnapshot::from(&directory_metadata),
+            entries,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FileSnapshot {
+    metadata: MetadataSnapshot,
+    contents: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MetadataSnapshot {
+    len: u64,
+    permissions: u32,
+    device: u64,
+    inode: u64,
+    modified: Option<SystemTime>,
+    accessed: Option<SystemTime>,
+    created: Option<SystemTime>,
+}
+
+impl From<&Metadata> for MetadataSnapshot {
+    fn from(metadata: &Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            permissions: metadata.permissions().mode(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified: metadata.modified().ok(),
+            accessed: metadata.accessed().ok(),
+            created: metadata.created().ok(),
+        }
     }
 }
 

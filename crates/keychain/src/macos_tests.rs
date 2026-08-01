@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::{
     macos::{
         delete_for_supported_identity, load_for_identity, load_for_supported_identity,
-        store_device_for_identity, store_for_identity,
+        load_wechat_non_interactively, store_device_for_identity, store_for_identity,
+        AuthenticationUiPolicy,
     },
     CredentialError, DeviceCredential, BRIDGE_CREDENTIAL_ACCOUNT, BRIDGE_CREDENTIAL_SERVICE,
     BRIDGE_SHARED_SECRET_LENGTH, DEVICE_CREDENTIAL_ACCOUNT, DEVICE_CREDENTIAL_SERVICE,
@@ -27,6 +28,26 @@ fn trait_store_dispatch_rejects_wrong_length_before_reaching_keychain_backend() 
         assert_eq!(result, Err(CredentialError::InvalidSecretLength));
         assert!(!backend_called.load(Ordering::Relaxed));
     }
+}
+
+#[test]
+fn wechat_load_requires_the_noninteractive_keychain_policy() {
+    let backend_called = AtomicBool::new(false);
+
+    let result = load_wechat_non_interactively(
+        crate::WECHAT_CREDENTIAL_SERVICE,
+        crate::WECHAT_CREDENTIAL_ACCOUNT,
+        |service, account, policy| {
+            backend_called.store(true, Ordering::Relaxed);
+            assert_eq!(service, crate::WECHAT_CREDENTIAL_SERVICE);
+            assert_eq!(account, crate::WECHAT_CREDENTIAL_ACCOUNT);
+            assert_eq!(policy, AuthenticationUiPolicy::Skip);
+            Ok(None)
+        },
+    );
+
+    assert_eq!(result, Ok(None));
+    assert!(backend_called.load(Ordering::Relaxed));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+    sync::{Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 use pca_domain::DomainError;
@@ -121,7 +121,14 @@ pub struct SqlcipherWechatSource<K, P> {
     key_store: K,
     probe: P,
     target: SqlcipherProbeTarget,
-    probe_succeeded: AtomicBool,
+    probe_state: Mutex<ProbeState>,
+    probe_ready: Condvar,
+}
+
+#[derive(Default)]
+struct ProbeState {
+    running: bool,
+    succeeded: bool,
 }
 
 impl<K, P> SqlcipherWechatSource<K, P>
@@ -135,7 +142,8 @@ where
             key_store,
             probe,
             target,
-            probe_succeeded: AtomicBool::new(false),
+            probe_state: Mutex::new(ProbeState::default()),
+            probe_ready: Condvar::new(),
         }
     }
 
@@ -145,16 +153,56 @@ where
     ///
     /// Returns only explicit, redacted `WECHAT_*` errors.
     pub fn probe_blocking(&self) -> Result<SourceCapabilities, DomainError> {
-        self.probe_succeeded.store(false, Ordering::Release);
-        let key_material = load_wechat_key_material(&self.key_store)
-            .map_err(map_credential_error)?
-            .ok_or_else(waiting_source)?;
-        let capabilities = self
-            .probe
-            .probe(&self.target, &key_material, DEFAULT_PROBE_TIMEOUT)
-            .map_err(map_probe_failure)?;
-        self.probe_succeeded.store(true, Ordering::Release);
-        Ok(capabilities)
+        let deadline = Instant::now()
+            .checked_add(DEFAULT_PROBE_TIMEOUT)
+            .ok_or_else(|| map_probe_failure(SqlcipherProbeFailure::TimedOut))?;
+        self.begin_probe(deadline)?;
+
+        let result = (|| {
+            let key_material = load_wechat_key_material(&self.key_store)
+                .map_err(map_credential_error)?
+                .ok_or_else(waiting_source)?;
+            let capabilities = self
+                .probe
+                .probe(&self.target, &key_material, remaining_probe_time(deadline)?)
+                .map_err(map_probe_failure)?;
+            remaining_probe_time(deadline)?;
+            Ok(capabilities)
+        })();
+
+        self.finish_probe(result.is_ok());
+        result
+    }
+
+    fn begin_probe(&self, deadline: Instant) -> Result<(), DomainError> {
+        let mut state = self
+            .probe_state
+            .lock()
+            .map_err(|_| capability_unavailable())?;
+        while state.running {
+            let remaining = remaining_probe_time(deadline)?;
+            let (next_state, wait) = self
+                .probe_ready
+                .wait_timeout(state, remaining)
+                .map_err(|_| capability_unavailable())?;
+            state = next_state;
+            if wait.timed_out() && state.running {
+                return Err(map_probe_failure(SqlcipherProbeFailure::TimedOut));
+            }
+        }
+        state.running = true;
+        state.succeeded = false;
+        Ok(())
+    }
+
+    fn finish_probe(&self, succeeded: bool) {
+        let mut state = match self.probe_state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.succeeded = succeeded;
+        state.running = false;
+        self.probe_ready.notify_all();
     }
 }
 
@@ -169,7 +217,8 @@ where
 
     fn read_after(&self, _: &SourceCursor) -> SourceReadFuture<'_> {
         Box::pin(async move {
-            if self.probe_succeeded.load(Ordering::Acquire) {
+            let probe_succeeded = self.probe_state.lock().is_ok_and(|state| state.succeeded);
+            if probe_succeeded {
                 // Message extraction belongs to the later source-schema task. Returning an empty
                 // batch here proves this capability gate cannot leak a record by itself.
                 Ok(Vec::new())
@@ -178,6 +227,13 @@ where
             }
         })
     }
+}
+
+fn remaining_probe_time(deadline: Instant) -> Result<Duration, DomainError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| map_probe_failure(SqlcipherProbeFailure::TimedOut))
 }
 
 fn map_credential_error(error: CredentialError) -> DomainError {
@@ -247,12 +303,20 @@ fn capability_unavailable() -> DomainError {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use std::{fmt::Write as _, time::Instant};
+    use std::{
+        fmt::Write as _,
+        fs::{File, Metadata, OpenOptions},
+        io::{Read, Write},
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        path::{Path, PathBuf},
+        time::Instant,
+    };
 
     use rusqlite::{
         hooks::{AuthAction, AuthContext, Authorization},
         Connection, OpenFlags,
     };
+    use tempfile::{Builder as TempDirBuilder, TempDir};
 
     use super::{
         ReadOnlySqlcipherProbe, RusqliteReadOnlyProbe, SourceCapabilities, SqlcipherProbeFailure,
@@ -270,15 +334,16 @@ mod macos {
             let deadline = Instant::now()
                 .checked_add(timeout)
                 .ok_or(SqlcipherProbeFailure::TimedOut)?;
-            if timeout.is_zero() || !target.database_path.is_file() {
-                return Err(SqlcipherProbeFailure::DatabaseUnavailable);
+            if timeout.is_zero() {
+                return Err(SqlcipherProbeFailure::TimedOut);
             }
-
+            let snapshot = PrivateSourceSnapshot::create(&target.database_path, deadline)?;
             let connection = Connection::open_with_flags(
-                &target.database_path,
+                snapshot.database_path(),
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+            remaining(deadline)?;
             connection
                 .busy_timeout(remaining(deadline)?)
                 .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
@@ -343,6 +408,207 @@ mod macos {
                 schema_version,
             })
         }
+    }
+
+    /// A private DB/WAL copy prevents `SQLite`'s WAL VFS from creating or updating `-shm` in the
+    /// `WeChat` source directory. The source files are opened only read-only with `O_NOFOLLOW` and
+    /// must be regular files on a local, non-FUSE filesystem.
+    ///
+    /// macOS cannot cancel an individual in-flight local filesystem syscall. To avoid leaking a
+    /// detached worker, the probe stays on the caller thread, uses nonblocking open flags, rejects
+    /// network/FUSE sources before `SQLite` sees them, and checks the shared wall-clock deadline
+    /// before and after every syscall and copy chunk. A kernel or hardware stall can delay the
+    /// error return, but no result is accepted after the two-second deadline.
+    struct PrivateSourceSnapshot {
+        _directory: TempDir,
+        database_path: PathBuf,
+    }
+
+    impl PrivateSourceSnapshot {
+        fn create(
+            source_database: &Path,
+            deadline: Instant,
+        ) -> Result<Self, SqlcipherProbeFailure> {
+            remaining(deadline)?;
+            let directory = TempDirBuilder::new()
+                .prefix("pca-wechat-probe-")
+                .tempdir()
+                .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+            ensure_directory_is_private_local(directory.path(), deadline)?;
+
+            let database_name = source_database
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .ok_or(SqlcipherProbeFailure::DatabaseUnavailable)?;
+            let source_file = open_local_regular_file(source_database, None, deadline)?
+                .ok_or(SqlcipherProbeFailure::DatabaseUnavailable)?;
+            let source_device = source_file.metadata.dev();
+            let database_path = directory.path().join(database_name);
+            copy_stable_source_file(source_file, &database_path, deadline)?;
+
+            let wal_path = sidecar_path(source_database, "-wal")?;
+            if let Some(wal_file) =
+                open_local_regular_file(&wal_path, Some(source_device), deadline)?
+            {
+                let snapshot_wal = sidecar_path(&database_path, "-wal")?;
+                copy_stable_source_file(wal_file, &snapshot_wal, deadline)?;
+            }
+
+            remaining(deadline)?;
+            Ok(Self {
+                _directory: directory,
+                database_path,
+            })
+        }
+
+        fn database_path(&self) -> &Path {
+            &self.database_path
+        }
+    }
+
+    struct OpenSourceFile {
+        file: File,
+        metadata: Metadata,
+    }
+
+    fn open_local_regular_file(
+        path: &Path,
+        expected_device: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Option<OpenSourceFile>, SqlcipherProbeFailure> {
+        remaining(deadline)?;
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(SqlcipherProbeFailure::DatabaseUnavailable),
+        };
+        remaining(deadline)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+        if !metadata.is_file() || expected_device.is_some_and(|device| metadata.dev() != device) {
+            return Err(SqlcipherProbeFailure::DatabaseUnavailable);
+        }
+        ensure_file_is_on_supported_filesystem(&file)?;
+        remaining(deadline)?;
+        Ok(Some(OpenSourceFile { file, metadata }))
+    }
+
+    fn ensure_directory_is_private_local(
+        directory: &Path,
+        deadline: Instant,
+    ) -> Result<(), SqlcipherProbeFailure> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(directory)
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        ensure_file_is_on_supported_filesystem(&file)?;
+        remaining(deadline).map(|_| ())
+    }
+
+    fn ensure_file_is_on_supported_filesystem(file: &File) -> Result<(), SqlcipherProbeFailure> {
+        let filesystem =
+            rustix::fs::fstatfs(file).map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+        let filesystem_name = filesystem
+            .f_fstypename
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| byte.cast_unsigned())
+            .collect::<Vec<_>>();
+        let filesystem_name = std::str::from_utf8(&filesystem_name)
+            .map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+        let is_local = filesystem.f_flags & u32::try_from(libc::MNT_LOCAL).unwrap_or(0) != 0;
+        if source_filesystem_is_supported(is_local, filesystem_name) {
+            Ok(())
+        } else {
+            Err(SqlcipherProbeFailure::DatabaseUnavailable)
+        }
+    }
+
+    fn source_filesystem_is_supported(is_local: bool, filesystem_name: &str) -> bool {
+        is_local
+            && !matches!(
+                filesystem_name.to_ascii_lowercase().as_str(),
+                "fusefs" | "macfuse" | "osxfuse"
+            )
+    }
+
+    fn copy_stable_source_file(
+        mut source: OpenSourceFile,
+        destination: &Path,
+        deadline: Instant,
+    ) -> Result<(), SqlcipherProbeFailure> {
+        let before = StableMetadata::from(&source.metadata);
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(destination)
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        loop {
+            remaining(deadline)?;
+            let read = source
+                .file
+                .read(&mut buffer)
+                .map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+            remaining(deadline)?;
+            if read == 0 {
+                break;
+            }
+            destination
+                .write_all(&buffer[..read])
+                .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+            remaining(deadline)?;
+        }
+        destination
+            .flush()
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        remaining(deadline)?;
+
+        let after = source
+            .file
+            .metadata()
+            .map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+        if before != StableMetadata::from(&after) {
+            return Err(SqlcipherProbeFailure::DatabaseUnavailable);
+        }
+        Ok(())
+    }
+
+    #[derive(Eq, PartialEq)]
+    struct StableMetadata {
+        device: u64,
+        inode: u64,
+        length: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+    }
+
+    impl From<&Metadata> for StableMetadata {
+        fn from(metadata: &Metadata) -> Self {
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+            }
+        }
+    }
+
+    fn sidecar_path(database: &Path, suffix: &str) -> Result<PathBuf, SqlcipherProbeFailure> {
+        let mut name = database
+            .file_name()
+            .ok_or(SqlcipherProbeFailure::DatabaseUnavailable)?
+            .to_os_string();
+        name.push(suffix);
+        Ok(database.with_file_name(name))
     }
 
     fn apply_raw_key(
@@ -411,6 +677,20 @@ mod macos {
                 rusqlite::Error::SqliteFailure(code, _)
                     if code.code == rusqlite::ErrorCode::OperationInterrupted
             )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::source_filesystem_is_supported;
+
+        #[test]
+        fn source_policy_rejects_network_and_fuse_filesystems() {
+            assert!(!source_filesystem_is_supported(false, "smbfs"));
+            assert!(!source_filesystem_is_supported(true, "macfuse"));
+            assert!(!source_filesystem_is_supported(true, "osxfuse"));
+            assert!(!source_filesystem_is_supported(true, "fusefs"));
+            assert!(source_filesystem_is_supported(true, "apfs"));
+        }
     }
 }
 
