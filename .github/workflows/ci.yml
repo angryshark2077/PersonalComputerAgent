@@ -49,11 +49,11 @@ jobs:
           swift test --package-path platform/macos
           --skip 'HandshakeTests.test(PostStartSignalsCleanlyStopRealServerProcess|ProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts|SignalDuringDelayedStartIsConsumedAfterRealServerStarts)'
       - name: Swift post-start signal test in an isolated runner
-        run: swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
+        run: python3 scripts/run-with-timeout.py --timeout 30 -- swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
       - name: Swift startup signal test in an isolated runner
-        run: swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
+        run: python3 scripts/run-with-timeout.py --timeout 30 -- swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
       - name: Swift delayed-start signal test in an isolated runner
-        run: swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
+        run: python3 scripts/run-with-timeout.py --timeout 30 -- swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
       - run: swift run --package-path platform/macos BridgeContractVerifier
 
   rust-msrv:
@@ -74,11 +74,11 @@ jobs:
           swift test --package-path platform/macos
           --skip 'HandshakeTests.test(PostStartSignalsCleanlyStopRealServerProcess|ProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts|SignalDuringDelayedStartIsConsumedAfterRealServerStarts)'
       - name: Swift post-start signal test in an isolated runner
-        run: swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
+        run: python3 scripts/run-with-timeout.py --timeout 30 -- swift test --package-path platform/macos --filter HandshakeTests.testPostStartSignalsCleanlyStopRealServerProcess
       - name: Swift startup signal test in an isolated runner
-        run: swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
+        run: python3 scripts/run-with-timeout.py --timeout 30 -- swift test --package-path platform/macos --filter HandshakeTests.testProcessLevelStartupSignalsExitZeroWithoutSocketArtifacts
       - name: Swift delayed-start signal test in an isolated runner
-        run: swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
+        run: python3 scripts/run-with-timeout.py --timeout 30 -- swift test --package-path platform/macos --filter HandshakeTests.testSignalDuringDelayedStartIsConsumedAfterRealServerStarts
       - run: swift run --package-path platform/macos BridgeContractVerifier
       - run: >-
           xcodebuild test

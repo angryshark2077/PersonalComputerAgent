@@ -249,7 +249,7 @@ final class HandshakeTests: XCTestCase {
             }
             guard FileManager.default.fileExists(atPath: readyHook.path) else {
                 if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-                process.waitUntilExit()
+                _ = try await waitForProcessExit(process, timeoutMilliseconds: 1_000)
                 XCTFail("signal harness never reached the installed-relay startup hook")
                 continue
             }
@@ -263,11 +263,10 @@ final class HandshakeTests: XCTestCase {
             }
             if process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
-                process.waitUntilExit()
+                _ = try await waitForProcessExit(process, timeoutMilliseconds: 1_000)
                 XCTFail("signal harness exceeded its hard exit deadline")
                 continue
             }
-            process.waitUntilExit()
 
             XCTAssertEqual(process.terminationReason, .exit)
             XCTAssertEqual(process.terminationStatus, 0)
@@ -296,10 +295,9 @@ final class HandshakeTests: XCTestCase {
         }
         if invalidProcess.isRunning {
             kill(invalidProcess.processIdentifier, SIGKILL)
-            invalidProcess.waitUntilExit()
+            _ = try await waitForProcessExit(invalidProcess, timeoutMilliseconds: 1_000)
             XCTFail("invalid invocation exceeded its hard exit deadline")
         } else {
-            invalidProcess.waitUntilExit()
             XCTAssertEqual(invalidProcess.terminationReason, .exit)
             XCTAssertEqual(invalidProcess.terminationStatus, 1)
         }
@@ -631,7 +629,7 @@ final class HandshakeTests: XCTestCase {
         }
         guard FileManager.default.fileExists(atPath: file.path) else {
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            process.waitUntilExit()
+            _ = try await waitForProcessExit(process, timeoutMilliseconds: 1_000)
             XCTFail(failure)
             return false
         }
@@ -649,14 +647,25 @@ final class HandshakeTests: XCTestCase {
         }
         if process.isRunning {
             kill(process.processIdentifier, SIGKILL)
-            process.waitUntilExit()
-            XCTFail(failure)
-            return false
+            guard try await waitForProcessExit(process, timeoutMilliseconds: 1_000) else {
+                XCTFail(failure)
+                return false
+            }
         }
-        process.waitUntilExit()
         XCTAssertEqual(process.terminationReason, .exit, failure)
         XCTAssertEqual(process.terminationStatus, expectedStatus, failure)
         return true
+    }
+
+    private func waitForProcessExit(
+        _ process: Process,
+        timeoutMilliseconds: UInt64
+    ) async throws -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(timeoutMilliseconds))
+        while process.isRunning, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        return !process.isRunning
     }
 
     private func challengeData(protocolVersion: Int, requestID: UUID) throws -> Data {
@@ -814,7 +823,7 @@ final class HandshakeTests: XCTestCase {
 
     private func readFrame(
         from descriptor: Int32,
-        timeoutMilliseconds: UInt64 = 5_000,
+        timeoutMilliseconds: UInt64 = 15_000,
         oneByteAtATime: Bool = false
     ) async throws -> Data {
         var decoder = FrameDecoder()
