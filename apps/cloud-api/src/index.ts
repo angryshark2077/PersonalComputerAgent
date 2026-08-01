@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 
 import { Hono } from "hono";
@@ -328,21 +328,15 @@ export function createProductionApp(environment: ProductionEnvironment = process
   const database = drizzle(pool, { schema: cloudSchema });
   const repository = new DrizzleControlRepository(database);
   const auth = betterAuth({
-    database: drizzleAdapter(database, {
-      provider: "pg",
-      schema: { user: authUsers, session: authSessions, account: authAccounts },
-      transaction: true,
-    }),
+    database: createHashedSessionAdapter(database),
     baseURL,
     secret,
     emailAndPassword: { enabled: true },
+    advanced: { database: { generateId: () => randomUUID() } },
     user: { fields: { image: "imageUrl" } },
     session: { fields: { token: "sessionTokenHash" } },
     account: { fields: { password: "passwordHash" } },
-    databaseHooks: {
-      ...createOwnerWorkspaceBootstrapHooks(repository),
-      ...createHashedSessionHooks(),
-    },
+    databaseHooks: createOwnerWorkspaceBootstrapHooks(repository),
   });
   const app = createApp({
     repository,
@@ -369,19 +363,109 @@ export function createOwnerWorkspaceBootstrapHooks(
 }
 
 /**
- * Better Auth keeps the resulting token in its signed browser cookie. Persist
- * only its SHA-256 form so PostgreSQL never receives the raw generated token.
+ * Better Auth owns the raw bearer token in its signed browser cookie. Its
+ * Drizzle adapter must still address our `session_token_hash` column, so this
+ * wrapper hashes every session-token predicate before it reaches PostgreSQL.
+ * Results are restored only when the raw token was supplied to this operation.
  */
-export function createHashedSessionHooks() {
-  return {
-    session: {
-      create: {
-        before: async (session: { token: string }) => ({
-          data: { token: hashSecret(session.token) },
-        }),
-      },
+export function createHashedSessionAdapter(database: Parameters<typeof drizzleAdapter>[0]) {
+  const adapterFactory = drizzleAdapter(database, {
+    provider: "pg",
+    schema: { user: authUsers, session: authSessions, account: authAccounts },
+    transaction: true,
+  });
+  return (options: Parameters<typeof adapterFactory>[0]) =>
+    wrapHashedSessionAdapter(adapterFactory(options));
+}
+
+type SessionAdapterInput = Record<string, unknown> & {
+  model?: string;
+  where?: SessionWhere[];
+  data?: Record<string, unknown>;
+  update?: Record<string, unknown>;
+  set?: Record<string, unknown>;
+};
+type SessionWhere = Record<string, unknown> & { field?: string; value?: unknown };
+
+function wrapHashedSessionAdapter<T extends object>(adapter: T): T {
+  return new Proxy(adapter, {
+    get(target, property, receiver) {
+      const operation = Reflect.get(target, property, receiver);
+      if (property === "transaction" && typeof operation === "function") {
+        return ((callback: (transaction: object) => Promise<unknown>) =>
+          (operation as (callback_: (transaction: object) => Promise<unknown>) => unknown).call(
+            target,
+            (transaction) => callback(wrapHashedSessionAdapter(transaction)),
+          )) as typeof operation;
+      }
+      if (typeof operation !== "function" || !hashedSessionOperations.has(property)) {
+        return operation;
+      }
+      return (async (input: SessionAdapterInput) => {
+        const transformed = hashSessionOperation(input);
+        const result = await operation.call(target, transformed.input);
+        return restoreRawSessionToken(result, transformed.rawTokenByHash);
+      }) as typeof operation;
     },
+  });
+}
+
+const hashedSessionOperations = new Set<PropertyKey>([
+  "create",
+  "findOne",
+  "findMany",
+  "count",
+  "update",
+  "updateMany",
+  "delete",
+  "deleteMany",
+  "consumeOne",
+  "incrementOne",
+]);
+
+function hashSessionOperation(input: SessionAdapterInput) {
+  if (input.model !== "session") return { input, rawTokenByHash: new Map<string, string>() };
+  const rawTokenByHash = new Map<string, string>();
+  const hashToken = (value: unknown) => {
+    if (typeof value !== "string") return value;
+    const hash = hashSecret(value);
+    rawTokenByHash.set(hash, value);
+    return hash;
   };
+  const hashValues = (values: Record<string, unknown> | undefined) => {
+    if (values === undefined) return values;
+    return {
+      ...values,
+      ...(values.token === undefined ? {} : { token: hashToken(values.token) }),
+      ...(values.ipAddress === "" ? { ipAddress: null } : {}),
+    };
+  };
+  return {
+    input: {
+      ...input,
+      where: input.where?.map((where) =>
+        where.field === "token"
+          ? {
+              ...where,
+              value: Array.isArray(where.value) ? where.value.map(hashToken) : hashToken(where.value),
+            }
+          : where,
+      ),
+      data: hashValues(input.data),
+      update: hashValues(input.update),
+      set: hashValues(input.set),
+    },
+    rawTokenByHash,
+  };
+}
+
+function restoreRawSessionToken(result: unknown, rawTokenByHash: ReadonlyMap<string, string>): unknown {
+  if (Array.isArray(result)) return result.map((row) => restoreRawSessionToken(row, rawTokenByHash));
+  if (typeof result !== "object" || result === null) return result;
+  const row = result as Record<string, unknown>;
+  const stored = typeof row.token === "string" ? row.token : row.sessionTokenHash;
+  const raw = typeof stored === "string" ? rawTokenByHash.get(stored) : undefined;
+  return raw === undefined ? result : { ...row, token: raw };
 }
 
 /**
