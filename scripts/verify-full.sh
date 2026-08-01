@@ -23,12 +23,14 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p pca-agentd --features process-test-hooks \
+  --test cloud_control_process \
   --test process_lifecycle \
   --test system_collector_process \
   --test collector_commit_kill
 cargo build -p pca-agentd --features process-test-hooks --bin pca-s1b-acceptance-agent
 PCA_S1B_ACCEPTANCE_AGENT="$repository_root/target/debug/pca-s1b-acceptance-agent" \
-  pnpm --filter @pca/cloud-api exec tsx "$repository_root/scripts/tests/s1b_pairing_acceptance.ts"
+  pnpm --filter @pca/cloud-api exec node --import tsx --test \
+    "$repository_root/scripts/tests/s1b_pairing_acceptance.ts"
 swift build --package-path platform/macos
 swift run --package-path platform/macos BridgeContractVerifier
 xcodebuild test \

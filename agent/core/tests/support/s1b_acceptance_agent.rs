@@ -13,33 +13,29 @@ use std::{
 };
 
 use pca_agentd::cloud_control::{
-    AgentControlSnapshot, AgentPairingService, CloudControlRuntime, CollectorControls,
-    ControlClient, ControlError, ControlFuture, EnabledControl, PairingCallbackHandoff,
-    PairingClient, PairingExchangeRequest, PairingSessionRequest, PairingSessionResponse,
-    PairingStartHandoff, WeChatControl,
+    AgentControlSnapshot, CloudControlRuntime, ControlClient, ControlError, ControlFuture,
+    LoadedDeviceCredentials,
 };
 use pca_db_local::DbActorHandle;
 use pca_domain::{CollectorState, CollectorStatus};
 use pca_keychain::{
-    load_device_credential, CredentialError, CredentialStore, DeviceCredential,
-    DEVICE_CREDENTIAL_ACCOUNT, DEVICE_CREDENTIAL_SERVICE,
+    load_device_credential, store_device_credential, CredentialError, CredentialStore,
+    DeviceCredential, DEVICE_CREDENTIAL_ACCOUNT, DEVICE_CREDENTIAL_SERVICE,
 };
+use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use uuid::Uuid;
 
 type HarnessResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HarnessInput {
-    device_id: String,
-    workspace_id: String,
-    device_access_token: Option<String>,
-    refresh_token: Option<String>,
-    access_expires_at_ms: Option<i64>,
-    refresh_expires_at_ms: Option<i64>,
-    callback_uri: Option<String>,
-    configuration_revision: u64,
-    #[serde(rename = "message_body_canary")]
-    _message_body_canary: String,
+    api_origin: String,
+    session_id: String,
+    callback_state: String,
+    callback_code: String,
 }
 
 #[derive(Serialize)]
@@ -114,78 +110,146 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
-struct FixedPairingClient {
-    credential: DeviceCredential,
+struct AcceptanceHttpClient {
+    client: Client,
+    base_url: Url,
 }
 
-impl PairingClient for FixedPairingClient {
-    fn create_pairing_session<'a>(
-        &'a self,
-        request: &'a PairingSessionRequest,
-    ) -> ControlFuture<'a, PairingSessionResponse> {
-        Box::pin(async move {
-            if !request.callback_uri.starts_with("http://127.0.0.1:")
-                || request.callback_state.is_empty()
-                || request.code_challenge.is_empty()
-                || request.device_public_key.is_empty()
-            {
-                return Err(ControlError::Contract);
-            }
-            Ok(PairingSessionResponse {
-                session_id: "01983333-7333-8333-8333-333333333333".to_owned(),
-                authorization_url: "https://dashboard.invalid/pair".to_owned(),
-            })
-        })
+impl AcceptanceHttpClient {
+    fn new(origin: &str) -> Result<Self, ControlError> {
+        let base_url = Url::parse(origin).map_err(|_| ControlError::Contract)?;
+        if base_url.scheme() != "http"
+            || base_url.host_str() != Some("127.0.0.1")
+            || base_url.port().is_none()
+            || base_url.path() != "/"
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return Err(ControlError::Contract);
+        }
+        let client = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| ControlError::Transient)?;
+        Ok(Self { client, base_url })
     }
 
-    fn exchange_pairing_callback<'a>(
+    fn endpoint(&self, path: &str) -> Result<Url, ControlError> {
+        self.base_url.join(path).map_err(|_| ControlError::Contract)
+    }
+
+    async fn exchange(&self, input: &HarnessInput) -> Result<DeviceCredential, ControlError> {
+        let response = self
+            .client
+            .post(self.endpoint("v1/device-pairing/exchange")?)
+            .json(&PairingExchangeRequest {
+                session_id: &input.session_id,
+                authorization_code: &input.callback_code,
+                code_verifier: &input.callback_state,
+            })
+            .send()
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        let grant = parse_response::<CredentialGrant>(response).await?;
+        credential_from_grant(grant, 1)
+    }
+}
+
+impl ControlClient for AcceptanceHttpClient {
+    fn refresh<'a>(
         &'a self,
-        request: &'a PairingExchangeRequest,
+        credentials: &'a DeviceCredential,
     ) -> ControlFuture<'a, DeviceCredential> {
         Box::pin(async move {
-            if request.session_id != "01983333-7333-8333-8333-333333333333"
-                || request.authorization_code != "accepted-callback-code"
-                || request.code_verifier.is_empty()
-            {
-                return Err(ControlError::Contract);
-            }
-            Ok(self.credential.clone())
+            let response = self
+                .client
+                .post(self.endpoint("v1/devices/token/refresh")?)
+                .bearer_auth(credentials.refresh_credential())
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            let generation = credentials.credential_generation().saturating_add(1);
+            credential_from_grant(
+                parse_response::<CredentialGrant>(response).await?,
+                generation,
+            )
+        })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        outbox_depth: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .post(self.endpoint("v1/agent/control")?)
+                .bearer_auth(credentials.access_credential())
+                .json(&HeartbeatRequest {
+                    heartbeat_id: Uuid::new_v4().to_string(),
+                    agent_version: "s1b-acceptance",
+                    presence: "online",
+                    outbox_depth,
+                })
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            parse_response::<ControlResponse>(response)
+                .await
+                .map(|response| response.snapshot)
         })
     }
 }
 
-struct SnapshotClient {
+#[derive(Serialize)]
+struct PairingExchangeRequest<'a> {
+    session_id: &'a str,
+    authorization_code: &'a str,
+    code_verifier: &'a str,
+}
+
+#[derive(Serialize)]
+struct HeartbeatRequest {
+    heartbeat_id: String,
+    agent_version: &'static str,
+    presence: &'static str,
+    outbox_depth: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialGrant {
+    workspace_id: String,
+    device_id: String,
+    device_access_token: String,
+    refresh_token: String,
+    access_expires_at: String,
+    refresh_expires_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlResponse {
     snapshot: AgentControlSnapshot,
+    #[allow(dead_code)]
+    server_time: String,
 }
 
-impl ControlClient for SnapshotClient {
-    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
-        Box::pin(async { Err(ControlError::InvalidCredential) })
-    }
-
-    fn heartbeat_and_control<'a>(
-        &'a self,
-        _: &'a DeviceCredential,
-        _: u64,
-    ) -> ControlFuture<'a, AgentControlSnapshot> {
-        Box::pin(async move { Ok(self.snapshot.clone()) })
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorResponse {
+    error: ErrorBody,
 }
 
-struct RevokedClient;
-
-impl ControlClient for RevokedClient {
-    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
-        Box::pin(async { Err(ControlError::Revoked) })
-    }
-
-    fn heartbeat_and_control<'a>(
-        &'a self,
-        _: &'a DeviceCredential,
-        _: u64,
-    ) -> ControlFuture<'a, AgentControlSnapshot> {
-        Box::pin(async { Err(ControlError::Revoked) })
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorBody {
+    error_code: String,
+    #[allow(dead_code)]
+    message: String,
+    #[allow(dead_code)]
+    retryable: bool,
 }
 
 #[tokio::main]
@@ -199,10 +263,14 @@ async fn main() -> HarnessResult<()> {
     let database =
         Arc::new(DbActorHandle::open(&runtime_root.join("agent.sqlite"), "s1b-acceptance").await?);
     let store = Arc::new(FileCredentialStore::new(&runtime_root));
+    let client = Arc::new(
+        AcceptanceHttpClient::new(&input.api_origin)
+            .map_err(|error| control_failure("invalid local Cloud origin", error))?,
+    );
 
     match phase {
-        "pair-control" => pair_and_apply(&database, &store, &input, &status_file).await?,
-        "revoke" => revoke(&database, &store, &input, &status_file).await?,
+        "pair-control" => pair_and_apply(&database, &store, client, &input, &status_file).await?,
+        "revoke" => revoke(&database, &store, client, &status_file).await?,
         _ => return Err("unsupported acceptance phase".into()),
     }
 
@@ -218,68 +286,30 @@ async fn main() -> HarnessResult<()> {
 async fn pair_and_apply(
     database: &Arc<DbActorHandle>,
     store: &Arc<FileCredentialStore>,
+    client: Arc<AcceptanceHttpClient>,
     input: &HarnessInput,
     status_file: &Path,
 ) -> HarnessResult<()> {
-    let credential = DeviceCredential::new(
-        input.device_id.clone(),
-        input.workspace_id.clone(),
-        input
-            .device_access_token
-            .as_deref()
-            .ok_or("missing access credential")?,
-        input
-            .refresh_token
-            .as_deref()
-            .ok_or("missing refresh credential")?,
-    )?
-    .with_metadata(
-        1,
-        input.access_expires_at_ms.ok_or("missing access expiry")?,
-        input
-            .refresh_expires_at_ms
-            .ok_or("missing refresh expiry")?,
-    );
-    let pairing = AgentPairingService::new(
-        Arc::clone(database),
-        Arc::clone(store) as Arc<dyn CredentialStore>,
-        Arc::new(FixedPairingClient {
-            credential: credential.clone(),
-        }),
-    );
-    let session = pairing
-        .begin(PairingStartHandoff {
-            callback_uri: input.callback_uri.clone().ok_or("missing callback URI")?,
-        })
+    let credential = client
+        .exchange(input)
         .await
-        .map_err(|_| "pairing begin failed")?;
-    pairing
-        .complete(PairingCallbackHandoff {
-            session_id: session.session_id,
-            authorization_code: "accepted-callback-code".to_owned(),
-        })
-        .await?;
-    let stored = load_device_credential(store.as_ref())?.ok_or("credential was not stored")?;
-    if stored != credential {
-        return Err("stored credential did not round trip".into());
-    }
-
-    let runtime = CloudControlRuntime::start_from_keychain(
+        .map_err(|error| control_failure("pairing exchange failed", error))?;
+    let device_id = credential.device_id().to_owned();
+    let workspace_id = credential.workspace_id().to_owned();
+    store_device_credential(store.as_ref(), &credential)?;
+    let runtime = CloudControlRuntime::start(
         Arc::clone(database),
-        Arc::clone(store) as Arc<dyn CredentialStore>,
-        Arc::new(SnapshotClient {
-            snapshot: snapshot(input, false),
-        }),
+        LoadedDeviceCredentials::new(credential, Arc::clone(store) as Arc<dyn CredentialStore>),
+        client,
     )
-    .await?
-    .ok_or("paired runtime did not start")?;
-    await_revision(&runtime, input.configuration_revision).await?;
+    .await?;
+    let revision = await_revision(&runtime).await?;
     runtime.shutdown().await?;
     let pairing_state = database
         .load_pairing_state()
         .await?
         .ok_or("pairing state missing")?;
-    if pairing_state.applied_control_revision != input.configuration_revision {
+    if pairing_state.applied_control_revision != revision {
         return Err("control revision was not durable".into());
     }
     write_status(
@@ -288,9 +318,9 @@ async fn pair_and_apply(
             phase: "pair-control",
             agent_status: "degraded",
             paired: true,
-            applied_control_revision: Some(input.configuration_revision),
-            device_id: &input.device_id,
-            workspace_id: &input.workspace_id,
+            applied_control_revision: Some(revision),
+            device_id: &device_id,
+            workspace_id: &workspace_id,
         },
     )
 }
@@ -298,17 +328,25 @@ async fn pair_and_apply(
 async fn revoke(
     database: &Arc<DbActorHandle>,
     store: &Arc<FileCredentialStore>,
-    input: &HarnessInput,
+    client: Arc<AcceptanceHttpClient>,
     status_file: &Path,
 ) -> HarnessResult<()> {
+    let credential = load_device_credential(store.as_ref())?.ok_or("missing paired credential")?;
+    let device_id = credential.device_id().to_owned();
+    let workspace_id = credential.workspace_id().to_owned();
+    let revision = database
+        .load_pairing_state()
+        .await?
+        .ok_or("pairing state missing")?
+        .applied_control_revision;
     for collector_key in ["network", "communication.wechat"] {
         database
             .upsert_collector_state(&CollectorState {
                 collector_key: collector_key.to_owned(),
                 collector_version: "s1b-acceptance".to_owned(),
                 status: CollectorStatus::Running,
-                desired_config_revision: input.configuration_revision,
-                applied_config_revision: input.configuration_revision,
+                desired_config_revision: revision,
+                applied_config_revision: revision,
                 last_event_at_ms: None,
                 last_health_at_ms: None,
                 last_error_code: None,
@@ -320,7 +358,7 @@ async fn revoke(
     let runtime = CloudControlRuntime::start_from_keychain(
         Arc::clone(database),
         Arc::clone(store) as Arc<dyn CredentialStore>,
-        Arc::new(RevokedClient),
+        client,
     )
     .await?
     .ok_or("revocation runtime did not start")?;
@@ -350,39 +388,24 @@ async fn revoke(
             agent_status: "unpaired",
             paired: false,
             applied_control_revision: None,
-            device_id: &input.device_id,
-            workspace_id: &input.workspace_id,
+            device_id: &device_id,
+            workspace_id: &workspace_id,
         },
     )
 }
 
-fn snapshot(input: &HarnessInput, revoked: bool) -> AgentControlSnapshot {
-    AgentControlSnapshot {
-        device_id: input.device_id.clone(),
-        workspace_id: input.workspace_id.clone(),
-        revoked,
-        configuration_revision: input.configuration_revision,
-        collectors: CollectorControls {
-            network: EnabledControl { enabled: true },
-            communication_wechat: WeChatControl {
-                enabled: true,
-                direction: "outgoing".to_owned(),
-                message_type: "text".to_owned(),
-                sync_mode: "full".to_owned(),
-            },
-        },
-    }
-}
-
 async fn await_revision(
     runtime: &pca_agentd::cloud_control::CloudControlHandle,
-    revision: u64,
-) -> HarnessResult<()> {
-    for _ in 0..100 {
-        if runtime.applied_revision().await == Some(revision) {
-            return Ok(());
+) -> HarnessResult<u64> {
+    for _ in 0..200 {
+        if let Some(revision) = runtime
+            .applied_revision()
+            .await
+            .filter(|revision| *revision > 0)
+        {
+            return Ok(revision);
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Err("timed out waiting for control revision".into())
 }
@@ -390,13 +413,66 @@ async fn await_revision(
 async fn await_unpaired(
     runtime: &pca_agentd::cloud_control::CloudControlHandle,
 ) -> HarnessResult<()> {
-    for _ in 0..100 {
+    for _ in 0..200 {
         if runtime.is_unpaired().await {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Err("timed out waiting for revocation".into())
+}
+
+fn credential_from_grant(
+    grant: CredentialGrant,
+    generation: u64,
+) -> Result<DeviceCredential, ControlError> {
+    let access_expires_at_ms = parse_time_ms(&grant.access_expires_at)?;
+    let refresh_expires_at_ms = parse_time_ms(&grant.refresh_expires_at)?;
+    DeviceCredential::new(
+        grant.device_id,
+        grant.workspace_id,
+        &grant.device_access_token,
+        &grant.refresh_token,
+    )
+    .map(|credential| {
+        credential.with_metadata(generation, access_expires_at_ms, refresh_expires_at_ms)
+    })
+    .map_err(|_| ControlError::Contract)
+}
+
+async fn parse_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+) -> Result<T, ControlError> {
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    if status.is_success() {
+        return serde_json::from_slice(&bytes).map_err(|_| ControlError::Contract);
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return Err(ControlError::Transient);
+    }
+    if matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE
+    ) {
+        return match serde_json::from_slice::<ErrorResponse>(&bytes) {
+            Ok(error) if error.error.error_code == "DEVICE_REVOKED" => Err(ControlError::Revoked),
+            _ => Err(ControlError::InvalidCredential),
+        };
+    }
+    Err(ControlError::Contract)
+}
+
+fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
+    let timestamp = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ControlError::Contract)?;
+    i64::try_from(timestamp.unix_timestamp_nanos() / 1_000_000).map_err(|_| ControlError::Contract)
+}
+
+fn control_failure(context: &str, error: ControlError) -> io::Error {
+    io::Error::other(format!("{context}: {error:?}"))
 }
 
 fn write_status(path: &Path, status: &HarnessStatus<'_>) -> HarnessResult<()> {

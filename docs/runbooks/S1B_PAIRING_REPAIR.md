@@ -97,14 +97,31 @@ local repair condition; do not expose or export it.
 
 ## Verification before declaring an installation paired
 
-Run the repository gate and confirm its PostgreSQL migration evidence:
+Run the repository gate and confirm its PostgreSQL migration evidence and local
+shared-state process acceptance:
 
 ```bash
-./scripts/verify-full.sh
+CLOUD_API_INTERNAL_ORIGIN=http://pca-cloud-api.railway.internal:8080 ./scripts/verify-full.sh
 ```
+
+The S1B process acceptance inside this gate starts one synthetic Cloud service
+on loopback HTTP. That service alone owns the pairing session and generated
+authorization code, exchange-issued credentials, device configuration revision,
+audit row and revocation. The Rust acceptance Agent receives only the local API
+origin plus callback metadata, exchanges and sends control over real HTTP, writes
+the returned synthetic credential to a file-backed Keychain double, and uses a
+temporary SQLite database. Dashboard clients authorize, read, configure and
+revoke through the same service. Runtime-generated canaries are checked against
+Agent stdout/stderr, non-credential JSON responses and status files,
+SQLite/WAL/SHM, and fixture sources.
+
+This proves the local callback-to-revocation state transition and secret-storage
+boundary. It does not use production HTTPS, Better Auth, PostgreSQL, a signed
+Setup-to-Agent transport, the macOS Keychain ACL, or Railway networking, and is
+not evidence that a deployed installation paired successfully.
 
 For a future live deployment, separately record the deployed API origin,
 database migration version, Better Auth login result, one successful callback,
 first heartbeat/control revision, Dashboard audit row, and revoke cleanup.
-Those deployment observations are not implied by the in-memory and temporary
-PostgreSQL tests in this repository.
+Those deployment observations are not implied by the local synthetic acceptance
+or temporary PostgreSQL tests in this repository.

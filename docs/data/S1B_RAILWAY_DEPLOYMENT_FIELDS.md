@@ -37,9 +37,10 @@ Keychain material.
 ## Health and migration behavior
 
 - Both public services expose `/healthz` with exactly `{ "status": "ok" }`
-  when ready. The Dashboard returns `503` with `{ "status": "not_ready" }`
-  when `CLOUD_API_INTERNAL_ORIGIN` is missing or invalid, so Railway cannot
-  admit a runtime that has no private API route. `scripts/verify-railway-deployment.sh`
+  when ready. A production Dashboard build fails when
+  `CLOUD_API_INTERNAL_ORIGIN` is missing or invalid; a successfully configured
+  build bakes the private rewrites into its route manifest, so `/healthz` does
+  not re-read a runtime-only fallback. `scripts/verify-railway-deployment.sh`
   requires public HTTPS origins and rejects health bodies containing
   `DATABASE_URL`, token, or Keychain wording.
 - The API pre-deploy command is `pnpm --filter @pca/cloud-api migrate`.
@@ -52,8 +53,16 @@ Keychain material.
 
 ## Live acceptance remains unverified
 
-The local full gate runs the offline deployment-verifier test, but does not
-contact Railway. The operator must complete
+The local full gate runs the offline deployment-verifier test plus a synthetic
+shared-Cloud process acceptance. In that acceptance, one loopback HTTP service
+owns the generated pairing code, credential hashes, device/config revision,
+audit and revocation; the real Rust helper exchanges and sends control through
+that service while Dashboard clients mutate and read the same state. It scans
+runtime canaries across process output, non-credential JSON/status, temporary
+SQLite/WAL/SHM and fixture sources. It does not contact Railway or prove
+production auth, TLS, PostgreSQL, signed local IPC or macOS Keychain ACLs.
+
+The operator must complete
 `docs/runbooks/S1B_RAILWAY_DEPLOYMENT.md`, then the pairing/revoke checks in
 `docs/runbooks/S1B_PAIRING_REPAIR.md`. Until a real API HTTPS origin, signed
 Setup-to-Agent local transport, and restricted Keychain ACL are installed and

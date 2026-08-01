@@ -42,7 +42,11 @@ cat >"$fixture_directory/bin/pnpm" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ " $* " == *"s1b_pairing_acceptance.ts"* ]]; then
-  echo "fixture S1B process acceptance executed"
+  if [[ " $* " != *" exec node --import tsx --test "* ]]; then
+    echo "expected S1B acceptance to run through node --test with the tsx loader" >&2
+    exit 1
+  fi
+  echo "fixture S1B shared process acceptance executed"
 fi
 EOF
 chmod +x "$fixture_directory/bin/pnpm"
@@ -54,7 +58,7 @@ output=$(cd "$fixture_directory" && \
 
 deployment_line=$(printf '%s\n' "$output" | grep -n 'fixture Railway deployment verifier executed' | cut -d: -f1)
 acceptance_build_line=$(printf '%s\n' "$output" | grep -n 'fixture S1B acceptance Agent built' | cut -d: -f1)
-acceptance_line=$(printf '%s\n' "$output" | grep -n 'fixture S1B process acceptance executed' | cut -d: -f1)
+acceptance_line=$(printf '%s\n' "$output" | grep -n 'fixture S1B shared process acceptance executed' | cut -d: -f1)
 success_line=$(printf '%s\n' "$output" | grep -n '^FULL VERIFICATION PASSED$' | cut -d: -f1)
 
 [[ -n "$deployment_line" ]] || {
