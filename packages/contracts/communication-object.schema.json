@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/communication-object.schema.json",
+  "title": "CommunicationObject",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["attachment_id", "kind", "sha256", "size_bytes", "mime_type"],
+  "properties": {
+    "attachment_id": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["audio", "image", "video"] },
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "size_bytes": { "type": "integer", "minimum": 1 },
+    "mime_type": { "type": "string", "minLength": 1 }
+  }
+}

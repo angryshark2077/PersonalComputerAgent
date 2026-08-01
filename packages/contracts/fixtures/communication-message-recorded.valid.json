@@ -1,0 +1,18 @@
+{
+  "message_id": "message-1",
+  "conversation_id": "conversation-1",
+  "source_key": "account-1:conversation-1:message-1",
+  "occurred_at": "2026-08-02T12:00:00.000Z",
+  "direction": "incoming",
+  "kind": "image",
+  "conversation": { "scope": "group", "member_count": 8 },
+  "attachments": [
+    {
+      "attachment_id": "attachment-1",
+      "kind": "image",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size_bytes": 1,
+      "mime_type": "image/png"
+    }
+  ]
+}

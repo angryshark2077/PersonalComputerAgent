@@ -178,7 +178,7 @@ test("handshake fixtures never carry the shared secret", () => {
   }
 });
 
-test("pairing and control contracts accept the approved wire shapes", () => {
+test("pairing and v2 control contracts accept the approved wire shapes", () => {
   assert.equal(
     validateContract("device-pairing", fixture("pairing-start.valid.json")).valid,
     true,
@@ -190,13 +190,13 @@ test("pairing and control contracts accept the approved wire shapes", () => {
   assert.equal(
     validateContract(
       "agent-control-snapshot",
-      fixture("agent-control-snapshot.valid.json"),
+      fixture("agent-control-snapshot.v2.valid.json"),
     ).valid,
     true,
   );
 });
 
-test("pairing and control contracts reject broadened inputs", () => {
+test("pairing and v2 control contracts reject broadened inputs", () => {
   assert.equal(
     validateContract(
       "device-pairing",
@@ -213,13 +213,13 @@ test("pairing and control contracts reject broadened inputs", () => {
     false,
   );
 
-  const unknownScope = fixture("agent-control-snapshot.valid.json") as {
+  const unknownScope = fixture("agent-control-snapshot.v2.valid.json") as {
     collectors: Record<string, unknown>;
   };
   unknownScope.collectors.screen = { enabled: true };
   assert.equal(validateContract("agent-control-snapshot", unknownScope).valid, false);
 
-  const negativeRevision = fixture("agent-control-snapshot.valid.json") as {
+  const negativeRevision = fixture("agent-control-snapshot.v2.valid.json") as {
     configuration_revision: number;
   };
   negativeRevision.configuration_revision = -1;
@@ -228,12 +228,37 @@ test("pairing and control contracts reject broadened inputs", () => {
     false,
   );
 
-  const broadenedWechatScope = fixture("agent-control-snapshot.valid.json") as {
-    collectors: { "communication.wechat": { direction: string } };
+  const broadenedWechatScope = fixture("agent-control-snapshot.v2.valid.json") as {
+    collectors: { "communication.wechat": { max_group_members: number } };
   };
-  broadenedWechatScope.collectors["communication.wechat"].direction = "incoming";
+  broadenedWechatScope.collectors["communication.wechat"].max_group_members = 9;
   assert.equal(
     validateContract("agent-control-snapshot", broadenedWechatScope).valid,
+    false,
+  );
+
+  assert.equal(
+    validateContract(
+      "agent-control-snapshot",
+      fixture("agent-control-snapshot.valid.json"),
+    ).valid,
+    false,
+  );
+});
+
+test("communication contracts accept only eligible messages and complete manifests", () => {
+  assert.equal(
+    validateContract(
+      "communication-message-recorded",
+      fixture("communication-message-recorded.valid.json"),
+    ).valid,
+    true,
+  );
+  assert.equal(
+    validateContract(
+      "communication-message-recorded",
+      fixture("communication-message-recorded.invalid-large-group.json"),
+    ).valid,
     false,
   );
 });

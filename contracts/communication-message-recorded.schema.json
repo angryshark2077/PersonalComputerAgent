@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/communication-message-recorded.schema.json",
+  "title": "CommunicationMessageRecorded",
+  "$defs": {
+    "conversation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope"],
+          "properties": { "scope": { "const": "direct" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope", "member_count"],
+          "properties": {
+            "scope": { "const": "group" },
+            "member_count": { "type": "integer", "minimum": 1, "maximum": 8 }
+          }
+        }
+      ]
+    },
+    "base": {
+      "type": "object",
+      "required": ["message_id", "conversation_id", "source_key", "occurred_at", "direction", "kind", "conversation"],
+      "properties": {
+        "message_id": { "type": "string", "minLength": 1 },
+        "conversation_id": { "type": "string", "minLength": 1 },
+        "source_key": { "type": "string", "minLength": 1 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "direction": { "enum": ["incoming", "outgoing"] },
+        "kind": { "enum": ["text", "audio", "image", "video"] },
+        "conversation": { "$ref": "#/$defs/conversation" }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [{ "$ref": "#/$defs/base" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text"],
+      "properties": {
+        "message_id": { "type": "string", "minLength": 1 },
+        "conversation_id": { "type": "string", "minLength": 1 },
+        "source_key": { "type": "string", "minLength": 1 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "direction": { "enum": ["incoming", "outgoing"] },
+        "kind": { "const": "text" },
+        "conversation": { "$ref": "#/$defs/conversation" },
+        "text": { "type": "string", "minLength": 1 }
+      }
+    },
+    {
+      "allOf": [{ "$ref": "#/$defs/base" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attachments"],
+      "properties": {
+        "message_id": { "type": "string", "minLength": 1 },
+        "conversation_id": { "type": "string", "minLength": 1 },
+        "source_key": { "type": "string", "minLength": 1 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "direction": { "enum": ["incoming", "outgoing"] },
+        "kind": { "const": "audio" },
+        "conversation": { "$ref": "#/$defs/conversation" },
+        "attachments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "allOf": [
+              { "$ref": "https://personalcomputeragent.local/contracts/communication-object.schema.json" },
+              { "type": "object", "properties": { "kind": { "const": "audio" } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "allOf": [{ "$ref": "#/$defs/base" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attachments"],
+      "properties": {
+        "message_id": { "type": "string", "minLength": 1 },
+        "conversation_id": { "type": "string", "minLength": 1 },
+        "source_key": { "type": "string", "minLength": 1 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "direction": { "enum": ["incoming", "outgoing"] },
+        "kind": { "const": "image" },
+        "conversation": { "$ref": "#/$defs/conversation" },
+        "attachments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "allOf": [
+              { "$ref": "https://personalcomputeragent.local/contracts/communication-object.schema.json" },
+              { "type": "object", "properties": { "kind": { "const": "image" } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "allOf": [{ "$ref": "#/$defs/base" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attachments"],
+      "properties": {
+        "message_id": { "type": "string", "minLength": 1 },
+        "conversation_id": { "type": "string", "minLength": 1 },
+        "source_key": { "type": "string", "minLength": 1 },
+        "occurred_at": { "type": "string", "format": "date-time" },
+        "direction": { "enum": ["incoming", "outgoing"] },
+        "kind": { "const": "video" },
+        "conversation": { "$ref": "#/$defs/conversation" },
+        "attachments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "allOf": [
+              { "$ref": "https://personalcomputeragent.local/contracts/communication-object.schema.json" },
+              { "type": "object", "properties": { "kind": { "const": "video" } } }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

@@ -521,6 +521,406 @@ pub enum Sensitivity {
     Secret,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    Text,
+    Audio,
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConversationScope {
+    Direct,
+    Group { member_count: u8 },
+}
+
+impl ConversationScope {
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        match self {
+            Self::Direct => true,
+            Self::Group { member_count } => *member_count > 0 && *member_count <= 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConversationScopePolicy {
+    DirectAndGroupAtMostEightMembers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CommunicationSyncMode {
+    Full,
+}
+
+/// The only communication authorization scope accepted by v2 control contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawCommunicationScopeV2")]
+pub struct CommunicationScopeV2 {
+    enabled: bool,
+    directions: Vec<Direction>,
+    message_types: Vec<MessageKind>,
+    conversation_scope: ConversationScopePolicy,
+    max_group_members: u8,
+    sync_mode: CommunicationSyncMode,
+    retention_days: u16,
+}
+
+impl CommunicationScopeV2 {
+    /// Returns whether collection is expressly enabled under the fixed v2 scope.
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn directions(&self) -> &[Direction] {
+        &self.directions
+    }
+
+    #[must_use]
+    pub fn message_types(&self) -> &[MessageKind] {
+        &self.message_types
+    }
+
+    #[must_use]
+    pub const fn max_group_members(&self) -> u8 {
+        self.max_group_members
+    }
+
+    #[must_use]
+    pub const fn retention_days(&self) -> u16 {
+        self.retention_days
+    }
+
+    fn try_new(raw: RawCommunicationScopeV2) -> Result<Self, DomainError> {
+        if raw.directions.as_slice() != [Direction::Incoming, Direction::Outgoing]
+            || raw.message_types.as_slice()
+                != [
+                    MessageKind::Text,
+                    MessageKind::Audio,
+                    MessageKind::Image,
+                    MessageKind::Video,
+                ]
+            || raw.max_group_members != 8
+            || raw.retention_days != 180
+        {
+            return Err(invalid_communication_record());
+        }
+
+        Ok(Self {
+            enabled: raw.enabled,
+            directions: raw.directions,
+            message_types: raw.message_types,
+            conversation_scope: raw.conversation_scope,
+            max_group_members: raw.max_group_members,
+            sync_mode: raw.sync_mode,
+            retention_days: raw.retention_days,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCommunicationScopeV2 {
+    enabled: bool,
+    directions: Vec<Direction>,
+    message_types: Vec<MessageKind>,
+    conversation_scope: ConversationScopePolicy,
+    max_group_members: u8,
+    sync_mode: CommunicationSyncMode,
+    retention_days: u16,
+}
+
+impl TryFrom<RawCommunicationScopeV2> for CommunicationScopeV2 {
+    type Error = DomainError;
+
+    fn try_from(raw: RawCommunicationScopeV2) -> Result<Self, Self::Error> {
+        Self::try_new(raw)
+    }
+}
+
+/// A complete manifest for one immutable communication media object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawCommunicationAttachment")]
+pub struct CommunicationAttachment {
+    attachment_id: String,
+    kind: MessageKind,
+    sha256: String,
+    size_bytes: u64,
+    mime_type: String,
+}
+
+impl CommunicationAttachment {
+    /// Creates a complete manifest without retaining a local path, body, or credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the manifest has an empty identifier or MIME type, a text
+    /// kind, a non-SHA-256 digest, or a zero byte length.
+    pub fn try_new(
+        attachment_id: String,
+        kind: MessageKind,
+        sha256: String,
+        size_bytes: u64,
+        mime_type: String,
+    ) -> Result<Self, DomainError> {
+        if attachment_id.trim().is_empty()
+            || matches!(kind, MessageKind::Text)
+            || !is_sha256(&sha256)
+            || size_bytes == 0
+            || mime_type.trim().is_empty()
+        {
+            return Err(invalid_communication_record());
+        }
+
+        Ok(Self {
+            attachment_id,
+            kind,
+            sha256,
+            size_bytes,
+            mime_type,
+        })
+    }
+
+    #[must_use]
+    pub fn attachment_id(&self) -> &str {
+        &self.attachment_id
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> MessageKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    #[must_use]
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    fn validate(&self) -> Result<(), DomainError> {
+        Self::try_new(
+            self.attachment_id.clone(),
+            self.kind,
+            self.sha256.clone(),
+            self.size_bytes,
+            self.mime_type.clone(),
+        )
+        .map(|_| ())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCommunicationAttachment {
+    attachment_id: String,
+    kind: MessageKind,
+    sha256: String,
+    size_bytes: u64,
+    mime_type: String,
+}
+
+impl TryFrom<RawCommunicationAttachment> for CommunicationAttachment {
+    type Error = DomainError;
+
+    fn try_from(raw: RawCommunicationAttachment) -> Result<Self, Self::Error> {
+        Self::try_new(
+            raw.attachment_id,
+            raw.kind,
+            raw.sha256,
+            raw.size_bytes,
+            raw.mime_type,
+        )
+    }
+}
+
+/// Input to the pure message-record validator. It has no source, storage, or network handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommunicationMessageRecordedInput {
+    pub message_id: String,
+    pub conversation_id: String,
+    pub source_key: String,
+    pub occurred_at: String,
+    pub direction: Direction,
+    pub kind: MessageKind,
+    pub conversation: ConversationScope,
+    pub text: Option<String>,
+    pub attachments: Vec<CommunicationAttachment>,
+}
+
+/// A validated, eligible communication message record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawCommunicationMessageRecorded")]
+pub struct CommunicationMessageRecorded {
+    message_id: String,
+    conversation_id: String,
+    source_key: String,
+    occurred_at: String,
+    direction: Direction,
+    kind: MessageKind,
+    conversation: ConversationScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<CommunicationAttachment>,
+}
+
+impl CommunicationMessageRecorded {
+    /// Validates the fixed set of eligible communication message shapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error when the record lacks stable identifiers, has an ineligible
+    /// conversation, or does not have the exact text or media manifest required by its kind.
+    pub fn try_new(input: CommunicationMessageRecordedInput) -> Result<Self, DomainError> {
+        if input.message_id.trim().is_empty()
+            || input.conversation_id.trim().is_empty()
+            || input.source_key.trim().is_empty()
+            || input.occurred_at.trim().is_empty()
+            || !input.conversation.is_allowed()
+        {
+            return Err(invalid_communication_record());
+        }
+
+        match input.kind {
+            MessageKind::Text => {
+                if input
+                    .text
+                    .as_deref()
+                    .is_none_or(|text| text.trim().is_empty())
+                    || !input.attachments.is_empty()
+                {
+                    return Err(invalid_communication_record());
+                }
+            }
+            media_kind => {
+                if input.text.is_some()
+                    || input.attachments.is_empty()
+                    || input.attachments.iter().any(|attachment| {
+                        attachment.validate().is_err() || attachment.kind() != media_kind
+                    })
+                {
+                    return Err(invalid_communication_record());
+                }
+            }
+        }
+
+        Ok(Self {
+            message_id: input.message_id,
+            conversation_id: input.conversation_id,
+            source_key: input.source_key,
+            occurred_at: input.occurred_at,
+            direction: input.direction,
+            kind: input.kind,
+            conversation: input.conversation,
+            text: input.text,
+            attachments: input.attachments,
+        })
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> &str {
+        &self.message_id
+    }
+
+    #[must_use]
+    pub fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+
+    #[must_use]
+    pub fn source_key(&self) -> &str {
+        &self.source_key
+    }
+
+    #[must_use]
+    pub fn occurred_at(&self) -> &str {
+        &self.occurred_at
+    }
+
+    #[must_use]
+    pub const fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> MessageKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn conversation(&self) -> &ConversationScope {
+        &self.conversation
+    }
+
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    #[must_use]
+    pub fn attachments(&self) -> &[CommunicationAttachment] {
+        &self.attachments
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCommunicationMessageRecorded {
+    message_id: String,
+    conversation_id: String,
+    source_key: String,
+    occurred_at: String,
+    direction: Direction,
+    kind: MessageKind,
+    conversation: ConversationScope,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    attachments: Vec<CommunicationAttachment>,
+}
+
+impl TryFrom<RawCommunicationMessageRecorded> for CommunicationMessageRecorded {
+    type Error = DomainError;
+
+    fn try_from(raw: RawCommunicationMessageRecorded) -> Result<Self, Self::Error> {
+        Self::try_new(CommunicationMessageRecordedInput {
+            message_id: raw.message_id,
+            conversation_id: raw.conversation_id,
+            source_key: raw.source_key,
+            occurred_at: raw.occurred_at,
+            direction: raw.direction,
+            kind: raw.kind,
+            conversation: raw.conversation,
+            text: raw.text,
+            attachments: raw.attachments,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub event_id: String,
@@ -647,6 +1047,21 @@ impl std::error::Error for DomainError {}
 
 fn invalid_system_sample(message: &str) -> DomainError {
     DomainError::new("COLLECTOR_DEGRADED", message, false)
+}
+
+fn invalid_communication_record() -> DomainError {
+    DomainError::new(
+        "COMMUNICATION_INVALID_RECORD",
+        "communication record violates the fixed collection scope",
+        false,
+    )
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_percentage(value: f64, field: &str) -> Result<(), DomainError> {

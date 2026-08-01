@@ -1,16 +1,8 @@
 {
-  "device_id": "01985555-7555-8555-8555-555555555555",
-  "workspace_id": "01982222-7222-8222-8222-222222222222",
-  "platform": "macos",
-  "paired_at": "2026-07-31T10:00:00.000Z",
+  "device_id": "device-test-001",
+  "workspace_id": "workspace-test-001",
   "revoked": false,
-  "configuration_revision": 1,
-  "status": {
-    "presence": "online",
-    "agent_version": "0.1.0",
-    "outbox_depth": 2,
-    "observed_at": "2026-07-31T10:01:00.000Z"
-  },
+  "configuration_revision": 3,
   "collectors": {
     "network": { "enabled": true },
     "communication.wechat": {

@@ -161,12 +161,52 @@ export interface AgentControlSnapshot {
     network: { enabled: boolean };
     "communication.wechat": {
       enabled: boolean;
-      direction: "outgoing";
-      message_type: "text";
+      directions: ["incoming", "outgoing"];
+      message_types: ["text", "audio", "image", "video"];
+      conversation_scope: "direct_and_group_at_most_eight_members";
+      max_group_members: 8;
       sync_mode: "full";
+      retention_days: 180;
     };
   };
 }
+
+export type CommunicationDirection = "incoming" | "outgoing";
+export type CommunicationMessageKind = "text" | "audio" | "image" | "video";
+
+export type CommunicationConversation =
+  | { scope: "direct" }
+  | { scope: "group"; member_count: number };
+
+export interface CommunicationAttachment {
+  attachment_id: string;
+  kind: Exclude<CommunicationMessageKind, "text">;
+  sha256: string;
+  size_bytes: number;
+  mime_type: string;
+}
+
+export type CommunicationMessageRecorded =
+  | {
+      message_id: string;
+      conversation_id: string;
+      source_key: string;
+      occurred_at: string;
+      direction: CommunicationDirection;
+      kind: "text";
+      conversation: CommunicationConversation;
+      text: string;
+    }
+  | {
+      message_id: string;
+      conversation_id: string;
+      source_key: string;
+      occurred_at: string;
+      direction: CommunicationDirection;
+      kind: Exclude<CommunicationMessageKind, "text">;
+      conversation: CommunicationConversation;
+      attachments: CommunicationAttachment[];
+    };
 
 export interface DashboardDeviceStatus {
   presence: "online" | "stale" | "offline" | "sleeping";

@@ -30,12 +30,40 @@
         "communication.wechat": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled", "direction", "message_type", "sync_mode"],
+          "required": [
+            "enabled",
+            "directions",
+            "message_types",
+            "conversation_scope",
+            "max_group_members",
+            "sync_mode",
+            "retention_days"
+          ],
           "properties": {
             "enabled": { "type": "boolean" },
-            "direction": { "const": "outgoing" },
-            "message_type": { "const": "text" },
-            "sync_mode": { "const": "full" }
+            "directions": {
+              "type": "array",
+              "prefixItems": [{ "const": "incoming" }, { "const": "outgoing" }],
+              "items": false,
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "message_types": {
+              "type": "array",
+              "prefixItems": [
+                { "const": "text" },
+                { "const": "audio" },
+                { "const": "image" },
+                { "const": "video" }
+              ],
+              "items": false,
+              "minItems": 4,
+              "maxItems": 4
+            },
+            "conversation_scope": { "const": "direct_and_group_at_most_eight_members" },
+            "max_group_members": { "const": 8 },
+            "sync_mode": { "const": "full" },
+            "retention_days": { "const": 180 }
           }
         }
       }
