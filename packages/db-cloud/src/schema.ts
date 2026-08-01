@@ -7,6 +7,7 @@ import {
   foreignKey,
   index,
   inet,
+  integer,
   jsonb,
   pgTable,
   primaryKey,
@@ -347,6 +348,34 @@ export const deviceRevocationAudit = pgTable(
   ],
 );
 
+export const systemEvents = pgTable(
+  "system_events",
+  {
+    eventId: uuid("event_id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    eventType: text("event_type").notNull(),
+    source: text("source").notNull(),
+    schemaVersion: integer("schema_version").notNull(),
+    occurredAt: timestampColumn("occurred_at").notNull(),
+    createdAt: timestampColumn("created_at").notNull(),
+    sensitivity: text("sensitivity").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    idempotencyKey: text("idempotency_key"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    index("idx_system_events_device_chronology").on(
+      table.workspaceId,
+      table.deviceId,
+      table.occurredAt.desc(),
+    ),
+  ],
+);
+
 export const cloudSchema = {
   authUsers,
   authSessions,
@@ -361,4 +390,5 @@ export const cloudSchema = {
   collectorConfigAudit,
   deviceHeartbeats,
   deviceRevocationAudit,
+  systemEvents,
 };

@@ -53,10 +53,10 @@ async function loadMigrations(migrationDirectory: string) {
     .filter((entry): entry is { file: string; match: RegExpExecArray } => entry.match !== null)
     .sort((left, right) => left.file.localeCompare(right.file));
   if (
-    files.length !== 5 ||
+    files.length === 0 ||
     files.some((entry, index) => entry.match[1] !== String(index).padStart(4, "0"))
   ) {
-    throw new Error("expected committed cloud migrations 0000 through 0004");
+    throw new Error("expected contiguous committed cloud migrations beginning at 0000");
   }
   return Promise.all(
     files.map(async ({ file, match }) => {

@@ -3,6 +3,7 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use pca_db_local::{DbActorHandle, DbError, PairingState};
+use pca_domain::EventEnvelope;
 use pca_keychain::{
     delete_device_credential, load_device_credential, store_device_credential, CredentialError,
     CredentialStore, DeviceCredential,
@@ -46,6 +47,28 @@ pub trait ControlClient: Send + Sync {
         credentials: &'a DeviceCredential,
         outbox_depth: u64,
     ) -> ControlFuture<'a, AgentControlSnapshot>;
+
+    fn sync_system_events<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: &'a [EventEnvelope],
+    ) -> ControlFuture<'a, SyncEventsResponse> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SyncEventsResponse {
+    batch_id: String,
+    accepted: Vec<String>,
+    duplicates: Vec<String>,
+    rejected: Vec<SyncEventRejection>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SyncEventRejection {
+    #[serde(rename = "event_id")]
+    _event_id: String,
 }
 
 /// Cloud pairing operations owned by Agent Core. The local Setup transport is deliberately
@@ -640,6 +663,7 @@ async fn control_once(
     {
         return Err(ControlError::Contract);
     }
+    sync_pending_system_events(database, &credentials.credential, client).await?;
     let current = state.lock().await.applied_revision.unwrap_or(0);
     let Some(applied) = apply_snapshot(current, &snapshot)? else {
         return Ok(());
@@ -650,6 +674,43 @@ async fn control_once(
         .map_err(|_| ControlError::Transient)?;
     state.lock().await.applied_revision = Some(applied.configuration_revision);
     Ok(())
+}
+
+async fn sync_pending_system_events(
+    database: &DbActorHandle,
+    credentials: &DeviceCredential,
+    client: &dyn ControlClient,
+) -> Result<(), ControlError> {
+    let events = database
+        .load_pending_system_events(20)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    if events.is_empty() {
+        return Ok(());
+    }
+    let expected: std::collections::BTreeSet<_> =
+        events.iter().map(|event| event.event_id.as_str()).collect();
+    let response = client.sync_system_events(credentials, &events).await?;
+    let acknowledged: std::collections::BTreeSet<_> = response
+        .accepted
+        .iter()
+        .chain(response.duplicates.iter())
+        .map(String::as_str)
+        .collect();
+    if !response.rejected.is_empty()
+        || response.accepted.len() + response.duplicates.len() != expected.len()
+        || acknowledged != expected
+    {
+        return Err(ControlError::Contract);
+    }
+    let event_ids = events
+        .into_iter()
+        .map(|event| event.event_id)
+        .collect::<Vec<_>>();
+    database
+        .acknowledge_system_events(&event_ids)
+        .await
+        .map_err(|_| ControlError::Transient)
 }
 
 async fn revoke(
@@ -801,6 +862,34 @@ impl ControlClient for HttpControlClient {
                 .map(|response| response.snapshot)
         })
     }
+
+    fn sync_system_events<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        events: &'a [EventEnvelope],
+    ) -> ControlFuture<'a, SyncEventsResponse> {
+        Box::pin(async move {
+            let client = Self::client()?;
+            let batch_id = Uuid::new_v4().to_string();
+            let response = client
+                .post(self.endpoint("v1/agent/sync/events")?)
+                .bearer_auth(credentials.access_credential())
+                .json(&SyncEventsRequest {
+                    batch_id: batch_id.clone(),
+                    device_id: credentials.device_id(),
+                    protocol_version: 1,
+                    events,
+                })
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            let parsed = parse_response::<SyncEventsResponse>(response).await?;
+            if parsed.batch_id != batch_id {
+                return Err(ControlError::Contract);
+            }
+            Ok(parsed)
+        })
+    }
 }
 
 impl PairingClient for HttpControlClient {
@@ -856,6 +945,14 @@ struct HeartbeatRequest {
     agent_version: String,
     presence: &'static str,
     outbox_depth: u64,
+}
+
+#[derive(Serialize)]
+struct SyncEventsRequest<'a> {
+    batch_id: String,
+    device_id: &'a str,
+    protocol_version: u8,
+    events: &'a [EventEnvelope],
 }
 
 #[derive(Deserialize)]
@@ -927,10 +1024,14 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        retry_delay, ControlClient, ControlError, DeviceCredential, HttpControlClient,
-        CONTROL_INTERVAL, MAX_BACKOFF, PRODUCTION_CLOUD_API_ORIGIN,
+        retry_delay, sync_pending_system_events, AgentControlSnapshot, ControlClient, ControlError,
+        ControlFuture, DeviceCredential, HttpControlClient, SyncEventsResponse, CONTROL_INTERVAL,
+        MAX_BACKOFF, PRODUCTION_CLOUD_API_ORIGIN,
     };
+    use pca_db_local::DbActorHandle;
+    use pca_domain::{EventEnvelope, Sensitivity};
     use reqwest::Url;
+    use serde_json::{Map, Value};
     use std::{env, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1079,5 +1180,192 @@ mod tests {
             .expect("new proxy receives the next request")
             .expect("new proxy request channel")
             .starts_with("CONNECT pca-cloud-api-production.up.railway.app:443"));
+    }
+
+    struct AcceptingSyncClient;
+
+    impl ControlClient for AcceptingSyncClient {
+        fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn heartbeat_and_control<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: u64,
+        ) -> ControlFuture<'a, AgentControlSnapshot> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn sync_system_events<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            events: &'a [EventEnvelope],
+        ) -> ControlFuture<'a, SyncEventsResponse> {
+            let accepted = events.iter().map(|event| event.event_id.clone()).collect();
+            Box::pin(async move {
+                Ok(SyncEventsResponse {
+                    batch_id: "test-batch".to_owned(),
+                    accepted,
+                    duplicates: Vec::new(),
+                    rejected: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_system_events_are_acknowledged_without_touching_other_outbox_rows() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        let system_event = system_metric_event("01984444-7444-8444-8444-444444444444");
+        let lifecycle_event = EventEnvelope {
+            event_id: "01985555-7555-8555-8555-555555555555".to_owned(),
+            workspace_id: system_event.workspace_id.clone(),
+            device_id: system_event.device_id.clone(),
+            event_type: "AGENT_STARTED".to_owned(),
+            source: "runtime".to_owned(),
+            schema_version: 1,
+            occurred_at: system_event.occurred_at.clone(),
+            created_at: system_event.created_at.clone(),
+            sensitivity: Sensitivity::Normal,
+            payload: Map::new(),
+            attachment_refs: Vec::new(),
+            idempotency_key: None,
+        };
+        database
+            .append_event_with_outbox(&system_event)
+            .await
+            .expect("persist system event");
+        database
+            .append_event_with_outbox(&lifecycle_event)
+            .await
+            .expect("persist lifecycle event");
+        let credential = DeviceCredential::new(
+            system_event.device_id.clone(),
+            system_event.workspace_id.clone(),
+            "access-credential-for-sync-test",
+            "refresh-credential-for-sync-test",
+        )
+        .expect("valid device credential");
+
+        sync_pending_system_events(&database, &credential, &AcceptingSyncClient)
+            .await
+            .expect("sync accepted system event");
+
+        assert!(database
+            .load_pending_system_events(20)
+            .await
+            .expect("load pending system events")
+            .is_empty());
+        assert_eq!(
+            database.active_outbox_depth().await.expect("outbox depth"),
+            1
+        );
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn malformed_sync_response_does_not_acknowledge_the_local_event() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        let event = system_metric_event("01986666-7666-8666-8666-666666666667");
+        database
+            .append_event_with_outbox(&event)
+            .await
+            .expect("persist system event");
+        let credential = DeviceCredential::new(
+            event.device_id.clone(),
+            event.workspace_id.clone(),
+            "access-credential-for-sync-test",
+            "refresh-credential-for-sync-test",
+        )
+        .expect("valid device credential");
+
+        assert!(matches!(
+            sync_pending_system_events(&database, &credential, &DuplicatingSyncClient).await,
+            Err(ControlError::Contract)
+        ));
+        assert_eq!(
+            database
+                .load_pending_system_events(20)
+                .await
+                .expect("load pending system events")
+                .len(),
+            1
+        );
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    fn system_metric_event(event_id: &str) -> EventEnvelope {
+        let mut payload = Map::new();
+        payload.insert(
+            "metric_group".to_owned(),
+            Value::String("cpu_memory".to_owned()),
+        );
+        payload.insert("sample_window_ms".to_owned(), Value::from(30_000));
+        payload.insert("logical_cpu_count".to_owned(), Value::from(10));
+        payload.insert(
+            "host".to_owned(),
+            serde_json::json!({
+                "cpu_usage_percent": 12.34,
+                "memory_total_bytes": 34_359_738_368_u64,
+                "memory_used_bytes": 17_179_869_184_u64,
+            }),
+        );
+        payload.insert(
+            "agent".to_owned(),
+            serde_json::json!({ "cpu_usage_percent": 0.42, "memory_resident_bytes": 73_400_320_u64 }),
+        );
+        EventEnvelope {
+            event_id: event_id.to_owned(),
+            workspace_id: "01983333-7333-8333-8333-333333333333".to_owned(),
+            device_id: "01982222-7222-8222-8222-222222222222".to_owned(),
+            event_type: "system.metric_sampled".to_owned(),
+            source: "system".to_owned(),
+            schema_version: 1,
+            occurred_at: "2026-08-02T00:00:00Z".to_owned(),
+            created_at: "2026-08-02T00:00:00Z".to_owned(),
+            sensitivity: Sensitivity::Normal,
+            payload,
+            attachment_refs: Vec::new(),
+            idempotency_key: Some(format!("system:{event_id}")),
+        }
+    }
+
+    struct DuplicatingSyncClient;
+
+    impl ControlClient for DuplicatingSyncClient {
+        fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn heartbeat_and_control<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: u64,
+        ) -> ControlFuture<'a, AgentControlSnapshot> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn sync_system_events<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            events: &'a [EventEnvelope],
+        ) -> ControlFuture<'a, SyncEventsResponse> {
+            let event_id = events[0].event_id.clone();
+            Box::pin(async move {
+                Ok(SyncEventsResponse {
+                    batch_id: "test-batch".to_owned(),
+                    accepted: vec![event_id.clone()],
+                    duplicates: vec![event_id],
+                    rejected: Vec::new(),
+                })
+            })
+        }
     }
 }

@@ -26,6 +26,7 @@ import {
   type OwnerAuthenticator,
 } from "./auth.js";
 import { parseCollectorConfig, parseHeartbeat } from "./control.js";
+import { parseSyncBatch } from "./sync.js";
 import {
   accessCredentialLifetimeMs,
   errorResponse,
@@ -206,6 +207,34 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.post("/v1/agent/sync/events", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const batch = parseSyncBatch(await context.req.json().catch(() => null));
+    if (batch === null || batch.deviceId !== device.deviceId) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid system event batch.");
+    }
+    if (batch.events.some((event) => event.workspaceId !== device.workspaceId || event.deviceId !== device.deviceId)) {
+      return errorResponse(context, 403, "WORKSPACE_FORBIDDEN", "The requested Workspace is forbidden.");
+    }
+    try {
+      const result = await options.repository.appendSystemEvents(
+        device.workspaceId,
+        device.deviceId,
+        batch.events,
+      );
+      return context.json({
+        batch_id: batch.batchId,
+        accepted: result.acceptedEventIds,
+        duplicates: result.duplicateEventIds,
+        rejected: [],
+        server_time: new Date().toISOString(),
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.get("/v1/workspaces", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
@@ -248,6 +277,33 @@ export function createApp(options: CreateAppOptions): Hono {
       return context.json({
         ...ownerDeviceSummaryResponse(device),
         collectors: device.snapshot.collectors,
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.get("/v1/devices/:deviceId/system-metrics", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const limit = parseMetricLimit(context.req.query("limit"));
+    if (limit === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid system metric limit.");
+    }
+    try {
+      const metrics = await options.repository.listOwnerSystemMetrics(
+        context.req.param("deviceId"),
+        principal.workspaceId,
+        principal.userId,
+        limit,
+      );
+      return context.json({
+        metrics: metrics.map((metric) => ({
+          event_id: metric.eventId,
+          occurred_at: metric.occurredAt.toISOString(),
+          metric_group: metric.metricGroup,
+          payload: metric.payload,
+        })),
       });
     } catch (error) {
       return repositoryErrorResponse(context, error);
@@ -323,6 +379,12 @@ function pairingAuthorizationURL(sessionId: string, callbackState: string): stri
   const url = new URL("/pair", productionDashboardOrigin);
   url.search = new URLSearchParams({ session_id: sessionId, callback_state: callbackState }).toString();
   return url.toString();
+}
+
+function parseMetricLimit(value: string | undefined): number | null {
+  if (value === undefined) return 20;
+  const limit = Number(value);
+  return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
 }
 
 export interface ProductionEnvironment {

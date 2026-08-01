@@ -17,9 +17,9 @@ use pca_agentd::{
 use pca_bridge_client::supervisor::{
     BridgeSupervisor, BridgeSupervisorConfig, BridgeSupervisorError,
 };
-use pca_db_local::DbActorHandle;
 #[cfg(feature = "process-test-hooks")]
 use pca_db_local::ProcessTestHooks;
+use pca_db_local::{DbActorHandle, PairingState};
 use pca_domain::{AgentStatus, BridgeStatus, RuntimeStatusEnvelope};
 use pca_keychain::CredentialStore;
 #[cfg(not(feature = "process-test-hooks"))]
@@ -32,10 +32,12 @@ use pca_keychain::{
 use reqwest::Url;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::{sync::watch, task::JoinHandle};
+use uuid::Uuid;
 
 #[cfg(feature = "process-test-hooks")]
 use crate::config::ProcessTestFatalCleanupConfig;
 use crate::{
+    collector_registry::CollectorIdentity,
     config::{CommandConfig, RunConfig},
     lifecycle::{LifecycleRuntime, NoopCapabilityRefresher, RuntimeIdentity},
     system_runtime::SystemRuntimeHandle,
@@ -315,7 +317,7 @@ impl RuntimeResources {
             .await
             .map_err(|_| FailureStage::Lifecycle)?;
 
-        self.start_system_collector(config).await?;
+        self.start_system_collector(config, pairing_valid).await?;
 
         #[cfg(feature = "process-test-hooks")]
         if let Some(hook) = &config.process_test_fatal_cleanup {
@@ -355,11 +357,13 @@ impl RuntimeResources {
                 }
                 changed = pairing_state_receiver.changed() => {
                     if changed.is_ok() {
+                        let paired = *pairing_state_receiver.borrow_and_update();
                         transition_pairing_runtime_state(
                             &mut self.state,
-                            *pairing_state_receiver.borrow_and_update(),
+                            paired,
                         )
                         .map_err(|_| FailureStage::State)?;
+                        self.restart_system_collector(config, paired).await?;
                         self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
                     }
                 }
@@ -367,7 +371,22 @@ impl RuntimeResources {
         }
     }
 
-    async fn start_system_collector(&mut self, config: &RunConfig) -> Result<(), FailureStage> {
+    async fn start_system_collector(
+        &mut self,
+        config: &RunConfig,
+        paired: bool,
+    ) -> Result<(), FailureStage> {
+        let identity = if paired {
+            collector_identity_from_pairing_state(
+                self.database()
+                    .load_pairing_state()
+                    .await
+                    .map_err(|_| FailureStage::SystemCollector)?
+                    .as_ref(),
+            )
+        } else {
+            None
+        };
         self.system_runtime = Some(
             SystemRuntimeHandle::start(
                 Arc::clone(
@@ -375,13 +394,27 @@ impl RuntimeResources {
                         .as_ref()
                         .expect("database exists until cleanup"),
                 ),
-                config.collector_identity(),
+                identity.or_else(|| config.collector_identity()),
                 config.paths.data_dir.clone(),
             )
             .await
             .map_err(|_| FailureStage::SystemCollector)?,
         );
         Ok(())
+    }
+
+    async fn restart_system_collector(
+        &mut self,
+        config: &RunConfig,
+        paired: bool,
+    ) -> Result<(), FailureStage> {
+        if let Some(runtime) = self.system_runtime.take() {
+            runtime
+                .shutdown()
+                .await
+                .map_err(|_| FailureStage::SystemCollectorCleanup)?;
+        }
+        self.start_system_collector(config, paired).await
     }
 
     async fn persist_status(&self) -> Result<(), FailureStage> {
@@ -651,6 +684,21 @@ async fn start_paired_control(
     .map_err(|_| FailureStage::ControlConfiguration)
 }
 
+fn collector_identity_from_pairing_state(
+    state: Option<&PairingState>,
+) -> Option<CollectorIdentity> {
+    let state = state?;
+    let workspace_id = Uuid::parse_str(&state.workspace_id).ok()?;
+    let device_id = Uuid::parse_str(&state.device_id).ok()?;
+    if workspace_id.is_nil() || device_id.is_nil() {
+        return None;
+    }
+    Some(CollectorIdentity {
+        workspace_id,
+        device_id,
+    })
+}
+
 fn transition_startup_agent_state(
     state: &mut RuntimeStateMachine,
     pairing_valid: bool,
@@ -872,6 +920,9 @@ fn write_process_test_file(path: &Path, contents: &[u8]) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector_registry::CollectorIdentity;
+    use pca_db_local::PairingState;
+    use uuid::Uuid;
 
     #[test]
     fn paired_startup_transitions_through_unpaired_before_running() {
@@ -891,5 +942,33 @@ mod tests {
             .expect("revocation transitions the runtime to unpaired");
 
         assert_eq!(state.agent_status(), AgentStatus::Unpaired);
+    }
+
+    #[test]
+    fn system_collector_identity_comes_only_from_a_valid_paired_device() {
+        let paired = PairingState::paired(
+            "01982222-7222-8222-8222-222222222222",
+            "01983333-7333-8333-8333-333333333333",
+            "keychain://pca/device/current",
+            1,
+            PRODUCTION_CLOUD_API_ORIGIN,
+        );
+
+        assert_eq!(
+            collector_identity_from_pairing_state(Some(&paired)),
+            Some(CollectorIdentity {
+                workspace_id: Uuid::parse_str("01983333-7333-8333-8333-333333333333")
+                    .expect("workspace UUID"),
+                device_id: Uuid::parse_str("01982222-7222-8222-8222-222222222222")
+                    .expect("device UUID"),
+            }),
+        );
+
+        let invalid = PairingState {
+            device_id: Uuid::nil().to_string(),
+            ..paired
+        };
+        assert_eq!(collector_identity_from_pairing_state(Some(&invalid)), None);
+        assert_eq!(collector_identity_from_pairing_state(None), None);
     }
 }

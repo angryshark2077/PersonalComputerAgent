@@ -147,6 +147,14 @@ enum Request {
     ActiveOutboxDepth {
         response: oneshot::Sender<Result<u64, DbError>>,
     },
+    LoadPendingSystemEvents {
+        limit: u16,
+        response: oneshot::Sender<Result<Vec<EventEnvelope>, DbError>>,
+    },
+    AcknowledgeSystemEvents {
+        event_ids: Vec<String>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
 }
 
 impl Request {
@@ -160,12 +168,14 @@ impl Request {
             | Self::SaveControlRevision { response, .. }
             | Self::ClearPairingState { response }
             | Self::ClearPairingStateAndDisableSensitiveCollectors { response }
-            | Self::Checkpoint { response } => response.is_closed(),
+            | Self::Checkpoint { response }
+            | Self::AcknowledgeSystemEvents { response, .. } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
             Self::LoadPairingState { response } => response.is_closed(),
             Self::Health { response } => response.is_closed(),
             Self::CountEventAndOutbox { response, .. } => response.is_closed(),
             Self::ActiveOutboxDepth { response } => response.is_closed(),
+            Self::LoadPendingSystemEvents { response, .. } => response.is_closed(),
         }
     }
 }
@@ -482,6 +492,53 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Loads at most 200 pending, non-sensitive System Collector events in Outbox order.
+    ///
+    /// Other event classes remain pending for their own future sync protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, decoding, or `SQLite` query error.
+    pub async fn load_pending_system_events(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<EventEnvelope>, DbError> {
+        if limit == 0 || limit > 200 {
+            return Err(DbError::sqlite(
+                "load pending system events",
+                "limit must be 1 through 200",
+            ));
+        }
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::LoadPendingSystemEvents {
+            limit,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Marks only the exact System events accepted by the authenticated Cloud endpoint as acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, transaction, or `SQLite` write error.
+    pub async fn acknowledge_system_events(&self, event_ids: &[String]) -> Result<(), DbError> {
+        if event_ids.is_empty() || event_ids.len() > 200 {
+            return Err(DbError::sqlite(
+                "acknowledge system events",
+                "event IDs must contain 1 through 200 items",
+            ));
+        }
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::AcknowledgeSystemEvents {
+            event_ids: event_ids.to_vec(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Closes the request queue, waits without blocking the async executor, and joins the owner.
     ///
     /// Requests whose response futures were canceled are skipped before they touch `SQLite`.
@@ -639,6 +696,18 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, option
             }
             Request::ActiveOutboxDepth { response } => {
                 let _ = response.send(repository::active_outbox_depth(&connection));
+            }
+            Request::LoadPendingSystemEvents { limit, response } => {
+                let _ = response.send(repository::load_pending_system_events(&connection, limit));
+            }
+            Request::AcknowledgeSystemEvents {
+                event_ids,
+                response,
+            } => {
+                let _ = response.send(repository::acknowledge_system_events(
+                    &mut connection,
+                    &event_ids,
+                ));
             }
         }
     }

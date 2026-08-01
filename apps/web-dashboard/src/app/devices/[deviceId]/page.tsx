@@ -9,18 +9,22 @@ import {
   cloudApiOrigin,
   getCollectorAudit,
   getDevice,
+  getSystemMetrics,
   revokeDevice,
   updateCollectorConfig,
   type CollectorConfig,
   type CollectorConfigAudit,
   type DashboardDevice,
+  type DashboardSystemMetric,
 } from "../../../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../../../lib/auth";
 import { DashboardShell } from "../../../components/dashboard-shell";
+import { summarizeSystemMetrics } from "../../../lib/system-metrics";
 
 interface DeviceScreen {
   device: DashboardDevice;
   audit: CollectorConfigAudit[];
+  metrics: DashboardSystemMetric[];
 }
 
 export default function DevicePage() {
@@ -32,11 +36,12 @@ export default function DevicePage() {
 
   async function refresh(): Promise<void> {
     const origin = cloudApiOrigin();
-    const [device, audit] = await Promise.all([
+    const [device, audit, metrics] = await Promise.all([
       getDevice(window.fetch, origin, deviceId),
       getCollectorAudit(window.fetch, origin, deviceId),
+      getSystemMetrics(window.fetch, origin, deviceId),
     ]);
-    setScreen({ device, audit });
+    setScreen({ device, audit, metrics });
   }
 
   useEffect(() => {
@@ -83,6 +88,7 @@ export default function DevicePage() {
   if (screen === null) return <DashboardShell><p className="status-note">Loading device…</p></DashboardShell>;
 
   const disabled = busy || screen.device.revoked;
+  const metrics = summarizeSystemMetrics(screen.metrics);
   return (
     <DashboardShell>
       <Link className="back-link" href="/">Back to devices</Link>
@@ -120,6 +126,18 @@ export default function DevicePage() {
             {screen.device.revoked ? "Device revoked" : "Revoke device"}
           </button>
         </div>
+        <section className="dashboard-panel collector-card" aria-labelledby="metrics-heading">
+          <h2 id="metrics-heading">System metrics</h2>
+          {metrics.cpu === null && metrics.memory === null && metrics.disk === null ? (
+            <p>Waiting for the first system sample.</p>
+          ) : (
+            <dl className="system-metrics">
+              <div><dt>CPU</dt><dd>{metrics.cpu ?? "Unavailable"}</dd></div>
+              <div><dt>Memory</dt><dd>{metrics.memory ?? "Unavailable"}</dd></div>
+              <div><dt>Disk</dt><dd>{metrics.disk ?? "Unavailable"}</dd></div>
+            </dl>
+          )}
+        </section>
         <section className="dashboard-panel collector-card" aria-labelledby="audit-heading">
           <h2 id="audit-heading">Configuration audit</h2>
           {screen.audit.length === 0 ? <p>No configuration changes.</p> : (

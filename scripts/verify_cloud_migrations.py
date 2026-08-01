@@ -22,6 +22,7 @@ EXPECTED_TABLES = [
     "devices",
     "pairing_authorization_codes",
     "pairing_sessions",
+    "system_events",
     "workspace_members",
     "workspaces",
 ]
@@ -269,6 +270,7 @@ def verify(repository_root: Path) -> None:
         repository_root
         / "packages/db-cloud/migrations/0003_s1b_pairing_state_and_better_auth_session.sql",
         repository_root / "packages/db-cloud/migrations/0004_s1b_hash_better_auth_sessions.sql",
+        repository_root / "packages/db-cloud/migrations/0005_s2_system_events.sql",
     ]
     for migration in migrations:
         if not migration.is_file():
@@ -299,7 +301,7 @@ def verify(repository_root: Path) -> None:
                 "(id, checksum, app_version, started_at, completed_at, status) VALUES "
                 "('0000', 'sentinel', '0.0.0', now(), now(), 'completed')",
             )
-            for migration in migrations[1:-1]:
+            for migration in migrations[1:4]:
                 apply(postgres, "pca_upgrade", migration)
             postgres.psql(
                 "pca_upgrade",
@@ -315,7 +317,8 @@ def verify(repository_root: Path) -> None:
                 );
                 """,
             )
-            apply(postgres, "pca_upgrade", migrations[-1])
+            for migration in migrations[4:]:
+                apply(postgres, "pca_upgrade", migration)
             for migration in migrations[1:]:
                 apply(postgres, "pca_upgrade", migration)
             if table_names(postgres, "pca_upgrade") != EXPECTED_TABLES:

@@ -27,6 +27,7 @@ EXPECTED_MIGRATIONS = {
         "0002_s1b_device_revocation_audit.sql",
         "0003_s1b_pairing_state_and_better_auth_session.sql",
         "0004_s1b_hash_better_auth_sessions.sql",
+        "0005_s2_system_events.sql",
     ],
 }
 
@@ -165,6 +166,7 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "collector_config_audit",
         "device_revocation_audit",
         "device_heartbeats",
+        "system_events",
     }
     actual_tables = set(
         re.findall(r"CREATE TABLE IF NOT EXISTS\s+([a-z_]+)", sql, flags=re.IGNORECASE)
@@ -176,13 +178,17 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "idx_devices_workspace",
         "idx_collector_config_audit_chronology",
         "idx_device_heartbeats_last",
+        "idx_system_events_device_chronology",
     }
     actual_indexes = set(
         re.findall(r"CREATE INDEX IF NOT EXISTS\s+([a-z_]+)", sql, flags=re.IGNORECASE)
     )
     if not required_indexes.issubset(actual_indexes):
         return f"missing S1B Cloud indexes: {sorted(required_indexes - actual_indexes)}"
-    remediation = files[-1].read_text(encoding="utf-8")
+    remediation = next(
+        (path.read_text(encoding="utf-8") for path in files if path.name.startswith("0004_")),
+        "",
+    )
     if not re.search(
         r"ALTER\s+TABLE\s+auth_sessions\s+DROP\s+COLUMN\s+IF\s+EXISTS\s+session_token",
         remediation,

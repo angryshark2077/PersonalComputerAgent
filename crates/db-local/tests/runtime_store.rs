@@ -56,6 +56,42 @@ fn event(event_id: &str) -> EventEnvelope {
     }
 }
 
+fn system_metric_event(event_id: &str) -> EventEnvelope {
+    let mut payload = Map::new();
+    payload.insert(
+        "metric_group".to_owned(),
+        Value::String("cpu_memory".to_owned()),
+    );
+    payload.insert("sample_window_ms".to_owned(), Value::from(30_000));
+    payload.insert("logical_cpu_count".to_owned(), Value::from(10));
+    payload.insert(
+        "host".to_owned(),
+        serde_json::json!({
+            "cpu_usage_percent": 12.34,
+            "memory_total_bytes": 34_359_738_368_u64,
+            "memory_used_bytes": 17_179_869_184_u64,
+        }),
+    );
+    payload.insert(
+        "agent".to_owned(),
+        serde_json::json!({ "cpu_usage_percent": 0.42, "memory_resident_bytes": 73_400_320_u64 }),
+    );
+    EventEnvelope {
+        event_id: event_id.to_owned(),
+        workspace_id: "01983333-7333-8333-8333-333333333333".to_owned(),
+        device_id: "01982222-7222-8222-8222-222222222222".to_owned(),
+        event_type: "system.metric_sampled".to_owned(),
+        source: "system".to_owned(),
+        schema_version: 1,
+        occurred_at: "2026-08-02T00:00:00Z".to_owned(),
+        created_at: "2026-08-02T00:00:00Z".to_owned(),
+        sensitivity: Sensitivity::Normal,
+        payload,
+        attachment_refs: Vec::new(),
+        idempotency_key: Some(format!("system:{event_id}")),
+    }
+}
+
 fn collector_state(status: CollectorStatus) -> CollectorState {
     CollectorState {
         collector_key: "system".to_owned(),
@@ -942,4 +978,35 @@ async fn async_shutdown_skips_cancelled_queued_requests_and_joins_owner() {
         event_count <= 1,
         "canceled requests wrote {event_count} events"
     );
+}
+
+#[tokio::test]
+async fn system_sync_batch_excludes_lifecycle_events_and_acks_only_accepted_system_events() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let system = system_metric_event("01986666-7666-8666-8666-666666666666");
+    db.append_event_with_outbox(&system)
+        .await
+        .expect("persist system event");
+    db.append_event_with_outbox(&event("lifecycle-event"))
+        .await
+        .expect("persist lifecycle event");
+
+    let pending = db
+        .load_pending_system_events(20)
+        .await
+        .expect("load pending system events");
+    assert_eq!(pending, vec![system.clone()]);
+
+    db.acknowledge_system_events(std::slice::from_ref(&system.event_id))
+        .await
+        .expect("acknowledge accepted system event");
+    assert!(db
+        .load_pending_system_events(20)
+        .await
+        .expect("reload pending system events")
+        .is_empty());
+    assert_eq!(db.active_outbox_depth().await.expect("outbox depth"), 1);
 }

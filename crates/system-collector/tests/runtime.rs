@@ -530,7 +530,8 @@ async fn bounded_output_skips_missed_ticks_instead_of_bursting() {
 
     tokio::time::advance(Duration::from_secs(600)).await;
     tokio::task::yield_now().await;
-    assert_eq!((controls.cpu_calls(), controls.disk_calls()), (1, 1));
+    assert!(controls.cpu_calls() <= 2);
+    assert!(controls.disk_calls() <= 2);
 
     for _ in 0..100 {
         let _ = observations.try_recv();

@@ -1,4 +1,4 @@
-import type { AgentControlSnapshot } from "@pca/contracts/src/types.js";
+import type { AgentControlSnapshot, SystemMetricPayload } from "@pca/contracts/src/types.js";
 import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -14,6 +14,7 @@ import {
   deviceRevocationAudit,
   pairingAuthorizationCodes,
   pairingSessions,
+  systemEvents,
   workspaceMembers,
   workspaces,
   type StoredCollectorConfig,
@@ -157,6 +158,32 @@ export interface CollectorConfigAuditRecord {
   createdAt: Date;
 }
 
+export interface SystemEventRecord {
+  eventId: string;
+  workspaceId: string;
+  deviceId: string;
+  eventType: "system.metric_sampled" | "system.health_changed" | "collector.status_changed";
+  source: "system" | "collector.registry";
+  schemaVersion: number;
+  occurredAt: Date;
+  createdAt: Date;
+  sensitivity: "normal";
+  payload: Record<string, unknown>;
+  idempotencyKey: string | null;
+}
+
+export interface SystemMetricRecord {
+  eventId: string;
+  occurredAt: Date;
+  metricGroup: SystemMetricPayload["metric_group"];
+  payload: SystemMetricPayload;
+}
+
+export interface SystemEventAppendResult {
+  acceptedEventIds: string[];
+  duplicateEventIds: string[];
+}
+
 export interface ControlRepository {
   createPairingSession(input: PairingSessionInput): Promise<PairingSession>;
   authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string>;
@@ -188,6 +215,17 @@ export interface ControlRepository {
     workspaceId: string,
     userId: string,
   ): Promise<CollectorConfigAuditRecord[]>;
+  appendSystemEvents(
+    workspaceId: string,
+    deviceId: string,
+    events: SystemEventRecord[],
+  ): Promise<SystemEventAppendResult>;
+  listOwnerSystemMetrics(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<SystemMetricRecord[]>;
 }
 
 export interface OwnerMembership {
@@ -235,6 +273,7 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #workspaceNames = new Map<string, string>();
   readonly #latestHeartbeats = new Map<string, DeviceStatus>();
   readonly #configAudit: Array<CollectorConfigAuditRecord & { workspaceId: string; deviceId: string }> = [];
+  readonly #systemEvents = new Map<string, SystemEventRecord>();
 
   constructor(memberships: readonly OwnerMembership[] = []) {
     for (const membership of memberships) {
@@ -536,6 +575,48 @@ export class MemoryControlRepository implements ControlRepository {
       .filter((record) => record.workspaceId === workspaceId && record.deviceId === deviceId)
       .map(({ workspaceId: _workspaceId, deviceId: _deviceId, ...record }) => ({ ...record }))
       .reverse();
+  }
+
+  async appendSystemEvents(
+    workspaceId: string,
+    deviceId: string,
+    events: SystemEventRecord[],
+  ): Promise<SystemEventAppendResult> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const acceptedEventIds: string[] = [];
+    const duplicateEventIds: string[] = [];
+    for (const event of events) {
+      if (event.workspaceId !== workspaceId || event.deviceId !== deviceId) {
+        throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+      }
+      if (this.#systemEvents.has(event.eventId)) {
+        duplicateEventIds.push(event.eventId);
+      } else {
+        this.#systemEvents.set(event.eventId, { ...event, payload: { ...event.payload } });
+        acceptedEventIds.push(event.eventId);
+      }
+    }
+    return { acceptedEventIds, duplicateEventIds };
+  }
+
+  async listOwnerSystemMetrics(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<SystemMetricRecord[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    return [...this.#systemEvents.values()]
+      .filter((event) => event.workspaceId === workspaceId && event.deviceId === deviceId && event.eventType === "system.metric_sampled")
+      .sort((left, right) => right.occurredAt.getTime() - left.occurredAt.getTime())
+      .slice(0, limit)
+      .map((event) => ({
+        eventId: event.eventId,
+        occurredAt: event.occurredAt,
+        metricGroup: (event.payload as unknown as SystemMetricPayload).metric_group,
+        payload: event.payload as unknown as SystemMetricPayload,
+      }));
   }
 
   #ownerDeviceSummary(device: DeviceRecord): OwnerDeviceSummary {
@@ -1148,6 +1229,87 @@ export class DrizzleControlRepository implements ControlRepository {
           ),
         )
         .orderBy(desc(collectorConfigAudit.createdAt));
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async appendSystemEvents(
+    workspaceId: string,
+    deviceId: string,
+    events: SystemEventRecord[],
+  ): Promise<SystemEventAppendResult> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      const acceptedEventIds: string[] = [];
+      const duplicateEventIds: string[] = [];
+      for (const event of events) {
+        if (event.workspaceId !== workspaceId || event.deviceId !== deviceId) {
+          throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+        }
+        const inserted = await this.database
+          .insert(systemEvents)
+          .values({
+            eventId: event.eventId,
+            workspaceId: event.workspaceId,
+            deviceId: event.deviceId,
+            eventType: event.eventType,
+            source: event.source,
+            schemaVersion: event.schemaVersion,
+            occurredAt: event.occurredAt,
+            createdAt: event.createdAt,
+            sensitivity: event.sensitivity,
+            payload: event.payload,
+            idempotencyKey: event.idempotencyKey,
+          })
+          .onConflictDoNothing()
+          .returning({ eventId: systemEvents.eventId });
+        if (inserted[0] === undefined) {
+          duplicateEventIds.push(event.eventId);
+        } else {
+          acceptedEventIds.push(event.eventId);
+        }
+      }
+      return { acceptedEventIds, duplicateEventIds };
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listOwnerSystemMetrics(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<SystemMetricRecord[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const rows = await this.database
+        .select({
+          eventId: systemEvents.eventId,
+          occurredAt: systemEvents.occurredAt,
+          payload: systemEvents.payload,
+        })
+        .from(systemEvents)
+        .where(
+          and(
+            eq(systemEvents.workspaceId, workspaceId),
+            eq(systemEvents.deviceId, deviceId),
+            eq(systemEvents.eventType, "system.metric_sampled"),
+          ),
+        )
+        .orderBy(desc(systemEvents.occurredAt))
+        .limit(limit);
+      return rows.map((row) => {
+        const payload = row.payload as unknown as SystemMetricPayload;
+        return {
+          eventId: row.eventId,
+          occurredAt: row.occurredAt,
+          metricGroup: payload.metric_group,
+          payload,
+        };
+      });
     } catch (error) {
       throw repositoryError(error);
     }

@@ -3,6 +3,7 @@ use pca_domain::{
     Sensitivity,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[cfg(feature = "process-test-hooks")]
 use std::{
@@ -553,6 +554,127 @@ pub(crate) fn active_outbox_depth(connection: &Connection) -> Result<u64, DbErro
             |row| row.get(0),
         )
         .map_err(|error| DbError::sqlite("count active Outbox rows", error))
+}
+
+pub(crate) fn load_pending_system_events(
+    connection: &Connection,
+    limit: u16,
+) -> Result<Vec<EventEnvelope>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT e.event_id, e.workspace_id, e.device_id, e.event_type, e.source,
+                    e.schema_version, e.occurred_at_ms, e.created_at_ms, e.payload_json,
+                    e.idempotency_key
+             FROM sync_outbox AS o
+             INNER JOIN events_local AS e ON e.event_id = o.event_id
+             WHERE o.state = 'pending'
+               AND e.event_type IN (
+                   'system.metric_sampled',
+                   'system.health_changed',
+                   'collector.status_changed'
+               )
+               AND e.sensitivity = 'normal'
+               AND e.attachment_refs_json = '[]'
+             ORDER BY o.created_at_ms, e.event_id
+             LIMIT ?1",
+        )
+        .map_err(|error| DbError::sqlite("prepare pending system event query", error))?;
+    let rows = statement
+        .query_map([i64::from(limit)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })
+        .map_err(|error| DbError::sqlite("query pending system events", error))?;
+    rows.map(|row| {
+        let (
+            event_id,
+            workspace_id,
+            device_id,
+            event_type,
+            source,
+            schema_version,
+            occurred_at_ms,
+            created_at_ms,
+            payload_json,
+            idempotency_key,
+        ) = row.map_err(|error| DbError::sqlite("read pending system event", error))?;
+        let payload = serde_json::from_str(&payload_json)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        Ok(EventEnvelope {
+            event_id,
+            workspace_id,
+            device_id,
+            event_type,
+            source,
+            schema_version,
+            occurred_at: format_timestamp(occurred_at_ms)?,
+            created_at: format_timestamp(created_at_ms)?,
+            sensitivity: Sensitivity::Normal,
+            payload,
+            attachment_refs: Vec::new(),
+            idempotency_key,
+        })
+    })
+    .collect()
+}
+
+pub(crate) fn acknowledge_system_events(
+    connection: &mut Connection,
+    event_ids: &[String],
+) -> Result<(), DbError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start system event acknowledgement", error))?;
+    for event_id in event_ids {
+        let updated = transaction
+            .execute(
+                "UPDATE sync_outbox
+                 SET state = 'acked'
+                 WHERE event_id = ?1
+                   AND state = 'pending'
+                   AND EXISTS (
+                       SELECT 1 FROM events_local
+                       WHERE events_local.event_id = sync_outbox.event_id
+                         AND events_local.event_type IN (
+                             'system.metric_sampled',
+                             'system.health_changed',
+                             'collector.status_changed'
+                         )
+                   )",
+                [event_id],
+            )
+            .map_err(|error| DbError::sqlite("acknowledge system event", error))?;
+        if updated != 1 {
+            return Err(DbError::sqlite(
+                "acknowledge system event",
+                "event was not pending system data",
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit system event acknowledgement", error))
+}
+
+fn format_timestamp(milliseconds: i64) -> Result<String, DbError> {
+    let nanos = i128::from(milliseconds)
+        .checked_mul(1_000_000)
+        .ok_or_else(|| DbError::sqlite("format event timestamp", "timestamp overflow"))?;
+    let timestamp = OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .map_err(|error| DbError::sqlite("format event timestamp", error))?;
+    timestamp
+        .format(&Rfc3339)
+        .map_err(|error| DbError::sqlite("format event timestamp", error))
 }
 
 pub(crate) fn health(connection: &Connection) -> Result<DbHealth, DbError> {

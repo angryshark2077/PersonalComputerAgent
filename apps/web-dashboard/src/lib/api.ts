@@ -29,6 +29,13 @@ export interface DashboardWorkspace {
   name: string;
 }
 
+export interface DashboardSystemMetric {
+  event_id: string;
+  occurred_at: string;
+  metric_group: "cpu_memory" | "disk";
+  payload: Record<string, unknown>;
+}
+
 export interface CollectorConfigAudit {
   actor_user_id: string;
   configuration_revision: number;
@@ -93,6 +100,18 @@ export async function getCollectorAudit(
     apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/collector-config/audit`),
   );
   return result.audit;
+}
+
+export async function getSystemMetrics(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+): Promise<DashboardSystemMetric[]> {
+  const result = await jsonRequest<{ metrics: DashboardSystemMetric[] }>(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/system-metrics`),
+  );
+  return result.metrics;
 }
 
 export async function updateCollectorConfig(

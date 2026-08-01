@@ -114,6 +114,14 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 
 .collector-card p { color: #667085; margin: 8px 0 18px; }
 
+.system-metrics { display: grid; gap: 12px; margin: 18px 0 0; }
+
+.system-metrics div { align-items: baseline; display: flex; gap: 18px; justify-content: space-between; }
+
+.system-metrics dt { color: #667085; font-size: 14px; }
+
+.system-metrics dd { font-size: 14px; font-weight: 650; margin: 0; text-align: right; }
+
 .primary-button {
   background: #246bfe;
   border: 1px solid #246bfe;

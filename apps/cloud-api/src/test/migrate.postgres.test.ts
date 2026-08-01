@@ -15,16 +15,18 @@ const postgresUser = "pca_migration_test";
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const committedMigrationDirectory = resolve(testDirectory, "../../../../packages/db-cloud/migrations");
 
-test("PostgreSQL migrations replay safely and retain only hashed session tokens", async () => {
+test("PostgreSQL migrations replay safely, retain only hashed session tokens, and create system events", async () => {
   const postgres = await startTemporaryPostgres();
   const pool = new Pool({ connectionString: postgres.connectionString });
   try {
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
     await assertHashedSessionSchema(pool);
+    await assertSystemEventSchema(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
     await assertHashedSessionSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004"]);
+    await assertSystemEventSchema(pool);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -57,6 +59,13 @@ async function assertHashedSessionSchema(pool: Pool) {
   const columns = result.rows.map((row) => row.column_name);
   assert.ok(columns.includes("session_token_hash"));
   assert.ok(!columns.includes("session_token"));
+}
+
+async function assertSystemEventSchema(pool: Pool) {
+  const result = await pool.query<{ exists: boolean }>(
+    "SELECT to_regclass('public.system_events') IS NOT NULL AS exists",
+  );
+  assert.equal(result.rows[0]?.exists, true);
 }
 
 async function migrationIds(pool: Pool): Promise<string[]> {
