@@ -7,6 +7,7 @@ use pca_agent_runtime::{
     CrashMarkerGuard, LocalHeartbeatWriter, RuntimeError, RuntimePaths, RuntimeStateMachine,
     SingleInstanceGuard,
 };
+use pca_agentd::cloud_control::synchronize_pairing_state;
 use pca_bridge_client::supervisor::{
     BridgeSupervisor, BridgeSupervisorConfig, BridgeSupervisorError,
 };
@@ -20,7 +21,6 @@ use pca_keychain::{
     BRIDGE_SHARED_SECRET_LENGTH,
 };
 use pca_keychain::{CredentialStore, MacOSKeychainStore};
-use pca_agentd::cloud_control::synchronize_pairing_state;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -189,6 +189,7 @@ impl RuntimeResources {
             .expect("database exists until cleanup")
     }
 
+    #[allow(clippy::too_many_lines)] // Startup and signal handling deliberately share one ordered lifecycle.
     async fn run_until_signal(
         &mut self,
         config: &RunConfig,

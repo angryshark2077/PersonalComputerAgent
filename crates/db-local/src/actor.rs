@@ -408,7 +408,7 @@ impl DbActorHandle {
 
     /// Atomically removes pairing and durably keeps future sensitive Collector sources disabled.
     ///
-    /// S1B has no Network or WeChat source implementation; these rows prevent a later runtime
+    /// S1B has no Network or `WeChat` source implementation; these rows prevent a later runtime
     /// from treating a revoked pairing as an authorization to start either source.
     ///
     /// # Errors

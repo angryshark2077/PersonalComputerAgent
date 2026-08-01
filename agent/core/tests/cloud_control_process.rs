@@ -11,8 +11,11 @@ use pca_agentd::cloud_control::{
     CloudControlRuntime, CloudControlRuntimeError, ControlClient, ControlError, ControlFuture,
 };
 use pca_db_local::{DbActorHandle, PairingState};
-use pca_keychain::{CredentialError, CredentialStore, DeviceCredential, DEVICE_CREDENTIAL_ACCOUNT, DEVICE_CREDENTIAL_SERVICE};
 use pca_domain::{CollectorState, CollectorStatus};
+use pca_keychain::{
+    CredentialError, CredentialStore, DeviceCredential, DEVICE_CREDENTIAL_ACCOUNT,
+    DEVICE_CREDENTIAL_SERVICE,
+};
 use tempfile::TempDir;
 
 #[derive(Default)]
@@ -24,11 +27,19 @@ struct MemoryStore {
 
 impl CredentialStore for MemoryStore {
     fn load(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
-        Ok(self.values.lock().map_err(|_| CredentialError::Unavailable)?.get(&(service.to_owned(), account.to_owned())).cloned())
+        Ok(self
+            .values
+            .lock()
+            .map_err(|_| CredentialError::Unavailable)?
+            .get(&(service.to_owned(), account.to_owned()))
+            .cloned())
     }
 
     fn store(&self, service: &str, account: &str, value: &[u8]) -> Result<(), CredentialError> {
-        self.values.lock().map_err(|_| CredentialError::Unavailable)?.insert((service.to_owned(), account.to_owned()), value.to_vec());
+        self.values
+            .lock()
+            .map_err(|_| CredentialError::Unavailable)?
+            .insert((service.to_owned(), account.to_owned()), value.to_vec());
         Ok(())
     }
 
@@ -37,7 +48,10 @@ impl CredentialStore for MemoryStore {
         if self.fail_delete.load(Ordering::Relaxed) {
             return Err(CredentialError::OperationFailed);
         }
-        self.values.lock().map_err(|_| CredentialError::Unavailable)?.remove(&(service.to_owned(), account.to_owned()));
+        self.values
+            .lock()
+            .map_err(|_| CredentialError::Unavailable)?
+            .remove(&(service.to_owned(), account.to_owned()));
         Ok(())
     }
 }
@@ -62,14 +76,21 @@ fn credentials(store: Arc<MemoryStore>) -> pca_agentd::cloud_control::LoadedDevi
     let credential = DeviceCredential::new(
         "11111111-1111-4111-8111-111111111111".to_owned(),
         "22222222-2222-4222-8222-222222222222".to_owned(),
-        "synthetic-access", "synthetic-refresh",
-    ).unwrap().with_metadata(1, 1_700_000_000_000, 1_800_000_000_000);
+        "synthetic-access",
+        "synthetic-refresh",
+    )
+    .unwrap()
+    .with_metadata(1, 1_700_000_000_000, 1_800_000_000_000);
     pca_agentd::cloud_control::LoadedDeviceCredentials::new(credential, store)
 }
 
 async fn db() -> (TempDir, Arc<DbActorHandle>) {
     let temp = TempDir::new().unwrap();
-    let database = Arc::new(DbActorHandle::open(&temp.path().join("agent.sqlite"), "test").await.unwrap());
+    let database = Arc::new(
+        DbActorHandle::open(&temp.path().join("agent.sqlite"), "test")
+            .await
+            .unwrap(),
+    );
     (temp, database)
 }
 
@@ -112,14 +133,28 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let credentials = credentials(Arc::clone(&store));
-    database.save_pairing_state(&PairingState::paired(
-        credentials.credential().device_id(), credentials.credential().workspace_id(),
-        "keychain://pca/device/current", 1,
-    )).await.unwrap();
+    database
+        .save_pairing_state(&PairingState::paired(
+            credentials.credential().device_id(),
+            credentials.credential().workspace_id(),
+            "keychain://pca/device/current",
+            1,
+        ))
+        .await
+        .unwrap();
     save_sensitive_enabled(&database).await;
-    store.store(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT, &credentials.credential().encode().unwrap()).unwrap();
+    store
+        .store(
+            DEVICE_CREDENTIAL_SERVICE,
+            DEVICE_CREDENTIAL_ACCOUNT,
+            &credentials.credential().encode().unwrap(),
+        )
+        .unwrap();
 
-    let runtime = CloudControlRuntime::start(Arc::clone(&database), credentials, Arc::new(RevokedClient)).await.unwrap();
+    let runtime =
+        CloudControlRuntime::start(Arc::clone(&database), credentials, Arc::new(RevokedClient))
+            .await
+            .unwrap();
     for _ in 0..4 {
         tokio::task::yield_now().await;
     }
@@ -131,12 +166,18 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
     assert!(database.load_pairing_state().await.unwrap().is_none());
     assert!(runtime.is_unpaired().await);
     assert_eq!(runtime.applied_revision().await, None);
-    assert!(store.load(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT).unwrap().is_none());
+    assert!(store
+        .load(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT)
+        .unwrap()
+        .is_none());
     runtime.shutdown().await.unwrap();
     assert_sensitive_disabled(&database).await;
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
-        Err(_) => panic!("runtime released database after shutdown"),
+        Err(error) => {
+            drop(error);
+            panic!("runtime released database after shutdown");
+        }
     }
 }
 
@@ -156,7 +197,11 @@ async fn corrupt_startup_credential_clears_pairing_and_disables_sensitive_collec
         .unwrap();
     save_sensitive_enabled(&database).await;
     store
-        .store(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT, b"corrupt")
+        .store(
+            DEVICE_CREDENTIAL_SERVICE,
+            DEVICE_CREDENTIAL_ACCOUNT,
+            b"corrupt",
+        )
         .unwrap();
 
     let runtime = CloudControlRuntime::start_from_keychain(
@@ -172,7 +217,10 @@ async fn corrupt_startup_credential_clears_pairing_and_disables_sensitive_collec
     assert_sensitive_disabled(&database).await;
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
-        Err(_) => panic!("startup released database"),
+        Err(error) => {
+            drop(error);
+            panic!("startup released database");
+        }
     }
 }
 
@@ -200,9 +248,10 @@ async fn failed_keychain_delete_still_disables_sensitive_collectors() {
         .unwrap();
     store.fail_delete.store(true, Ordering::Relaxed);
 
-    let runtime = CloudControlRuntime::start(Arc::clone(&database), credentials, Arc::new(RevokedClient))
-        .await
-        .unwrap();
+    let runtime =
+        CloudControlRuntime::start(Arc::clone(&database), credentials, Arc::new(RevokedClient))
+            .await
+            .unwrap();
     for _ in 0..4 {
         tokio::task::yield_now().await;
     }
@@ -213,10 +262,15 @@ async fn failed_keychain_delete_still_disables_sensitive_collectors() {
     assert_eq!(store.delete_attempts.load(Ordering::Relaxed), 1);
     assert!(matches!(
         runtime.shutdown().await,
-        Err(CloudControlRuntimeError::Keychain(CredentialError::OperationFailed))
+        Err(CloudControlRuntimeError::Keychain(
+            CredentialError::OperationFailed
+        ))
     ));
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
-        Err(_) => panic!("runtime released database after failed Keychain deletion"),
+        Err(error) => {
+            drop(error);
+            panic!("runtime released database after failed Keychain deletion");
+        }
     }
 }

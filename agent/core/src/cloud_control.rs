@@ -1,12 +1,6 @@
-use std::{
-    error::Error,
-    fmt,
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-    time::Duration,
-};
+use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
+use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use pca_db_local::{DbActorHandle, DbError, PairingState};
 use pca_keychain::{
@@ -16,7 +10,6 @@ use pca_keychain::{
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
@@ -25,7 +18,7 @@ use tokio::{
 use uuid::Uuid;
 
 const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
-const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
 
 /// Future returned by the small Cloud-control port.
@@ -42,8 +35,10 @@ pub enum ControlError {
 
 /// Authenticated, bounded Cloud-control operations owned by Agent Core.
 pub trait ControlClient: Send + Sync {
-    fn refresh<'a>(&'a self, credentials: &'a DeviceCredential)
-        -> ControlFuture<'a, DeviceCredential>;
+    fn refresh<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+    ) -> ControlFuture<'a, DeviceCredential>;
 
     fn heartbeat_and_control<'a>(
         &'a self,
@@ -141,6 +136,11 @@ impl AgentPairingService {
     }
 
     /// Creates Agent-owned PKCE/state/device material and returns only browser-safe values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::Contract`] when the callback or Cloud response violates the
+    /// pairing contract, or a Cloud-control error when session creation fails.
     pub async fn begin(
         &self,
         handoff: PairingStartHandoff,
@@ -185,6 +185,11 @@ impl AgentPairingService {
     }
 
     /// Consumes one callback and persists only its resulting Keychain-backed non-secret pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the callback is invalid, the Cloud exchange or Keychain operation
+    /// fails, or the durable pairing state cannot be saved.
     pub async fn complete(
         &self,
         handoff: PairingCallbackHandoff,
@@ -218,7 +223,10 @@ impl AgentPairingService {
 
     pub async fn cancel(&self, session_id: &str) {
         let mut pending = self.pending.lock().await;
-        if pending.as_ref().is_some_and(|pending| pending.session_id == session_id) {
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+        {
             *pending = None;
         }
     }
@@ -307,9 +315,14 @@ pub struct AppliedControl {
 }
 
 /// Rejects malformed scopes and ignores snapshots that cannot advance the durable revision.
+///
+/// # Errors
+///
+/// Returns [`ControlError::Contract`] when the snapshot identifiers or collector scopes are
+/// malformed or unsupported.
 pub fn apply_snapshot(
     current: u64,
-    snapshot: AgentControlSnapshot,
+    snapshot: &AgentControlSnapshot,
 ) -> Result<Option<AppliedControl>, ControlError> {
     snapshot.validate_exact_scopes()?;
     if snapshot.configuration_revision <= current {
@@ -340,7 +353,12 @@ pub struct CloudControlHandle {
 
 impl CloudControlRuntime {
     /// Loads the Keychain record at Agent startup. Missing or corrupt records fail closed to the
-    /// unpaired state and leave no stale SQLite pointer behind.
+    /// unpaired state and leave no stale `SQLite` pointer behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Keychain cannot be accessed or the local pairing state cannot
+    /// be synchronized or started.
     pub async fn start_from_keychain(
         database: Arc<DbActorHandle>,
         store: Arc<dyn CredentialStore>,
@@ -349,8 +367,9 @@ impl CloudControlRuntime {
         if !synchronize_pairing_state(&database, store.as_ref()).await? {
             return Ok(None);
         }
-        let credential = load_device_credential(store.as_ref())?
-            .ok_or(CloudControlRuntimeError::Keychain(CredentialError::InvalidCredential))?;
+        let credential = load_device_credential(store.as_ref())?.ok_or(
+            CloudControlRuntimeError::Keychain(CredentialError::InvalidCredential),
+        )?;
         Self::start(
             database,
             LoadedDeviceCredentials::new(credential, store),
@@ -361,6 +380,10 @@ impl CloudControlRuntime {
     }
 
     /// Validates the local non-secret pointer and begins an immediate control request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the local pairing state cannot be validated or persisted.
     pub async fn start(
         database: Arc<DbActorHandle>,
         credentials: LoadedDeviceCredentials,
@@ -387,10 +410,15 @@ impl CloudControlRuntime {
     }
 }
 
-/// Reconciles the non-secret SQLite pointer with the Keychain record at Agent startup.
+/// Reconciles the non-secret `SQLite` pointer with the Keychain record at Agent startup.
 ///
 /// A missing or corrupt record is unpaired. A Keychain availability failure is returned so the
 /// caller can keep unrelated local runtime capabilities alive in `degraded` state.
+///
+/// # Errors
+///
+/// Returns an error when the Keychain cannot be accessed or the local pairing state cannot be
+/// synchronized.
 pub async fn synchronize_pairing_state(
     database: &DbActorHandle,
     store: &dyn CredentialStore,
@@ -422,12 +450,18 @@ impl CloudControlHandle {
     }
 
     /// Stops the worker without aborting an in-flight HTTPS request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the worker ends unexpectedly or reports a runtime failure.
     pub async fn shutdown(mut self) -> Result<(), CloudControlRuntimeError> {
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send_replace(true);
         }
         match self.worker.take() {
-            Some(worker) => worker.await.map_err(|_| CloudControlRuntimeError::WorkerStopped)?,
+            Some(worker) => worker
+                .await
+                .map_err(|_| CloudControlRuntimeError::WorkerStopped)?,
             None => Ok(()),
         }
     }
@@ -511,7 +545,7 @@ async fn run_control_loop(
                 retry_attempt = 0;
                 wait = CONTROL_INTERVAL;
             }
-            Err(ControlError::Transient) | Err(ControlError::Contract) => {
+            Err(ControlError::Transient | ControlError::Contract) => {
                 retry_attempt = retry_attempt.saturating_add(1);
                 wait = retry_delay(retry_attempt);
             }
@@ -565,7 +599,7 @@ async fn control_once(
         return Err(ControlError::Contract);
     }
     let current = state.lock().await.applied_revision.unwrap_or(0);
-    let Some(applied) = apply_snapshot(current, snapshot)? else {
+    let Some(applied) = apply_snapshot(current, &snapshot)? else {
         return Ok(());
     };
     database
@@ -596,7 +630,7 @@ async fn revoke(
 
 async fn wait_or_shutdown(wait: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
-        _ = time::sleep(wait) => false,
+        () = time::sleep(wait) => false,
         changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow_and_update(),
     }
 }
@@ -604,8 +638,8 @@ async fn wait_or_shutdown(wait: Duration, shutdown: &mut watch::Receiver<bool>) 
 fn retry_delay(attempt: u8) -> Duration {
     let shift = u32::from(attempt.saturating_sub(1).min(8));
     let base = Duration::from_secs(1_u64 << shift).min(MAX_BACKOFF);
-    let jitter = Duration::from_millis((base.as_millis() / 4) as u64);
-    if attempt % 2 == 0 {
+    let jitter = base / 4;
+    if attempt.is_multiple_of(2) {
         base.saturating_sub(jitter)
     } else {
         base.saturating_add(jitter).min(MAX_BACKOFF)
@@ -631,6 +665,11 @@ pub struct HttpControlClient {
 
 impl HttpControlClient {
     /// Creates an adapter only for an HTTPS Cloud API origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::Contract`] for a non-HTTPS URL and [`ControlError::Transient`]
+    /// when the HTTPS client cannot be initialized.
     pub fn new(base_url: Url) -> Result<Self, ControlError> {
         if base_url.scheme() != "https" {
             return Err(ControlError::Contract);
@@ -701,7 +740,9 @@ impl ControlClient for HttpControlClient {
                 .send()
                 .await
                 .map_err(|_| ControlError::Transient)?;
-            parse_response::<ControlResponse>(response).await.map(|response| response.snapshot)
+            parse_response::<ControlResponse>(response)
+                .await
+                .map(|response| response.snapshot)
         })
     }
 }
@@ -750,16 +791,24 @@ struct ErrorBody {
     retryable: bool,
 }
 
-async fn parse_response<T: for<'de> Deserialize<'de>>(response: reqwest::Response) -> Result<T, ControlError> {
+async fn parse_response<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+) -> Result<T, ControlError> {
     let status = response.status();
-    let bytes = response.bytes().await.map_err(|_| ControlError::Transient)?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| ControlError::Transient)?;
     if status.is_success() {
         return serde_json::from_slice(&bytes).map_err(|_| ControlError::Contract);
     }
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         return Err(ControlError::Transient);
     }
-    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
+    if matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE
+    ) {
         return match serde_json::from_slice::<ErrorResponse>(&bytes) {
             Ok(error) if error.error.error_code == "DEVICE_REVOKED" => Err(ControlError::Revoked),
             _ => Err(ControlError::InvalidCredential),
