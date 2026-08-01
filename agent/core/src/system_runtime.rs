@@ -595,7 +595,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tempfile::TempDir;
     use tokio::sync::Notify;
@@ -875,7 +875,8 @@ mod tests {
     }
 
     async fn yield_until(mut condition: impl FnMut() -> bool) {
-        for _ in 0..20_000 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             if condition() {
                 return;
             }
@@ -883,6 +884,20 @@ mod tests {
             std::thread::yield_now();
         }
         panic!("condition did not become true");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn yield_until_allows_real_background_progress() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let background_ready = Arc::clone(&ready);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            background_ready.store(true, Ordering::SeqCst);
+        });
+
+        yield_until(|| ready.load(Ordering::SeqCst)).await;
+
+        worker.join().expect("join background worker");
     }
 
     async fn close_database(database: Arc<DbActorHandle>) {

@@ -520,7 +520,7 @@ final class HandshakeTests: XCTestCase {
             pathValidator: SocketPathValidator(approvedRunRoot: runRoot),
             handshakeHandler: HandshakeHandler(bridgeVersion: "0.0.0-s1a"),
             credentialProvider: FixedCredentialProvider(secret: secret),
-            idleTimeoutMilliseconds: 5_000
+            idleTimeoutMilliseconds: 60_000
         )
         try await server.start()
         let serveTask = Task { try await server.serve() }
@@ -814,7 +814,7 @@ final class HandshakeTests: XCTestCase {
 
     private func readFrame(
         from descriptor: Int32,
-        timeoutMilliseconds: UInt64 = 5_000,
+        timeoutMilliseconds: UInt64 = 2_000,
         oneByteAtATime: Bool = false
     ) async throws -> Data {
         var decoder = FrameDecoder()
