@@ -14,7 +14,12 @@ pub const BRIDGE_CREDENTIAL_ACCOUNT: &str = "shared-secret-v1";
 pub const BRIDGE_SHARED_SECRET_LENGTH: usize = 32;
 pub const DEVICE_CREDENTIAL_SERVICE: &str = "com.pca.device";
 pub const DEVICE_CREDENTIAL_ACCOUNT: &str = "current-v1";
+pub const WECHAT_CREDENTIAL_SERVICE: &str = "com.pca.wechat";
+pub const WECHAT_CREDENTIAL_ACCOUNT: &str = "current-v1";
+pub const WECHAT_CREDENTIAL_REF: &str = "keychain://com.pca.wechat/current-v1";
 const DEVICE_CREDENTIAL_VERSION: u8 = 1;
+const WECHAT_KEY_MATERIAL_VERSION: u8 = 1;
+const WECHAT_RAW_KEY_LENGTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialError {
@@ -32,7 +37,7 @@ impl fmt::Display for CredentialError {
             Self::Unavailable => "credential store unavailable",
             Self::InvalidSecretLength => "invalid credential length",
             Self::CorruptSecret => "stored credential is corrupt",
-            Self::InvalidCredential => "device credential is invalid",
+            Self::InvalidCredential => "credential is invalid",
             Self::OperationFailed => "credential operation failed",
             Self::UnsupportedIdentity => "credential identity unsupported",
         };
@@ -63,6 +68,132 @@ pub trait CredentialStore: Send + Sync {
     ///
     /// Returns a safe [`CredentialError`] when the backing store cannot complete the operation.
     fn delete(&self, service: &str, account: &str) -> Result<(), CredentialError>;
+}
+
+/// Versioned `SQLCipher` key material retained only in the fixed `WeChat` Keychain item.
+///
+/// This type deliberately does not implement `Serialize`, `Clone`, or expose its account proof
+/// through `Debug`. Only [`Self::encode`] serializes it for Keychain storage; SQLite-facing DTOs,
+/// Events, logs, and diagnostics must never receive this value.
+///
+/// ```compile_fail
+/// use pca_keychain::WechatKeyMaterial;
+///
+/// fn requires_serialize<T: serde::Serialize>(_: &T) {}
+/// let material = WechatKeyMaterial::new("account-proof", [7; 32]).unwrap();
+/// requires_serialize(&material);
+/// ```
+#[derive(Eq, PartialEq)]
+pub struct WechatKeyMaterial {
+    account_id: String,
+    raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
+}
+
+impl fmt::Debug for WechatKeyMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WechatKeyMaterial")
+            .field("value", &"redacted")
+            .finish()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWechatKeyMaterial {
+    version: u8,
+    account_id: String,
+    raw_key: Vec<u8>,
+}
+
+impl WechatKeyMaterial {
+    /// Creates validated account-scoped raw `SQLCipher` key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] for an empty/control-character account
+    /// proof or an all-zero raw key.
+    pub fn new(
+        account_id: &str,
+        raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
+    ) -> Result<Self, CredentialError> {
+        let material = Self {
+            account_id: account_id.to_owned(),
+            raw_key,
+        };
+        material.validate()?;
+        Ok(material)
+    }
+
+    /// Returns the source account proof only to the read-only `WeChat` source probe.
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// Returns the raw key only to the read-only `SQLCipher` adapter.
+    #[must_use]
+    pub const fn raw_key(&self) -> &[u8; WECHAT_RAW_KEY_LENGTH] {
+        &self.raw_key
+    }
+
+    /// Encodes this value solely for storage in the fixed Keychain item.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] without exposing secret material when the
+    /// value is invalid or cannot be encoded.
+    pub fn encode(&self) -> Result<Vec<u8>, CredentialError> {
+        self.validate()?;
+        serde_json::to_vec(&StoredWechatKeyMaterial {
+            version: WECHAT_KEY_MATERIAL_VERSION,
+            account_id: self.account_id.clone(),
+            raw_key: self.raw_key.to_vec(),
+        })
+        .map_err(|_| CredentialError::InvalidCredential)
+    }
+
+    pub(crate) fn decode(value: &[u8]) -> Result<Self, CredentialError> {
+        let stored: StoredWechatKeyMaterial =
+            serde_json::from_slice(value).map_err(|_| CredentialError::InvalidCredential)?;
+        let raw_key = stored
+            .raw_key
+            .try_into()
+            .map_err(|_| CredentialError::InvalidCredential)?;
+        if stored.version != WECHAT_KEY_MATERIAL_VERSION {
+            return Err(CredentialError::InvalidCredential);
+        }
+        Self::new(&stored.account_id, raw_key)
+    }
+
+    fn validate(&self) -> Result<(), CredentialError> {
+        let account = self.account_id.trim();
+        if account.is_empty()
+            || account != self.account_id
+            || account.len() > 512
+            || account.chars().any(char::is_control)
+            || self.raw_key.iter().all(|byte| *byte == 0)
+        {
+            Err(CredentialError::InvalidCredential)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Loads and validates the fixed account-scoped `WeChat` `KeyMaterial` reference.
+///
+/// # Errors
+///
+/// Returns a safe backing-store error or [`CredentialError::InvalidCredential`] for malformed
+/// stored material. Error values never include account or key bytes.
+pub fn load_wechat_key_material(
+    store: &dyn CredentialStore,
+) -> Result<Option<WechatKeyMaterial>, CredentialError> {
+    store
+        .load(WECHAT_CREDENTIAL_SERVICE, WECHAT_CREDENTIAL_ACCOUNT)?
+        .map(|record| WechatKeyMaterial::decode(&record))
+        .transpose()
 }
 
 /// The versioned device credential payload kept in the dedicated macOS Keychain item.

@@ -5,16 +5,17 @@ use security_framework::passwords::{
 use crate::{
     delete_bridge_shared_secret, load_bridge_shared_secret, store_bridge_shared_secret,
     validate_bridge_identity, validate_bridge_secret_for_store, validate_loaded_bridge_secret,
-    CredentialError, CredentialStore, DeviceCredential, BRIDGE_CREDENTIAL_ACCOUNT,
-    BRIDGE_CREDENTIAL_SERVICE, BRIDGE_SHARED_SECRET_LENGTH, DEVICE_CREDENTIAL_ACCOUNT,
-    DEVICE_CREDENTIAL_SERVICE,
+    CredentialError, CredentialStore, DeviceCredential, WechatKeyMaterial,
+    BRIDGE_CREDENTIAL_ACCOUNT, BRIDGE_CREDENTIAL_SERVICE, BRIDGE_SHARED_SECRET_LENGTH,
+    DEVICE_CREDENTIAL_ACCOUNT, DEVICE_CREDENTIAL_SERVICE, WECHAT_CREDENTIAL_ACCOUNT,
+    WECHAT_CREDENTIAL_SERVICE,
 };
 
 const ITEM_NOT_FOUND_STATUS: i32 = -25_300;
 const KEYCHAIN_NOT_AVAILABLE_STATUS: i32 = -25_291;
 const INTERACTION_NOT_ALLOWED_STATUS: i32 = -25_308;
 
-/// macOS Keychain adapter dedicated to PCA's fixed Bridge and device identities.
+/// macOS Keychain adapter dedicated to PCA's fixed Bridge, device, and `WeChat` identities.
 ///
 /// Although [`CredentialStore`] is generic, this adapter rejects every other service/account pair
 /// with [`CredentialError::UnsupportedIdentity`]. Device-item creation is intentionally reserved
@@ -86,17 +87,23 @@ impl CredentialStore for MacOSKeychainStore {
                     }
                 })
             }
+            CredentialIdentity::Wechat => Err(CredentialError::UnsupportedIdentity),
         }
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<(), CredentialError> {
-        delete_for_supported_identity(service, account, || {
-            match delete_generic_password(service, account) {
-                Ok(()) => Ok(()),
-                Err(error) if error.code() == ITEM_NOT_FOUND_STATUS => Ok(()),
-                Err(error) => Err(map_keychain_error(error.code())),
+        match identity(service, account)? {
+            CredentialIdentity::Bridge | CredentialIdentity::Device => {
+                delete_for_supported_identity(service, account, || {
+                    match delete_generic_password(service, account) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.code() == ITEM_NOT_FOUND_STATUS => Ok(()),
+                        Err(error) => Err(map_keychain_error(error.code())),
+                    }
+                })
             }
-        })
+            CredentialIdentity::Wechat => Err(CredentialError::UnsupportedIdentity),
+        }
     }
 }
 
@@ -104,6 +111,7 @@ impl CredentialStore for MacOSKeychainStore {
 enum CredentialIdentity {
     Bridge,
     Device,
+    Wechat,
 }
 
 fn identity(service: &str, account: &str) -> Result<CredentialIdentity, CredentialError> {
@@ -112,6 +120,8 @@ fn identity(service: &str, account: &str) -> Result<CredentialIdentity, Credenti
         Ok(CredentialIdentity::Bridge)
     } else if service == DEVICE_CREDENTIAL_SERVICE && account == DEVICE_CREDENTIAL_ACCOUNT {
         Ok(CredentialIdentity::Device)
+    } else if service == WECHAT_CREDENTIAL_SERVICE && account == WECHAT_CREDENTIAL_ACCOUNT {
+        Ok(CredentialIdentity::Wechat)
     } else {
         Err(CredentialError::UnsupportedIdentity)
     }
@@ -128,7 +138,26 @@ where
     match identity(service, account)? {
         CredentialIdentity::Bridge => load_for_identity(service, account, backend),
         CredentialIdentity::Device => load_device_for_identity(service, account, backend),
+        CredentialIdentity::Wechat => load_wechat_for_identity(service, account, backend),
     }
+}
+
+pub(crate) fn load_wechat_for_identity<F>(
+    service: &str,
+    account: &str,
+    backend: F,
+) -> Result<Option<Vec<u8>>, CredentialError>
+where
+    F: FnOnce() -> Result<Option<Vec<u8>>, CredentialError>,
+{
+    if service != WECHAT_CREDENTIAL_SERVICE || account != WECHAT_CREDENTIAL_ACCOUNT {
+        return Err(CredentialError::UnsupportedIdentity);
+    }
+    let record = backend()?;
+    if let Some(record) = record.as_deref() {
+        WechatKeyMaterial::decode(record)?;
+    }
+    Ok(record)
 }
 
 pub(crate) fn load_for_identity<F>(

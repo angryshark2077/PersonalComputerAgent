@@ -3,6 +3,7 @@
 mod eligibility;
 pub mod fixtures;
 pub mod source;
+pub mod sqlcipher_source;
 
 use pca_domain::{CommunicationMessageRecorded, DomainError};
 use pca_provider_contracts::{

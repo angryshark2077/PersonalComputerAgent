@@ -23,7 +23,12 @@ pub struct FixtureWechatSource {
 
 impl WechatSource for FixtureWechatSource {
     fn probe(&self) -> SourceProbeFuture<'_> {
-        Box::pin(async { Ok(SourceCapabilities { schema_version: 1 }) })
+        Box::pin(async {
+            Ok(SourceCapabilities {
+                source_version: "fixture-v1".to_owned(),
+                schema_version: 1,
+            })
+        })
     }
 
     fn read_after(&self, _: &SourceCursor) -> SourceReadFuture<'_> {

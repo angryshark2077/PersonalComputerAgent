@@ -8,8 +8,9 @@ pub type SourceReadFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<SourceRecord>, DomainError>> + Send + 'a>>;
 
 /// The only source capability data this boundary needs before Task 3 adds production probing.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceCapabilities {
+    pub source_version: String,
     pub schema_version: u32,
 }
 
