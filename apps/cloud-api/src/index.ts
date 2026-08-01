@@ -329,7 +329,6 @@ export interface ProductionEnvironment {
   DATABASE_URL?: string;
   BETTER_AUTH_SECRET?: string;
   BETTER_AUTH_URL?: string;
-  TRUSTED_PROXY_CLIENT_IP_HMAC_SECRET?: string;
 }
 
 export function createProductionApp(environment: ProductionEnvironment = process.env): Hono {
@@ -353,7 +352,6 @@ export function createProductionApp(environment: ProductionEnvironment = process
   const app = createApp({
     repository,
     ownerAuthenticator: createBetterAuthOwnerAuthenticator(auth, repository),
-    clientAddress: createTrustedProxyClientAddress(environment),
   });
   app.all("/api/auth/*", (context) => auth.handler(context.req.raw));
   return app;
@@ -487,7 +485,7 @@ function restoreRawSessionToken(result: unknown, rawTokenByHash: ReadonlyMap<str
  * be available to clients. Invalid, unsigned, or non-IP values are unattributed.
  */
 export function createTrustedProxyClientAddress(
-  environment: Pick<ProductionEnvironment, "TRUSTED_PROXY_CLIENT_IP_HMAC_SECRET">,
+  environment: { TRUSTED_PROXY_CLIENT_IP_HMAC_SECRET?: string },
 ): (request: Request) => string | undefined {
   const secret = environment.TRUSTED_PROXY_CLIENT_IP_HMAC_SECRET;
   return (request) => {

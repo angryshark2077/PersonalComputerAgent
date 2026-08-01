@@ -21,12 +21,14 @@ use pca_db_local::DbActorHandle;
 #[cfg(feature = "process-test-hooks")]
 use pca_db_local::ProcessTestHooks;
 use pca_domain::{AgentStatus, BridgeStatus, RuntimeStatusEnvelope};
+use pca_keychain::CredentialStore;
+#[cfg(not(feature = "process-test-hooks"))]
+use pca_keychain::MacOSKeychainStore;
 #[cfg(feature = "process-test-hooks")]
 use pca_keychain::{
     CredentialError, BRIDGE_CREDENTIAL_ACCOUNT, BRIDGE_CREDENTIAL_SERVICE,
     BRIDGE_SHARED_SECRET_LENGTH,
 };
-use pca_keychain::{CredentialStore, MacOSKeychainStore};
 use reqwest::Url;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::{sync::watch, task::JoinHandle};
@@ -223,15 +225,13 @@ impl RuntimeResources {
             .map_err(|_| FailureStage::DatabaseHealth)?;
         self.schema_version = Some(health.schema_version);
 
+        #[cfg(not(feature = "process-test-hooks"))]
         let credential_store: Arc<dyn CredentialStore> = Arc::new(MacOSKeychainStore);
         #[cfg(feature = "process-test-hooks")]
-        let credential_store = if config.process_test_fatal_cleanup.is_some() {
-            Arc::new(ProcessTestCredentialStore) as Arc<dyn CredentialStore>
-        } else {
-            credential_store
-        };
+        let credential_store: Arc<dyn CredentialStore> = Arc::new(ProcessTestCredentialStore);
         let (bridge_status_sender, mut bridge_status_receiver) =
             watch::channel(BridgeStatus::Disconnected);
+        let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
 
         // A build with process hooks has no production Keychain identity; keeping those harnesses
         // explicitly unpaired prevents test-only identities from becoming a release input.
@@ -245,6 +245,7 @@ impl RuntimeResources {
                         .expect("database exists until cleanup"),
                 ),
                 Arc::clone(&credential_store),
+                pairing_state_sender.clone(),
             )
             .await
             .ok()
@@ -274,6 +275,7 @@ impl RuntimeResources {
                         .expect("database exists until cleanup"),
                 ),
                 credential_store,
+                pairing_state_sender,
                 pairing_shutdown_receiver,
             )
             .await?,
@@ -348,6 +350,16 @@ impl RuntimeResources {
                         let next = *bridge_status_receiver.borrow_and_update();
                         set_bridge_status(&mut self.state, next)
                             .map_err(|_| FailureStage::State)?;
+                        self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
+                    }
+                }
+                changed = pairing_state_receiver.changed() => {
+                    if changed.is_ok() {
+                        transition_pairing_runtime_state(
+                            &mut self.state,
+                            *pairing_state_receiver.borrow_and_update(),
+                        )
+                        .map_err(|_| FailureStage::State)?;
                         self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
                     }
                 }
@@ -611,26 +623,29 @@ async fn start_pairing_server(
     config: &RunConfig,
     database: Arc<DbActorHandle>,
     credential_store: Arc<dyn CredentialStore>,
+    pairing_state_sender: watch::Sender<bool>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), PairingIpcServerError>>, FailureStage> {
     let socket = PairingSocket::bind(&config.paths.pairing_socket_file)
         .await
         .map_err(|_| FailureStage::PairingConfiguration)?;
-    let server = PairingIpcServer::new(socket, database, credential_store);
+    let server = PairingIpcServer::new(socket, database, credential_store, pairing_state_sender);
     Ok(tokio::spawn(server.serve(shutdown)))
 }
 
 async fn start_paired_control(
     database: Arc<DbActorHandle>,
     credential_store: Arc<dyn CredentialStore>,
+    pairing_state_sender: watch::Sender<bool>,
 ) -> Result<Option<CloudControlHandle>, FailureStage> {
     let origin =
         Url::parse(PRODUCTION_CLOUD_API_ORIGIN).map_err(|_| FailureStage::ControlConfiguration)?;
     let client = HttpControlClient::new(origin).map_err(|_| FailureStage::ControlConfiguration)?;
-    CloudControlRuntime::start_from_keychain(
+    CloudControlRuntime::start_from_keychain_with_pairing_state(
         database,
         credential_store,
         Arc::new(client) as Arc<dyn ControlClient>,
+        pairing_state_sender,
     )
     .await
     .map_err(|_| FailureStage::ControlConfiguration)
@@ -645,6 +660,29 @@ fn transition_startup_agent_state(
         state.transition_agent(AgentStatus::Running)?;
     }
     Ok(())
+}
+
+fn transition_pairing_runtime_state(
+    state: &mut RuntimeStateMachine,
+    paired: bool,
+) -> Result<(), RuntimeError> {
+    match (state.agent_status(), paired) {
+        (AgentStatus::Unpaired | AgentStatus::Degraded, true) => {
+            state.transition_agent(AgentStatus::Running)
+        }
+        (AgentStatus::Unpaired, false) | (AgentStatus::Running, true) => Ok(()),
+        (AgentStatus::Running | AgentStatus::WaitingPermission | AgentStatus::Degraded, false) => {
+            state.transition_agent(AgentStatus::Unpaired)
+        }
+        _ => Err(RuntimeError::IllegalAgentTransition {
+            from: state.agent_status(),
+            to: if paired {
+                AgentStatus::Running
+            } else {
+                AgentStatus::Unpaired
+            },
+        }),
+    }
 }
 
 async fn stop_pairing_server(
@@ -842,5 +880,16 @@ mod tests {
         transition_startup_agent_state(&mut state, true).expect("paired startup is legal");
 
         assert_eq!(state.agent_status(), AgentStatus::Running);
+    }
+
+    #[test]
+    fn pairing_runtime_transition_marks_a_running_agent_unpaired_after_revocation() {
+        let mut state = RuntimeStateMachine::starting();
+        transition_startup_agent_state(&mut state, true).expect("paired startup is legal");
+
+        transition_pairing_runtime_state(&mut state, false)
+            .expect("revocation transitions the runtime to unpaired");
+
+        assert_eq!(state.agent_status(), AgentStatus::Unpaired);
     }
 }

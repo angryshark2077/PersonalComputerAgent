@@ -268,6 +268,16 @@ test("production composition fails closed when persistent configuration is absen
   assert.throws(() => createProductionApp({}), /missing required configuration: DATABASE_URL/);
 });
 
+test("production composition does not require trusted proxy configuration for pairing rate limits", () => {
+  const api = createProductionApp({
+    DATABASE_URL: "postgresql://localhost:1/pca",
+    BETTER_AUTH_SECRET: "test-secret-that-is-long-enough-to-be-valid",
+    BETTER_AUTH_URL: "http://localhost:3000",
+  });
+
+  assert.ok(api);
+});
+
 test("production composition wires persistent PostgreSQL and Better Auth", () => {
   const api = createProductionApp({
     DATABASE_URL: "postgresql://localhost:1/pca",

@@ -248,6 +248,7 @@ struct PairingSessionRequest<'a> {
 #[serde(deny_unknown_fields)]
 struct PairingSessionResponse {
     session_id: String,
+    authorization_url: String,
 }
 
 #[derive(Serialize)]
@@ -352,6 +353,8 @@ async fn pair_and_apply(
         .start_pairing(&random_base64url(), &challenge, &callback_state)
         .await
         .map_err(|error| control_failure("pairing start failed", error))?;
+    Url::parse(&session.authorization_url)
+        .map_err(|_| "pairing start returned an invalid authorization URL")?;
     let callback = read_input_line::<CallbackInput>()?;
     let credential = client
         .exchange(&session.session_id, &callback.callback_code, &verifier)

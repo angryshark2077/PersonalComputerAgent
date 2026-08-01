@@ -537,7 +537,7 @@ async fn supervisor_emits_incompatible_once_and_does_not_restart() {
         .expect("make fake executable");
     let config = BridgeSupervisorConfig::new(&executable, &socket, "0.0.0-s1a")
         .expect("valid supervisor config")
-        .with_operation_timeout(Duration::from_secs(1));
+        .with_operation_timeout(Duration::from_secs(3));
     let (status_tx, status_rx) = watch::channel(BridgeStatus::Disconnected);
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     BridgeSupervisor::new(

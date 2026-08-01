@@ -296,6 +296,10 @@ mod tests {
             tokio::spawn(async move { canceled_sampler.sample(MetricGroup::Disk).await });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         canceled.abort();
+        assert!(canceled
+            .await
+            .expect_err("canceled request task must stop")
+            .is_cancelled());
         release_sender.send(()).expect("release first sample");
         first.await.expect("first task").expect("first sample");
 

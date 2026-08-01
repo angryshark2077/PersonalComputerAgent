@@ -50,6 +50,7 @@ pub struct PairingIpcServer {
     store: Arc<dyn CredentialStore>,
     pending: Mutex<Option<PendingPairing>>,
     control: Mutex<Option<CloudControlHandle>>,
+    pairing_state_sender: watch::Sender<bool>,
 }
 
 struct PendingPairing {
@@ -117,6 +118,10 @@ impl PairingIpcOperation {
 
 impl PairingIpcRequest {
     /// Strictly decodes one public envelope before authentication and dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingIpcRequestError::Invalid`] for malformed or disallowed input.
     pub fn decode(bytes: &[u8]) -> Result<Self, PairingIpcRequestError> {
         let request: Self =
             serde_json::from_slice(bytes).map_err(|_| PairingIpcRequestError::Invalid)?;
@@ -170,6 +175,10 @@ impl PairingIpcRequest {
     }
 
     /// Authenticates one request with the Keychain ACL-protected Bridge secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingIpcRequestError::Invalid`] when the request proof does not verify.
     pub fn authenticate(&self, secret: &[u8; 32]) -> Result<(), PairingIpcRequestError> {
         let nonce = URL_SAFE_NO_PAD
             .decode(&self.nonce)
@@ -194,6 +203,11 @@ pub enum PairingIpcRequestError {
 
 impl PairingSocket {
     /// Binds one 0600 Unix-domain socket after refusing symlinks and regular-file targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is unsafe or the socket cannot be created securely.
+    #[allow(clippy::unused_async)] // Tokio's Unix listener requires a current runtime to bind.
     pub async fn bind(path: impl AsRef<Path>) -> Result<Self, PairingSocketError> {
         let path = path.as_ref();
         if !path.is_absolute() || path == Path::new("/") || path.parent().is_none() {
@@ -222,6 +236,11 @@ impl PairingSocket {
     }
 
     /// Closes the listener and removes only the socket that this instance bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path changed into an unsafe target or cannot be removed.
+    #[allow(clippy::unused_async)] // Socket teardown shares the async lifecycle API.
     pub async fn shutdown(self) -> Result<(), PairingSocketError> {
         let Self { listener, path } = self;
         drop(listener);
@@ -242,6 +261,7 @@ impl PairingIpcServer {
         socket: PairingSocket,
         database: Arc<DbActorHandle>,
         store: Arc<dyn CredentialStore>,
+        pairing_state_sender: watch::Sender<bool>,
     ) -> Self {
         Self {
             socket,
@@ -249,10 +269,15 @@ impl PairingIpcServer {
             store,
             pending: Mutex::new(None),
             control: Mutex::new(None),
+            pairing_state_sender,
         }
     }
 
     /// Serves one bounded request per connection until the Agent lifecycle requests shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the owned socket cannot be removed during shutdown.
     pub async fn serve(
         self,
         mut shutdown: watch::Receiver<bool>,
@@ -280,6 +305,7 @@ impl PairingIpcServer {
             .map_err(PairingIpcServerError::Socket)
     }
 
+    #[allow(clippy::too_many_lines)] // The four protocol operations share one authenticated dispatch boundary.
     async fn handle_connection(&self, mut stream: UnixStream) -> Result<(), ()> {
         let bytes = timeout(Duration::from_secs(5), read_frame_bytes(&mut stream))
             .await
@@ -348,22 +374,25 @@ impl PairingIpcServer {
                         })
                         .await
                     {
-                        Ok(completion) => match CloudControlRuntime::start_from_keychain(
-                            Arc::clone(&self.database),
-                            Arc::clone(&self.store),
-                            pending.client.clone() as Arc<dyn ControlClient>,
-                        )
-                        .await
-                        {
-                            Ok(Some(control)) => {
-                                *self.control.lock().await = Some(control);
-                                json!({
-                                    "device_id": completion.device_id,
-                                    "workspace_id": completion.workspace_id,
-                                })
+                        Ok(completion) => {
+                            match CloudControlRuntime::start_from_keychain_with_pairing_state(
+                                Arc::clone(&self.database),
+                                Arc::clone(&self.store),
+                                pending.client.clone() as Arc<dyn ControlClient>,
+                                self.pairing_state_sender.clone(),
+                            )
+                            .await
+                            {
+                                Ok(Some(control)) => {
+                                    *self.control.lock().await = Some(control);
+                                    json!({
+                                        "device_id": completion.device_id,
+                                        "workspace_id": completion.workspace_id,
+                                    })
+                                }
+                                _ => error_response("CONTROL_UNAVAILABLE"),
                             }
-                            _ => error_response("CONTROL_UNAVAILABLE"),
-                        },
+                        }
                         Err(_) => error_response("PAIRING_UNAVAILABLE"),
                     },
                 }

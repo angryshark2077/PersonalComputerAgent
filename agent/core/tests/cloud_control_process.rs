@@ -4,7 +4,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
 };
 
 use pca_agentd::cloud_control::{
@@ -17,6 +16,7 @@ use pca_keychain::{
     DEVICE_CREDENTIAL_SERVICE,
 };
 use tempfile::TempDir;
+use tokio::sync::watch;
 
 #[derive(Default)]
 struct MemoryStore {
@@ -128,6 +128,16 @@ async fn assert_sensitive_disabled(database: &DbActorHandle) {
     );
 }
 
+async fn await_unpaired(runtime: &pca_agentd::cloud_control::CloudControlHandle) {
+    for _ in 0..100 {
+        if runtime.is_unpaired().await {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("control runtime did not process revocation");
+}
+
 #[tokio::test(start_paused = true)]
 async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
     let (_temp, database) = db().await;
@@ -156,13 +166,7 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
         CloudControlRuntime::start(Arc::clone(&database), credentials, Arc::new(RevokedClient))
             .await
             .unwrap();
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(Duration::from_secs(30)).await;
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    await_unpaired(&runtime).await;
 
     assert!(database.load_pairing_state().await.unwrap().is_none());
     assert!(runtime.is_unpaired().await);
@@ -173,6 +177,56 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
         .is_none());
     runtime.shutdown().await.unwrap();
     assert_sensitive_disabled(&database).await;
+    match Arc::try_unwrap(database) {
+        Ok(database) => database.shutdown().await.unwrap(),
+        Err(error) => {
+            drop(error);
+            panic!("runtime released database after shutdown");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn revocation_notifies_the_agent_runtime_after_local_cleanup() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let credentials = credentials(Arc::clone(&store));
+    database
+        .save_pairing_state(&PairingState::paired(
+            credentials.credential().device_id(),
+            credentials.credential().workspace_id(),
+            "keychain://pca/device/current",
+            1,
+            "https://pca-cloud-api-production.up.railway.app",
+        ))
+        .await
+        .unwrap();
+    save_sensitive_enabled(&database).await;
+    store
+        .store(
+            DEVICE_CREDENTIAL_SERVICE,
+            DEVICE_CREDENTIAL_ACCOUNT,
+            &credentials.credential().encode().unwrap(),
+        )
+        .unwrap();
+    let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
+
+    let runtime = CloudControlRuntime::start_with_pairing_state(
+        Arc::clone(&database),
+        credentials,
+        Arc::new(RevokedClient),
+        pairing_state_sender,
+    )
+    .await
+    .unwrap();
+    assert!(*pairing_state_receiver.borrow_and_update());
+    await_unpaired(&runtime).await;
+    pairing_state_receiver.changed().await.unwrap();
+
+    assert!(!*pairing_state_receiver.borrow_and_update());
+    assert!(database.load_pairing_state().await.unwrap().is_none());
+    assert_sensitive_disabled(&database).await;
+    runtime.shutdown().await.unwrap();
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
         Err(error) => {
@@ -255,9 +309,7 @@ async fn failed_keychain_delete_still_disables_sensitive_collectors() {
         CloudControlRuntime::start(Arc::clone(&database), credentials, Arc::new(RevokedClient))
             .await
             .unwrap();
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    await_unpaired(&runtime).await;
 
     assert!(runtime.is_unpaired().await);
     assert!(database.load_pairing_state().await.unwrap().is_none());

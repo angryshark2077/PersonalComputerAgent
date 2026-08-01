@@ -42,6 +42,7 @@ jobs:
           --test process_lifecycle
           --test system_collector_process
           --test collector_commit_kill
+          --test event_outbox_kill
       - run: swift build --package-path platform/macos
       - name: Swift package tests except process-signal cases
         run: >-

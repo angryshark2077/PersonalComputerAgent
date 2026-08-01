@@ -18,6 +18,22 @@ name = "pca-s1b-acceptance-agent"
 path = "tests/support/s1b_acceptance_agent.rs"
 required-features = ["process-test-hooks"]
 
+[[test]]
+name = "process_lifecycle"
+required-features = ["process-test-hooks"]
+
+[[test]]
+name = "system_collector_process"
+required-features = ["process-test-hooks"]
+
+[[test]]
+name = "collector_commit_kill"
+required-features = ["process-test-hooks"]
+
+[[test]]
+name = "event_outbox_kill"
+required-features = ["process-test-hooks"]
+
 [dependencies]
 base64 = "=0.22.1"
 pca-agent-runtime = { path = "../../crates/agent-runtime" }
@@ -26,7 +42,7 @@ pca-db-local = { path = "../../crates/db-local" }
 pca-domain = { path = "../../crates/domain" }
 pca-keychain = { path = "../../crates/keychain" }
 pca-system-collector = { path = "../../crates/system-collector" }
-reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "=0.11.27", default-features = false, features = ["__internal_proxy_sys_no_cache", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "=0.10.9"

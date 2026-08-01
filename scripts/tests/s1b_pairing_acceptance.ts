@@ -11,9 +11,9 @@ import {
   type S1bPairingHandoff,
 } from "../../apps/cloud-api/src/test/support/s1b-acceptance-cloud.ts";
 import {
-  authorizePairing,
   getCollectorAudit,
   getDevice,
+  pairingAuthorizePath,
   revokeDevice,
   updateCollectorConfig,
   type DashboardFetch,
@@ -45,12 +45,18 @@ async function main(): Promise<void> {
       await agent.result;
       throw error;
     }
-    const redirect = await authorizePairing(
-      dashboardFetch,
-      cloud.origin,
-      handoff.sessionId,
-      handoff.callbackState,
+    const authorizationResponse = await dashboardFetch(
+      new URL(pairingAuthorizePath(handoff.sessionId), cloud.origin),
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ callback_state: handoff.callbackState }),
+        redirect: "manual",
+      },
     );
+    assert.equal(authorizationResponse.status, 302, "native pairing form must redirect to loopback");
+    const redirect = authorizationResponse.headers.get("location");
+    assert.ok(redirect, "native pairing form must include a callback location");
     const callbackCode = await cloud.acceptCallback(redirect, handoff.callbackState);
     assert.notEqual(callbackCode, "accepted-callback-code");
     assert.ok(callbackCode.length >= 32, "Cloud must generate an opaque authorization code");
@@ -286,8 +292,10 @@ async function exchangeBeforeAgentExit(
 ): Promise<S1bExchangedDevice> {
   return Promise.race([
     exchange,
-    agent.then(() => {
-      throw new Error("acceptance Agent exited before exchanging credentials");
+    agent.then((result) => {
+      throw new Error(
+        `acceptance Agent exited before exchanging credentials: code=${result.code} stderr=${result.stderr}`,
+      );
     }),
   ]);
 }

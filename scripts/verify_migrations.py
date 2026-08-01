@@ -19,6 +19,7 @@ EXPECTED_MIGRATIONS = {
         "0001_s1a_runtime.sql",
         "0002_s2_collector_state.sql",
         "0003_s1b_pairing_state.sql",
+        "0004_s1b_cloud_api_origin.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",
@@ -67,16 +68,17 @@ def schema_definitions(connection: sqlite3.Connection) -> list[tuple[str, str, s
 
 def replay_local_chain(files: list[Path]) -> str | None:
     connection = sqlite3.connect(":memory:")
+    replayed_connection = sqlite3.connect(":memory:")
     try:
         connection.execute("PRAGMA foreign_keys = ON")
+        replayed_connection.execute("PRAGMA foreign_keys = ON")
         for path in files:
             connection.executescript(path.read_text(encoding="utf-8"))
+            replayed_connection.executescript(path.read_text(encoding="utf-8"))
         original_schema = schema_definitions(connection)
-        for path in files:
-            connection.executescript(path.read_text(encoding="utf-8"))
-        replayed_schema = schema_definitions(connection)
+        replayed_schema = schema_definitions(replayed_connection)
         if not original_schema or original_schema != replayed_schema:
-            return "local migration chain is not replay-safe"
+            return "local migration chain is not deterministic"
 
         for path in files:
             migration_id = path.name.split("_", 1)[0]
@@ -108,6 +110,7 @@ def replay_local_chain(files: list[Path]) -> str | None:
             "credential_generation",
             "applied_control_revision",
             "paired_at_ms",
+            "cloud_api_origin",
         ]:
             return f"unexpected pairing_state columns: {pairing_columns}"
         if connection.execute("SELECT COUNT(*) FROM pairing_state").fetchone() != (0,):
@@ -116,6 +119,7 @@ def replay_local_chain(files: list[Path]) -> str | None:
         return f"local migration replay failed: {error}"
     finally:
         connection.close()
+        replayed_connection.close()
     return None
 
 

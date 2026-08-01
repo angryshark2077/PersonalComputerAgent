@@ -365,16 +365,34 @@ impl CloudControlRuntime {
         store: Arc<dyn CredentialStore>,
         client: Arc<dyn ControlClient>,
     ) -> Result<Option<CloudControlHandle>, CloudControlRuntimeError> {
+        let (pairing_state_sender, _) = watch::channel(false);
+        Self::start_from_keychain_with_pairing_state(database, store, client, pairing_state_sender)
+            .await
+    }
+
+    /// Loads a credential and reports its paired state to the Agent lifecycle owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Keychain access, state synchronization, or worker startup fails.
+    pub async fn start_from_keychain_with_pairing_state(
+        database: Arc<DbActorHandle>,
+        store: Arc<dyn CredentialStore>,
+        client: Arc<dyn ControlClient>,
+        pairing_state_sender: watch::Sender<bool>,
+    ) -> Result<Option<CloudControlHandle>, CloudControlRuntimeError> {
         if !synchronize_pairing_state(&database, store.as_ref()).await? {
+            pairing_state_sender.send_replace(false);
             return Ok(None);
         }
         let credential = load_device_credential(store.as_ref())?.ok_or(
             CloudControlRuntimeError::Keychain(CredentialError::InvalidCredential),
         )?;
-        Self::start(
+        Self::start_with_pairing_state(
             database,
             LoadedDeviceCredentials::new(credential, store),
             client,
+            pairing_state_sender,
         )
         .await
         .map(Some)
@@ -390,7 +408,23 @@ impl CloudControlRuntime {
         credentials: LoadedDeviceCredentials,
         client: Arc<dyn ControlClient>,
     ) -> Result<CloudControlHandle, CloudControlRuntimeError> {
+        let (pairing_state_sender, _) = watch::channel(false);
+        Self::start_with_pairing_state(database, credentials, client, pairing_state_sender).await
+    }
+
+    /// Validates local state, starts control, and reports paired/revoked transitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when local state cannot be persisted or the worker cannot start.
+    pub async fn start_with_pairing_state(
+        database: Arc<DbActorHandle>,
+        credentials: LoadedDeviceCredentials,
+        client: Arc<dyn ControlClient>,
+        pairing_state_sender: watch::Sender<bool>,
+    ) -> Result<CloudControlHandle, CloudControlRuntimeError> {
         let applied_revision = ensure_pairing_state(&database, credentials.credential()).await?;
+        pairing_state_sender.send_replace(true);
         let state = Arc::new(Mutex::new(ControlState {
             unpaired: false,
             applied_revision: Some(applied_revision),
@@ -402,6 +436,7 @@ impl CloudControlRuntime {
             client,
             Arc::clone(&state),
             shutdown_receiver,
+            pairing_state_sender,
         ));
         Ok(CloudControlHandle {
             state,
@@ -531,6 +566,7 @@ async fn run_control_loop(
     client: Arc<dyn ControlClient>,
     state: Arc<Mutex<ControlState>>,
     mut shutdown: watch::Receiver<bool>,
+    pairing_state_sender: watch::Sender<bool>,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut retry_attempt = 0_u8;
     let mut wait = Duration::ZERO;
@@ -557,7 +593,8 @@ async fn run_control_loop(
                         if next.device_id() != credentials.credential.device_id()
                             || next.workspace_id() != credentials.credential.workspace_id()
                         {
-                            return revoke(&database, &credentials, &state).await;
+                            return revoke(&database, &credentials, &state, &pairing_state_sender)
+                                .await;
                         }
                         store_device_credential(credentials.store.as_ref(), &next)?;
                         credentials.credential = next;
@@ -566,7 +603,8 @@ async fn run_control_loop(
                         wait = Duration::ZERO;
                     }
                     Err(ControlError::Revoked | ControlError::InvalidCredential) => {
-                        return revoke(&database, &credentials, &state).await;
+                        return revoke(&database, &credentials, &state, &pairing_state_sender)
+                            .await;
                     }
                     Err(ControlError::Transient | ControlError::Contract) => {
                         retry_attempt = retry_attempt.saturating_add(1);
@@ -574,7 +612,9 @@ async fn run_control_loop(
                     }
                 }
             }
-            Err(ControlError::Revoked) => return revoke(&database, &credentials, &state).await,
+            Err(ControlError::Revoked) => {
+                return revoke(&database, &credentials, &state, &pairing_state_sender).await;
+            }
         }
     }
 }
@@ -616,6 +656,7 @@ async fn revoke(
     database: &DbActorHandle,
     credentials: &LoadedDeviceCredentials,
     state: &Arc<Mutex<ControlState>>,
+    pairing_state_sender: &watch::Sender<bool>,
 ) -> Result<(), CloudControlRuntimeError> {
     {
         let mut state = state.lock().await;
@@ -626,6 +667,7 @@ async fn revoke(
     database
         .clear_pairing_state_and_disable_sensitive_collectors()
         .await?;
+    pairing_state_sender.send_replace(false);
     keychain_result?;
     Ok(())
 }
@@ -661,7 +703,6 @@ fn pkce_challenge(verifier: &str) -> String {
 
 /// HTTPS adapter for the fixed S1B endpoints. It never serializes credentials to diagnostics.
 pub struct HttpControlClient {
-    client: Client,
     base_url: Url,
 }
 
@@ -670,8 +711,7 @@ impl HttpControlClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ControlError::Contract`] for a non-HTTPS URL and [`ControlError::Transient`]
-    /// when the HTTPS client cannot be initialized.
+    /// Returns [`ControlError::Contract`] for a non-HTTPS URL.
     pub fn new(base_url: Url) -> Result<Self, ControlError> {
         if base_url.scheme() != "https"
             || base_url.host_str() != Some("pca-cloud-api-production.up.railway.app")
@@ -684,12 +724,16 @@ impl HttpControlClient {
         {
             return Err(ControlError::Contract);
         }
-        let client = Client::builder()
+        Ok(Self { base_url })
+    }
+
+    fn client() -> Result<Client, ControlError> {
+        Client::builder()
             .https_only(true)
             .timeout(Duration::from_secs(15))
+            .pool_max_idle_per_host(0)
             .build()
-            .map_err(|_| ControlError::Transient)?;
-        Ok(Self { client, base_url })
+            .map_err(|_| ControlError::Transient)
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, ControlError> {
@@ -703,8 +747,8 @@ impl ControlClient for HttpControlClient {
         credentials: &'a DeviceCredential,
     ) -> ControlFuture<'a, DeviceCredential> {
         Box::pin(async move {
-            let response = self
-                .client
+            let client = Self::client()?;
+            let response = client
                 .post(self.endpoint("v1/devices/token/refresh")?)
                 .bearer_auth(credentials.refresh_credential())
                 .send()
@@ -736,14 +780,16 @@ impl ControlClient for HttpControlClient {
         outbox_depth: u64,
     ) -> ControlFuture<'a, AgentControlSnapshot> {
         Box::pin(async move {
+            let client = Self::client()?;
             let request = HeartbeatRequest {
                 heartbeat_id: Uuid::new_v4().to_string(),
-                agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+                agent_version: option_env!("PCA_APP_VERSION")
+                    .unwrap_or(env!("CARGO_PKG_VERSION"))
+                    .to_owned(),
                 presence: "online",
                 outbox_depth,
             };
-            let response = self
-                .client
+            let response = client
                 .post(self.endpoint("v1/agent/control")?)
                 .bearer_auth(credentials.access_credential())
                 .json(&request)
@@ -763,8 +809,8 @@ impl PairingClient for HttpControlClient {
         request: &'a PairingSessionRequest,
     ) -> ControlFuture<'a, PairingSessionResponse> {
         Box::pin(async move {
-            let response = self
-                .client
+            let client = Self::client()?;
+            let response = client
                 .post(self.endpoint("v1/device-pairing/sessions")?)
                 .json(request)
                 .send()
@@ -779,8 +825,8 @@ impl PairingClient for HttpControlClient {
         request: &'a PairingExchangeRequest,
     ) -> ControlFuture<'a, DeviceCredential> {
         Box::pin(async move {
-            let response = self
-                .client
+            let client = Self::client()?;
+            let response = client
                 .post(self.endpoint("v1/device-pairing/exchange")?)
                 .json(request)
                 .send()
@@ -880,9 +926,99 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{retry_delay, ControlError, HttpControlClient, CONTROL_INTERVAL, MAX_BACKOFF};
+    use super::{
+        retry_delay, ControlClient, ControlError, DeviceCredential, HttpControlClient,
+        CONTROL_INTERVAL, MAX_BACKOFF, PRODUCTION_CLOUD_API_ORIGIN,
+    };
     use reqwest::Url;
-    use std::time::Duration;
+    use std::{env, time::Duration};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::{oneshot, Mutex as AsyncMutex},
+        time::timeout,
+    };
+
+    static PROXY_ENVIRONMENT_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+    struct ProxyEnvironment {
+        values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ProxyEnvironment {
+        fn replace_with(proxy: &str) -> Self {
+            let names = [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ];
+            let values = names
+                .into_iter()
+                .map(|name| (name, env::var_os(name)))
+                .collect();
+            for name in names {
+                env::remove_var(name);
+            }
+            env::set_var("HTTPS_PROXY", proxy);
+            Self { values }
+        }
+
+        fn set_proxy(&self, proxy: &str) {
+            for (name, _) in &self.values {
+                env::remove_var(name);
+            }
+            env::set_var("HTTPS_PROXY", proxy);
+        }
+    }
+
+    impl Drop for ProxyEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    async fn failing_proxy() -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test proxy");
+        let proxy = format!(
+            "http://{}",
+            listener.local_addr().expect("test proxy address")
+        );
+        let (request_sender, request_receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept proxy request");
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 512];
+                let read = stream.read(&mut chunk).await.expect("read proxy request");
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = request_sender.send(String::from_utf8(bytes).expect("UTF-8 proxy request"));
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+        });
+        (proxy, request_receiver)
+    }
 
     #[test]
     fn retry_backoff_is_jittered_and_bounded() {
@@ -903,5 +1039,45 @@ mod tests {
                 Err(ControlError::Contract)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn control_client_uses_the_current_system_proxy_after_a_proxy_switch() {
+        let _lock = PROXY_ENVIRONMENT_LOCK.lock().await;
+        let (first_proxy, first_request) = failing_proxy().await;
+        let environment = ProxyEnvironment::replace_with(&first_proxy);
+        let client = HttpControlClient::new(
+            Url::parse(PRODUCTION_CLOUD_API_ORIGIN).expect("production Cloud origin"),
+        )
+        .expect("production Cloud client");
+        let credential = DeviceCredential::new(
+            "01983333-7333-8333-8333-333333333333".to_owned(),
+            "01982222-7222-8222-8222-222222222222".to_owned(),
+            "access-credential-for-proxy-test",
+            "refresh-credential-for-proxy-test",
+        )
+        .expect("valid device credential");
+
+        assert!(matches!(
+            client.heartbeat_and_control(&credential, 0).await,
+            Err(ControlError::Transient)
+        ));
+        assert!(timeout(Duration::from_secs(2), first_request)
+            .await
+            .expect("first proxy receives a request")
+            .expect("first proxy request channel")
+            .starts_with("CONNECT pca-cloud-api-production.up.railway.app:443"));
+
+        let (second_proxy, second_request) = failing_proxy().await;
+        environment.set_proxy(&second_proxy);
+        assert!(matches!(
+            client.heartbeat_and_control(&credential, 0).await,
+            Err(ControlError::Transient)
+        ));
+        assert!(timeout(Duration::from_secs(2), second_request)
+            .await
+            .expect("new proxy receives the next request")
+            .expect("new proxy request channel")
+            .starts_with("CONNECT pca-cloud-api-production.up.railway.app:443"));
     }
 }

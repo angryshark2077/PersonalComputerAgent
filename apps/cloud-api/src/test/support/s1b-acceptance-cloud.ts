@@ -173,7 +173,8 @@ export async function createS1bAcceptanceCloud(): Promise<S1bAcceptanceCloud> {
             } catch (error) {
               rejectExchange(error instanceof Error ? error : new Error("invalid exchange grant"));
             }
-          } else if (contentType.includes("application/json")) {
+          } else if (contentType.includes("application/json")
+            && !(url.pathname === "/v1/device-pairing/sessions" && request.method === "POST")) {
             nonCredentialJson.push(Buffer.from(await response.clone().arrayBuffer()));
           }
 

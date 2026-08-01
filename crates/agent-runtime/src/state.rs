@@ -90,7 +90,8 @@ const fn agent_transition_is_legal(from: AgentStatus, to: AgentStatus) -> bool {
                 | AgentStatus::Stopped,
         ) | (
             AgentStatus::Running,
-            AgentStatus::WaitingPermission
+            AgentStatus::Unpaired
+                | AgentStatus::WaitingPermission
                 | AgentStatus::Degraded
                 | AgentStatus::Sleeping
                 | AgentStatus::Updating

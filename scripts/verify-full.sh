@@ -27,7 +27,8 @@ cargo test -p pca-agentd --features process-test-hooks \
   --test cloud_control_process \
   --test process_lifecycle \
   --test system_collector_process \
-  --test collector_commit_kill
+  --test collector_commit_kill \
+  --test event_outbox_kill
 cargo build -p pca-agentd --features process-test-hooks --bin pca-s1b-acceptance-agent
 PCA_S1B_ACCEPTANCE_AGENT="$repository_root/target/debug/pca-s1b-acceptance-agent" \
   pnpm --filter @pca/cloud-api exec node --import tsx --test \

@@ -163,7 +163,8 @@ async fn authenticated_status_reports_an_unpaired_agent() {
         )
         .expect("Bridge secret");
     let socket = PairingSocket::bind(&socket_path).await.expect("socket");
-    let server = PairingIpcServer::new(socket, Arc::clone(&database), store);
+    let (pairing_state_sender, _) = watch::channel(false);
+    let server = PairingIpcServer::new(socket, Arc::clone(&database), store, pairing_state_sender);
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let server_task = tokio::spawn(server.serve(shutdown_receiver));
 
@@ -200,9 +201,8 @@ async fn authenticated_status_reports_an_unpaired_agent() {
         .expect("server shutdown timeout")
         .expect("server task")
         .expect("server shutdown");
-    let database = match Arc::try_unwrap(database) {
-        Ok(database) => database,
-        Err(_) => panic!("server released database"),
+    let Ok(database) = Arc::try_unwrap(database) else {
+        panic!("server released database");
     };
     database.shutdown().await.expect("database shutdown");
 }
