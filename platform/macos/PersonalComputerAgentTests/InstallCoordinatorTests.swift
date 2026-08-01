@@ -26,8 +26,17 @@ final class InstallCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(result, .success(version: "1.0.0"))
         XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.deviceCredentialProvisionCount, 1)
         XCTAssertEqual(
             fixture.credentialProvisioner.trustedApplicationURLs,
+            [[
+                fixture.paths.installedBundleURL,
+                fixture.paths.installedAgentExecutableURL,
+                fixture.paths.installedBridgeExecutableURL,
+            ]]
+        )
+        XCTAssertEqual(
+            fixture.credentialProvisioner.deviceCredentialTrustedApplicationURLs,
             [[
                 fixture.paths.installedBundleURL,
                 fixture.paths.installedAgentExecutableURL,
@@ -510,11 +519,22 @@ private final class Fixture {
 private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisioning {
     var provisionCount = 0
     var trustedApplicationURLs: [[URL]] = []
+    var deviceCredentialProvisionCount = 0
+    var deviceCredentialTrustedApplicationURLs: [[URL]] = []
     var error: InstallError?
 
     func ensureCredential(trustedApplicationURLs: [URL]) throws {
         provisionCount += 1
         self.trustedApplicationURLs.append(trustedApplicationURLs)
+        if let error {
+            self.error = nil
+            throw error
+        }
+    }
+
+    func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws {
+        deviceCredentialProvisionCount += 1
+        deviceCredentialTrustedApplicationURLs.append(trustedApplicationURLs)
         if let error {
             self.error = nil
             throw error

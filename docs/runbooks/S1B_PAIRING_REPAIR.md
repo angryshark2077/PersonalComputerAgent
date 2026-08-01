@@ -3,21 +3,23 @@
 ## Operational status and prerequisites
 
 S1B has verified contracts, local fail-closed state, Cloud API tests and
-PostgreSQL migration replay. It does **not** yet have a deployed Cloud origin
-or an installed Swift Setup-to-Agent 0600 IPC transport/Keychain ACL bootstrap.
-Therefore no one should claim that this runbook has executed a live pairing.
-The installed Setup UI currently fails closed through
-`UnavailablePairingAgentBridge`; it must not open a browser or create a device
-credential until that transport is delivered and a production HTTPS origin is
-configured.
+PostgreSQL migration replay. The installed Swift Setup/Repair app uses the
+private `Run/pairing.sock` transport and the installer bootstraps the installed
+identity's Keychain ACL. The Agent accepts only
+`https://pca-cloud-api-production.up.railway.app`; Setup does not expose a
+Cloud URL field and never sends a pairing request directly to Cloud.
+
+This is still not evidence that a deployed installation paired successfully.
+Record the live acceptance observations listed below after installing a signed
+release and completing one Owner-authorized browser flow.
 
 Before operating pairing, provide all of the following:
 
 1. A deployed HTTPS Cloud API with PostgreSQL migrations applied.
 2. Better Auth production secret/configuration in the service's secret store,
    never in this repository or a Dashboard build.
-3. A signed local IPC transport restricted to the installed Setup/Repair app
-   and `agentd`, plus a Keychain ACL created for that installed identity.
+3. A signed local release, so the installer can create the Keychain ACL for
+   the installed Setup/Repair app, `agentd`, and PCAPlatformBridge.
 4. An authenticated Owner Dashboard session for the intended Workspace.
 
 ## Normal pairing flow

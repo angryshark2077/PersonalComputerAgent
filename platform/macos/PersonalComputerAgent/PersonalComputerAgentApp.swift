@@ -46,6 +46,7 @@ private struct PCAInstallerApplication: App {
     init() {
         do {
             let paths = try InstallPaths.production()
+            let pairingConfiguration = try PairingIPCConfiguration.production(rootURL: paths.rootURL)
             let coordinator = InstallCoordinator(
                 paths: paths,
                 validator: BundleValidator(),
@@ -58,7 +59,9 @@ private struct PCAInstallerApplication: App {
                     coordinator: coordinator,
                     sourceBundle: Bundle.main.bundleURL,
                     automaticallyStart: CommandLine.arguments.dropFirst().first == "--setup-installed",
-                    pairingCoordinator: PairingCoordinator(agent: UnavailablePairingAgentBridge())
+                    pairingCoordinator: PairingCoordinator(agent: InstalledPairingAgentBridge(
+                        configuration: pairingConfiguration
+                    ))
                 )
             )
         } catch {

@@ -8,7 +8,10 @@ use pca_agent_runtime::{
     SingleInstanceGuard,
 };
 use pca_agentd::{
-    cloud_control::synchronize_pairing_state,
+    cloud_control::{
+        CloudControlHandle, CloudControlRuntime, ControlClient, HttpControlClient,
+        PRODUCTION_CLOUD_API_ORIGIN,
+    },
     pairing_ipc::{PairingIpcServer, PairingIpcServerError, PairingSocket},
 };
 use pca_bridge_client::supervisor::{
@@ -24,6 +27,7 @@ use pca_keychain::{
     BRIDGE_SHARED_SECRET_LENGTH,
 };
 use pca_keychain::{CredentialStore, MacOSKeychainStore};
+use reqwest::Url;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -79,6 +83,7 @@ enum FailureStage {
     Heartbeat,
     Signal,
     PairingConfiguration,
+    ControlConfiguration,
     #[cfg(feature = "process-test-hooks")]
     BridgeConfiguration,
     #[cfg(feature = "process-test-hooks")]
@@ -87,6 +92,7 @@ enum FailureStage {
     SystemCollectorCleanup,
     BridgeCleanup,
     PairingCleanup,
+    ControlCleanup,
     Checkpoint,
     FinalStatus,
     DatabaseOwnership,
@@ -108,6 +114,7 @@ impl FailureStage {
             Self::Heartbeat => "heartbeat",
             Self::Signal => "signal",
             Self::PairingConfiguration => "pairing_configuration",
+            Self::ControlConfiguration => "control_configuration",
             #[cfg(feature = "process-test-hooks")]
             Self::BridgeConfiguration => "bridge_configuration",
             #[cfg(feature = "process-test-hooks")]
@@ -116,6 +123,7 @@ impl FailureStage {
             Self::SystemCollectorCleanup => "system_collector_cleanup",
             Self::BridgeCleanup => "bridge_cleanup",
             Self::PairingCleanup => "pairing_cleanup",
+            Self::ControlCleanup => "control_cleanup",
             Self::Checkpoint => "checkpoint",
             Self::FinalStatus => "final_status",
             Self::DatabaseOwnership => "database_ownership",
@@ -173,6 +181,7 @@ struct RuntimeResources {
     bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
     pairing_shutdown: Option<watch::Sender<bool>>,
     pairing_task: Option<JoinHandle<Result<(), PairingIpcServerError>>>,
+    control: Option<CloudControlHandle>,
     heartbeat: Option<LocalHeartbeatWriter>,
     state: RuntimeStateMachine,
     schema_version: Option<u32>,
@@ -188,6 +197,7 @@ impl RuntimeResources {
             bridge_task: None,
             pairing_shutdown: None,
             pairing_task: None,
+            control: None,
             heartbeat: None,
             state: RuntimeStateMachine::starting(),
             schema_version: None,
@@ -225,13 +235,22 @@ impl RuntimeResources {
 
         // A build with process hooks has no production Keychain identity; keeping those harnesses
         // explicitly unpaired prevents test-only identities from becoming a release input.
-        let pairing_valid = if cfg!(feature = "process-test-hooks") {
-            false
+        self.control = if cfg!(feature = "process-test-hooks") {
+            None
         } else {
-            synchronize_pairing_state(self.database(), credential_store.as_ref())
-                .await
-                .unwrap_or(false)
+            start_paired_control(
+                Arc::clone(
+                    self.database
+                        .as_ref()
+                        .expect("database exists until cleanup"),
+                ),
+                Arc::clone(&credential_store),
+            )
+            .await
+            .ok()
+            .flatten()
         };
+        let pairing_valid = self.control.is_some();
         let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
         let bridge_task = start_bridge(
             config,
@@ -263,9 +282,7 @@ impl RuntimeResources {
 
         self.state
             .transition_agent(if pairing_valid {
-                // No bundled Cloud origin/local Setup transport is configured in this slice.
-                // A valid credential therefore remains locally healthy but Cloud-control degraded.
-                AgentStatus::Degraded
+                AgentStatus::Running
             } else {
                 AgentStatus::Unpaired
             })
@@ -400,6 +417,12 @@ impl RuntimeResources {
         }
         if stop_pairing_server(self.pairing_task.take()).await.is_err() {
             failures.push(FailureStage::PairingCleanup);
+        }
+
+        if let Some(control) = self.control.take() {
+            if control.shutdown().await.is_err() {
+                failures.push(FailureStage::ControlCleanup);
+            }
         }
 
         if self.database().checkpoint().await.is_err() {
@@ -600,6 +623,22 @@ async fn start_pairing_server(
         .map_err(|_| FailureStage::PairingConfiguration)?;
     let server = PairingIpcServer::new(socket, database, credential_store);
     Ok(tokio::spawn(server.serve(shutdown)))
+}
+
+async fn start_paired_control(
+    database: Arc<DbActorHandle>,
+    credential_store: Arc<dyn CredentialStore>,
+) -> Result<Option<CloudControlHandle>, FailureStage> {
+    let origin =
+        Url::parse(PRODUCTION_CLOUD_API_ORIGIN).map_err(|_| FailureStage::ControlConfiguration)?;
+    let client = HttpControlClient::new(origin).map_err(|_| FailureStage::ControlConfiguration)?;
+    CloudControlRuntime::start_from_keychain(
+        database,
+        credential_store,
+        Arc::new(client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .map_err(|_| FailureStage::ControlConfiguration)
 }
 
 async fn stop_pairing_server(

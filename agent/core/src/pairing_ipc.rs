@@ -25,10 +25,10 @@ use uuid::Uuid;
 use crate::cloud_control::{
     synchronize_pairing_state, AgentPairingService, CloudControlHandle, CloudControlRuntime,
     ControlClient, HttpControlClient, PairingCallbackHandoff, PairingClient, PairingStartHandoff,
+    PRODUCTION_CLOUD_API_ORIGIN,
 };
 
 const PAIRING_IPC_PROTOCOL_VERSION: u32 = 1;
-const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.up.railway.app";
 
 /// A private local endpoint reserved for the signed Setup/Repair application.
 pub struct PairingSocket {

@@ -12,6 +12,8 @@ public struct KeychainCredentialStore: Sendable {
     public static let service = "com.pca.bridge"
     public static let account = "shared-secret-v1"
     public static let sharedSecretLength = 32
+    public static let deviceService = "com.pca.device"
+    public static let deviceAccount = "current-v1"
 
     public init() {}
 
@@ -67,7 +69,34 @@ public struct KeychainCredentialStore: Sendable {
         }
     }
 
-    private static func baseQuery() -> [String: Any] {
+    /// Creates the device item once with the installed-app ACL.
+    ///
+    /// `agentd` only updates this item after its token exchange, preserving the ACL rather than
+    /// creating an unrestricted credential if pairing is interrupted before the first exchange.
+    public func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws {
+        let query = Self.baseQuery(service: Self.deviceService, account: Self.deviceAccount)
+        var result: CFTypeRef?
+        let lookupStatus = SecItemCopyMatching(query as CFDictionary, &result)
+        if lookupStatus == errSecSuccess { return }
+        guard lookupStatus == errSecItemNotFound else { throw Self.error(for: lookupStatus) }
+
+        let access = try Self.makeAccess(
+            trustedApplicationURLs: trustedApplicationURLs,
+            label: "Personal Computer Agent Device Credential"
+        )
+        var item = query
+        // This deliberately invalid record is never accepted as a paired credential. It reserves
+        // the item with the correct ACL so `agentd` can replace its value after the token exchange.
+        item[kSecValueData as String] = Data([0])
+        item[kSecAttrAccess as String] = access
+        let addStatus = SecItemAdd(item as CFDictionary, nil)
+        guard addStatus == errSecSuccess else { throw Self.error(for: addStatus) }
+    }
+
+    private static func baseQuery(
+        service: String = Self.service,
+        account: String = Self.account
+    ) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -75,7 +104,7 @@ public struct KeychainCredentialStore: Sendable {
         ]
     }
 
-    private static func makeAccess(trustedApplicationURLs: [URL]) throws -> SecAccess {
+    private static func makeAccess(trustedApplicationURLs: [URL], label: String = "Personal Computer Agent Bridge Credential") throws -> SecAccess {
         let normalizedURLs = trustedApplicationURLs.map(\.standardizedFileURL)
         guard !normalizedURLs.isEmpty,
               normalizedURLs.allSatisfy({ $0.isFileURL && $0.path.hasPrefix("/") }),
@@ -99,7 +128,7 @@ public struct KeychainCredentialStore: Sendable {
 
         var access: SecAccess?
         let status = SecAccessCreate(
-            "Personal Computer Agent Bridge Credential" as CFString,
+            label as CFString,
             trustedApplications as CFArray,
             &access
         )

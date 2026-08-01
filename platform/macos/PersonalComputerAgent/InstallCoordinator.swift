@@ -506,6 +506,7 @@ protocol InstallCoordinating: AnyObject {
 @MainActor
 protocol BridgeCredentialProvisioning {
     func ensureCredential(trustedApplicationURLs: [URL]) throws
+    func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws
 }
 
 @MainActor
@@ -529,6 +530,14 @@ struct KeychainBridgeCredentialProvisioner: BridgeCredentialProvisioning {
                 secret = generatedSecret
             }
             try store.store(secret, trustedApplicationURLs: trustedApplicationURLs)
+        } catch {
+            throw (error as? InstallError) ?? InstallError.credentialProvisioningFailed
+        }
+    }
+
+    func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws {
+        do {
+            try store.ensureDeviceCredentialPlaceholder(trustedApplicationURLs: trustedApplicationURLs)
         } catch {
             throw (error as? InstallError) ?? InstallError.credentialProvisioningFailed
         }
@@ -706,13 +715,13 @@ final class InstallCoordinator: InstallCoordinating {
 
         let installedVersion = try validator.version(at: paths.installedBundleURL)
         do {
-            try credentialProvisioner.ensureCredential(
-                trustedApplicationURLs: [
-                    paths.installedBundleURL,
-                    paths.installedAgentExecutableURL,
-                    paths.installedBridgeExecutableURL,
-                ]
-            )
+            let trustedApplicationURLs = [
+                paths.installedBundleURL,
+                paths.installedAgentExecutableURL,
+                paths.installedBridgeExecutableURL,
+            ]
+            try credentialProvisioner.ensureCredential(trustedApplicationURLs: trustedApplicationURLs)
+            try credentialProvisioner.ensureDeviceCredentialPlaceholder(trustedApplicationURLs: trustedApplicationURLs)
         } catch {
             if let transaction {
                 let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)
