@@ -78,6 +78,25 @@ final class PairingCoordinatorTests: XCTestCase {
             XCTAssertTrue(coordinator.listenerIsClosed)
         }
     }
+
+    func testPairingExpiryClosesListenerAndCancelsAgentSession() async throws {
+        let agent = ExpiringPairingAgent()
+        let coordinator = PairingCoordinator(
+            agent: agent,
+            browser: SuccessfulPairingBrowser(),
+            callbackTimeout: .milliseconds(10)
+        )
+
+        do {
+            _ = try await coordinator.repair()
+            XCTFail("an unanswered pairing request must expire")
+        } catch let error as PairingError {
+            XCTAssertEqual(error, .expired)
+        }
+
+        XCTAssertTrue(coordinator.listenerIsClosed)
+        XCTAssertEqual(agent.cancelledSessionID, agent.sessionID)
+    }
 }
 
 private struct TestBeginPayload: Encodable, Sendable {
@@ -88,4 +107,34 @@ private struct TestBeginPayload: Encodable, Sendable {
         case callbackURI = "callback_uri"
         case cloudAPIOrigin = "cloud_api_origin"
     }
+}
+
+@MainActor
+private final class ExpiringPairingAgent: PairingAgentHandingOff {
+    let sessionID = "01982222-7222-8222-8222-222222222222"
+    private(set) var cancelledSessionID: String?
+
+    func isPaired() async throws -> Bool { false }
+
+    func beginPairing(_: PairingStartHandoff) async throws -> PairingSessionHandoff {
+        PairingSessionHandoff(
+            sessionID: sessionID,
+            authorizationURL: URL(string: "https://pca-dashboard-production.up.railway.app/pair")!,
+            callbackState: String(repeating: "s", count: 43)
+        )
+    }
+
+    func completePairing(_: PairingCallbackHandoff) async throws -> PairingResult {
+        XCTFail("expired pairing must not complete")
+        return .alreadyPaired
+    }
+
+    func cancelPairing(sessionID: String) async {
+        cancelledSessionID = sessionID
+    }
+}
+
+@MainActor
+private final class SuccessfulPairingBrowser: PairingBrowserOpening {
+    func open(_: URL) -> Bool { true }
 }
