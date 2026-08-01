@@ -1,6 +1,12 @@
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
+
 use pca_domain::{
-    AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventCommit, EventEnvelope,
-    Sensitivity,
+    AgentStatus, BridgeStatus, CollectorState, CollectorStatus, CommunicationAttachment,
+    ConversationScope, Direction, EventCommit, EventEnvelope, MessageKind, Sensitivity,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -15,13 +21,21 @@ use std::{
 
 #[cfg(feature = "process-test-hooks")]
 use crate::actor::{ProcessTestBarrier, ProcessTestHooks};
-use crate::{migrations::MAX_SUPPORTED_SCHEMA_VERSION, DbError, DbHealth, PairingState};
+use crate::{
+    migrations::MAX_SUPPORTED_SCHEMA_VERSION, CommunicationMessageCommit, DbError, DbHealth,
+    PairingState,
+};
 
 struct SerializedEvent<'a> {
     event: &'a EventEnvelope,
     payload_json: String,
     attachment_refs_json: String,
     outbox_id: String,
+}
+
+struct ValidatedSpoolReference<'a> {
+    attachment: &'a CommunicationAttachment,
+    relative_path: PathBuf,
 }
 
 pub(crate) fn append_event_with_outbox(
@@ -76,6 +90,367 @@ pub(crate) fn commit_events(
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit Collector transaction", error))
+}
+
+pub(crate) fn commit_communication_message(
+    connection: &mut Connection,
+    spool_root: &Path,
+    commit: &CommunicationMessageCommit,
+) -> Result<(), DbError> {
+    validate_communication_commit(commit)?;
+    let serialized = serialize_event(&commit.event)?;
+    let spool_references = validate_spool_references(spool_root, commit)?;
+    let source_sequence = i64::try_from(commit.source_sequence).map_err(|_| {
+        DbError::sqlite(
+            "validate communication source sequence",
+            "source sequence exceeds SQLite integer range",
+        )
+    })?;
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start communication message transaction", error))?;
+    if communication_message_exists(&transaction, commit)? {
+        validate_existing_event(&transaction, &serialized)?;
+        validate_existing_outbox(&transaction, &serialized)?;
+        return Ok(());
+    }
+
+    insert_event(&transaction, &serialized)?;
+    upsert_communication_conversation(&transaction, commit)?;
+    let local_message_id = insert_communication_message(&transaction, commit, source_sequence)?;
+    for spool_reference in &spool_references {
+        insert_attachment_spool(&transaction, local_message_id, spool_reference)?;
+    }
+    insert_stable_outbox(&transaction, &serialized)?;
+    advance_communication_cursor(&transaction, commit, source_sequence)?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit communication message transaction", error))
+}
+
+fn validate_communication_commit(commit: &CommunicationMessageCommit) -> Result<(), DbError> {
+    if commit.account_id.trim().is_empty()
+        || commit.event.event_id.trim().is_empty()
+        || commit.event.event_type != "communication.message_recorded"
+        || commit.event.source != "communication.wechat"
+        || commit.event.schema_version != 1
+        || commit.event.sensitivity != Sensitivity::High
+        || commit.event.occurred_at != commit.message.occurred_at()
+        || commit.event.idempotency_key.as_deref() != Some(commit.message.source_key())
+    {
+        return Err(DbError::sqlite(
+            "validate communication message commit",
+            "event does not match the fixed communication message contract",
+        ));
+    }
+
+    let expected_payload = serde_json::to_value(&commit.message)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    if expected_payload.as_object() != Some(&commit.event.payload) {
+        return Err(DbError::sqlite(
+            "validate communication message commit",
+            "event payload does not exactly match the communication message",
+        ));
+    }
+
+    let expected_attachment_ids = commit
+        .message
+        .attachments()
+        .iter()
+        .map(|attachment| attachment.attachment_id().to_owned())
+        .collect::<Vec<_>>();
+    if commit.event.attachment_refs != expected_attachment_ids {
+        return Err(DbError::sqlite(
+            "validate communication message commit",
+            "event attachment references do not exactly match the message manifests",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_spool_references<'a>(
+    spool_root: &Path,
+    commit: &'a CommunicationMessageCommit,
+) -> Result<Vec<ValidatedSpoolReference<'a>>, DbError> {
+    let canonical_root = fs::canonicalize(spool_root)
+        .map_err(|error| DbError::sqlite("validate communication spool root", error))?;
+    let root_metadata = fs::metadata(&canonical_root)
+        .map_err(|error| DbError::sqlite("validate communication spool root", error))?;
+    if !root_metadata.is_dir() {
+        return Err(DbError::sqlite(
+            "validate communication spool root",
+            "communication spool root is not a directory",
+        ));
+    }
+
+    if commit.message.attachments().len() != commit.attachment_spool.len() {
+        return Err(DbError::sqlite(
+            "validate communication spool references",
+            "every media manifest must have exactly one private spool reference",
+        ));
+    }
+
+    let mut remaining = commit
+        .message
+        .attachments()
+        .iter()
+        .map(|attachment| (attachment.attachment_id(), attachment))
+        .collect::<std::collections::HashMap<_, _>>();
+    if remaining.len() != commit.message.attachments().len() {
+        return Err(DbError::sqlite(
+            "validate communication spool references",
+            "message contains duplicate attachment manifest identifiers",
+        ));
+    }
+
+    let mut seen_attachment_ids = HashSet::new();
+    let mut validated = Vec::with_capacity(commit.attachment_spool.len());
+    for reference in &commit.attachment_spool {
+        if !seen_attachment_ids.insert(&reference.attachment_id) {
+            return Err(DbError::sqlite(
+                "validate communication spool references",
+                "attachment spool reference is duplicated",
+            ));
+        }
+        let attachment = remaining
+            .remove(reference.attachment_id.as_str())
+            .ok_or_else(|| {
+                DbError::sqlite(
+                    "validate communication spool references",
+                    "attachment spool reference has no matching manifest",
+                )
+            })?;
+        if !is_lowercase_sha256(attachment.sha256()) || attachment.size_bytes() == 0 {
+            return Err(DbError::sqlite(
+                "validate communication spool references",
+                "attachment manifest has an invalid hash or byte length",
+            ));
+        }
+
+        let metadata = fs::symlink_metadata(&reference.path)
+            .map_err(|error| DbError::sqlite("validate communication spool path", error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(DbError::sqlite(
+                "validate communication spool path",
+                "attachment spool path must be a regular private file",
+            ));
+        }
+        let canonical_path = fs::canonicalize(&reference.path)
+            .map_err(|error| DbError::sqlite("validate communication spool path", error))?;
+        let relative_path = canonical_path.strip_prefix(&canonical_root).map_err(|_| {
+            DbError::sqlite(
+                "validate communication spool path",
+                "attachment spool path escapes the private spool root",
+            )
+        })?;
+        if relative_path.as_os_str().is_empty() {
+            return Err(DbError::sqlite(
+                "validate communication spool path",
+                "attachment spool path must name a file below the private spool root",
+            ));
+        }
+        validated.push(ValidatedSpoolReference {
+            attachment,
+            relative_path: relative_path.to_owned(),
+        });
+    }
+    if !remaining.is_empty() {
+        return Err(DbError::sqlite(
+            "validate communication spool references",
+            "message has a media manifest without a private spool reference",
+        ));
+    }
+    Ok(validated)
+}
+
+fn communication_message_exists(
+    transaction: &Transaction<'_>,
+    commit: &CommunicationMessageCommit,
+) -> Result<bool, DbError> {
+    let existing = transaction
+        .query_row(
+            "SELECT event_id, external_conversation_id, source_sequence
+             FROM communication_messages
+             WHERE account_id = ?1 AND source_key = ?2",
+            params![commit.account_id, commit.message.source_key()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| DbError::sqlite("read existing communication message", error))?;
+    let Some((event_id, conversation_id, source_sequence)) = existing else {
+        return Ok(false);
+    };
+    if event_id == commit.event.event_id
+        && conversation_id == commit.message.conversation_id()
+        && u64::try_from(source_sequence).ok() == Some(commit.source_sequence)
+    {
+        Ok(true)
+    } else {
+        Err(DbError::sqlite(
+            "validate existing communication message",
+            "source key conflicts with a different immutable communication message",
+        ))
+    }
+}
+
+fn upsert_communication_conversation(
+    transaction: &Transaction<'_>,
+    commit: &CommunicationMessageCommit,
+) -> Result<(), DbError> {
+    let (scope, member_count) = communication_scope(commit.message.conversation());
+    transaction
+        .execute(
+            "INSERT INTO communication_conversations (
+                account_id, external_conversation_id, scope, member_count, created_at_ms, updated_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4,
+                CAST(unixepoch(?5, 'subsec') * 1000 AS INTEGER),
+                CAST(unixepoch(?5, 'subsec') * 1000 AS INTEGER)
+             ) ON CONFLICT(account_id, external_conversation_id) DO UPDATE SET
+                scope = excluded.scope,
+                member_count = excluded.member_count,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                commit.account_id,
+                commit.message.conversation_id(),
+                scope,
+                member_count,
+                commit.event.created_at,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("upsert communication conversation", error))
+}
+
+fn insert_communication_message(
+    transaction: &Transaction<'_>,
+    commit: &CommunicationMessageCommit,
+    source_sequence: i64,
+) -> Result<i64, DbError> {
+    transaction
+        .execute(
+            "INSERT INTO communication_messages (
+                event_id, account_id, external_conversation_id, source_sequence, source_key,
+                direction, kind, occurred_at_ms, text_body, created_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                CAST(unixepoch(?8, 'subsec') * 1000 AS INTEGER), ?9,
+                CAST(unixepoch(?10, 'subsec') * 1000 AS INTEGER)
+             )",
+            params![
+                commit.event.event_id,
+                commit.account_id,
+                commit.message.conversation_id(),
+                source_sequence,
+                commit.message.source_key(),
+                direction_name(commit.message.direction()),
+                message_kind_name(commit.message.kind()),
+                commit.message.occurred_at(),
+                commit.message.text(),
+                commit.event.created_at,
+            ],
+        )
+        .map_err(|error| DbError::sqlite("insert communication message", error))?;
+    Ok(transaction.last_insert_rowid())
+}
+
+fn insert_attachment_spool(
+    transaction: &Transaction<'_>,
+    local_message_id: i64,
+    reference: &ValidatedSpoolReference<'_>,
+) -> Result<(), DbError> {
+    let relative_path = reference.relative_path.to_str().ok_or_else(|| {
+        DbError::sqlite(
+            "insert attachment spool",
+            "private spool path is not valid UTF-8",
+        )
+    })?;
+    let size_bytes = i64::try_from(reference.attachment.size_bytes()).map_err(|_| {
+        DbError::sqlite(
+            "insert attachment spool",
+            "attachment byte length exceeds SQLite integer range",
+        )
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO attachment_spool (
+                attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                spool_relative_path, transfer_state, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending',
+                CAST(unixepoch('now', 'subsec') * 1000 AS INTEGER))",
+            params![
+                reference.attachment.attachment_id(),
+                local_message_id,
+                message_kind_name(reference.attachment.kind()),
+                reference.attachment.sha256(),
+                size_bytes,
+                reference.attachment.mime_type(),
+                relative_path,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("insert attachment spool", error))
+}
+
+fn advance_communication_cursor(
+    transaction: &Transaction<'_>,
+    commit: &CommunicationMessageCommit,
+    source_sequence: i64,
+) -> Result<(), DbError> {
+    transaction
+        .execute(
+            "INSERT INTO communication_cursors (
+                account_id, external_conversation_id, last_source_sequence, updated_at_ms
+             ) VALUES (?1, ?2, ?3, CAST(unixepoch(?4, 'subsec') * 1000 AS INTEGER))
+             ON CONFLICT(account_id, external_conversation_id) DO UPDATE SET
+                last_source_sequence = MAX(last_source_sequence, excluded.last_source_sequence),
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                commit.account_id,
+                commit.message.conversation_id(),
+                source_sequence,
+                commit.event.created_at,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("advance communication cursor", error))
+}
+
+fn communication_scope(scope: &ConversationScope) -> (&'static str, Option<u8>) {
+    match scope {
+        ConversationScope::Direct => ("direct", None),
+        ConversationScope::Group { member_count } => ("group", Some(*member_count)),
+    }
+}
+
+const fn direction_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Incoming => "incoming",
+        Direction::Outgoing => "outgoing",
+    }
+}
+
+const fn message_kind_name(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Text => "text",
+        MessageKind::Audio => "audio",
+        MessageKind::Image => "image",
+        MessageKind::Video => "video",
+    }
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn serialize_event(event: &EventEnvelope) -> Result<SerializedEvent<'_>, DbError> {
@@ -666,6 +1041,116 @@ pub(crate) fn acknowledge_system_events(
         .map_err(|error| DbError::sqlite("commit system event acknowledgement", error))
 }
 
+pub(crate) fn load_pending_communication_events(
+    connection: &Connection,
+    limit: u16,
+) -> Result<Vec<EventEnvelope>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT e.event_id, e.workspace_id, e.device_id, e.event_type, e.source,
+                    e.schema_version, e.occurred_at_ms, e.created_at_ms, e.payload_json,
+                    e.attachment_refs_json, e.idempotency_key
+             FROM sync_outbox AS o
+             INNER JOIN events_local AS e ON e.event_id = o.event_id
+             INNER JOIN communication_messages AS m ON m.event_id = e.event_id
+             WHERE o.state = 'pending'
+               AND e.event_type = 'communication.message_recorded'
+               AND e.source = 'communication.wechat'
+               AND e.schema_version = 1
+               AND e.sensitivity = 'high'
+             ORDER BY o.created_at_ms, e.event_id
+             LIMIT ?1",
+        )
+        .map_err(|error| DbError::sqlite("prepare pending communication event query", error))?;
+    let rows = statement
+        .query_map([i64::from(limit)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u32>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })
+        .map_err(|error| DbError::sqlite("query pending communication events", error))?;
+    rows.map(|row| {
+        let (
+            event_id,
+            workspace_id,
+            device_id,
+            event_type,
+            source,
+            schema_version,
+            occurred_at_ms,
+            created_at_ms,
+            payload_json,
+            attachment_refs_json,
+            idempotency_key,
+        ) = row.map_err(|error| DbError::sqlite("read pending communication event", error))?;
+        Ok(EventEnvelope {
+            event_id,
+            workspace_id,
+            device_id,
+            event_type,
+            source,
+            schema_version,
+            occurred_at: format_timestamp(occurred_at_ms)?,
+            created_at: format_timestamp(created_at_ms)?,
+            sensitivity: Sensitivity::High,
+            payload: serde_json::from_str(&payload_json)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+            attachment_refs: serde_json::from_str(&attachment_refs_json)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+            idempotency_key,
+        })
+    })
+    .collect()
+}
+
+pub(crate) fn acknowledge_communication_events(
+    connection: &mut Connection,
+    event_ids: &[String],
+) -> Result<(), DbError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start communication event acknowledgement", error))?;
+    for event_id in event_ids {
+        let updated = transaction
+            .execute(
+                "UPDATE sync_outbox
+                 SET state = 'acked'
+                 WHERE event_id = ?1
+                   AND state = 'pending'
+                   AND EXISTS (
+                       SELECT 1 FROM communication_messages AS m
+                       INNER JOIN events_local AS e ON e.event_id = m.event_id
+                       WHERE e.event_id = sync_outbox.event_id
+                         AND e.event_type = 'communication.message_recorded'
+                         AND e.source = 'communication.wechat'
+                         AND e.schema_version = 1
+                         AND e.sensitivity = 'high'
+                   )",
+                [event_id],
+            )
+            .map_err(|error| DbError::sqlite("acknowledge communication event", error))?;
+        if updated != 1 {
+            return Err(DbError::sqlite(
+                "acknowledge communication event",
+                "event was not pending communication data",
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit communication event acknowledgement", error))
+}
+
 fn format_timestamp(milliseconds: i64) -> Result<String, DbError> {
     let nanos = i128::from(milliseconds)
         .checked_mul(1_000_000)
@@ -730,6 +1215,19 @@ pub(crate) fn smoke_queries(connection: &Connection) -> Result<(), DbError> {
         "SELECT outbox_id, event_id, state, created_at_ms FROM sync_outbox LIMIT 1",
         "SELECT diagnostic_id, occurred_at_ms, level, code, redacted_json
          FROM diagnostic_events LIMIT 1",
+        "SELECT account_id, external_conversation_id, scope, member_count,
+                created_at_ms, updated_at_ms
+         FROM communication_conversations LIMIT 1",
+        "SELECT local_message_id, event_id, account_id, external_conversation_id,
+                source_sequence, source_key, direction, kind, occurred_at_ms, text_body,
+                created_at_ms
+         FROM communication_messages LIMIT 1",
+        "SELECT account_id, external_conversation_id, last_source_sequence, updated_at_ms
+         FROM communication_cursors LIMIT 1",
+        "SELECT attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                spool_relative_path, transfer_state, created_at_ms
+         FROM attachment_spool LIMIT 1",
+        "SELECT account_id, source_key, tombstoned_at_ms FROM local_tombstones LIMIT 1",
     ] {
         let mut statement = connection
             .prepare(query)

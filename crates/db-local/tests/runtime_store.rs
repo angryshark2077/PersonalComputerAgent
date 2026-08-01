@@ -191,7 +191,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 4);
+    assert_eq!(health.schema_version, 5);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -206,10 +206,15 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         tables,
         vec![
             "agent_state",
+            "attachment_spool",
             "collector_states",
+            "communication_conversations",
+            "communication_cursors",
+            "communication_messages",
             "diagnostic_events",
             "events_local",
             "local_meta",
+            "local_tombstones",
             "pairing_state",
             "schema_migrations",
             "sync_outbox",
@@ -272,7 +277,7 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        4
+        5
     );
     db.shutdown().await.expect("close upgraded database");
 
@@ -841,7 +846,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0005', 'future', '9.0.0', 1, 1, 'completed')",
+             VALUES ('0006', 'future', '9.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -852,8 +857,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 5,
-            max_supported: 4
+            found: 6,
+            max_supported: 5
         })
     ));
 }
@@ -876,7 +881,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 4);
+    assert_eq!(health.schema_version, 5);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(

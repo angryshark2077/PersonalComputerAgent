@@ -1,13 +1,16 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, thread, time::Duration};
-
-#[cfg(feature = "process-test-hooks")]
-use std::path::PathBuf;
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 
 use pca_domain::{AgentStatus, BridgeStatus, CollectorState, EventCommit, EventEnvelope};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{migrations, repository, DbError, DbHealth, PairingState};
+use crate::{migrations, repository, CommunicationMessageCommit, DbError, DbHealth, PairingState};
 
 const REQUEST_CAPACITY: usize = 64;
 
@@ -155,6 +158,18 @@ enum Request {
         event_ids: Vec<String>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    CommitCommunicationMessage {
+        commit: Box<CommunicationMessageCommit>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    LoadPendingCommunicationEvents {
+        limit: u16,
+        response: oneshot::Sender<Result<Vec<EventEnvelope>, DbError>>,
+    },
+    AcknowledgeCommunicationEvents {
+        event_ids: Vec<String>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
 }
 
 impl Request {
@@ -169,13 +184,16 @@ impl Request {
             | Self::ClearPairingState { response }
             | Self::ClearPairingStateAndDisableSensitiveCollectors { response }
             | Self::Checkpoint { response }
-            | Self::AcknowledgeSystemEvents { response, .. } => response.is_closed(),
+            | Self::AcknowledgeSystemEvents { response, .. }
+            | Self::CommitCommunicationMessage { response, .. }
+            | Self::AcknowledgeCommunicationEvents { response, .. } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
             Self::LoadPairingState { response } => response.is_closed(),
             Self::Health { response } => response.is_closed(),
             Self::CountEventAndOutbox { response, .. } => response.is_closed(),
             Self::ActiveOutboxDepth { response } => response.is_closed(),
-            Self::LoadPendingSystemEvents { response, .. } => response.is_closed(),
+            Self::LoadPendingSystemEvents { response, .. }
+            | Self::LoadPendingCommunicationEvents { response, .. } => response.is_closed(),
         }
     }
 }
@@ -232,16 +250,27 @@ impl DbActorHandle {
         let (startup_sender, startup_receiver) = oneshot::channel();
         let (owner_stopped_sender, owner_stopped_receiver) = oneshot::channel();
         let path = path.to_owned();
+        let communication_spool_root = Self::communication_spool_root(&path);
         let app_version = app_version.to_owned();
         let owner_thread = thread::Builder::new()
             .name("pca-sqlite-owner".to_owned())
             .spawn(move || {
                 let result = open_connection(&path, &app_version);
                 match result {
-                    Ok(connection) => {
-                        let _ = startup_sender.send(Ok(()));
-                        run(connection, request_receiver, &options);
-                    }
+                    Ok(connection) => match ensure_private_spool_root(&communication_spool_root) {
+                        Ok(()) => {
+                            let _ = startup_sender.send(Ok(()));
+                            run(
+                                connection,
+                                request_receiver,
+                                &options,
+                                &communication_spool_root,
+                            );
+                        }
+                        Err(error) => {
+                            let _ = startup_sender.send(Err(error));
+                        }
+                    },
                     Err(error) => {
                         let _ = startup_sender.send(Err(error));
                     }
@@ -539,6 +568,78 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Returns the app-private attachment spool root tied to this local database path.
+    #[must_use]
+    pub fn communication_spool_root(database_path: &Path) -> PathBuf {
+        database_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("communication-spool")
+    }
+
+    /// Atomically stores one communication Event, its local projection, Cursor, private spool
+    /// metadata, and stable Outbox intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, serialization, constraint, or transaction error. Any error
+    /// leaves no partial rows from this commit.
+    pub async fn commit_communication_message(
+        &self,
+        commit: &CommunicationMessageCommit,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::CommitCommunicationMessage {
+            commit: Box::new(commit.clone()),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Loads at most 200 pending, high-sensitivity communication events in Outbox order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, decoding, or `SQLite` query error.
+    pub async fn load_pending_communication_events(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<EventEnvelope>, DbError> {
+        validate_communication_limit("load pending communication events", limit)?;
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::LoadPendingCommunicationEvents {
+            limit,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Marks only the exact pending communication events accepted by the dedicated Cloud protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, transaction, or `SQLite` write error.
+    pub async fn acknowledge_communication_events(
+        &self,
+        event_ids: &[String],
+    ) -> Result<(), DbError> {
+        if event_ids.is_empty() || event_ids.len() > 200 {
+            return Err(DbError::sqlite(
+                "acknowledge communication events",
+                "event IDs must contain 1 through 200 items",
+            ));
+        }
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::AcknowledgeCommunicationEvents {
+            event_ids: event_ids.to_vec(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Closes the request queue, waits without blocking the async executor, and joins the owner.
     ///
     /// Requests whose response futures were canceled are skipped before they touch `SQLite`.
@@ -616,8 +717,29 @@ fn open_connection(path: &Path, app_version: &str) -> Result<Connection, DbError
     Ok(connection)
 }
 
+fn ensure_private_spool_root(path: &Path) -> Result<(), DbError> {
+    fs::create_dir_all(path)
+        .map_err(|error| DbError::sqlite("create communication spool root", error))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| DbError::sqlite("inspect communication spool root", error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DbError::sqlite(
+            "inspect communication spool root",
+            "communication spool root must be a private directory",
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| DbError::sqlite("restrict communication spool permissions", error))
+}
+
 #[cfg_attr(not(feature = "process-test-hooks"), allow(unused_variables))]
-fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, options: &ActorOptions) {
+#[allow(clippy::too_many_lines)] // Request variants preserve a single SQLite-owner dispatch point.
+fn run(
+    mut connection: Connection,
+    mut requests: mpsc::Receiver<Request>,
+    options: &ActorOptions,
+    communication_spool_root: &Path,
+) {
     while let Some(request) = requests.blocking_recv() {
         if request.is_cancelled() {
             continue;
@@ -709,6 +831,36 @@ fn run(mut connection: Connection, mut requests: mpsc::Receiver<Request>, option
                     &event_ids,
                 ));
             }
+            Request::CommitCommunicationMessage { commit, response } => {
+                let _ = response.send(repository::commit_communication_message(
+                    &mut connection,
+                    communication_spool_root,
+                    &commit,
+                ));
+            }
+            Request::LoadPendingCommunicationEvents { limit, response } => {
+                let _ = response.send(repository::load_pending_communication_events(
+                    &connection,
+                    limit,
+                ));
+            }
+            Request::AcknowledgeCommunicationEvents {
+                event_ids,
+                response,
+            } => {
+                let _ = response.send(repository::acknowledge_communication_events(
+                    &mut connection,
+                    &event_ids,
+                ));
+            }
         }
+    }
+}
+
+fn validate_communication_limit(operation: &'static str, limit: u16) -> Result<(), DbError> {
+    if (1..=200).contains(&limit) {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(operation, "limit must be 1 through 200"))
     }
 }

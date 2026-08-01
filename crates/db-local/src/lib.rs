@@ -14,6 +14,9 @@ pub use actor::DbActorHandle;
 #[cfg(feature = "process-test-hooks")]
 pub use actor::ProcessTestHooks;
 pub use error::DbError;
+use std::path::PathBuf;
+
+use pca_domain::{CommunicationMessageRecorded, EventEnvelope};
 
 /// The initial local database migration.
 pub const BASELINE_MIGRATION: &str = include_str!("../migrations/0000_baseline.sql");
@@ -28,6 +31,32 @@ pub const S1B_PAIRING_STATE_MIGRATION: &str =
 /// The immutable S1B Cloud API origin migration.
 pub const S1B_CLOUD_API_ORIGIN_MIGRATION: &str =
     include_str!("../migrations/0004_s1b_cloud_api_origin.sql");
+/// The immutable S3 communication-message local storage migration.
+pub const WECHAT_MESSAGES_MIGRATION: &str = include_str!("../migrations/0005_wechat_messages.sql");
+
+/// A private spool-file reference corresponding to one validated media manifest.
+///
+/// This deliberately carries a path without implementing `Debug`, so ordinary diagnostics cannot
+/// emit private local file names.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CommunicationAttachmentSpoolReference {
+    pub attachment_id: String,
+    pub path: PathBuf,
+}
+
+/// The complete local atomic-write input for one eligible communication message.
+///
+/// The caller must provide a canonical event envelope and source sequence.  The local store
+/// validates the immutable event/message correspondence and all spool references before commit.
+/// This deliberately carries message content and has no `Debug` implementation.
+#[derive(Clone, PartialEq)]
+pub struct CommunicationMessageCommit {
+    pub account_id: String,
+    pub source_sequence: u64,
+    pub event: EventEnvelope,
+    pub message: CommunicationMessageRecorded,
+    pub attachment_spool: Vec<CommunicationAttachmentSpoolReference>,
+}
 
 /// Non-secret local pointer to an Agent credential validated in Keychain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +118,7 @@ pub struct DbHealth {
 mod tests {
     use super::{
         BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION, S1B_CLOUD_API_ORIGIN_MIGRATION,
-        S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION,
+        S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION, WECHAT_MESSAGES_MIGRATION,
     };
 
     #[test]
@@ -129,5 +158,13 @@ mod tests {
         assert!(S1B_CLOUD_API_ORIGIN_MIGRATION.contains("cloud_api_origin"));
         assert!(!S1B_CLOUD_API_ORIGIN_MIGRATION.contains("token"));
         assert!(!S1B_CLOUD_API_ORIGIN_MIGRATION.contains("secret"));
+    }
+
+    #[test]
+    fn wechat_message_migration_keeps_content_in_private_local_tables() {
+        assert!(WECHAT_MESSAGES_MIGRATION.contains("communication_messages"));
+        assert!(WECHAT_MESSAGES_MIGRATION.contains("attachment_spool"));
+        assert!(!WECHAT_MESSAGES_MIGRATION.contains("key_material"));
+        assert!(!WECHAT_MESSAGES_MIGRATION.contains("credential"));
     }
 }
