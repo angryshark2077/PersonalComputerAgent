@@ -148,6 +148,7 @@ export async function revokeDevice(
 }
 
 export function cloudApiOrigin(): string {
+  if (process.env.NODE_ENV === "production") return "";
   return process.env.NEXT_PUBLIC_CLOUD_API_ORIGIN ?? "";
 }
 
