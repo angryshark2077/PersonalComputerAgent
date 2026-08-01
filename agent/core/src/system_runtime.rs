@@ -1330,7 +1330,10 @@ mod tests {
             )
             .expect("lower outbox below low water");
         tokio::time::advance(Duration::from_secs(30)).await;
-        yield_until(|| controls.cpu_calls() == 1 && controls.disk_calls() == 1).await;
+        yield_until_with_timeout(Duration::from_secs(30), || {
+            controls.cpu_calls() == 1 && controls.disk_calls() == 1
+        })
+        .await;
 
         drop(observer);
         runtime.shutdown().await.expect("shutdown runtime");
