@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { safeLocalCallbackPath, signInWithEmail, signUpWithEmail } from "../src/lib/auth.ts";
+import { safeLocalCallbackPath, signInWithEmail, signOut, signUpWithEmail } from "../src/lib/auth.ts";
 
 test("sign in only returns to a local Dashboard path", () => {
   assert.equal(safeLocalCallbackPath("/pair?session_id=session&callback_state=state"), "/pair?session_id=session&callback_state=state");
@@ -38,4 +38,18 @@ test("sign up creates a Better Auth email session without putting credentials in
     await request?.text(),
     JSON.stringify({ name: "Owner", email: "owner@example.test", password: "password" }),
   );
+});
+
+test("sign out sends only an authenticated request to the Better Auth sign-out endpoint", async () => {
+  let request: Request | undefined;
+  await signOut(async (input, init) => {
+    request = new Request(input, init);
+    return new Response(null, { status: 200 });
+  }, "https://cloud.example.test");
+
+  assert.equal(request?.url, "https://cloud.example.test/api/auth/sign-out");
+  assert.equal(request?.method, "POST");
+  assert.equal(request?.headers.get("content-type"), null);
+  assert.equal(request?.headers.get("cookie"), null);
+  assert.equal(request?.credentials, "include");
 });

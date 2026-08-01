@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 
 import { DashboardApiError, cloudApiOrigin, getDevices, getWorkspaces, type DashboardWorkspace } from "../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../lib/auth";
+import { DashboardShell } from "../components/dashboard-shell";
 
 interface DashboardHome {
   workspace: DashboardWorkspace | null;
@@ -34,25 +35,36 @@ export default function HomePage() {
     })();
   }, []);
 
-  if (error !== null) return <main><p role="alert">{error}</p></main>;
-  if (dashboard === null) return <main><p>Loading Owner Dashboard…</p></main>;
-
   return (
-    <main>
-      <h1>Personal Computer Agent</h1>
-      {dashboard.workspace === null ? <p>No Owner Workspace is available.</p> : <p>Workspace: {dashboard.workspace.name}</p>}
-      <h2>Devices</h2>
-      {dashboard.devices.length === 0 ? <p>No paired devices.</p> : (
-        <ul>
-          {dashboard.devices.map((device) => (
-            <li key={device.device_id}>
-              <Link href={`/devices/${encodeURIComponent(device.device_id)}`}>Device {device.device_id}</Link>
-              {device.revoked ? " (revoked)" : ""}
-            </li>
-          ))}
-        </ul>
+    <DashboardShell>
+      {error !== null ? <p role="alert">{error}</p> : null}
+      {dashboard === null ? <p className="status-note">Loading Owner Dashboard…</p> : (
+        <>
+          <section className="page-heading">
+            <p className="workspace-name">{dashboard.workspace === null ? "No Owner Workspace" : dashboard.workspace.name}</p>
+            <h1>Devices</h1>
+            <p>Manage the Macs connected to your Personal Computer Agent workspace.</p>
+          </section>
+          <section className="dashboard-panel" aria-labelledby="devices-heading">
+            <div className="panel-header">
+              <h2 id="devices-heading">Connected devices</h2>
+              <p className="panel-count">{dashboard.devices.length} total</p>
+            </div>
+            {dashboard.devices.length === 0 ? <p className="empty-state">No paired devices yet.</p> : (
+              <ul className="device-list">
+                {dashboard.devices.map((device) => (
+                  <li key={device.device_id}>
+                    <Link href={`/devices/${encodeURIComponent(device.device_id)}`}>
+                      Device {device.device_id}{device.revoked ? " (revoked)" : ""}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </>
       )}
-    </main>
+    </DashboardShell>
   );
 }
 

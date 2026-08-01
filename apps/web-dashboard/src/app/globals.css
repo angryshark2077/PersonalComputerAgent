@@ -1,0 +1,144 @@
+:root {
+  color: #172033;
+  background: #f6f8fc;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; min-width: 320px; }
+
+button,
+input { font: inherit; }
+
+button { cursor: pointer; }
+
+button:disabled { cursor: not-allowed; opacity: 0.58; }
+
+.dashboard-shell { min-height: 100vh; }
+
+.dashboard-nav {
+  align-items: center;
+  background: #ffffff;
+  border-bottom: 1px solid #e5e9f2;
+  display: flex;
+  gap: 36px;
+  min-height: 68px;
+  padding: 0 40px;
+}
+
+.dashboard-brand {
+  color: #172033;
+  font-size: 16px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.dashboard-nav nav { align-self: stretch; display: flex; }
+
+.dashboard-nav nav a {
+  align-items: center;
+  border-bottom: 2px solid transparent;
+  color: #667085;
+  display: inline-flex;
+  font-size: 14px;
+  font-weight: 650;
+  padding: 0 2px;
+  text-decoration: none;
+}
+
+.dashboard-nav nav a.is-active { border-bottom-color: #246bfe; color: #172033; }
+
+.dashboard-account { align-items: center; display: flex; gap: 12px; margin-left: auto; }
+
+.dashboard-account p { color: #b42318; font-size: 13px; margin: 0; }
+
+.quiet-button {
+  background: transparent;
+  border: 1px solid #d7deeb;
+  border-radius: 8px;
+  color: #344054;
+  font-size: 14px;
+  font-weight: 650;
+  min-height: 36px;
+  padding: 0 13px;
+  white-space: nowrap;
+}
+
+.dashboard-content { margin: 0 auto; max-width: 1040px; padding: 56px 40px 80px; }
+
+.page-heading { margin-bottom: 30px; }
+
+.workspace-name { color: #53627a; font-size: 14px; font-weight: 650; margin: 0 0 10px; }
+
+.page-heading h1 { color: #172033; font-size: clamp(30px, 4vw, 42px); letter-spacing: -0.045em; line-height: 1.08; margin: 0; }
+
+.page-heading p:last-child { color: #667085; margin: 12px 0 0; }
+
+.dashboard-panel {
+  background: #ffffff;
+  border: 1px solid #e5e9f2;
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.panel-header { align-items: center; border-bottom: 1px solid #e5e9f2; display: flex; justify-content: space-between; padding: 19px 22px; }
+
+.panel-header h2 { font-size: 16px; letter-spacing: -0.015em; margin: 0; }
+
+.panel-count { color: #667085; font-size: 13px; margin: 0; }
+
+.device-list { list-style: none; margin: 0; padding: 0; }
+
+.device-list li + li { border-top: 1px solid #edf0f5; }
+
+.device-list a { color: #172033; display: block; font-size: 14px; font-weight: 650; padding: 18px 22px; text-decoration: none; }
+
+.device-list a:hover { background: #f7f9fe; color: #155eef; }
+
+.empty-state { color: #667085; margin: 0; padding: 28px 22px; }
+
+.status-note { color: #667085; font-size: 14px; margin: 0; }
+
+.back-link { color: #475467; display: inline-block; font-size: 14px; font-weight: 650; margin-bottom: 24px; text-decoration: none; }
+
+.back-link:hover { color: #155eef; }
+
+.device-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 28px 0 36px; }
+
+.collector-card { margin-top: 16px; padding: 22px; }
+
+.collector-card h2 { font-size: 16px; margin: 0; }
+
+.collector-card p { color: #667085; margin: 8px 0 18px; }
+
+.primary-button {
+  background: #246bfe;
+  border: 1px solid #246bfe;
+  border-radius: 8px;
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 700;
+  min-height: 38px;
+  padding: 0 14px;
+}
+
+.danger-button {
+  background: #ffffff;
+  border: 1px solid #f04438;
+  border-radius: 8px;
+  color: #b42318;
+  font-size: 14px;
+  font-weight: 700;
+  min-height: 38px;
+  padding: 0 14px;
+}
+
+@media (max-width: 640px) {
+  .dashboard-nav { gap: 12px; padding: 0 16px; }
+  .dashboard-brand { font-size: 14px; }
+  .dashboard-content { padding: 38px 20px 56px; }
+  .dashboard-account p { display: none; }
+}

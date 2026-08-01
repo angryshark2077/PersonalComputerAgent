@@ -57,6 +57,14 @@ export async function signUpWithEmail(
   await emailRequest(fetcher, cloudApiOrigin, "/api/auth/sign-up/email", registration);
 }
 
+export async function signOut(fetcher: DashboardFetch, cloudApiOrigin: string): Promise<void> {
+  const response = await fetcher(apiUrl(cloudApiOrigin, "/api/auth/sign-out"), {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!response.ok) throw new AuthenticationError("Unable to sign out.");
+}
+
 function apiUrl(cloudApiOrigin: string, path: string): string {
   return cloudApiOrigin.length === 0 ? path : new URL(path, cloudApiOrigin).toString();
 }
