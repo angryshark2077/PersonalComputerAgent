@@ -1285,8 +1285,8 @@ mod tests {
         )
         .await
         .expect("start boundary runtime");
-        let observer =
-            Connection::open(directory.path().join("agent.sqlite3")).expect("open observer");
+        let database_path = directory.path().join("agent.sqlite3");
+        let observer = Connection::open(&database_path).expect("open observer");
         yield_until_with_timeout(Duration::from_secs(30), || {
             status_transitions(&observer).len() == 2
         })
@@ -1322,7 +1322,9 @@ mod tests {
             ]
         );
 
-        observer
+        drop(observer);
+        Connection::open(&database_path)
+            .expect("open outbox ack connection")
             .execute(
                 "UPDATE sync_outbox SET state = 'acked'
                  WHERE event_id LIKE 'seed-%' AND rowid <= 2_003",
@@ -1335,7 +1337,6 @@ mod tests {
         })
         .await;
 
-        drop(observer);
         runtime.shutdown().await.expect("shutdown runtime");
         close_database(database).await;
     }
