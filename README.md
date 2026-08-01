@@ -55,3 +55,9 @@ PCA_TEAM_ID="$PCA_TEAM_ID" ./scripts/verify-s1a-live.sh \
 ```
 
 The exact first-install, approval, recovery, logout/login, and uninstall evidence procedure is in [`docs/runbooks/S1A_SELF_USE_INSTALL.md`](docs/runbooks/S1A_SELF_USE_INSTALL.md). A green unsigned CI run proves source/build/test reproducibility; it does not prove a signed DMG, Gatekeeper approval, a real graphical install, or login recovery.
+
+## S1B Railway deployment
+
+The operator-only Railway setup, public-health verification, and the boundary
+between deployment and live pairing acceptance are in
+[`docs/runbooks/S1B_RAILWAY_DEPLOYMENT.md`](docs/runbooks/S1B_RAILWAY_DEPLOYMENT.md).
