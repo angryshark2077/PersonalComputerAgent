@@ -1,19 +1,15 @@
 import type { NextConfig } from "next";
 
 import {
+  requireBuildProxyOrigin,
   validateDashboardEnvironment,
   validateInternalOrigin,
 } from "./src/lib/railway-environment.ts";
 
 export function createNextConfig(
-  internalOrigin: string | undefined,
-  privateHosts: readonly string[] = [],
+  internalOrigin: string,
 ): NextConfig {
-  if (internalOrigin === undefined || internalOrigin.length === 0) {
-    return {};
-  }
-
-  const origin = validateInternalOrigin(internalOrigin, privateHosts);
+  const origin = validateInternalOrigin(internalOrigin);
   return {
     async rewrites() {
       return [
@@ -26,4 +22,7 @@ export function createNextConfig(
 
 validateDashboardEnvironment(process.env);
 
-export default createNextConfig(process.env.CLOUD_API_INTERNAL_ORIGIN);
+const buildProxyOrigin =
+  process.env.NODE_ENV === "production" ? requireBuildProxyOrigin(process.env) : undefined;
+
+export default buildProxyOrigin === undefined ? {} : createNextConfig(buildProxyOrigin);

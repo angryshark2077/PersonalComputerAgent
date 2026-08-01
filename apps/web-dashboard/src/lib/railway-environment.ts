@@ -3,10 +3,6 @@ export interface DashboardEnvironment {
   NEXT_PUBLIC_CLOUD_API_ORIGIN?: string | undefined;
 }
 
-export type DashboardReadiness =
-  | { ready: true }
-  | { ready: false; error: string };
-
 export function validateDashboardEnvironment(environment: DashboardEnvironment): void {
   if (environment.NEXT_PUBLIC_CLOUD_API_ORIGIN) {
     throw new Error("Dashboard Cloud API requests must use the same-origin proxy.");
@@ -38,25 +34,19 @@ export function validateInternalOrigin(
   return url.origin;
 }
 
-export function dashboardReadiness(environment: DashboardEnvironment): DashboardReadiness {
-  try {
-    validateDashboardEnvironment(environment);
-    if (!environment.CLOUD_API_INTERNAL_ORIGIN) {
-      return { ready: false, error: "CLOUD_API_INTERNAL_ORIGIN is required at runtime." };
-    }
-    validateInternalOrigin(environment.CLOUD_API_INTERNAL_ORIGIN);
-    return { ready: true };
-  } catch (error) {
-    return {
-      ready: false,
-      error: error instanceof Error ? error.message : "Dashboard configuration is invalid.",
-    };
+export function requireBuildProxyOrigin(environment: NodeJS.ProcessEnv): string {
+  if (!environment.CLOUD_API_INTERNAL_ORIGIN) {
+    throw new Error("CLOUD_API_INTERNAL_ORIGIN is required for the production Dashboard build.");
   }
+
+  return validateInternalOrigin(environment.CLOUD_API_INTERNAL_ORIGIN);
 }
 
-export function dashboardHealthResponse(environment: DashboardEnvironment): Response {
-  const readiness = dashboardReadiness(environment);
-  return readiness.ready
-    ? Response.json({ status: "ok" })
-    : Response.json({ status: "not_ready" }, { status: 503 });
+export const dashboardBuildProxyOrigin =
+  process.env.NODE_ENV === "production" ? requireBuildProxyOrigin(process.env) : undefined;
+
+export const dashboardBuildReadiness = { ready: true } as const;
+
+export function dashboardHealthResponse(): Response {
+  return Response.json({ status: "ok" });
 }

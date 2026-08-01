@@ -7,7 +7,7 @@
     "test": "node --test",
     "typecheck": "tsc -p tsconfig.json",
     "dev": "next dev",
-    "build": "next build",
+    "build": "NODE_ENV=production next build",
     "start": "next start"
   },
   "devDependencies": {
