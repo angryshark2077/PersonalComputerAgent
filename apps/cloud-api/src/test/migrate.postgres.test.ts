@@ -15,7 +15,7 @@ const postgresUser = "pca_migration_test";
 const testDirectory = dirname(fileURLToPath(import.meta.url));
 const committedMigrationDirectory = resolve(testDirectory, "../../../../packages/db-cloud/migrations");
 
-test("PostgreSQL migrations replay safely and create the private event inboxes", async () => {
+test("PostgreSQL migrations replay safely and create private communication projections", async () => {
   const postgres = await startTemporaryPostgres();
   const pool = new Pool({ connectionString: postgres.connectionString });
   try {
@@ -23,12 +23,15 @@ test("PostgreSQL migrations replay safely and create the private event inboxes",
     await assertHashedSessionSchema(pool);
     await assertSystemEventSchema(pool);
     await assertCommunicationEventSchema(pool);
+    await assertCommunicationProjectionSchema(pool);
+    await assertCommunicationProjectionBackfill(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
     await assertHashedSessionSchema(pool);
     await assertSystemEventSchema(pool);
     await assertCommunicationEventSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006"]);
+    await assertCommunicationProjectionSchema(pool);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -75,6 +78,65 @@ async function assertCommunicationEventSchema(pool: Pool) {
     "SELECT to_regclass('public.communication_events') IS NOT NULL AS exists",
   );
   assert.equal(result.rows[0]?.exists, true);
+}
+
+async function assertCommunicationProjectionSchema(pool: Pool) {
+  const result = await pool.query<{ exists: boolean }>(
+    "SELECT to_regclass('public.communication_messages') IS NOT NULL AS exists",
+  );
+  assert.equal(result.rows[0]?.exists, true);
+}
+
+async function assertCommunicationProjectionBackfill(pool: Pool) {
+  const workspaceId = "01982222-7222-8222-8222-222222222224";
+  const userId = "01983333-7333-8333-8333-333333333335";
+  const deviceId = "01981111-7111-8111-8111-111111111112";
+  await pool.query(
+    "INSERT INTO auth_users (id, name, email, created_at, updated_at) VALUES ($1, 'Migration', 'migration@example.invalid', now(), now())",
+    [userId],
+  );
+  await pool.query(
+    "INSERT INTO workspaces (id, name, slug, created_at, updated_at) VALUES ($1, 'Migration', 'migration', now(), now())",
+    [workspaceId],
+  );
+  await pool.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES ($1, $2, 'owner', now())",
+    [workspaceId, userId],
+  );
+  await pool.query(
+    "INSERT INTO devices (id, workspace_id, owner_user_id, device_public_key_hash, platform, created_at) VALUES ($1, $2, $3, $4, 'macos', now())",
+    [deviceId, workspaceId, userId, "a".repeat(64)],
+  );
+  await pool.query(
+    `INSERT INTO communication_events (
+       event_id, workspace_id, device_id, event_type, source, schema_version,
+       occurred_at, created_at, sensitivity, payload, attachment_refs, idempotency_key
+     ) VALUES (
+       '01986666-7666-8666-8666-666666666669', $1, $2,
+       'communication.message_recorded', 'communication.wechat', 1,
+       '2026-08-02T00:00:00Z', '2026-08-02T00:00:00Z', 'high', $3::jsonb, '[]'::jsonb,
+       'source-key-migration'
+     )`,
+    [
+      workspaceId,
+      deviceId,
+      JSON.stringify({
+        message_id: "message-migration",
+        conversation_id: "conversation-migration",
+        source_key: "source-key-migration",
+        occurred_at: "2026-08-02T00:00:00Z",
+        direction: "incoming",
+        kind: "text",
+        conversation: { scope: "direct" },
+        text: "private body",
+      }),
+    ],
+  );
+  await pool.query(await readFile(join(committedMigrationDirectory, "0007_communication_projections.sql"), "utf8"));
+  const result = await pool.query<{ message_id: string; text_body: string }>(
+    "SELECT message_id, text_body FROM communication_messages WHERE event_id = '01986666-7666-8666-8666-666666666669'",
+  );
+  assert.deepEqual(result.rows, [{ message_id: "message-migration", text_body: "private body" }]);
 }
 
 async function migrationIds(pool: Pool): Promise<string[]> {

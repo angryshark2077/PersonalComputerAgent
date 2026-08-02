@@ -408,6 +408,105 @@ export const communicationEvents = pgTable(
   ],
 );
 
+export const communicationConversations = pgTable(
+  "communication_conversations",
+  {
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    conversationId: text("conversation_id").notNull(),
+    scope: text("scope").notNull(),
+    memberCount: integer("member_count"),
+    lastMessageAt: timestampColumn("last_message_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workspaceId, table.deviceId, table.conversationId] }),
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    check(
+      "communication_conversations_scope_members",
+      sql`(${table.scope} = 'direct' AND ${table.memberCount} IS NULL) OR (${table.scope} = 'group' AND ${table.memberCount} BETWEEN 1 AND 8)`,
+    ),
+  ],
+);
+
+export const communicationMessages = pgTable(
+  "communication_messages",
+  {
+    eventId: uuid("event_id")
+      .primaryKey()
+      .references(() => communicationEvents.eventId, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    conversationId: text("conversation_id").notNull(),
+    messageId: text("message_id").notNull(),
+    sourceKey: text("source_key").notNull(),
+    occurredAt: timestampColumn("occurred_at").notNull(),
+    direction: text("direction").notNull(),
+    kind: text("kind").notNull(),
+    textBody: text("text_body"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId, table.conversationId],
+      foreignColumns: [
+        communicationConversations.workspaceId,
+        communicationConversations.deviceId,
+        communicationConversations.conversationId,
+      ],
+    }).onDelete("cascade"),
+    unique("communication_messages_source_key_unique").on(
+      table.workspaceId,
+      table.deviceId,
+      table.sourceKey,
+    ),
+    unique("communication_messages_message_id_unique").on(
+      table.workspaceId,
+      table.deviceId,
+      table.messageId,
+    ),
+    index("idx_communication_messages_device_conversation_chronology").on(
+      table.workspaceId,
+      table.deviceId,
+      table.conversationId,
+      table.occurredAt.desc(),
+    ),
+    check(
+      "communication_messages_direction",
+      sql`${table.direction} IN ('incoming', 'outgoing')`,
+    ),
+    check(
+      "communication_messages_kind",
+      sql`${table.kind} IN ('text', 'audio', 'image', 'video')`,
+    ),
+    check(
+      "communication_messages_text_body",
+      sql`(${table.kind} = 'text' AND ${table.textBody} IS NOT NULL) OR (${table.kind} <> 'text' AND ${table.textBody} IS NULL)`,
+    ),
+  ],
+);
+
+export const communicationMessageAttachments = pgTable(
+  "communication_message_attachments",
+  {
+    eventId: uuid("event_id")
+      .notNull()
+      .references(() => communicationMessages.eventId, { onDelete: "cascade" }),
+    attachmentId: text("attachment_id").notNull(),
+    kind: text("kind").notNull(),
+    sha256: char("sha256", { length: 64 }).notNull(),
+    sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+    mimeType: text("mime_type").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.eventId, table.attachmentId] }),
+    check("communication_message_attachments_kind", sql`${table.kind} IN ('audio', 'image', 'video')`),
+    check("communication_message_attachments_hash", sql`${table.sha256} ~ '^[a-f0-9]{64}$'`),
+    check("communication_message_attachments_size", sql`${table.sizeBytes} > 0`),
+  ],
+);
+
 export const cloudSchema = {
   authUsers,
   authSessions,
@@ -423,5 +522,8 @@ export const cloudSchema = {
   deviceHeartbeats,
   deviceRevocationAudit,
   communicationEvents,
+  communicationConversations,
+  communicationMessages,
+  communicationMessageAttachments,
   systemEvents,
 };

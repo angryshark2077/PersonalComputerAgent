@@ -338,6 +338,71 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.get("/v1/devices/:deviceId/communication/conversations", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const limit = parseCommunicationLimit(context.req.query("limit"));
+    if (limit === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication limit.");
+    }
+    try {
+      const conversations = await options.repository.listOwnerCommunicationConversations(
+        context.req.param("deviceId"),
+        principal.workspaceId,
+        principal.userId,
+        limit,
+      );
+      return context.json({
+        conversations: conversations.map((conversation) => ({
+          conversation_id: conversation.conversationId,
+          scope: conversation.scope,
+          member_count: conversation.memberCount,
+          message_count: conversation.messageCount,
+          last_message_at: conversation.lastMessageAt.toISOString(),
+        })),
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.get("/v1/devices/:deviceId/communication/conversations/:conversationId/messages", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const limit = parseCommunicationLimit(context.req.query("limit"));
+    if (limit === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication limit.");
+    }
+    try {
+      const messages = await options.repository.listOwnerCommunicationMessages(
+        context.req.param("deviceId"),
+        context.req.param("conversationId"),
+        principal.workspaceId,
+        principal.userId,
+        limit,
+      );
+      return context.json({
+        messages: messages.map((message) => ({
+          event_id: message.eventId,
+          message_id: message.messageId,
+          occurred_at: message.occurredAt.toISOString(),
+          direction: message.direction,
+          kind: message.kind,
+          text: message.text,
+          attachments: message.attachments.map((attachment) => ({
+            attachment_id: attachment.attachmentId,
+            kind: attachment.kind,
+            sha256: attachment.sha256,
+            size_bytes: attachment.sizeBytes,
+            mime_type: attachment.mimeType,
+          })),
+        })),
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.get("/v1/devices/:deviceId/collector-config/audit", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
@@ -411,6 +476,12 @@ function pairingAuthorizationURL(sessionId: string, callbackState: string): stri
 
 function parseMetricLimit(value: string | undefined): number | null {
   if (value === undefined) return 20;
+  const limit = Number(value);
+  return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
+}
+
+function parseCommunicationLimit(value: string | undefined): number | null {
+  if (value === undefined) return 50;
   const limit = Number(value);
   return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
 }

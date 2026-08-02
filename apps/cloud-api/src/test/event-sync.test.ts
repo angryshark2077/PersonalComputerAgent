@@ -11,11 +11,20 @@ const owner: OwnerPrincipal = {
   workspaceId: "01982222-7222-8222-8222-222222222222",
 };
 
+const otherOwner: OwnerPrincipal = {
+  userId: "01983333-7333-8333-8333-333333333334",
+  workspaceId: "01982222-7222-8222-8222-222222222223",
+};
+
 async function pairedApi() {
   const repository = new MemoryControlRepository([
     { workspaceId: owner.workspaceId, userId: owner.userId },
   ]);
   const api = createApp({ repository, ownerAuthenticator: async () => owner });
+  return pairedApiWith(api);
+}
+
+async function pairedApiWith(api: ReturnType<typeof createApp>) {
   const start = await api.request("/v1/device-pairing/sessions", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -94,7 +103,39 @@ function communicationText(deviceId: string) {
       text: "private body",
     },
     attachment_refs: [],
-    idempotency_key: "communication:message-1",
+    idempotency_key: "opaque-source-key-1",
+  };
+}
+
+function communicationImage(deviceId: string) {
+  return {
+    event_id: "01986666-7666-8666-8666-666666666668",
+    workspace_id: owner.workspaceId,
+    device_id: deviceId,
+    event_type: "communication.message_recorded",
+    source: "communication.wechat",
+    schema_version: 1,
+    occurred_at: "2026-08-02T00:01:00Z",
+    created_at: "2026-08-02T00:01:00Z",
+    sensitivity: "high",
+    payload: {
+      message_id: "message-2",
+      conversation_id: "conversation-1",
+      source_key: "opaque-source-key-2",
+      occurred_at: "2026-08-02T00:01:00Z",
+      direction: "outgoing",
+      kind: "image",
+      conversation: { scope: "group", member_count: 3 },
+      attachments: [{
+        attachment_id: "attachment-1",
+        kind: "image",
+        sha256: "a".repeat(64),
+        size_bytes: 1024,
+        mime_type: "image/jpeg",
+      }],
+    },
+    attachment_refs: ["attachment-1"],
+    idempotency_key: "opaque-source-key-2",
   };
 }
 
@@ -139,6 +180,122 @@ test("paired device syncs a private communication event only through its dedicat
 
   const wrongEndpoint = await api.request("/v1/agent/sync/events", request);
   assert.equal(wrongEndpoint.status, 400);
+});
+
+test("only the device owner can read projected communication conversations and messages", async () => {
+  const repository = new MemoryControlRepository([
+    { workspaceId: owner.workspaceId, userId: owner.userId },
+    { workspaceId: otherOwner.workspaceId, userId: otherOwner.userId },
+  ]);
+  const api = createApp({ repository, ownerAuthenticator: async () => owner });
+  const { credentials } = await pairedApiWith(api);
+  const request = {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777780",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationText(credentials.device_id)],
+    }),
+  };
+  assert.equal((await api.request("/v1/agent/sync/communication/events", request)).status, 200);
+
+  const conversations = await api.request(`/v1/devices/${credentials.device_id}/communication/conversations`);
+  assert.equal(conversations.status, 200);
+  assert.deepEqual(await conversations.json(), {
+    conversations: [{
+      conversation_id: "conversation-1",
+      scope: "direct",
+      member_count: null,
+      message_count: 1,
+      last_message_at: "2026-08-02T00:00:00.000Z",
+    }],
+  });
+
+  const messages = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages`,
+  );
+  assert.equal(messages.status, 200);
+  assert.deepEqual(await messages.json(), {
+    messages: [{
+      event_id: "01986666-7666-8666-8666-666666666667",
+      message_id: "message-1",
+      occurred_at: "2026-08-02T00:00:00.000Z",
+      direction: "incoming",
+      kind: "text",
+      text: "private body",
+      attachments: [],
+    }],
+  });
+
+  const otherApi = createApp({ repository, ownerAuthenticator: async () => otherOwner });
+  assert.equal(
+    (await otherApi.request(`/v1/devices/${credentials.device_id}/communication/conversations`)).status,
+    403,
+  );
+});
+
+test("communication attachment manifests are projected without exposing object access", async () => {
+  const { api, credentials } = await pairedApi();
+  const response = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777781",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationImage(credentials.device_id)],
+    }),
+  });
+  assert.equal(response.status, 200);
+
+  const messages = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages`,
+  );
+  assert.deepEqual(await messages.json(), {
+    messages: [{
+      event_id: "01986666-7666-8666-8666-666666666668",
+      message_id: "message-2",
+      occurred_at: "2026-08-02T00:01:00.000Z",
+      direction: "outgoing",
+      kind: "image",
+      text: null,
+      attachments: [{
+        attachment_id: "attachment-1",
+        kind: "image",
+        sha256: "a".repeat(64),
+        size_bytes: 1024,
+        mime_type: "image/jpeg",
+      }],
+    }],
+  });
+});
+
+test("communication sync rejects an idempotency key that is not the opaque source key", async () => {
+  const { api, credentials } = await pairedApi();
+  const event = communicationText(credentials.device_id);
+  event.idempotency_key = "different-key";
+  const response = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777782",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [event],
+    }),
+  });
+  assert.equal(response.status, 400);
 });
 
 test("paired device uploads one strict system metric idempotently and its owner can read it", async () => {

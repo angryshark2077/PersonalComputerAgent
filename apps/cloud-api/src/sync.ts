@@ -1,7 +1,9 @@
 import type { EventEnvelope } from "@pca/contracts/src/types.js";
 import { validateContract } from "@pca/contracts/src/validate.js";
 import type {
+  CommunicationAttachmentProjection,
   CommunicationEventRecord,
+  CommunicationMessageProjection,
   SystemEventRecord,
 } from "@pca/db-cloud/src/repository.js";
 
@@ -86,6 +88,8 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
   const occurredAt = new Date(event.occurred_at);
   const createdAt = new Date(event.created_at);
   if (Number.isNaN(occurredAt.getTime()) || Number.isNaN(createdAt.getTime())) return null;
+  const message = parseCommunicationMessage(event.payload, occurredAt, event.attachment_refs ?? []);
+  if (message === null || event.idempotency_key !== message.sourceKey) return null;
   return {
     eventId: event.event_id,
     workspaceId: event.workspace_id,
@@ -99,6 +103,61 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
     payload: event.payload as unknown as Record<string, unknown>,
     attachmentRefs: event.attachment_refs ?? [],
     idempotencyKey: event.idempotency_key ?? null,
+    message,
+  };
+}
+
+function parseCommunicationMessage(
+  payload: unknown,
+  eventOccurredAt: Date,
+  attachmentRefs: string[],
+): CommunicationMessageProjection | null {
+  const message = payload as {
+    message_id: string;
+    conversation_id: string;
+    source_key: string;
+    occurred_at: string;
+    direction: "incoming" | "outgoing";
+    kind: "text" | "audio" | "image" | "video";
+    conversation: { scope: "direct" | "group"; member_count?: number };
+    text?: string;
+    attachments?: Array<{
+      attachment_id: string;
+      kind: "audio" | "image" | "video";
+      sha256: string;
+      size_bytes: number;
+      mime_type: string;
+    }>;
+  };
+  const occurredAt = new Date(message.occurred_at);
+  if (Number.isNaN(occurredAt.getTime()) || occurredAt.getTime() !== eventOccurredAt.getTime()) return null;
+  const attachments = (message.attachments ?? []).map<CommunicationAttachmentProjection>((attachment) => ({
+    attachmentId: attachment.attachment_id,
+    kind: attachment.kind,
+    sha256: attachment.sha256,
+    sizeBytes: attachment.size_bytes,
+    mimeType: attachment.mime_type,
+  }));
+  if (
+    attachments.length !== attachmentRefs.length
+    || new Set(attachments.map((attachment) => attachment.attachmentId)).size !== attachments.length
+    || attachments.some((attachment) => !attachmentRefs.includes(attachment.attachmentId))
+  ) {
+    return null;
+  }
+  return {
+    messageId: message.message_id,
+    conversationId: message.conversation_id,
+    sourceKey: message.source_key,
+    occurredAt,
+    direction: message.direction,
+    kind: message.kind,
+    conversation: {
+      scope: message.conversation.scope,
+      memberCount: message.conversation.scope === "group" ? message.conversation.member_count ?? null : null,
+    },
+    text: message.kind === "text" ? message.text ?? null : null,
+    attachments,
   };
 }
 

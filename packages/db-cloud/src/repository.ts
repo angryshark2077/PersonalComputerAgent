@@ -6,7 +6,10 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import {
   authUsers,
   cloudSchema,
+  communicationConversations,
   communicationEvents,
+  communicationMessageAttachments,
+  communicationMessages,
   collectorConfigAudit,
   collectorConfigs,
   deviceCredentialGenerations,
@@ -198,6 +201,48 @@ export interface CommunicationEventRecord {
   payload: Record<string, unknown>;
   attachmentRefs: string[];
   idempotencyKey: string | null;
+  message: CommunicationMessageProjection;
+}
+
+export interface CommunicationMessageProjection {
+  messageId: string;
+  conversationId: string;
+  sourceKey: string;
+  occurredAt: Date;
+  direction: "incoming" | "outgoing";
+  kind: "text" | "audio" | "image" | "video";
+  conversation: {
+    scope: "direct" | "group";
+    memberCount: number | null;
+  };
+  text: string | null;
+  attachments: CommunicationAttachmentProjection[];
+}
+
+export interface CommunicationAttachmentProjection {
+  attachmentId: string;
+  kind: "audio" | "image" | "video";
+  sha256: string;
+  sizeBytes: number;
+  mimeType: string;
+}
+
+export interface CommunicationConversationRecord {
+  conversationId: string;
+  scope: "direct" | "group";
+  memberCount: number | null;
+  messageCount: number;
+  lastMessageAt: Date;
+}
+
+export interface CommunicationMessageRecord {
+  eventId: string;
+  messageId: string;
+  occurredAt: Date;
+  direction: "incoming" | "outgoing";
+  kind: "text" | "audio" | "image" | "video";
+  text: string | null;
+  attachments: CommunicationAttachmentProjection[];
 }
 
 export interface ControlRepository {
@@ -247,6 +292,19 @@ export interface ControlRepository {
     userId: string,
     limit: number,
   ): Promise<SystemMetricRecord[]>;
+  listOwnerCommunicationConversations(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<CommunicationConversationRecord[]>;
+  listOwnerCommunicationMessages(
+    deviceId: string,
+    conversationId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<CommunicationMessageRecord[]>;
 }
 
 export interface OwnerMembership {
@@ -643,10 +701,24 @@ export class MemoryControlRepository implements ControlRepository {
       ) {
         duplicateEventIds.push(event.eventId);
       } else {
+        const existingConversation = [...this.#communicationEvents.values()].find((candidate) =>
+          candidate.workspaceId === workspaceId
+          && candidate.deviceId === deviceId
+          && candidate.message.conversationId === event.message.conversationId,
+        );
+        if (
+          existingConversation !== undefined
+          && (
+            existingConversation.message.conversation.scope !== event.message.conversation.scope
+          )
+        ) {
+          throw new ControlRepositoryError("CONFLICT");
+        }
         this.#communicationEvents.set(event.eventId, {
           ...event,
           payload: { ...event.payload },
           attachmentRefs: [...event.attachmentRefs],
+          message: cloneCommunicationMessageProjection(event.message),
         });
         if (idempotencyKey !== null) {
           this.#communicationIdempotency.add(idempotencyKey);
@@ -655,6 +727,59 @@ export class MemoryControlRepository implements ControlRepository {
       }
     }
     return { acceptedEventIds, duplicateEventIds };
+  }
+
+  async listOwnerCommunicationConversations(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<CommunicationConversationRecord[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    const conversations = new Map<string, CommunicationConversationRecord>();
+    for (const event of this.#communicationEvents.values()) {
+      if (event.workspaceId !== workspaceId || event.deviceId !== deviceId) continue;
+      const existing = conversations.get(event.message.conversationId);
+      if (existing === undefined) {
+        conversations.set(event.message.conversationId, {
+          conversationId: event.message.conversationId,
+          scope: event.message.conversation.scope,
+          memberCount: event.message.conversation.memberCount,
+          messageCount: 1,
+          lastMessageAt: event.message.occurredAt,
+        });
+      } else {
+        existing.messageCount += 1;
+        if (event.message.occurredAt > existing.lastMessageAt) {
+          existing.lastMessageAt = event.message.occurredAt;
+          existing.memberCount = event.message.conversation.memberCount;
+        }
+      }
+    }
+    return [...conversations.values()]
+      .sort((left, right) => right.lastMessageAt.getTime() - left.lastMessageAt.getTime())
+      .slice(0, limit);
+  }
+
+  async listOwnerCommunicationMessages(
+    deviceId: string,
+    conversationId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<CommunicationMessageRecord[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    return [...this.#communicationEvents.values()]
+      .filter((event) =>
+        event.workspaceId === workspaceId
+        && event.deviceId === deviceId
+        && event.message.conversationId === conversationId,
+      )
+      .sort((left, right) => right.message.occurredAt.getTime() - left.message.occurredAt.getTime())
+      .slice(0, limit)
+      .map((event) => communicationMessageRecord(event));
   }
 
   async listOwnerSystemMetrics(
@@ -1347,31 +1472,218 @@ export class DrizzleControlRepository implements ControlRepository {
         if (event.workspaceId !== workspaceId || event.deviceId !== deviceId) {
           throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
         }
-        const inserted = await this.database
-          .insert(communicationEvents)
-          .values({
+        const accepted = await this.database.transaction(async (transaction) => {
+          const inserted = await transaction
+            .insert(communicationEvents)
+            .values({
+              eventId: event.eventId,
+              workspaceId: event.workspaceId,
+              deviceId: event.deviceId,
+              eventType: event.eventType,
+              source: event.source,
+              schemaVersion: event.schemaVersion,
+              occurredAt: event.occurredAt,
+              createdAt: event.createdAt,
+              sensitivity: event.sensitivity,
+              payload: event.payload,
+              attachmentRefs: event.attachmentRefs,
+              idempotencyKey: event.idempotencyKey,
+            })
+            .onConflictDoNothing()
+            .returning({ eventId: communicationEvents.eventId });
+          if (inserted[0] === undefined) return false;
+
+          const [existingConversation] = await transaction
+            .select({
+              scope: communicationConversations.scope,
+              memberCount: communicationConversations.memberCount,
+            })
+            .from(communicationConversations)
+            .where(
+              and(
+                eq(communicationConversations.workspaceId, workspaceId),
+                eq(communicationConversations.deviceId, deviceId),
+                eq(communicationConversations.conversationId, event.message.conversationId),
+              ),
+            )
+            .limit(1);
+          if (
+            existingConversation !== undefined
+            && (
+              existingConversation.scope !== event.message.conversation.scope
+            )
+          ) {
+            throw new ControlRepositoryError("CONFLICT");
+          }
+
+          await transaction
+            .insert(communicationConversations)
+            .values({
+              workspaceId,
+              deviceId,
+              conversationId: event.message.conversationId,
+              scope: event.message.conversation.scope,
+              memberCount: event.message.conversation.memberCount,
+              lastMessageAt: event.message.occurredAt,
+            })
+            .onConflictDoUpdate({
+              target: [
+                communicationConversations.workspaceId,
+                communicationConversations.deviceId,
+                communicationConversations.conversationId,
+              ],
+              set: {
+                memberCount: sql`CASE
+                  WHEN EXCLUDED.last_message_at >= ${communicationConversations.lastMessageAt}
+                    THEN EXCLUDED.member_count
+                  ELSE ${communicationConversations.memberCount}
+                END`,
+                lastMessageAt: sql`GREATEST(${communicationConversations.lastMessageAt}, EXCLUDED.last_message_at)`,
+              },
+            });
+          await transaction.insert(communicationMessages).values({
             eventId: event.eventId,
-            workspaceId: event.workspaceId,
-            deviceId: event.deviceId,
-            eventType: event.eventType,
-            source: event.source,
-            schemaVersion: event.schemaVersion,
-            occurredAt: event.occurredAt,
-            createdAt: event.createdAt,
-            sensitivity: event.sensitivity,
-            payload: event.payload,
-            attachmentRefs: event.attachmentRefs,
-            idempotencyKey: event.idempotencyKey,
-          })
-          .onConflictDoNothing()
-          .returning({ eventId: communicationEvents.eventId });
-        if (inserted[0] === undefined) {
+            workspaceId,
+            deviceId,
+            conversationId: event.message.conversationId,
+            messageId: event.message.messageId,
+            sourceKey: event.message.sourceKey,
+            occurredAt: event.message.occurredAt,
+            direction: event.message.direction,
+            kind: event.message.kind,
+            textBody: event.message.text,
+          });
+          if (event.message.attachments.length > 0) {
+            await transaction.insert(communicationMessageAttachments).values(
+              event.message.attachments.map((attachment) => ({
+                eventId: event.eventId,
+                attachmentId: attachment.attachmentId,
+                kind: attachment.kind,
+                sha256: attachment.sha256,
+                sizeBytes: attachment.sizeBytes,
+                mimeType: attachment.mimeType,
+              })),
+            );
+          }
+          return true;
+        });
+        if (!accepted) {
           duplicateEventIds.push(event.eventId);
         } else {
           acceptedEventIds.push(event.eventId);
         }
       }
       return { acceptedEventIds, duplicateEventIds };
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listOwnerCommunicationConversations(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<CommunicationConversationRecord[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const rows = await this.database
+        .select({
+          conversationId: communicationConversations.conversationId,
+          scope: communicationConversations.scope,
+          memberCount: communicationConversations.memberCount,
+          lastMessageAt: communicationConversations.lastMessageAt,
+          messageCount: sql<number>`count(${communicationMessages.eventId})::integer`,
+        })
+        .from(communicationConversations)
+        .innerJoin(
+          communicationMessages,
+          and(
+            eq(communicationMessages.workspaceId, communicationConversations.workspaceId),
+            eq(communicationMessages.deviceId, communicationConversations.deviceId),
+            eq(communicationMessages.conversationId, communicationConversations.conversationId),
+          ),
+        )
+        .where(
+          and(
+            eq(communicationConversations.workspaceId, workspaceId),
+            eq(communicationConversations.deviceId, deviceId),
+          ),
+        )
+        .groupBy(
+          communicationConversations.conversationId,
+          communicationConversations.scope,
+          communicationConversations.memberCount,
+          communicationConversations.lastMessageAt,
+        )
+        .orderBy(desc(communicationConversations.lastMessageAt))
+        .limit(limit);
+      return rows.map((row) => ({
+        conversationId: row.conversationId,
+        scope: row.scope as "direct" | "group",
+        memberCount: row.memberCount,
+        messageCount: row.messageCount,
+        lastMessageAt: row.lastMessageAt,
+      }));
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listOwnerCommunicationMessages(
+    deviceId: string,
+    conversationId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<CommunicationMessageRecord[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const messages = await this.database
+        .select({
+          eventId: communicationMessages.eventId,
+          messageId: communicationMessages.messageId,
+          occurredAt: communicationMessages.occurredAt,
+          direction: communicationMessages.direction,
+          kind: communicationMessages.kind,
+          text: communicationMessages.textBody,
+        })
+        .from(communicationMessages)
+        .where(
+          and(
+            eq(communicationMessages.workspaceId, workspaceId),
+            eq(communicationMessages.deviceId, deviceId),
+            eq(communicationMessages.conversationId, conversationId),
+          ),
+        )
+        .orderBy(desc(communicationMessages.occurredAt))
+        .limit(limit);
+      return Promise.all(messages.map(async (message) => {
+        const attachments = await this.database
+          .select({
+            attachmentId: communicationMessageAttachments.attachmentId,
+            kind: communicationMessageAttachments.kind,
+            sha256: communicationMessageAttachments.sha256,
+            sizeBytes: communicationMessageAttachments.sizeBytes,
+            mimeType: communicationMessageAttachments.mimeType,
+          })
+          .from(communicationMessageAttachments)
+          .where(eq(communicationMessageAttachments.eventId, message.eventId));
+        return {
+          eventId: message.eventId,
+          messageId: message.messageId,
+          occurredAt: message.occurredAt,
+          direction: message.direction as CommunicationMessageRecord["direction"],
+          kind: message.kind as CommunicationMessageRecord["kind"],
+          text: message.text,
+          attachments: attachments.map((attachment) => ({
+            ...attachment,
+            kind: attachment.kind as CommunicationAttachmentProjection["kind"],
+          })),
+        };
+      }));
     } catch (error) {
       throw repositoryError(error);
     }
@@ -1517,6 +1829,28 @@ function configKey(workspaceId: string, deviceId: string): string {
 
 function membershipKey(workspaceId: string, userId: string): string {
   return `${workspaceId}:${userId}`;
+}
+
+function cloneCommunicationMessageProjection(
+  message: CommunicationMessageProjection,
+): CommunicationMessageProjection {
+  return {
+    ...message,
+    conversation: { ...message.conversation },
+    attachments: message.attachments.map((attachment) => ({ ...attachment })),
+  };
+}
+
+function communicationMessageRecord(event: CommunicationEventRecord): CommunicationMessageRecord {
+  return {
+    eventId: event.eventId,
+    messageId: event.message.messageId,
+    occurredAt: event.message.occurredAt,
+    direction: event.message.direction,
+    kind: event.message.kind,
+    text: event.message.text,
+    attachments: event.message.attachments.map((attachment) => ({ ...attachment })),
+  };
 }
 
 function secureEqual(left: string, right: string): boolean {

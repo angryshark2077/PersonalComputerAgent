@@ -16,6 +16,10 @@ EXPECTED_TABLES = [
     "auth_users",
     "collector_config_audit",
     "collector_configs",
+    "communication_conversations",
+    "communication_events",
+    "communication_message_attachments",
+    "communication_messages",
     "device_credential_generations",
     "device_heartbeats",
     "device_revocation_audit",
@@ -271,6 +275,8 @@ def verify(repository_root: Path) -> None:
         / "packages/db-cloud/migrations/0003_s1b_pairing_state_and_better_auth_session.sql",
         repository_root / "packages/db-cloud/migrations/0004_s1b_hash_better_auth_sessions.sql",
         repository_root / "packages/db-cloud/migrations/0005_s2_system_events.sql",
+        repository_root / "packages/db-cloud/migrations/0006_communication_event_inbox.sql",
+        repository_root / "packages/db-cloud/migrations/0007_communication_projections.sql",
     ]
     for migration in migrations:
         if not migration.is_file():
