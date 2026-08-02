@@ -444,71 +444,26 @@ fn read_conversation_metadata(
     connection: &Connection,
     sessions: &[Session],
 ) -> Result<BTreeMap<String, ConversationMetadata>, SqlcipherProbeFailure> {
+    let contact_names = read_display_names(connection, "contact")?;
+    let stranger_names = read_display_names(connection, "stranger").unwrap_or_default();
+    let group_members = read_group_members(connection).unwrap_or_default();
+    let room_buffers = read_room_buffers(connection).unwrap_or_default();
     let mut metadata = BTreeMap::new();
-    let mut contact_statement = connection
-        .prepare("SELECT remark, nick_name, alias FROM contact WHERE username = ?1 LIMIT 1")
-        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
-    let mut stranger_statement = connection
-        .prepare("SELECT remark, nick_name, alias FROM stranger WHERE username = ?1 LIMIT 1")
-        .ok();
-    let mut count_statement = connection
-        .prepare(
-            "SELECT COUNT(*) FROM chatroom_member \
-             WHERE room_id = (SELECT rowid FROM name2id WHERE username = ?1)",
-        )
-        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
-    let mut member_statement = connection
-        .prepare(
-            "SELECT n.username FROM chatroom_member m \
-             JOIN name2id n ON m.member_id = n.rowid \
-             WHERE m.room_id = (SELECT rowid FROM name2id WHERE username = ?1)",
-        )
-        .ok();
-    let mut room_buffer_statement = connection
-        .prepare("SELECT ext_buffer FROM chat_room WHERE username = ?1 LIMIT 1")
-        .ok();
     for session in sessions {
-        let display_name = read_display_name(&mut contact_statement, &session.username)
-            .ok()
-            .flatten()
-            .or_else(|| {
-                stranger_statement.as_mut().and_then(|statement| {
-                    read_display_name(statement, &session.username)
-                        .ok()
-                        .flatten()
-                })
-            })
+        let display_name = contact_names
+            .get(&session.username)
+            .or_else(|| stranger_names.get(&session.username))
+            .cloned()
             .unwrap_or_else(|| session.username.clone());
         let (member_count, participant_names) = if session.username.ends_with("@chatroom") {
-            let count = count_statement
-                .query_row([&session.username], |row| row.get(0))
-                .ok()
-                .and_then(|count: i64| u8::try_from(count).ok());
-            let members = member_statement
-                .as_mut()
-                .and_then(|statement| {
-                    statement
-                        .query_map([&session.username], |row| row.get::<_, String>(0))
-                        .ok()
-                        .map(|rows| {
-                            rows.filter_map(Result::ok)
-                                .filter(|member| valid_identity(member))
-                                .collect::<Vec<_>>()
-                        })
-                })
+            let members = group_members
+                .get(&session.username)
+                .cloned()
                 .unwrap_or_default();
-            let room_buffer = room_buffer_statement
-                .as_mut()
-                .and_then(|statement| {
-                    statement
-                        .query_row([&session.username], |row| row.get::<_, Value>(0))
-                        .optional()
-                        .ok()
-                        .flatten()
-                })
-                .and_then(value_bytes);
-            let group_nicknames = room_buffer
-                .as_deref()
+            let count = u8::try_from(members.len()).ok();
+            let group_nicknames = room_buffers
+                .get(&session.username)
+                .map(Vec::as_slice)
                 .map(|buffer| parse_group_nicknames(buffer, &members))
                 .unwrap_or_default();
             let mut participant_names = BTreeMap::new();
@@ -516,16 +471,8 @@ fn read_conversation_metadata(
                 let name = group_nicknames
                     .get(&member)
                     .cloned()
-                    .or_else(|| {
-                        read_display_name(&mut contact_statement, &member)
-                            .ok()
-                            .flatten()
-                    })
-                    .or_else(|| {
-                        stranger_statement.as_mut().and_then(|statement| {
-                            read_display_name(statement, &member).ok().flatten()
-                        })
-                    })
+                    .or_else(|| contact_names.get(&member).cloned())
+                    .or_else(|| stranger_names.get(&member).cloned())
                     .unwrap_or_else(|| member.clone());
                 participant_names.insert(member, name);
             }
@@ -545,25 +492,79 @@ fn read_conversation_metadata(
     Ok(metadata)
 }
 
-fn read_display_name(
-    statement: &mut rusqlite::Statement<'_>,
-    username: &str,
-) -> Result<Option<String>, SqlcipherProbeFailure> {
-    let names = statement
-        .query_row([username], |row| {
+fn read_display_names(
+    connection: &Connection,
+    table: &str,
+) -> Result<BTreeMap<String, String>, SqlcipherProbeFailure> {
+    let sql = format!("SELECT username, remark, nick_name, alias FROM \"{table}\"");
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([], |row| {
             Ok((
-                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })
-        .optional()
         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
-    Ok(names
-        .into_iter()
-        .flat_map(|(remark, nickname, alias)| [remark, nickname, alias])
+    let mut names = BTreeMap::new();
+    for (username, remark, nickname, alias) in rows.flatten() {
+        if username.is_empty() || username.chars().any(char::is_control) {
+            continue;
+        }
+        if let Some(name) = [remark, nickname, alias]
+            .into_iter()
+            .flatten()
+            .find_map(valid_display_name)
+        {
+            names.insert(username, name);
+        }
+    }
+    Ok(names)
+}
+
+fn read_group_members(
+    connection: &Connection,
+) -> Result<BTreeMap<String, Vec<String>>, SqlcipherProbeFailure> {
+    let mut statement = connection
+        .prepare(
+            "SELECT room.username, member.username FROM chatroom_member membership \
+             JOIN name2id room ON membership.room_id = room.rowid \
+             JOIN name2id member ON membership.member_id = member.rowid",
+        )
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+    for (room, member) in rows.flatten() {
+        if room.ends_with("@chatroom") && valid_identity(&member) {
+            groups.entry(room).or_default().push(member);
+        }
+    }
+    Ok(groups)
+}
+
+fn read_room_buffers(
+    connection: &Connection,
+) -> Result<BTreeMap<String, Vec<u8>>, SqlcipherProbeFailure> {
+    let mut statement = connection
+        .prepare("SELECT username, ext_buffer FROM chat_room")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Value>(1)?))
+        })
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    Ok(rows
         .flatten()
-        .find_map(valid_display_name))
+        .filter_map(|(username, value)| value_bytes(value).map(|buffer| (username, buffer)))
+        .collect())
 }
 
 fn value_bytes(value: Value) -> Option<Vec<u8>> {
