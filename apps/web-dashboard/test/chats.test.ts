@@ -3,13 +3,22 @@ import test from "node:test";
 
 import {
   decodeDashboardRouteParam,
+  chatReadStorageKey,
   getCommunicationConversations,
   getCommunicationMessages,
+  isConversationUnread,
 } from "../src/lib/api.ts";
 
 test("decodes an encoded WeChat group identity exactly once", () => {
   assert.equal(decodeDashboardRouteParam("room%40chatroom"), "room@chatroom");
   assert.equal(decodeDashboardRouteParam("room@chatroom"), "room@chatroom");
+});
+
+test("chat unread state is isolated by device and conversation", () => {
+  assert.equal(chatReadStorageKey("device-a", "room@chatroom"), "pca.chat-read:device-a:room@chatroom");
+  assert.equal(isConversationUnread("2026-08-02T10:00:00Z", null), true);
+  assert.equal(isConversationUnread("2026-08-02T10:00:00Z", "2026-08-02T09:00:00Z"), true);
+  assert.equal(isConversationUnread("2026-08-02T10:00:00Z", "2026-08-02T10:00:00Z"), false);
 });
 
 test("loads owner-scoped conversations for one device", async () => {

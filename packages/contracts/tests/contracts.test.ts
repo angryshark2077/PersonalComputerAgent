@@ -263,6 +263,13 @@ test("communication contracts accept only eligible messages and complete manifes
   );
   assert.equal(
     validateContract(
+      "communication-message-sender-observed",
+      fixture("communication-message-sender-observed.valid.json"),
+    ).valid,
+    true,
+  );
+  assert.equal(
+    validateContract(
       "communication-message-recorded",
       fixture("communication-message-recorded.invalid-large-group.json"),
     ).valid,

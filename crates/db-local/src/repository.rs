@@ -1149,7 +1149,8 @@ pub(crate) fn load_pending_communication_events(
              WHERE o.state = 'pending'
                AND e.event_type IN (
                    'communication.message_recorded',
-                   'communication.conversation_observed'
+                   'communication.conversation_observed',
+                   'communication.message_sender_observed'
                )
                AND e.source = 'communication.wechat'
                AND e.schema_version = 1
@@ -1228,7 +1229,8 @@ pub(crate) fn acknowledge_communication_events(
                        WHERE e.event_id = sync_outbox.event_id
                          AND e.event_type IN (
                              'communication.message_recorded',
-                             'communication.conversation_observed'
+                             'communication.conversation_observed',
+                             'communication.message_sender_observed'
                          )
                          AND e.source = 'communication.wechat'
                          AND e.schema_version = 1

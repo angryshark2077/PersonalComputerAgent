@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/communication-message-sender-observed.schema.json",
+  "title": "CommunicationMessageSenderObserved",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["message_id", "source_key", "sender_id", "sender_display_name", "observed_at"],
+  "properties": {
+    "message_id": { "type": "string", "minLength": 1 },
+    "source_key": { "type": "string", "minLength": 1 },
+    "sender_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "sender_display_name": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "observed_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -460,7 +460,7 @@ async fn run_supervisor(
     let mut spool_paused = false;
     let mut retry_index = 0_usize;
     let mut retry_revision = control.configuration_revision;
-    let mut emitted_conversation_events = BTreeSet::new();
+    let mut emitted_metadata_events = BTreeSet::new();
 
     'supervisor: loop {
         let authoritative_control = authorization.borrow().control;
@@ -867,20 +867,23 @@ async fn run_supervisor(
                             break;
                         }
                         prepared.spool.disarm();
-                        if !emitted_conversation_events
-                            .contains(&prepared.conversation_event.event_id)
+                        for metadata_event in [&prepared.conversation_event, &prepared.sender_event]
                         {
-                            if database
-                                .append_event_with_outbox(&prepared.conversation_event)
-                                .await
-                                .map_err(|_| LocalPersistenceError::Database)
-                                .is_err()
-                            {
-                                persistence_failed = true;
-                                break;
+                            if !emitted_metadata_events.contains(&metadata_event.event_id) {
+                                if database
+                                    .append_event_with_outbox(metadata_event)
+                                    .await
+                                    .map_err(|_| LocalPersistenceError::Database)
+                                    .is_err()
+                                {
+                                    persistence_failed = true;
+                                    break;
+                                }
+                                emitted_metadata_events.insert(metadata_event.event_id.clone());
                             }
-                            emitted_conversation_events
-                                .insert(prepared.conversation_event.event_id.clone());
+                        }
+                        if persistence_failed {
+                            break;
                         }
                     }
                     if batch_paused {
@@ -1277,6 +1280,38 @@ async fn prepare_record(
         attachment_refs: Vec::new(),
         idempotency_key: Some(format!("conversation-observed:{conversation_event_id}")),
     };
+    let sender_fingerprint = Sha256::digest(
+        format!("{}\0{}", message.sender_id(), message.sender_display_name()).as_bytes(),
+    );
+    let sender_source_key = format!(
+        "message-sender-observed:{}:{sender_fingerprint:x}",
+        message.source_key()
+    );
+    let sender_event_id = stable_communication_event_id(identity, &account_id, &sender_source_key);
+    let sender_payload = serde_json::json!({
+        "message_id": message.message_id(),
+        "source_key": message.source_key(),
+        "sender_id": message.sender_id(),
+        "sender_display_name": message.sender_display_name(),
+        "observed_at": message.occurred_at(),
+    })
+    .as_object()
+    .cloned()
+    .ok_or(LocalPersistenceError::InvalidRecord)?;
+    let sender_event = EventEnvelope {
+        event_id: sender_event_id.clone(),
+        workspace_id: identity.workspace_id.hyphenated().to_string(),
+        device_id: identity.device_id.hyphenated().to_string(),
+        event_type: "communication.message_sender_observed".to_owned(),
+        source: COLLECTOR_KEY.to_owned(),
+        schema_version: 1,
+        occurred_at: message.occurred_at().to_owned(),
+        created_at: created_at.clone(),
+        sensitivity: Sensitivity::High,
+        payload: sender_payload,
+        attachment_refs: Vec::new(),
+        idempotency_key: Some(format!("message-sender-observed:{sender_event_id}")),
+    };
     let payload = serde_json::to_value(&message)
         .ok()
         .and_then(|value| value.as_object().cloned())
@@ -1301,6 +1336,7 @@ async fn prepare_record(
     };
     Ok(PreparedRecord {
         conversation_event,
+        sender_event,
         commit: CommunicationMessageCommit {
             account_id,
             source_sequence,
@@ -1332,6 +1368,7 @@ fn stable_communication_event_id(
 
 struct PreparedRecord {
     conversation_event: EventEnvelope,
+    sender_event: EventEnvelope,
     commit: CommunicationMessageCommit,
     spool: AttemptSpoolLease,
 }

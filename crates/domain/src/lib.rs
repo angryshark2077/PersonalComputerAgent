@@ -762,6 +762,8 @@ impl TryFrom<RawCommunicationAttachment> for CommunicationAttachment {
 pub struct CommunicationMessageRecordedInput {
     pub message_id: String,
     pub conversation_id: String,
+    pub sender_id: String,
+    pub sender_display_name: String,
     pub source_key: String,
     pub occurred_at: String,
     pub direction: Direction,
@@ -790,6 +792,8 @@ impl fmt::Debug for CommunicationMessageRecordedInput {
 pub struct CommunicationMessageRecorded {
     message_id: String,
     conversation_id: String,
+    sender_id: String,
+    sender_display_name: String,
     source_key: String,
     occurred_at: String,
     direction: Direction,
@@ -824,6 +828,12 @@ impl CommunicationMessageRecorded {
     pub fn try_new(input: CommunicationMessageRecordedInput) -> Result<Self, DomainError> {
         if input.message_id.trim().is_empty()
             || input.conversation_id.trim().is_empty()
+            || input.sender_id.trim().is_empty()
+            || input.sender_id.len() > 512
+            || input.sender_id.chars().any(char::is_control)
+            || input.sender_display_name.trim().is_empty()
+            || input.sender_display_name.len() > 1024
+            || input.sender_display_name.chars().any(char::is_control)
             || input.source_key.trim().is_empty()
             || input.occurred_at.trim().is_empty()
             || !input.conversation.is_allowed()
@@ -857,6 +867,8 @@ impl CommunicationMessageRecorded {
         Ok(Self {
             message_id: input.message_id,
             conversation_id: input.conversation_id,
+            sender_id: input.sender_id,
+            sender_display_name: input.sender_display_name,
             source_key: input.source_key,
             occurred_at: input.occurred_at,
             direction: input.direction,
@@ -875,6 +887,16 @@ impl CommunicationMessageRecorded {
     #[must_use]
     pub fn conversation_id(&self) -> &str {
         &self.conversation_id
+    }
+
+    #[must_use]
+    pub fn sender_id(&self) -> &str {
+        &self.sender_id
+    }
+
+    #[must_use]
+    pub fn sender_display_name(&self) -> &str {
+        &self.sender_display_name
     }
 
     #[must_use]
@@ -918,6 +940,8 @@ impl CommunicationMessageRecorded {
 struct RawCommunicationMessageRecorded {
     message_id: String,
     conversation_id: String,
+    sender_id: String,
+    sender_display_name: String,
     source_key: String,
     occurred_at: String,
     direction: Direction,
@@ -936,6 +960,8 @@ impl TryFrom<RawCommunicationMessageRecorded> for CommunicationMessageRecorded {
         Self::try_new(CommunicationMessageRecordedInput {
             message_id: raw.message_id,
             conversation_id: raw.conversation_id,
+            sender_id: raw.sender_id,
+            sender_display_name: raw.sender_display_name,
             source_key: raw.source_key,
             occurred_at: raw.occurred_at,
             direction: raw.direction,

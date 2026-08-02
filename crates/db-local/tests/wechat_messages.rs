@@ -52,6 +52,8 @@ fn valid_commit(database: &Path) -> CommunicationMessageCommit {
     let message = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
         message_id: "message-1".to_owned(),
         conversation_id: "conversation-1".to_owned(),
+        sender_id: "wxid_sender".to_owned(),
+        sender_display_name: "Sender".to_owned(),
         source_key: "source-key-1".to_owned(),
         occurred_at: "2026-08-02T12:00:00Z".to_owned(),
         direction: Direction::Incoming,
@@ -115,6 +117,8 @@ fn commit_with(
     commit.message = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
         message_id: message_id.to_owned(),
         conversation_id: conversation_id.to_owned(),
+        sender_id: "wxid_sender".to_owned(),
+        sender_display_name: "Sender".to_owned(),
         source_key: source_key.to_owned(),
         occurred_at: "2026-08-02T12:00:00Z".to_owned(),
         direction: Direction::Incoming,

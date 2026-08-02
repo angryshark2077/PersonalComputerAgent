@@ -19,6 +19,8 @@ fn valid_group_message(member_count: u8) -> CommunicationMessageRecordedInput {
     CommunicationMessageRecordedInput {
         message_id: "message-1".to_owned(),
         conversation_id: "conversation-1".to_owned(),
+        sender_id: "wxid_sender".to_owned(),
+        sender_display_name: "Sender".to_owned(),
         source_key: "account-1:conversation-1:message-1".to_owned(),
         occurred_at: "2026-08-02T12:00:00Z".to_owned(),
         direction: Direction::Incoming,
@@ -34,6 +36,8 @@ fn accepts_direct_text_and_small_group_media_only() {
     let text = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
         message_id: "message-1".to_owned(),
         conversation_id: "conversation-1".to_owned(),
+        sender_id: "wxid_self".to_owned(),
+        sender_display_name: "You".to_owned(),
         source_key: "account-1:conversation-1:message-1".to_owned(),
         occurred_at: "2026-08-02T12:00:00Z".to_owned(),
         direction: Direction::Outgoing,
@@ -87,6 +91,8 @@ fn debug_output_redacts_message_bodies_and_source_metadata() {
     let text_input = CommunicationMessageRecordedInput {
         message_id: "message-1".to_owned(),
         conversation_id: conversation_display_name.to_owned(),
+        sender_id: "wxid_sender".to_owned(),
+        sender_display_name: "Sender".to_owned(),
         source_key: source_path.to_owned(),
         occurred_at: "2026-08-02T12:00:00Z".to_owned(),
         direction: Direction::Incoming,
@@ -98,6 +104,8 @@ fn debug_output_redacts_message_bodies_and_source_metadata() {
     let media_input = CommunicationMessageRecordedInput {
         message_id: "message-2".to_owned(),
         conversation_id: conversation_display_name.to_owned(),
+        sender_id: "wxid_self".to_owned(),
+        sender_display_name: "You".to_owned(),
         source_key: source_path.to_owned(),
         occurred_at: "2026-08-02T12:00:00Z".to_owned(),
         direction: Direction::Outgoing,

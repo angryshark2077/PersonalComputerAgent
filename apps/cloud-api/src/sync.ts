@@ -5,6 +5,7 @@ import type {
   CommunicationConversationProjection,
   CommunicationEventRecord,
   CommunicationMessageProjection,
+  CommunicationMessageSenderProjection,
   SystemEventRecord,
 } from "@pca/db-cloud/src/repository.js";
 
@@ -110,6 +111,29 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
       conversation,
     };
   }
+  if (event.event_type === "communication.message_sender_observed") {
+    if (
+      (event.attachment_refs?.length ?? 0) !== 0
+      || !validateContract("communication-message-sender-observed", event.payload).valid
+    ) return null;
+    const sender = parseCommunicationMessageSender(event.payload, occurredAt);
+    if (sender === null || event.idempotency_key === undefined) return null;
+    return {
+      eventId: event.event_id,
+      workspaceId: event.workspace_id,
+      deviceId: event.device_id,
+      eventType: "communication.message_sender_observed",
+      source: "communication.wechat",
+      schemaVersion: 1,
+      occurredAt,
+      createdAt,
+      sensitivity: "high",
+      payload: event.payload as unknown as Record<string, unknown>,
+      attachmentRefs: [],
+      idempotencyKey: event.idempotency_key,
+      sender,
+    };
+  }
   if (
     event.event_type !== "communication.message_recorded"
     || !validateContract("communication-message-recorded", event.payload).valid
@@ -164,6 +188,8 @@ function parseCommunicationMessage(
   const message = payload as {
     message_id: string;
     conversation_id: string;
+    sender_id: string;
+    sender_display_name: string;
     source_key: string;
     occurred_at: string;
     direction: "incoming" | "outgoing";
@@ -197,6 +223,8 @@ function parseCommunicationMessage(
   return {
     messageId: message.message_id,
     conversationId: message.conversation_id,
+    senderId: message.sender_id,
+    senderDisplayName: message.sender_display_name.trim(),
     sourceKey: message.source_key,
     occurredAt,
     direction: message.direction,
@@ -207,6 +235,30 @@ function parseCommunicationMessage(
     },
     text: message.kind === "text" ? message.text ?? null : null,
     attachments,
+  };
+}
+
+function parseCommunicationMessageSender(
+  payload: unknown,
+  eventOccurredAt: Date,
+): CommunicationMessageSenderProjection | null {
+  const value = payload as {
+    message_id: string;
+    source_key: string;
+    sender_id: string;
+    sender_display_name: string;
+    observed_at: string;
+  };
+  const observedAt = new Date(value.observed_at);
+  if (Number.isNaN(observedAt.getTime()) || observedAt.getTime() !== eventOccurredAt.getTime()) {
+    return null;
+  }
+  return {
+    messageId: value.message_id,
+    sourceKey: value.source_key,
+    senderId: value.sender_id,
+    senderDisplayName: value.sender_display_name.trim(),
+    observedAt,
   };
 }
 

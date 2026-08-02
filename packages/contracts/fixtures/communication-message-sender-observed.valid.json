@@ -1,0 +1,7 @@
+{
+  "message_id": "message-1",
+  "source_key": "account-1:conversation-1:message-1",
+  "sender_id": "wxid_sender",
+  "sender_display_name": "Sender One",
+  "observed_at": "2026-08-02T12:00:00Z"
+}

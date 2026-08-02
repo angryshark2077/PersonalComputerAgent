@@ -61,6 +61,8 @@ export interface DashboardMessageAttachment {
 export interface DashboardMessage {
   event_id: string;
   message_id: string;
+  sender_id: string;
+  sender_display_name: string;
   occurred_at: string;
   direction: "incoming" | "outgoing";
   kind: "text" | "audio" | "image" | "video";
@@ -117,6 +119,17 @@ export function decodeDashboardRouteParam(value: string): string {
   } catch {
     return value;
   }
+}
+
+export function chatReadStorageKey(deviceId: string, conversationId: string): string {
+  return `pca.chat-read:${deviceId}:${conversationId}`;
+}
+
+export function isConversationUnread(lastMessageAt: string, readAt: string | null): boolean {
+  if (readAt === null) return true;
+  const last = Date.parse(lastMessageAt);
+  const read = Date.parse(readAt);
+  return Number.isNaN(last) || Number.isNaN(read) || last > read;
 }
 
 export async function getWorkspaces(

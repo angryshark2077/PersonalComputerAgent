@@ -1913,6 +1913,8 @@ mod tests {
         let message = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
             message_id: "message-1".to_owned(),
             conversation_id: "conversation-1".to_owned(),
+            sender_id: "wxid_sender".to_owned(),
+            sender_display_name: "Sender".to_owned(),
             source_key: "source-key-1".to_owned(),
             occurred_at: "2026-08-02T00:00:00Z".to_owned(),
             direction: Direction::Incoming,

@@ -24,10 +24,12 @@
     },
     "base": {
       "type": "object",
-      "required": ["message_id", "conversation_id", "source_key", "occurred_at", "direction", "kind", "conversation"],
+      "required": ["message_id", "conversation_id", "sender_id", "sender_display_name", "source_key", "occurred_at", "direction", "kind", "conversation"],
       "properties": {
         "message_id": { "type": "string", "minLength": 1 },
         "conversation_id": { "type": "string", "minLength": 1 },
+        "sender_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sender_display_name": { "type": "string", "minLength": 1, "maxLength": 1024 },
         "source_key": { "type": "string", "minLength": 1 },
         "occurred_at": { "type": "string", "format": "date-time" },
         "direction": { "enum": ["incoming", "outgoing"] },
@@ -45,6 +47,8 @@
       "properties": {
         "message_id": { "type": "string", "minLength": 1 },
         "conversation_id": { "type": "string", "minLength": 1 },
+        "sender_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sender_display_name": { "type": "string", "minLength": 1, "maxLength": 1024 },
         "source_key": { "type": "string", "minLength": 1 },
         "occurred_at": { "type": "string", "format": "date-time" },
         "direction": { "enum": ["incoming", "outgoing"] },
@@ -61,6 +65,8 @@
       "properties": {
         "message_id": { "type": "string", "minLength": 1 },
         "conversation_id": { "type": "string", "minLength": 1 },
+        "sender_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sender_display_name": { "type": "string", "minLength": 1, "maxLength": 1024 },
         "source_key": { "type": "string", "minLength": 1 },
         "occurred_at": { "type": "string", "format": "date-time" },
         "direction": { "enum": ["incoming", "outgoing"] },
@@ -86,6 +92,8 @@
       "properties": {
         "message_id": { "type": "string", "minLength": 1 },
         "conversation_id": { "type": "string", "minLength": 1 },
+        "sender_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sender_display_name": { "type": "string", "minLength": 1, "maxLength": 1024 },
         "source_key": { "type": "string", "minLength": 1 },
         "occurred_at": { "type": "string", "format": "date-time" },
         "direction": { "enum": ["incoming", "outgoing"] },
@@ -111,6 +119,8 @@
       "properties": {
         "message_id": { "type": "string", "minLength": 1 },
         "conversation_id": { "type": "string", "minLength": 1 },
+        "sender_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sender_display_name": { "type": "string", "minLength": 1, "maxLength": 1024 },
         "source_key": { "type": "string", "minLength": 1 },
         "occurred_at": { "type": "string", "format": "date-time" },
         "direction": { "enum": ["incoming", "outgoing"] },

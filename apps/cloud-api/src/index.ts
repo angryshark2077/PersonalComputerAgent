@@ -505,6 +505,8 @@ export function createApp(options: CreateAppOptions): Hono {
         messages: messages.map((message) => ({
           event_id: message.eventId,
           message_id: message.messageId,
+          sender_id: message.senderId,
+          sender_display_name: message.senderDisplayName,
           occurred_at: message.occurredAt.toISOString(),
           direction: message.direction,
           kind: message.kind,

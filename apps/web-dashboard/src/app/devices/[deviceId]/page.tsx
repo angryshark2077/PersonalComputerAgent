@@ -111,7 +111,7 @@ export default function DevicePage() {
         />
         <CollectorScopeCard
           name="WeChat messages"
-          detail="Incoming and outgoing text, audio, images and video; direct chats and groups up to 8 members; 180-day retention"
+          detail="Incoming and outgoing text, audio, images and video; direct chats and groups up to 15 members; 180-day retention"
           enabled={screen.device.collectors["communication.wechat"].enabled}
           disabled={disabled}
           onToggle={() => void save({

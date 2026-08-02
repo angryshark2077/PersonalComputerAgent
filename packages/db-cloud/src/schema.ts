@@ -442,6 +442,8 @@ export const communicationMessages = pgTable(
     deviceId: uuid("device_id").notNull(),
     conversationId: text("conversation_id").notNull(),
     messageId: text("message_id").notNull(),
+    senderId: text("sender_id").notNull().default(""),
+    senderDisplayName: text("sender_display_name").notNull().default(""),
     sourceKey: text("source_key").notNull(),
     occurredAt: timestampColumn("occurred_at").notNull(),
     direction: text("direction").notNull(),

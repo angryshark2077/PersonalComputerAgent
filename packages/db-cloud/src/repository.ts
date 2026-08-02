@@ -213,9 +213,15 @@ export interface CommunicationConversationEventRecord extends CommunicationEvent
   conversation: CommunicationConversationProjection;
 }
 
+export interface CommunicationMessageSenderEventRecord extends CommunicationEventRecordBase {
+  eventType: "communication.message_sender_observed";
+  sender: CommunicationMessageSenderProjection;
+}
+
 export type CommunicationEventRecord =
   | CommunicationMessageEventRecord
-  | CommunicationConversationEventRecord;
+  | CommunicationConversationEventRecord
+  | CommunicationMessageSenderEventRecord;
 
 export interface CommunicationConversationProjection {
   conversationId: string;
@@ -228,6 +234,8 @@ export interface CommunicationConversationProjection {
 export interface CommunicationMessageProjection {
   messageId: string;
   conversationId: string;
+  senderId: string;
+  senderDisplayName: string;
   sourceKey: string;
   occurredAt: Date;
   direction: "incoming" | "outgoing";
@@ -238,6 +246,14 @@ export interface CommunicationMessageProjection {
   };
   text: string | null;
   attachments: CommunicationAttachmentProjection[];
+}
+
+export interface CommunicationMessageSenderProjection {
+  messageId: string;
+  sourceKey: string;
+  senderId: string;
+  senderDisplayName: string;
+  observedAt: Date;
 }
 
 export interface CommunicationAttachmentProjection {
@@ -290,6 +306,8 @@ export interface CommunicationMessageRecord {
   messageId: string;
   occurredAt: Date;
   direction: "incoming" | "outgoing";
+  senderId: string;
+  senderDisplayName: string;
   kind: "text" | "audio" | "image" | "video";
   text: string | null;
   attachments: CommunicationMessageAttachmentRecord[];
@@ -775,6 +793,29 @@ export class MemoryControlRepository implements ControlRepository {
       ) {
         duplicateEventIds.push(event.eventId);
       } else {
+        if (event.eventType === "communication.message_sender_observed") {
+          this.#communicationEvents.set(event.eventId, {
+            ...event,
+            payload: { ...event.payload },
+            attachmentRefs: [],
+            sender: { ...event.sender },
+          });
+          for (const stored of this.#communicationEvents.values()) {
+            if (
+              stored.eventType === "communication.message_recorded"
+              && stored.workspaceId === workspaceId
+              && stored.deviceId === deviceId
+              && stored.message.sourceKey === event.sender.sourceKey
+              && stored.message.messageId === event.sender.messageId
+            ) {
+              stored.message.senderId = event.sender.senderId;
+              stored.message.senderDisplayName = event.sender.senderDisplayName;
+            }
+          }
+          if (idempotencyKey !== null) this.#communicationIdempotency.add(idempotencyKey);
+          acceptedEventIds.push(event.eventId);
+          continue;
+        }
         const projection = event.eventType === "communication.message_recorded"
           ? {
               conversationId: event.message.conversationId,
@@ -1674,6 +1715,24 @@ export class DrizzleControlRepository implements ControlRepository {
             .returning({ eventId: communicationEvents.eventId });
           if (inserted[0] === undefined) return false;
 
+          if (event.eventType === "communication.message_sender_observed") {
+            await transaction
+              .update(communicationMessages)
+              .set({
+                senderId: event.sender.senderId,
+                senderDisplayName: event.sender.senderDisplayName,
+              })
+              .where(
+                and(
+                  eq(communicationMessages.workspaceId, workspaceId),
+                  eq(communicationMessages.deviceId, deviceId),
+                  eq(communicationMessages.messageId, event.sender.messageId),
+                  eq(communicationMessages.sourceKey, event.sender.sourceKey),
+                ),
+              );
+            return true;
+          }
+
           const projection = event.eventType === "communication.message_recorded"
             ? {
                 conversationId: event.message.conversationId,
@@ -1744,6 +1803,8 @@ export class DrizzleControlRepository implements ControlRepository {
             deviceId,
             conversationId: event.message.conversationId,
             messageId: event.message.messageId,
+            senderId: event.message.senderId,
+            senderDisplayName: event.message.senderDisplayName,
             sourceKey: event.message.sourceKey,
             occurredAt: event.message.occurredAt,
             direction: event.message.direction,
@@ -1845,6 +1906,8 @@ export class DrizzleControlRepository implements ControlRepository {
         .select({
           eventId: communicationMessages.eventId,
           messageId: communicationMessages.messageId,
+          senderId: communicationMessages.senderId,
+          senderDisplayName: communicationMessages.senderDisplayName,
           occurredAt: communicationMessages.occurredAt,
           direction: communicationMessages.direction,
           kind: communicationMessages.kind,
@@ -1883,6 +1946,8 @@ export class DrizzleControlRepository implements ControlRepository {
         return {
           eventId: message.eventId,
           messageId: message.messageId,
+          senderId: message.senderId,
+          senderDisplayName: message.senderDisplayName,
           occurredAt: message.occurredAt,
           direction: message.direction as CommunicationMessageRecord["direction"],
           kind: message.kind as CommunicationMessageRecord["kind"],
@@ -2209,6 +2274,8 @@ function communicationMessageRecord(
   return {
     eventId: event.eventId,
     messageId: event.message.messageId,
+    senderId: event.message.senderId,
+    senderDisplayName: event.message.senderDisplayName,
     occurredAt: event.message.occurredAt,
     direction: event.message.direction,
     kind: event.message.kind,

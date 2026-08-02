@@ -356,6 +356,8 @@ fn text_record(sequence: u64) -> NormalizedCommunicationRecord {
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
             message_id: format!("message-{sequence}"),
             conversation_id: "conversation-1".to_owned(),
+            sender_id: "wxid_self".to_owned(),
+            sender_display_name: "You".to_owned(),
             source_key: format!("opaque-source-key-{sequence}"),
             occurred_at: "2026-08-02T00:00:00Z".to_owned(),
             direction: Direction::Outgoing,
@@ -390,6 +392,8 @@ fn media_record(path: &Path, declared: &[u8], sequence: u64) -> NormalizedCommun
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
             message_id: format!("message-{sequence}"),
             conversation_id: "conversation-1".to_owned(),
+            sender_id: "wxid_sender".to_owned(),
+            sender_display_name: "Sender".to_owned(),
             source_key: format!("opaque-source-key-{sequence}"),
             occurred_at: "2026-08-02T00:00:00Z".to_owned(),
             direction: Direction::Incoming,
@@ -436,6 +440,8 @@ fn multi_media_record(
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
             message_id: format!("message-{sequence}"),
             conversation_id: "conversation-1".to_owned(),
+            sender_id: "wxid_sender".to_owned(),
+            sender_display_name: "Sender".to_owned(),
             source_key: format!("opaque-source-key-{sequence}"),
             occurred_at: "2026-08-02T00:00:00Z".to_owned(),
             direction: Direction::Incoming,
@@ -914,23 +920,26 @@ async fn completed_media_is_streamed_to_its_hash_name_before_atomic_commit() {
 
     let pending = harness
         .database
-        .load_pending_communication_events(2)
+        .load_pending_communication_events(3)
         .await
         .expect("load message and conversation metadata events");
-    assert_eq!(pending.len(), 2);
+    assert_eq!(pending.len(), 3);
     assert!(pending
         .iter()
         .any(|event| event.event_type == "communication.message_recorded"));
     assert!(pending
         .iter()
         .any(|event| event.event_type == "communication.conversation_observed"));
+    assert!(pending
+        .iter()
+        .any(|event| event.event_type == "communication.message_sender_observed"));
 
     let name = format!("{:x}", Sha256::digest(bytes));
     let copied = DbActorHandle::communication_spool_root(&harness.database_path).join(name);
     assert_eq!(fs::read(copied).expect("read committed spool file"), bytes);
     let connection = Connection::open(&harness.database_path).unwrap();
-    assert_eq!(row_count(&connection, "events_local"), 2);
-    assert_eq!(row_count(&connection, "sync_outbox"), 2);
+    assert_eq!(row_count(&connection, "events_local"), 3);
+    assert_eq!(row_count(&connection, "sync_outbox"), 3);
     assert_eq!(row_count(&connection, "communication_messages"), 1);
     assert_eq!(row_count(&connection, "communication_cursors"), 1);
     assert_eq!(row_count(&connection, "attachment_spool"), 1);
@@ -1249,6 +1258,8 @@ async fn incomplete_media_envelope_is_rejected_before_runtime_and_cannot_advance
     let message = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
         message_id: "message-1".to_owned(),
         conversation_id: "conversation-1".to_owned(),
+        sender_id: "wxid_sender".to_owned(),
+        sender_display_name: "Sender".to_owned(),
         source_key: "opaque-source-key".to_owned(),
         occurred_at: "2026-08-02T00:00:00Z".to_owned(),
         direction: Direction::Incoming,
@@ -1363,7 +1374,7 @@ async fn spool_hard_limit_pauses_copy_until_usage_is_strictly_below_resume_water
     wait_for(&harness.state.poll_calls, 3).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if harness.database.active_outbox_depth().await.unwrap() == 2 {
+            if harness.database.active_outbox_depth().await.unwrap() == 3 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1381,7 +1392,7 @@ async fn spool_hard_limit_pauses_copy_until_usage_is_strictly_below_resume_water
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(depth, 2, "collector error after resume: {error_code:?}");
+    assert_eq!(depth, 3, "collector error after resume: {error_code:?}");
     assert!(fs::read_dir(root)
         .unwrap()
         .filter_map(Result::ok)
@@ -1434,7 +1445,7 @@ async fn b2_batch_rechecks_depth_and_skips_media_after_crossing_high_water() {
 
     assert_eq!(
         harness.database.active_outbox_depth().await.unwrap(),
-        OUTBOX_HIGH_WATER + 2
+        OUTBOX_HIGH_WATER + 3
     );
     let connection = Connection::open(&harness.database_path).unwrap();
     assert_eq!(row_count(&connection, "communication_messages"), 1);
@@ -1505,7 +1516,7 @@ async fn b2_system_outbox_movement_stops_later_batch_record_before_copy() {
 
     assert_eq!(
         harness.database.active_outbox_depth().await.unwrap(),
-        OUTBOX_HIGH_WATER + 3
+        OUTBOX_HIGH_WATER + 4
     );
     let connection = Connection::open(&harness.database_path).unwrap();
     assert_eq!(row_count(&connection, "communication_messages"), 1);

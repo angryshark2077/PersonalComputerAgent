@@ -2,11 +2,12 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { DashboardShell } from "../../../../../components/dashboard-shell";
 import {
   DashboardApiError,
+  chatReadStorageKey,
   cloudApiOrigin,
   decodeDashboardRouteParam,
   getCommunicationConversations,
@@ -21,7 +22,9 @@ export default function ChatMessagesPage() {
   const conversationId = decodeDashboardRouteParam(params.conversationId);
   const [messages, setMessages] = useState<DashboardMessage[] | null>(null);
   const [displayName, setDisplayName] = useState(conversationId);
+  const [conversationScope, setConversationScope] = useState<"direct" | "group">("direct");
   const [error, setError] = useState<string | null>(null);
+  const messagePanel = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     const origin = cloudApiOrigin();
@@ -40,17 +43,27 @@ export default function ChatMessagesPage() {
           ),
           getCommunicationConversations(window.fetch, origin, deviceId),
         ]);
-        setDisplayName(
-          conversations.find(
-            (conversation) => conversation.conversation_id === conversationId,
-          )?.display_name ?? conversationId,
+        const conversation = conversations.find(
+          (candidate) => candidate.conversation_id === conversationId,
         );
+        setDisplayName(conversation?.display_name ?? conversationId);
+        setConversationScope(conversation?.scope ?? "direct");
         setMessages(latest.toReversed());
+        window.localStorage.setItem(
+          chatReadStorageKey(deviceId, conversationId),
+          conversation?.last_message_at ?? new Date().toISOString(),
+        );
       } catch (cause) {
         setError(messageFor(cause));
       }
     })();
   }, [conversationId, deviceId]);
+
+  useEffect(() => {
+    if (messages !== null) {
+      messagePanel.current?.scrollTo({ top: messagePanel.current.scrollHeight });
+    }
+  }, [messages]);
 
   return (
     <DashboardShell>
@@ -62,12 +75,15 @@ export default function ChatMessagesPage() {
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
       {messages === null ? <p className="status-note">Loading messages…</p> : (
-        <section className="dashboard-panel" aria-label="Conversation messages">
+        <section ref={messagePanel} className="dashboard-panel message-scroll" aria-label="Conversation messages">
           {messages.length === 0 ? <p className="empty-state">No synchronized messages.</p> : (
             <ol className="message-list">
               {messages.map((message) => (
                 <li className={`message-row is-${message.direction}`} key={message.event_id}>
                   <article className="message-bubble">
+                    {conversationScope === "group"
+                      ? <p className="message-sender">{message.sender_display_name}</p>
+                      : null}
                     {message.kind === "text"
                       ? <p className="message-text">{message.text}</p>
                       : <MediaSummary message={message} />}

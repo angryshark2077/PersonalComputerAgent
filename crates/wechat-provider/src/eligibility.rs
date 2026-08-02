@@ -68,6 +68,8 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<NormalizedCommuni
     let message = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
         message_id: record.message_id,
         conversation_id: record.conversation_id,
+        sender_id: record.sender_id,
+        sender_display_name: record.sender_display_name,
         source_key: record.source_key,
         occurred_at: record.occurred_at,
         direction,

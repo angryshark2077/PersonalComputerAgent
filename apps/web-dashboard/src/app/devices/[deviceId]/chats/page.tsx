@@ -7,8 +7,10 @@ import { useEffect, useState } from "react";
 import { DashboardShell } from "../../../../components/dashboard-shell";
 import {
   DashboardApiError,
+  chatReadStorageKey,
   cloudApiOrigin,
   getCommunicationConversations,
+  isConversationUnread,
   type DashboardConversation,
 } from "../../../../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../../../../lib/auth";
@@ -17,6 +19,21 @@ export default function DeviceChatsPage() {
   const params = useParams<{ deviceId: string }>();
   const [conversations, setConversations] = useState<DashboardConversation[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [readTimes, setReadTimes] = useState<Record<string, string | null>>({});
+
+  useEffect(() => {
+    if (conversations === null) return;
+    const refreshReadTimes = () => setReadTimes(Object.fromEntries(conversations.map((conversation) => [
+      conversation.conversation_id,
+      window.localStorage.getItem(chatReadStorageKey(params.deviceId, conversation.conversation_id)),
+    ])));
+    window.addEventListener("focus", refreshReadTimes);
+    window.addEventListener("pageshow", refreshReadTimes);
+    return () => {
+      window.removeEventListener("focus", refreshReadTimes);
+      window.removeEventListener("pageshow", refreshReadTimes);
+    };
+  }, [conversations, params.deviceId]);
 
   useEffect(() => {
     const origin = cloudApiOrigin();
@@ -26,7 +43,12 @@ export default function DeviceChatsPage() {
         return;
       }
       try {
-        setConversations(await getCommunicationConversations(window.fetch, origin, params.deviceId));
+        const latest = await getCommunicationConversations(window.fetch, origin, params.deviceId);
+        setConversations(latest);
+        setReadTimes(Object.fromEntries(latest.map((conversation) => [
+          conversation.conversation_id,
+          window.localStorage.getItem(chatReadStorageKey(params.deviceId, conversation.conversation_id)),
+        ])));
       } catch (cause) {
         setError(messageFor(cause));
       }
@@ -58,6 +80,10 @@ export default function DeviceChatsPage() {
                   >
                     <div className="conversation-main">
                       <p className="conversation-title">{conversationTitle(conversation)}</p>
+                      {isConversationUnread(
+                        conversation.last_message_at,
+                        readTimes[conversation.conversation_id] ?? null,
+                      ) ? <span className="unread-dot" aria-label="Unread messages" /> : null}
                       <p className="conversation-id">{conversation.conversation_id}</p>
                     </div>
                     <div className="conversation-meta">

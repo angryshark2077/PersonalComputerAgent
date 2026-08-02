@@ -147,9 +147,15 @@ fn probe_source(paths: &SourcePaths) -> Result<SourceCapabilities, DomainError> 
     with_database(&paths.contact_database, &material, |connection| {
         require_columns(connection, "name2id", &["username"])?;
         require_columns(connection, "chatroom_member", &["room_id", "member_id"])?;
+        require_columns(connection, "chat_room", &["username", "ext_buffer"])?;
         require_columns(
             connection,
             "contact",
+            &["username", "remark", "nick_name", "alias"],
+        )?;
+        require_columns(
+            connection,
+            "stranger",
             &["username", "remark", "nick_name", "alias"],
         )
     })?;
@@ -246,6 +252,9 @@ fn read_database_text(
 ) -> Result<Vec<(String, i64, SourceMessageRecord)>, SqlcipherProbeFailure> {
     let my_rowid = local_sender_rowid(connection, context.local_username)?
         .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
+    let mut sender_statement = connection
+        .prepare("SELECT user_name FROM Name2Id WHERE rowid = ?1 LIMIT 1")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
     let mut records = Vec::new();
     for session in sessions {
         if records.len() >= limit {
@@ -258,6 +267,7 @@ fn read_database_text(
             .unwrap_or_else(|| ConversationMetadata {
                 display_name: session.username.clone(),
                 member_count: None,
+                participant_names: BTreeMap::new(),
             });
         let conversation = if session.username.ends_with("@chatroom") {
             let Some(member_count) = metadata.member_count else {
@@ -323,6 +333,29 @@ fn read_database_text(
             } else {
                 SourceDirection::Incoming
             };
+            let (sender_id, sender_display_name) = match direction {
+                SourceDirection::Outgoing => (context.local_username.to_owned(), "You".to_owned()),
+                SourceDirection::Incoming if session.username.ends_with("@chatroom") => {
+                    let sender_id = sender_statement
+                        .query_row([row.real_sender_id], |sender_row| {
+                            sender_row.get::<_, String>(0)
+                        })
+                        .optional()
+                        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+                        .filter(|value| valid_identity(value))
+                        .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
+                    let sender_display_name = metadata
+                        .participant_names
+                        .get(&sender_id)
+                        .cloned()
+                        .unwrap_or_else(|| sender_id.clone());
+                    (sender_id, sender_display_name)
+                }
+                SourceDirection::Incoming => {
+                    (session.username.clone(), metadata.display_name.clone())
+                }
+                SourceDirection::Unknown => continue,
+            };
             let Some(body) = decode_message_content(&row.compress_content, &row.message_content)
             else {
                 continue;
@@ -350,6 +383,8 @@ fn read_database_text(
                     message_id,
                     conversation_id: session.username.clone(),
                     conversation_display_name: metadata.display_name.clone(),
+                    sender_id,
+                    sender_display_name,
                     source_key,
                     occurred_at,
                     local_account: LocalAccountProof::Verified,
@@ -377,6 +412,7 @@ struct Session {
 struct ConversationMetadata {
     display_name: String,
     member_count: Option<u8>,
+    participant_names: BTreeMap<String, String>,
 }
 
 struct MessageRow {
@@ -418,7 +454,12 @@ fn read_conversation_metadata(
 ) -> Result<BTreeMap<String, ConversationMetadata>, SqlcipherProbeFailure> {
     let mut metadata = BTreeMap::new();
     let mut contact_statement = connection
-        .prepare("SELECT remark, nick_name, alias FROM contact WHERE username = ?1 LIMIT 1")
+        .prepare(
+            "SELECT remark, nick_name, alias FROM contact WHERE username = ?1 \
+             UNION ALL \
+             SELECT remark, nick_name, alias FROM stranger WHERE username = ?1 \
+             LIMIT 1",
+        )
         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
     let mut count_statement = connection
         .prepare(
@@ -426,40 +467,182 @@ fn read_conversation_metadata(
              WHERE room_id = (SELECT rowid FROM name2id WHERE username = ?1)",
         )
         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut member_statement = connection
+        .prepare(
+            "SELECT n.username FROM chatroom_member m \
+             JOIN name2id n ON m.member_id = n.rowid \
+             WHERE m.room_id = (SELECT rowid FROM name2id WHERE username = ?1)",
+        )
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut room_buffer_statement = connection
+        .prepare("SELECT ext_buffer FROM chat_room WHERE username = ?1 LIMIT 1")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
     for session in sessions {
-        let names = contact_statement
-            .query_row([&session.username], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .optional()
-            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
-        let display_name = names
-            .into_iter()
-            .flat_map(|(remark, nickname, alias)| [remark, nickname, alias])
-            .flatten()
-            .find_map(valid_display_name)
+        let display_name = read_display_name(&mut contact_statement, &session.username)?
             .unwrap_or_else(|| session.username.clone());
-        let member_count = if session.username.ends_with("@chatroom") {
+        let (member_count, participant_names) = if session.username.ends_with("@chatroom") {
             let count: i64 = count_statement
                 .query_row([&session.username], |row| row.get(0))
                 .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
-            u8::try_from(count).ok()
+            let members = member_statement
+                .query_map([&session.username], |row| row.get::<_, String>(0))
+                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+                .into_iter()
+                .filter(|member| valid_identity(member))
+                .collect::<Vec<_>>();
+            let room_buffer = room_buffer_statement
+                .query_row([&session.username], |row| row.get::<_, Value>(0))
+                .optional()
+                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+                .and_then(value_bytes);
+            let group_nicknames = room_buffer
+                .as_deref()
+                .map(|buffer| parse_group_nicknames(buffer, &members))
+                .unwrap_or_default();
+            let mut participant_names = BTreeMap::new();
+            for member in members {
+                let name = group_nicknames
+                    .get(&member)
+                    .cloned()
+                    .or(read_display_name(&mut contact_statement, &member)?)
+                    .unwrap_or_else(|| member.clone());
+                participant_names.insert(member, name);
+            }
+            (u8::try_from(count).ok(), participant_names)
         } else {
-            None
+            (None, BTreeMap::new())
         };
         metadata.insert(
             session.username.clone(),
             ConversationMetadata {
                 display_name,
                 member_count,
+                participant_names,
             },
         );
     }
     Ok(metadata)
+}
+
+fn read_display_name(
+    statement: &mut rusqlite::Statement<'_>,
+    username: &str,
+) -> Result<Option<String>, SqlcipherProbeFailure> {
+    let names = statement
+        .query_row([username], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .optional()
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    Ok(names
+        .into_iter()
+        .flat_map(|(remark, nickname, alias)| [remark, nickname, alias])
+        .flatten()
+        .find_map(valid_display_name))
+}
+
+fn value_bytes(value: Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Blob(value) => Some(value),
+        Value::Text(value) => Some(value.into_bytes()),
+        _ => None,
+    }
+}
+
+fn valid_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && !value.chars().any(char::is_control)
+        && !value.ends_with("@chatroom")
+}
+
+fn parse_group_nicknames(buffer: &[u8], candidates: &[String]) -> BTreeMap<String, String> {
+    let candidate_set = candidates
+        .iter()
+        .map(|candidate| candidate.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut names = BTreeMap::new();
+    let mut index = 0;
+    while index + 2 < buffer.len() {
+        if buffer[index] != 0x0a {
+            index += 1;
+            continue;
+        }
+        let Some((id_length, id_start)) = read_varint(buffer, index + 1) else {
+            index += 1;
+            continue;
+        };
+        let Some(id_end) = id_start.checked_add(id_length) else {
+            index += 1;
+            continue;
+        };
+        if id_length == 0 || id_length > 96 || id_end >= buffer.len() {
+            index += 1;
+            continue;
+        }
+        let Ok(member_id) = std::str::from_utf8(&buffer[id_start..id_end]) else {
+            index += 1;
+            continue;
+        };
+        let member_id = member_id.trim();
+        if !valid_identity(member_id)
+            || !candidate_set.contains(&member_id.to_ascii_lowercase())
+            || buffer[id_end] != 0x12
+        {
+            index = id_end;
+            continue;
+        }
+        let Some((name_length, name_start)) = read_varint(buffer, id_end + 1) else {
+            index = id_end;
+            continue;
+        };
+        let Some(name_end) = name_start.checked_add(name_length) else {
+            index = id_end;
+            continue;
+        };
+        if name_length == 0 || name_length > 128 || name_end > buffer.len() {
+            index = id_end;
+            continue;
+        }
+        if let Ok(name) = std::str::from_utf8(&buffer[name_start..name_end]) {
+            let cleaned = name
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>();
+            if let Some(name) = valid_display_name(cleaned) {
+                if !name.eq_ignore_ascii_case(member_id)
+                    && !name.ends_with("@chatroom")
+                    && !name.starts_with("wxid_")
+                {
+                    names.entry(member_id.to_owned()).or_insert(name);
+                }
+            }
+        }
+        index = name_end;
+    }
+    names
+}
+
+fn read_varint(buffer: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut value = 0_usize;
+    let mut shift = 0_u32;
+    let mut position = start;
+    while position < buffer.len() && shift <= 28 {
+        let byte = buffer[position];
+        value = value.checked_add(usize::from(byte & 0x7f).checked_shl(shift)?)?;
+        position += 1;
+        if byte & 0x80 == 0 {
+            return Some((value, position));
+        }
+        shift += 7;
+    }
+    None
 }
 
 fn valid_display_name(value: String) -> Option<String> {
@@ -690,7 +873,8 @@ fn capability_unavailable() -> DomainError {
 mod tests {
     use super::{
         clean_account_directory_name, decode_value, is_direct_conversation, is_message_database,
-        message_table_name, read_conversation_metadata, retention_cutoff_from, Session,
+        message_table_name, parse_group_nicknames, read_conversation_metadata,
+        retention_cutoff_from, Session,
     };
     use rusqlite::{types::Value, Connection};
     use std::path::Path;
@@ -723,21 +907,40 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE contact (username TEXT, remark TEXT, nick_name TEXT, alias TEXT);\
+                 CREATE TABLE stranger (username TEXT, remark TEXT, nick_name TEXT, alias TEXT);\
                  CREATE TABLE name2id (username TEXT);\
                  CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);\
+                 CREATE TABLE chat_room (username TEXT, ext_buffer BLOB);\
                  INSERT INTO contact VALUES ('wxid_friend', 'Friend Remark', 'Friend Nick', 'friend_alias');\
                  INSERT INTO contact VALUES ('room@chatroom', '', 'Group Name', 'room_alias');\
-                 INSERT INTO name2id(rowid, username) VALUES (7, 'room@chatroom');",
+                 INSERT INTO contact VALUES ('wxid_member1', 'Member Remark', 'Member Nick', 'member_alias');\
+                 INSERT INTO name2id(rowid, username) VALUES (100, 'room@chatroom');",
             )
             .expect("create contact fixture");
         for member in 1..=15 {
             connection
                 .execute(
-                    "INSERT INTO chatroom_member(room_id, member_id) VALUES (7, ?1)",
+                    "INSERT INTO name2id(rowid, username) VALUES (?1, ?2)",
+                    rusqlite::params![member, format!("wxid_member{member}")],
+                )
+                .expect("insert member identity");
+            connection
+                .execute(
+                    "INSERT INTO chatroom_member(room_id, member_id) VALUES (100, ?1)",
                     [member],
                 )
                 .expect("insert group member");
         }
+        let mut room_buffer = vec![0x0a, 12];
+        room_buffer.extend_from_slice(b"wxid_member1");
+        room_buffer.extend_from_slice(&[0x12, 11]);
+        room_buffer.extend_from_slice(b"Group Alias");
+        connection
+            .execute(
+                "INSERT INTO chat_room(username, ext_buffer) VALUES ('room@chatroom', ?1)",
+                [room_buffer],
+            )
+            .expect("insert group nickname buffer");
         let sessions = vec![
             Session {
                 username: "wxid_friend".to_owned(),
@@ -751,6 +954,24 @@ mod tests {
         assert_eq!(metadata["wxid_friend"].display_name, "Friend Remark");
         assert_eq!(metadata["room@chatroom"].display_name, "Group Name");
         assert_eq!(metadata["room@chatroom"].member_count, Some(15));
+        assert_eq!(
+            metadata["room@chatroom"].participant_names["wxid_member1"],
+            "Group Alias"
+        );
+        assert_eq!(
+            metadata["room@chatroom"].participant_names["wxid_member2"],
+            "wxid_member2"
+        );
+    }
+
+    #[test]
+    fn production_group_nickname_parser_rejects_unknown_members() {
+        let mut buffer = vec![0x0a, 12];
+        buffer.extend_from_slice(b"wxid_member1");
+        buffer.extend_from_slice(&[0x12, 5]);
+        buffer.extend_from_slice(b"Alice");
+        let names = parse_group_nicknames(&buffer, &["wxid_other".to_owned()]);
+        assert!(names.is_empty());
     }
 
     #[test]

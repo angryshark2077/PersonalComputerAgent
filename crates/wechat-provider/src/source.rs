@@ -33,6 +33,8 @@ pub struct SourceMessageRecord {
     pub message_id: String,
     pub conversation_id: String,
     pub conversation_display_name: String,
+    pub sender_id: String,
+    pub sender_display_name: String,
     pub source_key: String,
     pub occurred_at: String,
     pub local_account: LocalAccountProof,

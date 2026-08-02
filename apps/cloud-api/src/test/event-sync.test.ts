@@ -96,6 +96,8 @@ function communicationText(deviceId: string) {
     payload: {
       message_id: "message-1",
       conversation_id: "conversation-1",
+      sender_id: "wxid_sender",
+      sender_display_name: "Sender One",
       source_key: "opaque-source-key-1",
       occurred_at: "2026-08-02T00:00:00Z",
       direction: "incoming",
@@ -105,6 +107,29 @@ function communicationText(deviceId: string) {
     },
     attachment_refs: [],
     idempotency_key: "opaque-source-key-1",
+  };
+}
+
+function communicationSender(deviceId: string) {
+  return {
+    event_id: "01986666-7666-8666-8666-666666666671",
+    workspace_id: owner.workspaceId,
+    device_id: deviceId,
+    event_type: "communication.message_sender_observed",
+    source: "communication.wechat",
+    schema_version: 1,
+    occurred_at: "2026-08-02T00:00:00Z",
+    created_at: "2026-08-02T00:00:00Z",
+    sensitivity: "high",
+    payload: {
+      message_id: "message-1",
+      source_key: "opaque-source-key-1",
+      sender_id: "wxid_sender",
+      sender_display_name: "Group Alias",
+      observed_at: "2026-08-02T00:00:00Z",
+    },
+    attachment_refs: [],
+    idempotency_key: "message-sender-observed-1",
   };
 }
 
@@ -144,6 +169,8 @@ function communicationImage(deviceId: string) {
     payload: {
       message_id: "message-2",
       conversation_id: "conversation-1",
+      sender_id: "wxid_self",
+      sender_display_name: "You",
       source_key: "opaque-source-key-2",
       occurred_at: "2026-08-02T00:01:00Z",
       direction: "outgoing",
@@ -205,6 +232,7 @@ test("paired device syncs a private communication event only through its dedicat
       events: [
         communicationConversation(credentials.device_id),
         communicationText(credentials.device_id),
+        communicationSender(credentials.device_id),
       ],
     }),
   };
@@ -222,6 +250,7 @@ test("paired device syncs a private communication event only through its dedicat
   assert.deepEqual(body.accepted, [
     "01986666-7666-8666-8666-666666666670",
     "01986666-7666-8666-8666-666666666667",
+    "01986666-7666-8666-8666-666666666671",
   ]);
   assert.deepEqual(body.duplicates, []);
   assert.deepEqual(body.rejected, []);
@@ -235,6 +264,7 @@ test("paired device syncs a private communication event only through its dedicat
     [
       "01986666-7666-8666-8666-666666666670",
       "01986666-7666-8666-8666-666666666667",
+      "01986666-7666-8666-8666-666666666671",
     ],
   );
 
@@ -262,6 +292,7 @@ test("only the device owner can read projected communication conversations and m
       events: [
         communicationConversation(credentials.device_id),
         communicationText(credentials.device_id),
+        communicationSender(credentials.device_id),
       ],
     }),
   };
@@ -288,6 +319,8 @@ test("only the device owner can read projected communication conversations and m
     messages: [{
       event_id: "01986666-7666-8666-8666-666666666667",
       message_id: "message-1",
+      sender_id: "wxid_sender",
+      sender_display_name: "Group Alias",
       occurred_at: "2026-08-02T00:00:00.000Z",
       direction: "incoming",
       kind: "text",
@@ -327,6 +360,8 @@ test("communication attachment manifests are projected without exposing object a
     messages: [{
       event_id: "01986666-7666-8666-8666-666666666668",
       message_id: "message-2",
+      sender_id: "wxid_self",
+      sender_display_name: "You",
       occurred_at: "2026-08-02T00:01:00.000Z",
       direction: "outgoing",
       kind: "image",
@@ -426,6 +461,8 @@ test("only a completed attachment receives a short Owner read URL", async () => 
       messages: [{
         event_id: "01986666-7666-8666-8666-666666666668",
         message_id: "message-2",
+        sender_id: "wxid_self",
+        sender_display_name: "You",
         occurred_at: "2026-08-02T00:01:00.000Z",
         direction: "outgoing",
         kind: "image",
