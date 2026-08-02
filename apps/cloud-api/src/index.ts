@@ -26,7 +26,7 @@ import {
   type OwnerAuthenticator,
 } from "./auth.js";
 import { parseCollectorConfig, parseHeartbeat } from "./control.js";
-import { parseSyncBatch } from "./sync.js";
+import { parseCommunicationSyncBatch, parseSyncBatch } from "./sync.js";
 import {
   accessCredentialLifetimeMs,
   errorResponse,
@@ -219,6 +219,34 @@ export function createApp(options: CreateAppOptions): Hono {
     }
     try {
       const result = await options.repository.appendSystemEvents(
+        device.workspaceId,
+        device.deviceId,
+        batch.events,
+      );
+      return context.json({
+        batch_id: batch.batchId,
+        accepted: result.acceptedEventIds,
+        duplicates: result.duplicateEventIds,
+        rejected: [],
+        server_time: new Date().toISOString(),
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.post("/v1/agent/sync/communication/events", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const batch = parseCommunicationSyncBatch(await context.req.json().catch(() => null));
+    if (batch === null || batch.deviceId !== device.deviceId) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication event batch.");
+    }
+    if (batch.events.some((event) => event.workspaceId !== device.workspaceId || event.deviceId !== device.deviceId)) {
+      return errorResponse(context, 403, "WORKSPACE_FORBIDDEN", "The requested Workspace is forbidden.");
+    }
+    try {
+      const result = await options.repository.appendCommunicationEvents(
         device.workspaceId,
         device.deviceId,
         batch.events,
@@ -624,9 +652,12 @@ function collectorConfigResponse(config: { networkEnabled: boolean; wechatEnable
     network: { enabled: config.networkEnabled },
     "communication.wechat": {
       enabled: config.wechatEnabled,
-      direction: "outgoing" as const,
-      message_type: "text" as const,
+      directions: ["incoming", "outgoing"] as const,
+      message_types: ["text", "audio", "image", "video"] as const,
+      conversation_scope: "direct_and_group_at_most_eight_members" as const,
+      max_group_members: 8,
       sync_mode: "full" as const,
+      retention_days: 180,
     },
   };
 }

@@ -44,11 +44,22 @@ export function parseCollectorConfig(value: unknown): StoredCollectorConfig | nu
   }
   if (
     !isRecord(wechat) ||
-    !hasOnly(wechat, ["enabled", "direction", "message_type", "sync_mode"]) ||
+    !hasOnly(wechat, [
+      "enabled",
+      "directions",
+      "message_types",
+      "conversation_scope",
+      "max_group_members",
+      "sync_mode",
+      "retention_days",
+    ]) ||
     typeof wechat.enabled !== "boolean" ||
-    wechat.direction !== "outgoing" ||
-    wechat.message_type !== "text" ||
-    wechat.sync_mode !== "full"
+    !isExact(wechat.directions, ["incoming", "outgoing"]) ||
+    !isExact(wechat.message_types, ["text", "audio", "image", "video"]) ||
+    wechat.conversation_scope !== "direct_and_group_at_most_eight_members" ||
+    wechat.max_group_members !== 8 ||
+    wechat.sync_mode !== "full" ||
+    wechat.retention_days !== 180
   ) {
     return null;
   }
@@ -61,6 +72,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function hasOnly(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function isExact(value: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(value) && value.length === expected.length && value.every((item, index) => item === expected[index]);
 }
 
 function isPresence(value: unknown): value is HeartbeatRequest["presence"] {

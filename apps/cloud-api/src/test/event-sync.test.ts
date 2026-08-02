@@ -72,6 +72,75 @@ function systemMetric(deviceId: string) {
   };
 }
 
+function communicationText(deviceId: string) {
+  return {
+    event_id: "01986666-7666-8666-8666-666666666667",
+    workspace_id: owner.workspaceId,
+    device_id: deviceId,
+    event_type: "communication.message_recorded",
+    source: "communication.wechat",
+    schema_version: 1,
+    occurred_at: "2026-08-02T00:00:00Z",
+    created_at: "2026-08-02T00:00:00Z",
+    sensitivity: "high",
+    payload: {
+      message_id: "message-1",
+      conversation_id: "conversation-1",
+      source_key: "opaque-source-key-1",
+      occurred_at: "2026-08-02T00:00:00Z",
+      direction: "incoming",
+      kind: "text",
+      conversation: { scope: "direct" },
+      text: "private body",
+    },
+    attachment_refs: [],
+    idempotency_key: "communication:message-1",
+  };
+}
+
+test("paired device syncs a private communication event only through its dedicated endpoint", async () => {
+  const { api, credentials } = await pairedApi();
+  const request = {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777779",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationText(credentials.device_id)],
+    }),
+  };
+
+  const first = await api.request("/v1/agent/sync/communication/events", request);
+  assert.equal(first.status, 200);
+  const body = await first.json() as {
+    batch_id: string;
+    accepted: string[];
+    duplicates: string[];
+    rejected: unknown[];
+    server_time: string;
+  };
+  assert.equal(body.batch_id, "01987777-7777-8777-8777-777777777779");
+  assert.deepEqual(body.accepted, ["01986666-7666-8666-8666-666666666667"]);
+  assert.deepEqual(body.duplicates, []);
+  assert.deepEqual(body.rejected, []);
+  assert.notEqual(Number.isNaN(Date.parse(body.server_time)), true);
+
+  const duplicate = await api.request("/v1/agent/sync/communication/events", request);
+  const duplicateBody = await duplicate.json() as { accepted: string[]; duplicates: string[] };
+  assert.equal(duplicate.status, 200, JSON.stringify(duplicateBody));
+  assert.deepEqual(
+    duplicateBody.duplicates,
+    ["01986666-7666-8666-8666-666666666667"],
+  );
+
+  const wrongEndpoint = await api.request("/v1/agent/sync/events", request);
+  assert.equal(wrongEndpoint.status, 400);
+});
+
 test("paired device uploads one strict system metric idempotently and its owner can read it", async () => {
   const { api, credentials } = await pairedApi();
   const request = {

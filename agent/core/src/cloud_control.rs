@@ -60,6 +60,14 @@ pub trait ControlClient: Send + Sync {
     ) -> ControlFuture<'a, SyncEventsResponse> {
         Box::pin(async { Err(ControlError::Contract) })
     }
+
+    fn sync_communication_events<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: &'a [EventEnvelope],
+    ) -> ControlFuture<'a, SyncEventsResponse> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1197,6 +1205,7 @@ async fn control_once(
         publication.publish(owner_epoch, applied).await;
     }
     sync_pending_system_events(database, &credentials.credential, client).await?;
+    sync_pending_communication_events(database, &credentials.credential, client).await?;
     let Some(applied) = applied else {
         return Ok(());
     };
@@ -1260,6 +1269,45 @@ async fn sync_pending_system_events(
         .collect::<Vec<_>>();
     database
         .acknowledge_system_events(&event_ids)
+        .await
+        .map_err(|_| ControlError::Transient)
+}
+
+async fn sync_pending_communication_events(
+    database: &DbActorHandle,
+    credentials: &DeviceCredential,
+    client: &dyn ControlClient,
+) -> Result<(), ControlError> {
+    let events = database
+        .load_pending_communication_events(200)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    if events.is_empty() {
+        return Ok(());
+    }
+    let expected: std::collections::BTreeSet<_> =
+        events.iter().map(|event| event.event_id.as_str()).collect();
+    let response = client
+        .sync_communication_events(credentials, &events)
+        .await?;
+    let acknowledged: std::collections::BTreeSet<_> = response
+        .accepted
+        .iter()
+        .chain(response.duplicates.iter())
+        .map(String::as_str)
+        .collect();
+    if !response.rejected.is_empty()
+        || response.accepted.len() + response.duplicates.len() != expected.len()
+        || acknowledged != expected
+    {
+        return Err(ControlError::Contract);
+    }
+    let event_ids = events
+        .into_iter()
+        .map(|event| event.event_id)
+        .collect::<Vec<_>>();
+    database
+        .acknowledge_communication_events(&event_ids)
         .await
         .map_err(|_| ControlError::Transient)
 }
@@ -1469,6 +1517,34 @@ impl ControlClient for HttpControlClient {
             Ok(parsed)
         })
     }
+
+    fn sync_communication_events<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        events: &'a [EventEnvelope],
+    ) -> ControlFuture<'a, SyncEventsResponse> {
+        Box::pin(async move {
+            let client = Self::client()?;
+            let batch_id = Uuid::new_v4().to_string();
+            let response = client
+                .post(self.endpoint("v1/agent/sync/communication/events")?)
+                .bearer_auth(credentials.access_credential())
+                .json(&SyncEventsRequest {
+                    batch_id: batch_id.clone(),
+                    device_id: credentials.device_id(),
+                    protocol_version: 1,
+                    events,
+                })
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            let parsed = parse_response::<SyncEventsResponse>(response).await?;
+            if parsed.batch_id != batch_id {
+                return Err(ControlError::Contract);
+            }
+            Ok(parsed)
+        })
+    }
 }
 
 impl PairingClient for HttpControlClient {
@@ -1603,12 +1679,16 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        retry_delay, sync_pending_system_events, AgentControlSnapshot, ControlClient, ControlError,
-        ControlFuture, DeviceCredential, HttpControlClient, SyncEventsResponse, CONTROL_INTERVAL,
-        MAX_BACKOFF, PRODUCTION_CLOUD_API_ORIGIN,
+        retry_delay, sync_pending_communication_events, sync_pending_system_events,
+        AgentControlSnapshot, ControlClient, ControlError, ControlFuture, DeviceCredential,
+        HttpControlClient, SyncEventsResponse, CONTROL_INTERVAL, MAX_BACKOFF,
+        PRODUCTION_CLOUD_API_ORIGIN,
     };
-    use pca_db_local::DbActorHandle;
-    use pca_domain::{EventEnvelope, Sensitivity};
+    use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
+    use pca_domain::{
+        CommunicationMessageRecorded, CommunicationMessageRecordedInput, ConversationScope,
+        Direction, EventEnvelope, MessageKind, Sensitivity,
+    };
     use reqwest::Url;
     use serde_json::{Map, Value};
     use std::{env, time::Duration};
@@ -1791,6 +1871,111 @@ mod tests {
                 })
             })
         }
+    }
+
+    struct PartialCommunicationSyncClient;
+
+    impl ControlClient for PartialCommunicationSyncClient {
+        fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn heartbeat_and_control<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: u64,
+        ) -> ControlFuture<'a, AgentControlSnapshot> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn sync_communication_events<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: &'a [EventEnvelope],
+        ) -> ControlFuture<'a, SyncEventsResponse> {
+            Box::pin(async {
+                Ok(SyncEventsResponse {
+                    batch_id: "test-batch".to_owned(),
+                    accepted: Vec::new(),
+                    duplicates: Vec::new(),
+                    rejected: Vec::new(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_communication_ack_keeps_the_local_outbox_pending() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        let message = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
+            message_id: "message-1".to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            source_key: "source-key-1".to_owned(),
+            occurred_at: "2026-08-02T00:00:00Z".to_owned(),
+            direction: Direction::Incoming,
+            kind: MessageKind::Text,
+            conversation: ConversationScope::Direct,
+            text: Some("private body".to_owned()),
+            attachments: Vec::new(),
+        })
+        .expect("valid communication message");
+        let payload = serde_json::to_value(&message)
+            .expect("serialize message")
+            .as_object()
+            .cloned()
+            .expect("message payload object");
+        database
+            .commit_communication_message(&CommunicationMessageCommit {
+                account_id: "wechat-account-1".to_owned(),
+                source_sequence: 1,
+                event: EventEnvelope {
+                    event_id: "01986666-7666-8666-8666-666666666668".to_owned(),
+                    workspace_id: "01982222-7222-8222-8222-222222222222".to_owned(),
+                    device_id: "01983333-7333-8333-8333-333333333333".to_owned(),
+                    event_type: "communication.message_recorded".to_owned(),
+                    source: "communication.wechat".to_owned(),
+                    schema_version: 1,
+                    occurred_at: "2026-08-02T00:00:00Z".to_owned(),
+                    created_at: "2026-08-02T00:00:00Z".to_owned(),
+                    sensitivity: Sensitivity::High,
+                    payload,
+                    attachment_refs: Vec::new(),
+                    idempotency_key: Some("source-key-1".to_owned()),
+                },
+                message,
+                attachment_spool: Vec::new(),
+            })
+            .await
+            .expect("commit communication message");
+        let credential = DeviceCredential::new(
+            "01983333-7333-8333-8333-333333333333".to_owned(),
+            "01982222-7222-8222-8222-222222222222".to_owned(),
+            "access-credential-for-sync-test",
+            "refresh-credential-for-sync-test",
+        )
+        .expect("valid device credential");
+
+        assert!(matches!(
+            sync_pending_communication_events(
+                &database,
+                &credential,
+                &PartialCommunicationSyncClient
+            )
+            .await,
+            Err(ControlError::Contract)
+        ));
+        assert_eq!(
+            database
+                .load_pending_communication_events(200)
+                .await
+                .expect("pending communication events")
+                .len(),
+            1
+        );
+        database.shutdown().await.expect("shutdown database");
     }
 
     #[tokio::test]

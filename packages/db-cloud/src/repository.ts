@@ -6,6 +6,7 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import {
   authUsers,
   cloudSchema,
+  communicationEvents,
   collectorConfigAudit,
   collectorConfigs,
   deviceCredentialGenerations,
@@ -184,6 +185,21 @@ export interface SystemEventAppendResult {
   duplicateEventIds: string[];
 }
 
+export interface CommunicationEventRecord {
+  eventId: string;
+  workspaceId: string;
+  deviceId: string;
+  eventType: "communication.message_recorded";
+  source: "communication.wechat";
+  schemaVersion: 1;
+  occurredAt: Date;
+  createdAt: Date;
+  sensitivity: "high";
+  payload: Record<string, unknown>;
+  attachmentRefs: string[];
+  idempotencyKey: string | null;
+}
+
 export interface ControlRepository {
   createPairingSession(input: PairingSessionInput): Promise<PairingSession>;
   authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string>;
@@ -219,6 +235,11 @@ export interface ControlRepository {
     workspaceId: string,
     deviceId: string,
     events: SystemEventRecord[],
+  ): Promise<SystemEventAppendResult>;
+  appendCommunicationEvents(
+    workspaceId: string,
+    deviceId: string,
+    events: CommunicationEventRecord[],
   ): Promise<SystemEventAppendResult>;
   listOwnerSystemMetrics(
     deviceId: string,
@@ -274,6 +295,8 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #latestHeartbeats = new Map<string, DeviceStatus>();
   readonly #configAudit: Array<CollectorConfigAuditRecord & { workspaceId: string; deviceId: string }> = [];
   readonly #systemEvents = new Map<string, SystemEventRecord>();
+  readonly #communicationEvents = new Map<string, CommunicationEventRecord>();
+  readonly #communicationIdempotency = new Set<string>();
 
   constructor(memberships: readonly OwnerMembership[] = []) {
     for (const membership of memberships) {
@@ -593,6 +616,41 @@ export class MemoryControlRepository implements ControlRepository {
         duplicateEventIds.push(event.eventId);
       } else {
         this.#systemEvents.set(event.eventId, { ...event, payload: { ...event.payload } });
+        acceptedEventIds.push(event.eventId);
+      }
+    }
+    return { acceptedEventIds, duplicateEventIds };
+  }
+
+  async appendCommunicationEvents(
+    workspaceId: string,
+    deviceId: string,
+    events: CommunicationEventRecord[],
+  ): Promise<SystemEventAppendResult> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const acceptedEventIds: string[] = [];
+    const duplicateEventIds: string[] = [];
+    for (const event of events) {
+      if (event.workspaceId !== workspaceId || event.deviceId !== deviceId) {
+        throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+      }
+      const idempotencyKey = event.idempotencyKey === null
+        ? null
+        : `${event.workspaceId}:${event.deviceId}:${event.idempotencyKey}`;
+      if (
+        this.#communicationEvents.has(event.eventId)
+        || (idempotencyKey !== null && this.#communicationIdempotency.has(idempotencyKey))
+      ) {
+        duplicateEventIds.push(event.eventId);
+      } else {
+        this.#communicationEvents.set(event.eventId, {
+          ...event,
+          payload: { ...event.payload },
+          attachmentRefs: [...event.attachmentRefs],
+        });
+        if (idempotencyKey !== null) {
+          this.#communicationIdempotency.add(idempotencyKey);
+        }
         acceptedEventIds.push(event.eventId);
       }
     }
@@ -1276,6 +1334,49 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
+  async appendCommunicationEvents(
+    workspaceId: string,
+    deviceId: string,
+    events: CommunicationEventRecord[],
+  ): Promise<SystemEventAppendResult> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      const acceptedEventIds: string[] = [];
+      const duplicateEventIds: string[] = [];
+      for (const event of events) {
+        if (event.workspaceId !== workspaceId || event.deviceId !== deviceId) {
+          throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+        }
+        const inserted = await this.database
+          .insert(communicationEvents)
+          .values({
+            eventId: event.eventId,
+            workspaceId: event.workspaceId,
+            deviceId: event.deviceId,
+            eventType: event.eventType,
+            source: event.source,
+            schemaVersion: event.schemaVersion,
+            occurredAt: event.occurredAt,
+            createdAt: event.createdAt,
+            sensitivity: event.sensitivity,
+            payload: event.payload,
+            attachmentRefs: event.attachmentRefs,
+            idempotencyKey: event.idempotencyKey,
+          })
+          .onConflictDoNothing()
+          .returning({ eventId: communicationEvents.eventId });
+        if (inserted[0] === undefined) {
+          duplicateEventIds.push(event.eventId);
+        } else {
+          acceptedEventIds.push(event.eventId);
+        }
+      }
+      return { acceptedEventIds, duplicateEventIds };
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
   async listOwnerSystemMetrics(
     deviceId: string,
     workspaceId: string,
@@ -1434,9 +1535,12 @@ function snapshot(device: DeviceRecord, config: ConfigRecord): AgentControlSnaps
       network: { enabled: config.networkEnabled },
       "communication.wechat": {
         enabled: config.wechatEnabled,
-        direction: "outgoing",
-        message_type: "text",
+        directions: ["incoming", "outgoing"],
+        message_types: ["text", "audio", "image", "video"],
+        conversation_scope: "direct_and_group_at_most_eight_members",
+        max_group_members: 8,
         sync_mode: "full",
+        retention_days: 180,
       },
     },
   };
