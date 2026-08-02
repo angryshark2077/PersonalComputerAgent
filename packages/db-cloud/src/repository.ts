@@ -189,11 +189,10 @@ export interface SystemEventAppendResult {
   duplicateEventIds: string[];
 }
 
-export interface CommunicationEventRecord {
+interface CommunicationEventRecordBase {
   eventId: string;
   workspaceId: string;
   deviceId: string;
-  eventType: "communication.message_recorded";
   source: "communication.wechat";
   schemaVersion: 1;
   occurredAt: Date;
@@ -202,7 +201,28 @@ export interface CommunicationEventRecord {
   payload: Record<string, unknown>;
   attachmentRefs: string[];
   idempotencyKey: string | null;
+}
+
+export interface CommunicationMessageEventRecord extends CommunicationEventRecordBase {
+  eventType: "communication.message_recorded";
   message: CommunicationMessageProjection;
+}
+
+export interface CommunicationConversationEventRecord extends CommunicationEventRecordBase {
+  eventType: "communication.conversation_observed";
+  conversation: CommunicationConversationProjection;
+}
+
+export type CommunicationEventRecord =
+  | CommunicationMessageEventRecord
+  | CommunicationConversationEventRecord;
+
+export interface CommunicationConversationProjection {
+  conversationId: string;
+  displayName: string;
+  observedAt: Date;
+  scope: "direct" | "group";
+  memberCount: number | null;
 }
 
 export interface CommunicationMessageProjection {
@@ -258,6 +278,7 @@ export interface PrepareCommunicationObjectInput {
 
 export interface CommunicationConversationRecord {
   conversationId: string;
+  displayName: string;
   scope: "direct" | "group";
   memberCount: number | null;
   messageCount: number;
@@ -405,6 +426,7 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #configAudit: Array<CollectorConfigAuditRecord & { workspaceId: string; deviceId: string }> = [];
   readonly #systemEvents = new Map<string, SystemEventRecord>();
   readonly #communicationEvents = new Map<string, CommunicationEventRecord>();
+  readonly #communicationConversations = new Map<string, CommunicationConversationProjection>();
   readonly #communicationIdempotency = new Set<string>();
   readonly #communicationObjects = new Map<string, CommunicationObjectRecord>();
 
@@ -753,25 +775,42 @@ export class MemoryControlRepository implements ControlRepository {
       ) {
         duplicateEventIds.push(event.eventId);
       } else {
-        const existingConversation = [...this.#communicationEvents.values()].find((candidate) =>
-          candidate.workspaceId === workspaceId
-          && candidate.deviceId === deviceId
-          && candidate.message.conversationId === event.message.conversationId,
-        );
+        const projection = event.eventType === "communication.message_recorded"
+          ? {
+              conversationId: event.message.conversationId,
+              displayName: event.message.conversationId,
+              observedAt: event.message.occurredAt,
+              scope: event.message.conversation.scope,
+              memberCount: event.message.conversation.memberCount,
+            }
+          : event.conversation;
+        const conversationKey = `${workspaceId}:${deviceId}:${projection.conversationId}`;
+        const existingConversation = this.#communicationConversations.get(conversationKey);
         if (
           existingConversation !== undefined
-          && (
-            existingConversation.message.conversation.scope !== event.message.conversation.scope
-          )
+          && existingConversation.scope !== projection.scope
         ) {
           throw new ControlRepositoryError("CONFLICT");
         }
-        this.#communicationEvents.set(event.eventId, {
-          ...event,
-          payload: { ...event.payload },
-          attachmentRefs: [...event.attachmentRefs],
-          message: cloneCommunicationMessageProjection(event.message),
-        });
+        if (event.eventType === "communication.message_recorded") {
+          this.#communicationEvents.set(event.eventId, {
+            ...event,
+            payload: { ...event.payload },
+            attachmentRefs: [...event.attachmentRefs],
+            message: cloneCommunicationMessageProjection(event.message),
+          });
+          if (existingConversation === undefined) {
+            this.#communicationConversations.set(conversationKey, projection);
+          }
+        } else {
+          this.#communicationEvents.set(event.eventId, {
+            ...event,
+            payload: { ...event.payload },
+            attachmentRefs: [],
+            conversation: { ...event.conversation },
+          });
+          this.#communicationConversations.set(conversationKey, { ...event.conversation });
+        }
         if (idempotencyKey !== null) {
           this.#communicationIdempotency.add(idempotencyKey);
         }
@@ -791,11 +830,19 @@ export class MemoryControlRepository implements ControlRepository {
     this.#requireDevice(deviceId, workspaceId, true);
     const conversations = new Map<string, CommunicationConversationRecord>();
     for (const event of this.#communicationEvents.values()) {
-      if (event.workspaceId !== workspaceId || event.deviceId !== deviceId) continue;
+      if (
+        event.workspaceId !== workspaceId
+        || event.deviceId !== deviceId
+        || event.eventType !== "communication.message_recorded"
+      ) continue;
+      const metadata = this.#communicationConversations.get(
+        `${workspaceId}:${deviceId}:${event.message.conversationId}`,
+      );
       const existing = conversations.get(event.message.conversationId);
       if (existing === undefined) {
         conversations.set(event.message.conversationId, {
           conversationId: event.message.conversationId,
+          displayName: metadata?.displayName ?? event.message.conversationId,
           scope: event.message.conversation.scope,
           memberCount: event.message.conversation.memberCount,
           messageCount: 1,
@@ -824,9 +871,10 @@ export class MemoryControlRepository implements ControlRepository {
     this.#requireOwnerMembership(workspaceId, userId);
     this.#requireDevice(deviceId, workspaceId, true);
     return [...this.#communicationEvents.values()]
-      .filter((event) =>
+      .filter((event): event is CommunicationMessageEventRecord =>
         event.workspaceId === workspaceId
         && event.deviceId === deviceId
+        && event.eventType === "communication.message_recorded"
         && event.message.conversationId === conversationId,
       )
       .sort((left, right) => right.message.occurredAt.getTime() - left.message.occurredAt.getTime())
@@ -841,7 +889,9 @@ export class MemoryControlRepository implements ControlRepository {
   ): Promise<CommunicationObjectRecord> {
     this.#requireDevice(deviceId, workspaceId, false);
     const event = this.#communicationEvents.get(input.eventId);
-    const attachment = event?.workspaceId === workspaceId && event.deviceId === deviceId
+    const attachment = event?.workspaceId === workspaceId
+      && event.deviceId === deviceId
+      && event.eventType === "communication.message_recorded"
       ? event.message.attachments.find((candidate) => candidate.attachmentId === input.attachmentId)
       : undefined;
     if (attachment === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
@@ -1624,6 +1674,16 @@ export class DrizzleControlRepository implements ControlRepository {
             .returning({ eventId: communicationEvents.eventId });
           if (inserted[0] === undefined) return false;
 
+          const projection = event.eventType === "communication.message_recorded"
+            ? {
+                conversationId: event.message.conversationId,
+                displayName: event.message.conversationId,
+                observedAt: event.message.occurredAt,
+                scope: event.message.conversation.scope,
+                memberCount: event.message.conversation.memberCount,
+              }
+            : event.conversation;
+
           const [existingConversation] = await transaction
             .select({
               scope: communicationConversations.scope,
@@ -1634,14 +1694,14 @@ export class DrizzleControlRepository implements ControlRepository {
               and(
                 eq(communicationConversations.workspaceId, workspaceId),
                 eq(communicationConversations.deviceId, deviceId),
-                eq(communicationConversations.conversationId, event.message.conversationId),
+                eq(communicationConversations.conversationId, projection.conversationId),
               ),
             )
             .limit(1);
           if (
             existingConversation !== undefined
             && (
-              existingConversation.scope !== event.message.conversation.scope
+              existingConversation.scope !== projection.scope
             )
           ) {
             throw new ControlRepositoryError("CONFLICT");
@@ -1652,10 +1712,11 @@ export class DrizzleControlRepository implements ControlRepository {
             .values({
               workspaceId,
               deviceId,
-              conversationId: event.message.conversationId,
-              scope: event.message.conversation.scope,
-              memberCount: event.message.conversation.memberCount,
-              lastMessageAt: event.message.occurredAt,
+              conversationId: projection.conversationId,
+              displayName: projection.displayName,
+              scope: projection.scope,
+              memberCount: projection.memberCount,
+              lastMessageAt: projection.observedAt,
             })
             .onConflictDoUpdate({
               target: [
@@ -1664,6 +1725,9 @@ export class DrizzleControlRepository implements ControlRepository {
                 communicationConversations.conversationId,
               ],
               set: {
+                displayName: event.eventType === "communication.conversation_observed"
+                  ? projection.displayName
+                  : communicationConversations.displayName,
                 memberCount: sql`CASE
                   WHEN EXCLUDED.last_message_at >= ${communicationConversations.lastMessageAt}
                     THEN EXCLUDED.member_count
@@ -1672,6 +1736,8 @@ export class DrizzleControlRepository implements ControlRepository {
                 lastMessageAt: sql`GREATEST(${communicationConversations.lastMessageAt}, EXCLUDED.last_message_at)`,
               },
             });
+          if (event.eventType === "communication.conversation_observed") return true;
+
           await transaction.insert(communicationMessages).values({
             eventId: event.eventId,
             workspaceId,
@@ -1722,6 +1788,7 @@ export class DrizzleControlRepository implements ControlRepository {
       const rows = await this.database
         .select({
           conversationId: communicationConversations.conversationId,
+          displayName: communicationConversations.displayName,
           scope: communicationConversations.scope,
           memberCount: communicationConversations.memberCount,
           lastMessageAt: communicationConversations.lastMessageAt,
@@ -1744,6 +1811,7 @@ export class DrizzleControlRepository implements ControlRepository {
         )
         .groupBy(
           communicationConversations.conversationId,
+          communicationConversations.displayName,
           communicationConversations.scope,
           communicationConversations.memberCount,
           communicationConversations.lastMessageAt,
@@ -1752,6 +1820,7 @@ export class DrizzleControlRepository implements ControlRepository {
         .limit(limit);
       return rows.map((row) => ({
         conversationId: row.conversationId,
+        displayName: row.displayName || row.conversationId,
         scope: row.scope as "direct" | "group",
         memberCount: row.memberCount,
         messageCount: row.messageCount,
@@ -2134,7 +2203,7 @@ function cloneCommunicationMessageProjection(
 }
 
 function communicationMessageRecord(
-  event: CommunicationEventRecord,
+  event: CommunicationMessageEventRecord,
   objects: ReadonlyMap<string, CommunicationObjectRecord>,
 ): CommunicationMessageRecord {
   return {
@@ -2195,8 +2264,8 @@ function snapshot(device: DeviceRecord, config: ConfigRecord): AgentControlSnaps
         enabled: config.wechatEnabled,
         directions: ["incoming", "outgoing"],
         message_types: ["text", "audio", "image", "video"],
-        conversation_scope: "direct_and_group_at_most_eight_members",
-        max_group_members: 8,
+        conversation_scope: "direct_and_group_at_most_fifteen_members",
+        max_group_members: 15,
         sync_mode: "full",
         retention_days: 180,
       },

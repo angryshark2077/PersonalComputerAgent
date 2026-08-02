@@ -34,6 +34,9 @@ pub const WECHAT_MESSAGES_MIGRATION: &str = include_str!("../migrations/0005_wec
 /// The immutable Task 4 fix migration for deterministic attachment spool names.
 pub const HARDEN_ATTACHMENT_SPOOL_MIGRATION: &str =
     include_str!("../migrations/0006_harden_attachment_spool.sql");
+/// Expands the verified small-group limit while preserving existing communication rows.
+pub const EXPAND_GROUP_LIMIT_MIGRATION: &str =
+    include_str!("../migrations/0007_expand_group_limit.sql");
 
 /// A private spool-file reference corresponding to one validated media manifest.
 ///

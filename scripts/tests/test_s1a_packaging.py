@@ -73,7 +73,8 @@ class S1APackagingTests(unittest.TestCase):
             "app_cdhash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
             "main_cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
             "agent_cdhash=cccccccccccccccccccccccccccccccccccccccc "
-            "bridge_cdhash=dddddddddddddddddddddddddddddddddddddddd",
+            "bridge_cdhash=dddddddddddddddddddddddddddddddddddddddd "
+            "wechat_repair_cdhash=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             result.stdout,
         )
 
@@ -82,6 +83,12 @@ class S1APackagingTests(unittest.TestCase):
         result = self.run_verify()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PCAPlatformBridge", result.stdout)
+
+    def test_missing_wechat_repair_is_rejected(self) -> None:
+        (self.app / "Contents/Resources/bin/pca-wechat-repair").unlink()
+        result = self.run_verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pca-wechat-repair", result.stdout)
 
     def test_non_arm64_binary_is_rejected(self) -> None:
         (self.app / "Contents/Resources/bin/pca-agentd.arch").write_text("x86_64\n")
@@ -273,11 +280,12 @@ class S1APackagingTests(unittest.TestCase):
         executable = self.app / "Contents/MacOS/PersonalComputerAgent"
         agent = self.app / "Contents/Resources/bin/pca-agentd"
         bridge = self.app / "Contents/Resources/bin/PCAPlatformBridge"
+        wechat_repair = self.app / "Contents/Resources/bin/pca-wechat-repair"
         launch_agent = self.app / "Contents/Library/LaunchAgents/com.pca.agentd.plist"
         launch_agent.parent.mkdir(parents=True)
         agent.parent.mkdir(parents=True)
         executable.parent.mkdir(parents=True)
-        for binary in (executable, agent, bridge):
+        for binary in (executable, agent, bridge, wechat_repair):
             binary.write_bytes(b"synthetic Mach-O fixture")
             binary.chmod(0o755)
             binary.with_suffix(binary.suffix + ".arch").write_text("arm64\n")
@@ -327,6 +335,7 @@ elif [[ "$1" == "-d" ]]; then
     PersonalComputerAgent) cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
     pca-agentd) cdhash=cccccccccccccccccccccccccccccccccccccccc ;;
     PCAPlatformBridge) cdhash=dddddddddddddddddddddddddddddddddddddddd ;;
+    pca-wechat-repair) cdhash=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee ;;
     *) exit 65 ;;
   esac
   echo "CDHash=$cdhash" >&2

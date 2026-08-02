@@ -44,12 +44,12 @@ fn accepts_direct_text_and_small_group_media_only() {
     });
 
     assert!(text.is_ok());
-    assert!(CommunicationMessageRecorded::try_new(valid_group_message(8)).is_ok());
+    assert!(CommunicationMessageRecorded::try_new(valid_group_message(15)).is_ok());
 }
 
 #[test]
-fn rejects_group_larger_than_eight_and_unknown_attachment_fields() {
-    assert!(CommunicationMessageRecorded::try_new(valid_group_message(9)).is_err());
+fn rejects_group_larger_than_fifteen_and_unknown_attachment_fields() {
+    assert!(CommunicationMessageRecorded::try_new(valid_group_message(16)).is_err());
     assert!(serde_json::from_value::<CommunicationAttachment>(json!({
         "attachment_id": "a",
         "kind": "image",
@@ -63,17 +63,17 @@ fn rejects_group_larger_than_eight_and_unknown_attachment_fields() {
 
 #[test]
 fn rejects_empty_text_incomplete_media_and_mismatched_attachment_kind() {
-    let mut empty_text = valid_group_message(8);
+    let mut empty_text = valid_group_message(15);
     empty_text.kind = MessageKind::Text;
     empty_text.text = Some(" ".to_owned());
     empty_text.attachments = Vec::new();
     assert!(CommunicationMessageRecorded::try_new(empty_text).is_err());
 
-    let mut no_media = valid_group_message(8);
+    let mut no_media = valid_group_message(15);
     no_media.attachments = Vec::new();
     assert!(CommunicationMessageRecorded::try_new(no_media).is_err());
 
-    let mut mismatched_media = valid_group_message(8);
+    let mut mismatched_media = valid_group_message(15);
     mismatched_media.attachments = vec![attachment(MessageKind::Video)];
     assert!(CommunicationMessageRecorded::try_new(mismatched_media).is_err());
 }

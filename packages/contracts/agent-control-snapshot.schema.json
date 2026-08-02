@@ -60,8 +60,8 @@
               "minItems": 4,
               "maxItems": 4
             },
-            "conversation_scope": { "const": "direct_and_group_at_most_eight_members" },
-            "max_group_members": { "const": 8 },
+            "conversation_scope": { "const": "direct_and_group_at_most_fifteen_members" },
+            "max_group_members": { "const": 15 },
             "sync_mode": { "const": "full" },
             "retention_days": { "const": 180 }
           }

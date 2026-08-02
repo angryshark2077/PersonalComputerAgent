@@ -4,8 +4,8 @@ export interface CollectorConfig {
     enabled: boolean;
     directions: ["incoming", "outgoing"];
     message_types: ["text", "audio", "image", "video"];
-    conversation_scope: "direct_and_group_at_most_eight_members";
-    max_group_members: 8;
+    conversation_scope: "direct_and_group_at_most_fifteen_members";
+    max_group_members: 15;
     sync_mode: "full";
     retention_days: 180;
   };
@@ -37,6 +37,35 @@ export interface DashboardSystemMetric {
   occurred_at: string;
   metric_group: "cpu_memory" | "disk";
   payload: Record<string, unknown>;
+}
+
+export interface DashboardConversation {
+  conversation_id: string;
+  display_name: string;
+  scope: "direct" | "group";
+  member_count: number | null;
+  message_count: number;
+  last_message_at: string;
+}
+
+export interface DashboardMessageAttachment {
+  attachment_id: string;
+  kind: "audio" | "image" | "video";
+  sha256: string;
+  size_bytes: number;
+  mime_type: string;
+  object_id: string | null;
+  object_state: "prepared" | "completed" | null;
+}
+
+export interface DashboardMessage {
+  event_id: string;
+  message_id: string;
+  occurred_at: string;
+  direction: "incoming" | "outgoing";
+  kind: "text" | "audio" | "image" | "video";
+  text: string | null;
+  attachments: DashboardMessageAttachment[];
 }
 
 export interface CollectorConfigAudit {
@@ -115,6 +144,39 @@ export async function getSystemMetrics(
     apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/system-metrics`),
   );
   return result.metrics;
+}
+
+export async function getCommunicationConversations(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+  limit = 100,
+): Promise<DashboardConversation[]> {
+  const result = await jsonRequest<{ conversations: DashboardConversation[] }>(
+    fetcher,
+    apiUrl(
+      cloudApiOrigin,
+      `/v1/devices/${encodeURIComponent(deviceId)}/communication/conversations?limit=${limit}`,
+    ),
+  );
+  return result.conversations;
+}
+
+export async function getCommunicationMessages(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+  conversationId: string,
+  limit = 100,
+): Promise<DashboardMessage[]> {
+  const result = await jsonRequest<{ messages: DashboardMessage[] }>(
+    fetcher,
+    apiUrl(
+      cloudApiOrigin,
+      `/v1/devices/${encodeURIComponent(deviceId)}/communication/conversations/${encodeURIComponent(conversationId)}/messages?limit=${limit}`,
+    ),
+  );
+  return result.messages;
 }
 
 export async function updateCollectorConfig(

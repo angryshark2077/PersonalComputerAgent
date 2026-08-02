@@ -174,8 +174,8 @@ test("control state is Workspace-scoped, monotonic, and audited", async () => {
     enabled: false,
     directions: ["incoming", "outgoing"],
     message_types: ["text", "audio", "image", "video"],
-    conversation_scope: "direct_and_group_at_most_eight_members",
-    max_group_members: 8,
+    conversation_scope: "direct_and_group_at_most_fifteen_members",
+    max_group_members: 15,
     sync_mode: "full",
     retention_days: 180,
   });

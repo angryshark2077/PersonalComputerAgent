@@ -8,8 +8,13 @@ license.workspace = true
 pca-domain = { path = "../domain" }
 pca-keychain = { path = "../keychain" }
 pca-provider-contracts = { path = "../provider-contracts" }
+md-5 = "=0.10.6"
 rusqlite = { version = "=0.32.1", features = ["bundled-sqlcipher-vendored-openssl", "hooks"] }
+sha2 = "=0.10.9"
 tempfile = "3"
+time = { version = "=0.3.36", features = ["formatting"] }
+tokio = { version = "1", features = ["rt"] }
+zstd = "=0.13.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

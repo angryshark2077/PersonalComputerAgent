@@ -135,6 +135,10 @@ struct InstallPaths: Equatable, Sendable {
         installedBundleURL.appendingPathComponent("Contents/Resources/bin/PCAPlatformBridge")
     }
 
+    var installedWechatRepairExecutableURL: URL {
+        installedBundleURL.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair")
+    }
+
     static func production(fileManager: FileManager = .default) throws -> InstallPaths {
         try InstallPaths(
             rootURL: fileManager.homeDirectoryForCurrentUser
@@ -513,6 +517,7 @@ protocol InstallCoordinating: AnyObject {
 protocol BridgeCredentialProvisioning {
     func ensureCredential(trustedApplicationURLs: [URL]) throws
     func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws
+    func ensureWechatCredentialPlaceholder(trustedApplicationURLs: [URL]) throws
 }
 
 @MainActor
@@ -544,6 +549,14 @@ struct KeychainBridgeCredentialProvisioner: BridgeCredentialProvisioning {
     func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws {
         do {
             try store.ensureDeviceCredentialPlaceholder(trustedApplicationURLs: trustedApplicationURLs)
+        } catch {
+            throw (error as? InstallError) ?? InstallError.credentialProvisioningFailed
+        }
+    }
+
+    func ensureWechatCredentialPlaceholder(trustedApplicationURLs: [URL]) throws {
+        do {
+            try store.ensureWechatCredentialPlaceholder(trustedApplicationURLs: trustedApplicationURLs)
         } catch {
             throw (error as? InstallError) ?? InstallError.credentialProvisioningFailed
         }
@@ -728,6 +741,10 @@ final class InstallCoordinator: InstallCoordinating {
             ]
             try credentialProvisioner.ensureCredential(trustedApplicationURLs: trustedApplicationURLs)
             try credentialProvisioner.ensureDeviceCredentialPlaceholder(trustedApplicationURLs: trustedApplicationURLs)
+            try credentialProvisioner.ensureWechatCredentialPlaceholder(trustedApplicationURLs: [
+                paths.installedAgentExecutableURL,
+                paths.installedWechatRepairExecutableURL,
+            ])
         } catch {
             if let transaction {
                 let recovery = await recoverFailure(transaction, layoutIdentity: layoutIdentity)

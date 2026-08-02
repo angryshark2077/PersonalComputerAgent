@@ -2,6 +2,7 @@ import type { EventEnvelope } from "@pca/contracts/src/types.js";
 import { validateContract } from "@pca/contracts/src/validate.js";
 import type {
   CommunicationAttachmentProjection,
+  CommunicationConversationProjection,
   CommunicationEventRecord,
   CommunicationMessageProjection,
   SystemEventRecord,
@@ -79,15 +80,40 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
   if (
     event.schema_version !== 1
     || event.sensitivity !== "high"
-    || event.event_type !== "communication.message_recorded"
     || event.source !== "communication.wechat"
-    || !validateContract("communication-message-recorded", event.payload).valid
   ) {
     return null;
   }
   const occurredAt = new Date(event.occurred_at);
   const createdAt = new Date(event.created_at);
   if (Number.isNaN(occurredAt.getTime()) || Number.isNaN(createdAt.getTime())) return null;
+  if (event.event_type === "communication.conversation_observed") {
+    if (
+      (event.attachment_refs?.length ?? 0) !== 0
+      || !validateContract("communication-conversation-observed", event.payload).valid
+    ) return null;
+    const conversation = parseCommunicationConversation(event.payload, occurredAt);
+    if (conversation === null || event.idempotency_key === undefined) return null;
+    return {
+      eventId: event.event_id,
+      workspaceId: event.workspace_id,
+      deviceId: event.device_id,
+      eventType: "communication.conversation_observed",
+      source: "communication.wechat",
+      schemaVersion: 1,
+      occurredAt,
+      createdAt,
+      sensitivity: "high",
+      payload: event.payload as unknown as Record<string, unknown>,
+      attachmentRefs: [],
+      idempotencyKey: event.idempotency_key,
+      conversation,
+    };
+  }
+  if (
+    event.event_type !== "communication.message_recorded"
+    || !validateContract("communication-message-recorded", event.payload).valid
+  ) return null;
   const message = parseCommunicationMessage(event.payload, occurredAt, event.attachment_refs ?? []);
   if (message === null || event.idempotency_key !== message.sourceKey) return null;
   return {
@@ -104,6 +130,29 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
     attachmentRefs: event.attachment_refs ?? [],
     idempotencyKey: event.idempotency_key ?? null,
     message,
+  };
+}
+
+function parseCommunicationConversation(
+  payload: unknown,
+  eventOccurredAt: Date,
+): CommunicationConversationProjection | null {
+  const value = payload as {
+    conversation_id: string;
+    display_name: string;
+    observed_at: string;
+    conversation: { scope: "direct" | "group"; member_count?: number };
+  };
+  const observedAt = new Date(value.observed_at);
+  if (Number.isNaN(observedAt.getTime()) || observedAt.getTime() !== eventOccurredAt.getTime()) {
+    return null;
+  }
+  return {
+    conversationId: value.conversation_id,
+    displayName: value.display_name.trim(),
+    observedAt,
+    scope: value.conversation.scope,
+    memberCount: value.conversation.scope === "group" ? value.conversation.member_count ?? null : null,
   };
 }
 

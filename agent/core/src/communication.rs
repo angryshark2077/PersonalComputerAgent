@@ -10,7 +10,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use pca_db_local::{
     CommunicationAttachmentSpoolReference, CommunicationMessageCommit, DbActorHandle, DbError,
 };
@@ -461,6 +460,7 @@ async fn run_supervisor(
     let mut spool_paused = false;
     let mut retry_index = 0_usize;
     let mut retry_revision = control.configuration_revision;
+    let mut emitted_conversation_events = BTreeSet::new();
 
     'supervisor: loop {
         let authoritative_control = authorization.borrow().control;
@@ -867,6 +867,21 @@ async fn run_supervisor(
                             break;
                         }
                         prepared.spool.disarm();
+                        if !emitted_conversation_events
+                            .contains(&prepared.conversation_event.event_id)
+                        {
+                            if database
+                                .append_event_with_outbox(&prepared.conversation_event)
+                                .await
+                                .map_err(|_| LocalPersistenceError::Database)
+                                .is_err()
+                            {
+                                persistence_failed = true;
+                                break;
+                            }
+                            emitted_conversation_events
+                                .insert(prepared.conversation_event.event_id.clone());
+                        }
                     }
                     if batch_paused {
                         if provider.stop().is_err() {
@@ -889,9 +904,32 @@ async fn run_supervisor(
                             "WECHAT_LOCAL_SPOOL_UNAVAILABLE",
                         )
                         .await?;
-                    } else {
-                        persist_collector_state(&database, control, None).await?;
+                        if provider.stop().is_err() {
+                            return quarantine_provider(
+                                provider.as_mut(),
+                                &database,
+                                &mut control,
+                                &mut highest_revision,
+                                &mut commands,
+                                &mut authorization,
+                            )
+                            .await;
+                        }
+                        if wait_or_command(
+                            &database,
+                            &mut control,
+                            &mut highest_revision,
+                            &mut commands,
+                            &mut authorization,
+                            RETRY_DELAYS[0],
+                        )
+                        .await?
+                        {
+                            continue 'supervisor;
+                        }
+                        return Ok(());
                     }
+                    persist_collector_state(&database, control, None).await?;
                 }
                 Err(error) => {
                     if provider.stop().is_err() {
@@ -1199,7 +1237,8 @@ async fn prepare_record(
     let identity = control
         .identity
         .ok_or(LocalPersistenceError::InvalidRecord)?;
-    let (account_id, source_sequence, message, completed_media) = record.into_parts();
+    let (account_id, source_sequence, conversation_display_name, message, completed_media) =
+        record.into_parts();
     let prepared_media = copy_completed_media(
         database_path,
         message.attachments(),
@@ -1207,15 +1246,43 @@ async fn prepare_record(
         spool_paused,
     )
     .await?;
-    let created_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .map_err(|_| LocalPersistenceError::Clock)?;
+    let created_at = message.occurred_at().to_owned();
+    let display_name_fingerprint = Sha256::digest(conversation_display_name.as_bytes());
+    let conversation_source_key = format!(
+        "conversation-observed:{}:{display_name_fingerprint:x}",
+        message.source_key()
+    );
+    let conversation_payload = serde_json::json!({
+        "conversation_id": message.conversation_id(),
+        "display_name": conversation_display_name,
+        "observed_at": message.occurred_at(),
+        "conversation": message.conversation(),
+    })
+    .as_object()
+    .cloned()
+    .ok_or(LocalPersistenceError::InvalidRecord)?;
+    let conversation_event_id =
+        stable_communication_event_id(identity, &account_id, &conversation_source_key);
+    let conversation_event = EventEnvelope {
+        event_id: conversation_event_id.clone(),
+        workspace_id: identity.workspace_id.hyphenated().to_string(),
+        device_id: identity.device_id.hyphenated().to_string(),
+        event_type: "communication.conversation_observed".to_owned(),
+        source: COLLECTOR_KEY.to_owned(),
+        schema_version: 1,
+        occurred_at: message.occurred_at().to_owned(),
+        created_at: created_at.clone(),
+        sensitivity: Sensitivity::High,
+        payload: conversation_payload,
+        attachment_refs: Vec::new(),
+        idempotency_key: Some(format!("conversation-observed:{conversation_event_id}")),
+    };
     let payload = serde_json::to_value(&message)
         .ok()
         .and_then(|value| value.as_object().cloned())
         .ok_or(LocalPersistenceError::InvalidRecord)?;
     let event = EventEnvelope {
-        event_id: Uuid::new_v4().hyphenated().to_string(),
+        event_id: stable_communication_event_id(identity, &account_id, message.source_key()),
         workspace_id: identity.workspace_id.hyphenated().to_string(),
         device_id: identity.device_id.hyphenated().to_string(),
         event_type: "communication.message_recorded".to_owned(),
@@ -1233,6 +1300,7 @@ async fn prepare_record(
         idempotency_key: Some(message.source_key().to_owned()),
     };
     Ok(PreparedRecord {
+        conversation_event,
         commit: CommunicationMessageCommit {
             account_id,
             source_sequence,
@@ -1244,7 +1312,26 @@ async fn prepare_record(
     })
 }
 
+fn stable_communication_event_id(
+    identity: CommunicationIdentity,
+    account_id: &str,
+    source_key: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(identity.workspace_id.as_bytes());
+    hasher.update(identity.device_id.as_bytes());
+    hasher.update(account_id.as_bytes());
+    hasher.update(source_key.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).hyphenated().to_string()
+}
+
 struct PreparedRecord {
+    conversation_event: EventEnvelope,
     commit: CommunicationMessageCommit,
     spool: AttemptSpoolLease,
 }
@@ -1260,7 +1347,6 @@ enum LocalPersistenceError {
     Filesystem,
     InvalidRecord,
     Quota,
-    Clock,
 }
 
 async fn copy_completed_media(
@@ -1738,7 +1824,7 @@ async fn persist_collector(
         .map_err(CommunicationRuntimeError::Database)
 }
 
-/// Fail-closed factory installed by production until a versioned source factory is available.
+/// Fail-closed factory used by process-test and unsupported-platform builds.
 pub struct UnavailableCommunicationProviderFactory;
 
 impl CommunicationProviderFactory for UnavailableCommunicationProviderFactory {
@@ -1748,5 +1834,27 @@ impl CommunicationProviderFactory for UnavailableCommunicationProviderFactory {
             "verified WeChat source capability is unavailable",
             false,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stable_communication_event_id, CommunicationIdentity};
+    use uuid::Uuid;
+
+    #[test]
+    fn communication_event_identity_is_stable_for_source_replay() {
+        let identity = CommunicationIdentity {
+            workspace_id: Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                .expect("workspace UUID"),
+            device_id: Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+                .expect("device UUID"),
+        };
+        let first = stable_communication_event_id(identity, "account", "source-key");
+        let replay = stable_communication_event_id(identity, "account", "source-key");
+        let different = stable_communication_event_id(identity, "account", "other-source-key");
+
+        assert_eq!(first, replay);
+        assert_ne!(first, different);
     }
 }

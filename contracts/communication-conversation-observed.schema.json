@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://personalcomputeragent.local/contracts/communication-conversation-observed.schema.json",
+  "title": "CommunicationConversationObserved",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["conversation_id", "display_name", "observed_at", "conversation"],
+  "properties": {
+    "conversation_id": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "display_name": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "conversation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope"],
+          "properties": { "scope": { "const": "direct" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope", "member_count"],
+          "properties": {
+            "scope": { "const": "group" },
+            "member_count": { "type": "integer", "minimum": 1, "maximum": 15 }
+          }
+        }
+      ]
+    }
+  }
+}

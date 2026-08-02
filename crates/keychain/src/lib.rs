@@ -1,4 +1,8 @@
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    path::{Component, Path},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -18,8 +22,9 @@ pub const WECHAT_CREDENTIAL_SERVICE: &str = "com.pca.wechat";
 pub const WECHAT_CREDENTIAL_ACCOUNT: &str = "current-v1";
 pub const WECHAT_CREDENTIAL_REF: &str = "keychain://com.pca.wechat/current-v1";
 const DEVICE_CREDENTIAL_VERSION: u8 = 1;
-const WECHAT_KEY_MATERIAL_VERSION: u8 = 1;
+const WECHAT_KEY_MATERIAL_VERSION: u8 = 3;
 const WECHAT_RAW_KEY_LENGTH: usize = 32;
+const WECHAT_SQLCIPHER_SALT_LENGTH: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialError {
@@ -86,7 +91,7 @@ pub trait CredentialStore: Send + Sync {
 #[derive(Eq, PartialEq)]
 pub struct WechatKeyMaterial {
     account_id: String,
-    raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
+    database_keys: Vec<WechatDatabaseKeyMaterial>,
 }
 
 impl fmt::Debug for WechatKeyMaterial {
@@ -103,7 +108,135 @@ impl fmt::Debug for WechatKeyMaterial {
 struct StoredWechatKeyMaterial {
     version: u8,
     account_id: String,
+    #[serde(default)]
     raw_key: Vec<u8>,
+    #[serde(default)]
+    salt: Option<Vec<u8>>,
+    #[serde(default)]
+    database_keys: Vec<StoredWechatDatabaseKeyMaterial>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWechatDatabaseKeyMaterial {
+    database_path: Option<String>,
+    raw_key: Vec<u8>,
+    salt: Option<Vec<u8>>,
+}
+
+/// One database-scoped `SQLCipher` key recovered from the local `WeChat` process.
+///
+/// The relative path is non-secret routing metadata. Key and salt bytes remain redacted from
+/// `Debug` and can only be read by the native read-only database adapter.
+#[derive(Eq, PartialEq)]
+pub struct WechatDatabaseKeyMaterial {
+    database_path: Option<String>,
+    raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
+    salt: Option<[u8; WECHAT_SQLCIPHER_SALT_LENGTH]>,
+}
+
+impl fmt::Debug for WechatDatabaseKeyMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WechatDatabaseKeyMaterial")
+            .field("database_path", &self.database_path)
+            .field("raw_key", &"redacted")
+            .field("salt", &self.salt.as_ref().map(|_| "redacted"))
+            .finish()
+    }
+}
+
+impl WechatDatabaseKeyMaterial {
+    /// Creates one validated database-scoped key entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] for a non-canonical relative path, an
+    /// all-zero key, or an all-zero salt.
+    pub fn new(
+        database_path: &str,
+        raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
+        salt: [u8; WECHAT_SQLCIPHER_SALT_LENGTH],
+    ) -> Result<Self, CredentialError> {
+        let entry = Self {
+            database_path: Some(database_path.to_owned()),
+            raw_key,
+            salt: Some(salt),
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    /// Creates one database-scoped key that `WeChat` passes directly to `sqlite3_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] for a non-canonical relative path or an
+    /// all-zero key.
+    pub fn new_passphrase(
+        database_path: &str,
+        raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
+    ) -> Result<Self, CredentialError> {
+        let entry = Self {
+            database_path: Some(database_path.to_owned()),
+            raw_key,
+            salt: None,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    /// Returns the raw key only to the read-only `SQLCipher` adapter.
+    #[must_use]
+    pub const fn raw_key(&self) -> &[u8; WECHAT_RAW_KEY_LENGTH] {
+        &self.raw_key
+    }
+
+    /// Returns the optional database salt only to the read-only `SQLCipher` adapter.
+    #[must_use]
+    pub const fn salt(&self) -> Option<&[u8; WECHAT_SQLCIPHER_SALT_LENGTH]> {
+        self.salt.as_ref()
+    }
+
+    /// Distinguishes a database-routed credential from a legacy wildcard credential.
+    #[must_use]
+    pub const fn is_database_scoped(&self) -> bool {
+        self.database_path.is_some()
+    }
+
+    fn legacy(
+        raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
+        salt: Option<[u8; WECHAT_SQLCIPHER_SALT_LENGTH]>,
+    ) -> Result<Self, CredentialError> {
+        let entry = Self {
+            database_path: None,
+            raw_key,
+            salt,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    fn validate(&self) -> Result<(), CredentialError> {
+        let path_is_valid = self.database_path.as_deref().is_none_or(|value| {
+            !value.is_empty()
+                && value.len() <= 512
+                && !value.chars().any(char::is_control)
+                && Path::new(value)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+        });
+        if !path_is_valid
+            || self.raw_key.iter().all(|byte| *byte == 0)
+            || self
+                .salt
+                .is_some_and(|salt| salt.iter().all(|byte| *byte == 0))
+        {
+            Err(CredentialError::InvalidCredential)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl WechatKeyMaterial {
@@ -119,7 +252,26 @@ impl WechatKeyMaterial {
     ) -> Result<Self, CredentialError> {
         let material = Self {
             account_id: account_id.to_owned(),
-            raw_key,
+            database_keys: vec![WechatDatabaseKeyMaterial::legacy(raw_key, None)?],
+        };
+        material.validate()?;
+        Ok(material)
+    }
+
+    /// Creates validated raw `SQLCipher` material whose database salt was recovered together
+    /// with the key during an explicit local repair operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] for invalid account proof or key bytes.
+    pub fn new_with_salt(
+        account_id: &str,
+        raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
+        salt: [u8; WECHAT_SQLCIPHER_SALT_LENGTH],
+    ) -> Result<Self, CredentialError> {
+        let material = Self {
+            account_id: account_id.to_owned(),
+            database_keys: vec![WechatDatabaseKeyMaterial::legacy(raw_key, Some(salt))?],
         };
         material.validate()?;
         Ok(material)
@@ -131,10 +283,34 @@ impl WechatKeyMaterial {
         &self.account_id
     }
 
-    /// Returns the raw key only to the read-only `SQLCipher` adapter.
+    /// Creates validated account-scoped material for independently keyed databases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] when the account proof, entries, or paths
+    /// are invalid, empty, or duplicated.
+    pub fn new_for_databases(
+        account_id: &str,
+        database_keys: Vec<WechatDatabaseKeyMaterial>,
+    ) -> Result<Self, CredentialError> {
+        let material = Self {
+            account_id: account_id.to_owned(),
+            database_keys,
+        };
+        material.validate()?;
+        Ok(material)
+    }
+
+    /// Selects the exact key for an absolute source database path. Legacy single-key records are
+    /// accepted as a wildcard so existing Keychain items remain readable.
     #[must_use]
-    pub const fn raw_key(&self) -> &[u8; WECHAT_RAW_KEY_LENGTH] {
-        &self.raw_key
+    pub fn key_for_database(&self, database_path: &Path) -> Option<&WechatDatabaseKeyMaterial> {
+        self.database_keys.iter().find(|entry| {
+            entry
+                .database_path
+                .as_deref()
+                .is_none_or(|relative| database_path.ends_with(relative))
+        })
     }
 
     /// Encodes this value solely for storage in the fixed Keychain item.
@@ -148,7 +324,17 @@ impl WechatKeyMaterial {
         serde_json::to_vec(&StoredWechatKeyMaterial {
             version: WECHAT_KEY_MATERIAL_VERSION,
             account_id: self.account_id.clone(),
-            raw_key: self.raw_key.to_vec(),
+            raw_key: Vec::new(),
+            salt: None,
+            database_keys: self
+                .database_keys
+                .iter()
+                .map(|entry| StoredWechatDatabaseKeyMaterial {
+                    database_path: entry.database_path.clone(),
+                    raw_key: entry.raw_key.to_vec(),
+                    salt: entry.salt.map(|salt| salt.to_vec()),
+                })
+                .collect(),
         })
         .map_err(|_| CredentialError::InvalidCredential)
     }
@@ -156,14 +342,71 @@ impl WechatKeyMaterial {
     pub(crate) fn decode(value: &[u8]) -> Result<Self, CredentialError> {
         let stored: StoredWechatKeyMaterial =
             serde_json::from_slice(value).map_err(|_| CredentialError::InvalidCredential)?;
-        let raw_key = stored
-            .raw_key
-            .try_into()
-            .map_err(|_| CredentialError::InvalidCredential)?;
-        if stored.version != WECHAT_KEY_MATERIAL_VERSION {
-            return Err(CredentialError::InvalidCredential);
+        match stored.version {
+            1 => Self::new(
+                &stored.account_id,
+                stored
+                    .raw_key
+                    .try_into()
+                    .map_err(|_| CredentialError::InvalidCredential)?,
+            ),
+            2 => match stored.salt {
+                Some(salt) => Self::new_with_salt(
+                    &stored.account_id,
+                    stored
+                        .raw_key
+                        .try_into()
+                        .map_err(|_| CredentialError::InvalidCredential)?,
+                    salt.try_into()
+                        .map_err(|_| CredentialError::InvalidCredential)?,
+                ),
+                None => Self::new(
+                    &stored.account_id,
+                    stored
+                        .raw_key
+                        .try_into()
+                        .map_err(|_| CredentialError::InvalidCredential)?,
+                ),
+            },
+            WECHAT_KEY_MATERIAL_VERSION => {
+                let database_keys = stored
+                    .database_keys
+                    .into_iter()
+                    .map(|entry| {
+                        let raw_key = entry
+                            .raw_key
+                            .try_into()
+                            .map_err(|_| CredentialError::InvalidCredential)?;
+                        match entry.database_path {
+                            Some(database_path) => match entry.salt {
+                                Some(salt) => WechatDatabaseKeyMaterial::new(
+                                    &database_path,
+                                    raw_key,
+                                    salt.try_into()
+                                        .map_err(|_| CredentialError::InvalidCredential)?,
+                                ),
+                                None => WechatDatabaseKeyMaterial::new_passphrase(
+                                    &database_path,
+                                    raw_key,
+                                ),
+                            },
+                            None => WechatDatabaseKeyMaterial::legacy(
+                                raw_key,
+                                entry
+                                    .salt
+                                    .map(|salt| {
+                                        salt.try_into()
+                                            .map_err(|_| CredentialError::InvalidCredential)
+                                    })
+                                    .transpose()?,
+                            ),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Self::new_for_databases(&stored.account_id, database_keys)
+            }
+            _ => Err(CredentialError::InvalidCredential),
         }
-        Self::new(&stored.account_id, raw_key)
     }
 
     fn validate(&self) -> Result<(), CredentialError> {
@@ -172,7 +415,17 @@ impl WechatKeyMaterial {
             || account != self.account_id
             || account.len() > 512
             || account.chars().any(char::is_control)
-            || self.raw_key.iter().all(|byte| *byte == 0)
+            || self.database_keys.is_empty()
+            || self
+                .database_keys
+                .iter()
+                .any(|entry| entry.validate().is_err())
+            || self.database_keys.iter().enumerate().any(|(index, entry)| {
+                entry.database_path.is_some()
+                    && self.database_keys[index + 1..]
+                        .iter()
+                        .any(|other| other.database_path == entry.database_path)
+            })
         {
             Err(CredentialError::InvalidCredential)
         } else {

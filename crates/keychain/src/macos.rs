@@ -57,6 +57,26 @@ impl MacOSKeychainStore {
     pub fn delete_shared_secret(&self) -> Result<(), CredentialError> {
         delete_bridge_shared_secret(self)
     }
+
+    /// Persists previously validated `WeChat` `SQLCipher` material in PCA's fixed Keychain item.
+    /// This is intentionally not exposed through the generic credential-store port: only the
+    /// explicit local repair path may create this sensitive item.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted Keychain error. The key material is never included in diagnostics.
+    pub fn store_validated_wechat_key_material(
+        &self,
+        material: &WechatKeyMaterial,
+    ) -> Result<(), CredentialError> {
+        let encoded = material.encode()?;
+        set_generic_password(
+            WECHAT_CREDENTIAL_SERVICE,
+            WECHAT_CREDENTIAL_ACCOUNT,
+            &encoded,
+        )
+        .map_err(|error| map_keychain_error(error.code()))
+    }
 }
 
 impl CredentialStore for MacOSKeychainStore {

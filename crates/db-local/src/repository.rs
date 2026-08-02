@@ -1146,9 +1146,11 @@ pub(crate) fn load_pending_communication_events(
                     e.attachment_refs_json, e.idempotency_key
              FROM sync_outbox AS o
              INNER JOIN events_local AS e ON e.event_id = o.event_id
-             INNER JOIN communication_messages AS m ON m.event_id = e.event_id
              WHERE o.state = 'pending'
-               AND e.event_type = 'communication.message_recorded'
+               AND e.event_type IN (
+                   'communication.message_recorded',
+                   'communication.conversation_observed'
+               )
                AND e.source = 'communication.wechat'
                AND e.schema_version = 1
                AND e.sensitivity = 'high'
@@ -1222,10 +1224,12 @@ pub(crate) fn acknowledge_communication_events(
                  WHERE event_id = ?1
                    AND state = 'pending'
                    AND EXISTS (
-                       SELECT 1 FROM communication_messages AS m
-                       INNER JOIN events_local AS e ON e.event_id = m.event_id
+                       SELECT 1 FROM events_local AS e
                        WHERE e.event_id = sync_outbox.event_id
-                         AND e.event_type = 'communication.message_recorded'
+                         AND e.event_type IN (
+                             'communication.message_recorded',
+                             'communication.conversation_observed'
+                         )
                          AND e.source = 'communication.wechat'
                          AND e.schema_version = 1
                          AND e.sensitivity = 'high'

@@ -449,6 +449,7 @@ export function createApp(options: CreateAppOptions): Hono {
       return context.json({
         conversations: conversations.map((conversation) => ({
           conversation_id: conversation.conversationId,
+          display_name: conversation.displayName,
           scope: conversation.scope,
           member_count: conversation.memberCount,
           message_count: conversation.messageCount,
@@ -874,8 +875,8 @@ function collectorConfigResponse(config: { networkEnabled: boolean; wechatEnable
       enabled: config.wechatEnabled,
       directions: ["incoming", "outgoing"] as const,
       message_types: ["text", "audio", "image", "video"] as const,
-      conversation_scope: "direct_and_group_at_most_eight_members" as const,
-      max_group_members: 8,
+      conversation_scope: "direct_and_group_at_most_fifteen_members" as const,
+      max_group_members: 15,
       sync_mode: "full" as const,
       retention_days: 180,
     },

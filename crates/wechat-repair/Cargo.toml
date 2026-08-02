@@ -1,0 +1,17 @@
+[package]
+name = "pca-wechat-repair"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "=0.2.189"
+pca-keychain = { path = "../keychain" }
+pca-provider-contracts = { path = "../provider-contracts" }
+pca-wechat-provider = { path = "../wechat-provider" }
+sha2 = "=0.10.9"
+tempfile = "3"
+tokio = { version = "1", features = ["rt"] }
+
+[lints]
+workspace = true

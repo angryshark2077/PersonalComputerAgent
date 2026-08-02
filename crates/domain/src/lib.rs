@@ -549,7 +549,7 @@ impl ConversationScope {
     pub const fn is_allowed(&self) -> bool {
         match self {
             Self::Direct => true,
-            Self::Group { member_count } => *member_count > 0 && *member_count <= 8,
+            Self::Group { member_count } => *member_count > 0 && *member_count <= 15,
         }
     }
 }
@@ -557,7 +557,7 @@ impl ConversationScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ConversationScopePolicy {
-    DirectAndGroupAtMostEightMembers,
+    DirectAndGroupAtMostFifteenMembers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -615,7 +615,7 @@ impl CommunicationScopeV2 {
                     MessageKind::Image,
                     MessageKind::Video,
                 ]
-            || raw.max_group_members != 8
+            || raw.max_group_members != 15
             || raw.retention_days != 180
         {
             return Err(invalid_communication_record());

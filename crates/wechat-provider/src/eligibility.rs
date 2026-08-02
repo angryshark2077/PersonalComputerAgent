@@ -32,7 +32,7 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<NormalizedCommuni
         SourceConversation::Direct => ConversationScope::Direct,
         SourceConversation::Group {
             membership: GroupMembershipEvidence::Verified(member_count),
-        } if (1..=8).contains(&member_count) => ConversationScope::Group { member_count },
+        } if (1..=15).contains(&member_count) => ConversationScope::Group { member_count },
         _ => return None,
     };
 
@@ -80,6 +80,7 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<NormalizedCommuni
     NormalizedCommunicationRecord::try_new(
         record.account_id,
         record.source_sequence,
+        record.conversation_display_name,
         message,
         completed_media,
     )

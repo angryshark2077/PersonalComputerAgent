@@ -414,6 +414,7 @@ export const communicationConversations = pgTable(
     workspaceId: uuid("workspace_id").notNull(),
     deviceId: uuid("device_id").notNull(),
     conversationId: text("conversation_id").notNull(),
+    displayName: text("display_name").notNull().default(""),
     scope: text("scope").notNull(),
     memberCount: integer("member_count"),
     lastMessageAt: timestampColumn("last_message_at").notNull(),
@@ -426,7 +427,7 @@ export const communicationConversations = pgTable(
     }).onDelete("cascade"),
     check(
       "communication_conversations_scope_members",
-      sql`(${table.scope} = 'direct' AND ${table.memberCount} IS NULL) OR (${table.scope} = 'group' AND ${table.memberCount} BETWEEN 1 AND 8)`,
+      sql`(${table.scope} = 'direct' AND ${table.memberCount} IS NULL) OR (${table.scope} = 'group' AND ${table.memberCount} BETWEEN 1 AND 15)`,
     ),
   ],
 );

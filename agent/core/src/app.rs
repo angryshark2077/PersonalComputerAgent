@@ -7,14 +7,14 @@ use pca_agent_runtime::{
     CrashMarkerGuard, LocalHeartbeatWriter, RuntimeError, RuntimePaths, RuntimeStateMachine,
     SingleInstanceGuard,
 };
+#[cfg(any(not(target_os = "macos"), feature = "process-test-hooks"))]
+use pca_agentd::communication::UnavailableCommunicationProviderFactory;
 use pca_agentd::{
     cloud_control::{
         CloudControlCommands, CloudControlOwner, ControlClient, HttpControlClient,
         PRODUCTION_CLOUD_API_ORIGIN,
     },
-    communication::{
-        CommunicationAuthorization, CommunicationRuntime, UnavailableCommunicationProviderFactory,
-    },
+    communication::{CommunicationAuthorization, CommunicationRuntime},
     pairing_ipc::{PairingIpcServer, PairingIpcServerError, PairingSocket},
 };
 use pca_bridge_client::supervisor::{
@@ -32,6 +32,8 @@ use pca_keychain::{
     CredentialError, BRIDGE_CREDENTIAL_ACCOUNT, BRIDGE_CREDENTIAL_SERVICE,
     BRIDGE_SHARED_SECRET_LENGTH,
 };
+#[cfg(all(target_os = "macos", not(feature = "process-test-hooks")))]
+use pca_wechat_provider::MacOSWechatProviderFactory;
 use reqwest::Url;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::{sync::watch, task::JoinHandle};
@@ -54,6 +56,18 @@ const EXIT_RUNTIME_FAILURE: u8 = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEALTH_FRESHNESS: TimeDuration = TimeDuration::seconds(5);
 const LIFECYCLE_CAPACITY: usize = 32;
+
+fn production_communication_factory(
+) -> Arc<dyn pca_provider_contracts::CommunicationProviderFactory> {
+    #[cfg(all(target_os = "macos", not(feature = "process-test-hooks")))]
+    {
+        Arc::new(MacOSWechatProviderFactory)
+    }
+    #[cfg(any(not(target_os = "macos"), feature = "process-test-hooks"))]
+    {
+        Arc::new(UnavailableCommunicationProviderFactory)
+    }
+}
 
 pub(crate) async fn execute(command: CommandConfig) -> u8 {
     match command {
@@ -336,7 +350,7 @@ impl RuntimeResources {
                         .expect("database exists until cleanup"),
                 ),
                 config.paths.database_file.clone(),
-                Arc::new(UnavailableCommunicationProviderFactory),
+                production_communication_factory(),
                 communication_authorization.clone(),
             )
             .await

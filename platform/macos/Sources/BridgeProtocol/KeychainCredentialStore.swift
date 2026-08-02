@@ -14,6 +14,8 @@ public struct KeychainCredentialStore: Sendable {
     public static let sharedSecretLength = 32
     public static let deviceService = "com.pca.device"
     public static let deviceAccount = "current-v1"
+    public static let wechatService = "com.pca.wechat"
+    public static let wechatAccount = "current-v1"
 
     public init() {}
 
@@ -91,6 +93,32 @@ public struct KeychainCredentialStore: Sendable {
         item[kSecAttrAccess as String] = access
         let addStatus = SecItemAdd(item as CFDictionary, nil)
         guard addStatus == errSecSuccess else { throw Self.error(for: addStatus) }
+    }
+
+    /// Creates the `WeChat` credential item with access limited to the installed
+    /// repair tool and `agentd`. An invalid placeholder keeps collection fail-closed until repair.
+    public func ensureWechatCredentialPlaceholder(trustedApplicationURLs: [URL]) throws {
+        let query = Self.wechatCredentialExistenceQuery()
+        // Query only for existence. Requesting kSecReturnData here asks the installer to read a
+        // secret whose ACL intentionally trusts only agentd and the repair tool, which causes an
+        // unnecessary login-keychain password prompt on every upgrade.
+        let lookupStatus = SecItemCopyMatching(query as CFDictionary, nil)
+        if lookupStatus == errSecSuccess { return }
+        guard lookupStatus == errSecItemNotFound else { throw Self.error(for: lookupStatus) }
+
+        let access = try Self.makeAccess(
+            trustedApplicationURLs: trustedApplicationURLs,
+            label: "Personal Computer Agent WeChat Credential"
+        )
+        var item = query
+        item[kSecValueData as String] = Data([0])
+        item[kSecAttrAccess as String] = access
+        let addStatus = SecItemAdd(item as CFDictionary, nil)
+        guard addStatus == errSecSuccess else { throw Self.error(for: addStatus) }
+    }
+
+    static func wechatCredentialExistenceQuery() -> [String: Any] {
+        Self.baseQuery(service: Self.wechatService, account: Self.wechatAccount)
     }
 
     private static func baseQuery(

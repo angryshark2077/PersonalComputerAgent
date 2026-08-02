@@ -19,6 +19,7 @@ export type ContractSchemaName =
   | "device-pairing"
   | "agent-control-snapshot"
   | "dashboard-control"
+  | "communication-conversation-observed"
   | "communication-message-recorded"
   | "communication-object";
 
@@ -43,6 +44,7 @@ const schemaNames: ContractSchemaName[] = [
   "device-pairing",
   "agent-control-snapshot",
   "dashboard-control",
+  "communication-conversation-observed",
   "communication-message-recorded",
   "communication-object",
 ];

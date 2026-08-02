@@ -97,6 +97,7 @@ export default function DevicePage() {
         <h1>Device</h1>
         <p>Review collection permissions and device access.</p>
       </section>
+      <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>View chats</Link>
       {error !== null ? <p role="alert">{error}</p> : null}
       <CollectorScopeCard
           name="Network"

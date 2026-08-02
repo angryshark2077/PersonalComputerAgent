@@ -36,7 +36,7 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
   white-space: nowrap;
 }
 
-.dashboard-nav nav { align-self: stretch; display: flex; }
+.dashboard-nav nav { align-self: stretch; display: flex; gap: 24px; }
 
 .dashboard-nav nav a {
   align-items: center;
@@ -106,6 +106,40 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 
 .back-link:hover { color: #155eef; }
 
+.primary-link { color: #155eef; display: inline-block; font-size: 14px; font-weight: 700; margin-bottom: 16px; text-decoration: none; }
+
+.conversation-list { list-style: none; margin: 0; padding: 0; }
+
+.conversation-list li + li { border-top: 1px solid #edf0f5; }
+
+.conversation-link { align-items: center; color: #172033; display: flex; gap: 18px; justify-content: space-between; padding: 18px 22px; text-decoration: none; }
+
+.conversation-link:hover { background: #f7f9fe; }
+
+.conversation-main { min-width: 0; }
+
+.conversation-title { font-size: 14px; font-weight: 700; margin: 0 0 5px; }
+
+.conversation-id { color: #667085; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; margin: 0; overflow-wrap: anywhere; }
+
+.conversation-meta { color: #667085; flex: 0 0 auto; font-size: 12px; text-align: right; }
+
+.message-list { display: flex; flex-direction: column; gap: 12px; list-style: none; margin: 0; padding: 22px; }
+
+.message-row { display: flex; }
+
+.message-row.is-outgoing { justify-content: flex-end; }
+
+.message-bubble { background: #f0f3f8; border-radius: 12px; max-width: min(72%, 680px); padding: 11px 13px; }
+
+.message-row.is-outgoing .message-bubble { background: #dce8ff; }
+
+.message-text { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+.message-meta { color: #667085; font-size: 11px; margin: 7px 0 0; }
+
+.message-attachment { color: #475467; font-size: 13px; margin: 0; }
+
 .device-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 28px 0 36px; }
 
 .collector-card { margin-top: 16px; padding: 22px; }
@@ -149,4 +183,7 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
   .dashboard-brand { font-size: 14px; }
   .dashboard-content { padding: 38px 20px 56px; }
   .dashboard-account p { display: none; }
+  .conversation-link { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .conversation-meta { text-align: left; }
+  .message-bubble { max-width: 88%; }
 }

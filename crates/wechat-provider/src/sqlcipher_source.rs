@@ -120,6 +120,67 @@ pub trait ReadOnlySqlcipherProbe: Send + Sync {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RusqliteReadOnlyProbe;
 
+/// Verifies one recovered key against a private, read-only database snapshot without inspecting
+/// application records. It is used only by the explicit local repair binary before Keychain
+/// persistence.
+///
+/// # Errors
+///
+/// Returns a redacted failure; neither the key, salt, database path, nor database contents are
+/// returned or logged.
+#[cfg(target_os = "macos")]
+pub fn validate_recovered_key(
+    database_path: &std::path::Path,
+    key_material: &WechatKeyMaterial,
+    timeout: Duration,
+) -> Result<(), SqlcipherProbeFailure> {
+    macos::validate_recovered_key(database_path, key_material, timeout)
+}
+
+/// Bounded table metadata returned only to the explicit local repair diagnostic.
+///
+/// This value deliberately contains no rows, database path, account identifier, or key material.
+pub struct SqlcipherSchemaTable {
+    name: String,
+    columns: Vec<String>,
+}
+
+impl SqlcipherSchemaTable {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
+/// Reads only bounded table and column names from a private read-only source snapshot.
+///
+/// # Errors
+///
+/// Returns a redacted failure when the key, database, schema, or deadline cannot be verified.
+#[cfg(target_os = "macos")]
+pub fn inspect_recovered_schema(
+    database_path: &std::path::Path,
+    key_material: &WechatKeyMaterial,
+    timeout: Duration,
+) -> Result<Vec<SqlcipherSchemaTable>, SqlcipherProbeFailure> {
+    macos::inspect_recovered_schema(database_path, key_material, timeout)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn with_recovered_database<T>(
+    database_path: &std::path::Path,
+    key_material: &WechatKeyMaterial,
+    timeout: Duration,
+    operation: impl FnOnce(&rusqlite::Connection) -> Result<T, SqlcipherProbeFailure>,
+) -> Result<T, SqlcipherProbeFailure> {
+    macos::with_recovered_database(database_path, key_material, timeout, operation)
+}
+
 /// A source that returns records only after Keychain, `SQLCipher`, schema, and account proof pass.
 pub struct SqlcipherWechatSource {
     request_sender: SyncSender<WorkerCommand>,
@@ -572,7 +633,7 @@ mod macos {
 
     use super::{
         ReadOnlySqlcipherProbe, RusqliteReadOnlyProbe, SourceCapabilities, SqlcipherProbeFailure,
-        SqlcipherProbeTarget, WechatKeyMaterial,
+        SqlcipherProbeTarget, SqlcipherSchemaTable, WechatKeyMaterial,
     };
     use std::time::Duration;
 
@@ -611,7 +672,7 @@ mod macos {
                 return Err(SqlcipherProbeFailure::CapabilityUnavailable);
             }
 
-            apply_raw_key(&connection, key_material.raw_key())?;
+            apply_key_material(&connection, key_material, &target.database_path)?;
             connection
                 .pragma_update(None, "query_only", true)
                 .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
@@ -863,20 +924,225 @@ mod macos {
         Ok(database.with_file_name(name))
     }
 
-    fn apply_raw_key(
+    pub(super) fn apply_key_material(
         connection: &Connection,
-        raw_key: &[u8; 32],
+        key_material: &WechatKeyMaterial,
+        database_path: &Path,
     ) -> Result<(), SqlcipherProbeFailure> {
-        let mut raw_literal = String::with_capacity(67);
+        let database_key = key_material
+            .key_for_database(database_path)
+            .ok_or(SqlcipherProbeFailure::KeyRejected)?;
+        if database_key.is_database_scoped() && database_key.salt().is_none() {
+            sqlcipher_ffi::apply_wechat_key(connection, database_key.raw_key())?;
+            connection
+                .pragma_update(None, "cipher_page_size", 4096_i64)
+                .map_err(|_| SqlcipherProbeFailure::KeyRejected)?;
+            return Ok(());
+        }
+        let salt_length = database_key.salt().map_or(0, |salt| salt.len());
+        let mut raw_literal = String::with_capacity(67 + (salt_length * 2));
         raw_literal.push_str("x'");
-        for byte in raw_key {
+        for byte in database_key.raw_key() {
             write!(&mut raw_literal, "{byte:02x}")
                 .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        }
+        if let Some(salt) = database_key.salt() {
+            for byte in salt {
+                write!(&mut raw_literal, "{byte:02x}")
+                    .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+            }
         }
         raw_literal.push('\'');
         connection
             .pragma_update(None, "key", raw_literal)
             .map_err(|_| SqlcipherProbeFailure::KeyRejected)
+    }
+
+    #[allow(unsafe_code)]
+    mod sqlcipher_ffi {
+        use rusqlite::{ffi, Connection};
+
+        use super::SqlcipherProbeFailure;
+
+        pub(super) fn apply_wechat_key(
+            connection: &Connection,
+            key: &[u8; 32],
+        ) -> Result<(), SqlcipherProbeFailure> {
+            let key_length = i32::try_from(key.len())
+                .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+            // SAFETY: `connection.handle()` is valid for the lifetime of `connection`; SQLCipher
+            // copies the exactly bounded 32-byte key during this call, and neither pointer escapes.
+            let result = unsafe {
+                ffi::sqlite3_key(
+                    connection.handle(),
+                    key.as_ptr().cast::<std::ffi::c_void>(),
+                    key_length,
+                )
+            };
+            if result == ffi::SQLITE_OK {
+                Ok(())
+            } else {
+                Err(SqlcipherProbeFailure::KeyRejected)
+            }
+        }
+    }
+
+    pub(super) fn validate_recovered_key(
+        database_path: &Path,
+        key_material: &WechatKeyMaterial,
+        timeout: Duration,
+    ) -> Result<(), SqlcipherProbeFailure> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(SqlcipherProbeFailure::TimedOut)?;
+        if timeout.is_zero() {
+            return Err(SqlcipherProbeFailure::TimedOut);
+        }
+        let snapshot = PrivateSourceSnapshot::create(database_path, deadline)?;
+        let connection = Connection::open_with_flags(
+            snapshot.database_path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+        connection
+            .busy_timeout(remaining(deadline)?)
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        connection.progress_handler(
+            1_000,
+            Some(move || Instant::now().checked_duration_since(deadline).is_some()),
+        );
+        let cipher_version: String = connection
+            .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        if cipher_version.trim().is_empty() {
+            return Err(SqlcipherProbeFailure::CapabilityUnavailable);
+        }
+        apply_key_material(&connection, key_material, database_path)?;
+        connection
+            .pragma_update(None, "query_only", true)
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        connection.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Select | AuthAction::Read { .. } => Authorization::Allow,
+            _ => Authorization::Deny,
+        }));
+        ensure_unlocked(&connection, deadline)
+    }
+
+    pub(super) fn with_recovered_database<T>(
+        database_path: &Path,
+        key_material: &WechatKeyMaterial,
+        timeout: Duration,
+        operation: impl FnOnce(&Connection) -> Result<T, SqlcipherProbeFailure>,
+    ) -> Result<T, SqlcipherProbeFailure> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(SqlcipherProbeFailure::TimedOut)?;
+        if timeout.is_zero() {
+            return Err(SqlcipherProbeFailure::TimedOut);
+        }
+        let snapshot = PrivateSourceSnapshot::create(database_path, deadline)?;
+        let connection = Connection::open_with_flags(
+            snapshot.database_path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+        connection
+            .busy_timeout(remaining(deadline)?)
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        connection.progress_handler(
+            1_000,
+            Some(move || Instant::now().checked_duration_since(deadline).is_some()),
+        );
+        apply_key_material(&connection, key_material, database_path)?;
+        connection
+            .pragma_update(None, "query_only", true)
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        ensure_unlocked(&connection, deadline)?;
+        let result = operation(&connection)?;
+        remaining(deadline)?;
+        Ok(result)
+    }
+
+    pub(super) fn inspect_recovered_schema(
+        database_path: &Path,
+        key_material: &WechatKeyMaterial,
+        timeout: Duration,
+    ) -> Result<Vec<SqlcipherSchemaTable>, SqlcipherProbeFailure> {
+        const MAX_TABLES: usize = 4_096;
+        const MAX_COLUMNS_PER_TABLE: usize = 256;
+        const MAX_IDENTIFIER_BYTES: usize = 512;
+
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(SqlcipherProbeFailure::TimedOut)?;
+        if timeout.is_zero() {
+            return Err(SqlcipherProbeFailure::TimedOut);
+        }
+        let snapshot = PrivateSourceSnapshot::create(database_path, deadline)?;
+        let connection = Connection::open_with_flags(
+            snapshot.database_path(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| SqlcipherProbeFailure::DatabaseUnavailable)?;
+        connection
+            .busy_timeout(remaining(deadline)?)
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        connection.progress_handler(
+            1_000,
+            Some(move || Instant::now().checked_duration_since(deadline).is_some()),
+        );
+        apply_key_material(&connection, key_material, database_path)?;
+        connection
+            .pragma_update(None, "query_only", true)
+            .map_err(|_| SqlcipherProbeFailure::CapabilityUnavailable)?;
+        ensure_unlocked(&connection, deadline)?;
+
+        let mut names_statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 4097",
+            )
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let table_names = names_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        if table_names.len() > MAX_TABLES
+            || table_names.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > MAX_IDENTIFIER_BYTES
+                    || name.chars().any(char::is_control)
+            })
+        {
+            return Err(SqlcipherProbeFailure::UnsupportedSchema);
+        }
+
+        let mut tables = Vec::with_capacity(table_names.len());
+        for name in table_names {
+            remaining(deadline)?;
+            let mut columns_statement = connection
+                .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid LIMIT 257")
+                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+            let columns = columns_statement
+                .query_map([&name], |row| row.get::<_, String>(0))
+                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+            if columns.is_empty()
+                || columns.len() > MAX_COLUMNS_PER_TABLE
+                || columns.iter().any(|column| {
+                    column.is_empty()
+                        || column.len() > MAX_IDENTIFIER_BYTES
+                        || column.chars().any(char::is_control)
+                })
+            {
+                return Err(SqlcipherProbeFailure::UnsupportedSchema);
+            }
+            tables.push(SqlcipherSchemaTable { name, columns });
+        }
+        remaining(deadline)?;
+        Ok(tables)
     }
 
     fn ensure_unlocked(

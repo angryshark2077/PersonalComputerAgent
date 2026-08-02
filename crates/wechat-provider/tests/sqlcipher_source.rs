@@ -13,14 +13,14 @@ use std::{
 
 use pca_domain::DomainError;
 use pca_keychain::{
-    CredentialError, CredentialStore, WechatKeyMaterial, WECHAT_CREDENTIAL_ACCOUNT,
-    WECHAT_CREDENTIAL_SERVICE,
+    CredentialError, CredentialStore, WechatDatabaseKeyMaterial, WechatKeyMaterial,
+    WECHAT_CREDENTIAL_ACCOUNT, WECHAT_CREDENTIAL_SERVICE,
 };
 use pca_wechat_provider::{
     source::{SourceCapabilities, SourceCursor, WechatSource},
     sqlcipher_source::{
-        ReadOnlySqlcipherProbe, RusqliteReadOnlyProbe, SqlcipherProbeFailure, SqlcipherProbeTarget,
-        SqlcipherWechatSource,
+        inspect_recovered_schema, ReadOnlySqlcipherProbe, RusqliteReadOnlyProbe,
+        SqlcipherProbeFailure, SqlcipherProbeTarget, SqlcipherWechatSource,
     },
 };
 use rusqlite::Connection;
@@ -362,6 +362,58 @@ async fn encrypted_fixture_proves_read_only_sqlcipher_version_schema_and_account
 }
 
 #[tokio::test]
+async fn wechat_binary_passphrase_fixture_proves_database_scoped_key_mode() {
+    let fixture = WechatPassphraseFixture::new([0x37; 32]);
+    let entry = WechatDatabaseKeyMaterial::new_passphrase("source.db", [0x37; 32])
+        .expect("database-scoped WeChat key");
+    let material = WechatKeyMaterial::new_for_databases("fixture-local-account", vec![entry])
+        .expect("WeChat key material")
+        .encode()
+        .expect("encoded WeChat key material");
+    let source = SqlcipherWechatSource::with_dependencies(
+        EncodedKeyStore(material),
+        RusqliteReadOnlyProbe,
+        fixture_target(fixture.database_path().to_path_buf()),
+    );
+
+    let capabilities = source.probe().await.expect("WeChat passphrase probe");
+    assert_eq!(capabilities.schema_version, 7);
+}
+
+#[test]
+fn explicit_schema_probe_returns_only_bounded_metadata_without_touching_source() {
+    let fixture = WechatPassphraseFixture::new([0x52; 32]);
+    let before = DirectorySnapshot::capture(
+        fixture
+            .database_path()
+            .parent()
+            .expect("fixture source directory"),
+    );
+    let entry = WechatDatabaseKeyMaterial::new_passphrase("source.db", [0x52; 32])
+        .expect("database-scoped WeChat key");
+    let material = WechatKeyMaterial::new_for_databases("fixture-local-account", vec![entry])
+        .expect("WeChat key material");
+
+    let tables =
+        inspect_recovered_schema(fixture.database_path(), &material, Duration::from_secs(2))
+            .expect("read-only schema metadata");
+    let after = DirectorySnapshot::capture(
+        fixture
+            .database_path()
+            .parent()
+            .expect("fixture source directory"),
+    );
+
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].name(), "source_probe_metadata");
+    assert_eq!(
+        tables[0].columns(),
+        ["source_version", "schema_version", "account_id"]
+    );
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
 async fn wal_source_probe_creates_or_modifies_nothing_in_the_source_directory() {
     let fixture = WalEncryptedFixture::new([0x6d; 32]);
     let before = DirectorySnapshot::capture(fixture.source_directory());
@@ -510,6 +562,50 @@ impl Drop for EncryptedFixture {
     }
 }
 
+struct WechatPassphraseFixture {
+    directory: PathBuf,
+    database: PathBuf,
+}
+
+impl WechatPassphraseFixture {
+    fn new(key: [u8; 32]) -> Self {
+        let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pca-wechat-passphrase-fixture-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create isolated fixture directory");
+        let database = directory.join("source.db");
+        let connection = Connection::open(&database).expect("create SQLCipher fixture");
+        apply_wechat_passphrase(&connection, &key).expect("set WeChat binary passphrase");
+        connection
+            .execute_batch(
+                "CREATE TABLE source_probe_metadata (\
+                    source_version TEXT NOT NULL, \
+                    schema_version INTEGER NOT NULL, \
+                    account_id TEXT NOT NULL\
+                 );\
+                 INSERT INTO source_probe_metadata VALUES ('4.1.12', 7, 'fixture-local-account');",
+            )
+            .expect("create encrypted fixture schema");
+        drop(connection);
+        Self {
+            directory,
+            database,
+        }
+    }
+
+    fn database_path(&self) -> &Path {
+        &self.database
+    }
+}
+
+impl Drop for WechatPassphraseFixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.directory).expect("remove owned fixture directory");
+    }
+}
+
 struct WalEncryptedFixture {
     root: PathBuf,
     source_directory: PathBuf,
@@ -652,4 +748,15 @@ fn apply_raw_key(connection: &Connection, key: &[u8; 32]) -> Result<(), DomainEr
     connection
         .pragma_update(None, "key", raw_literal)
         .map_err(|_| DomainError::new("FIXTURE_ERROR", "key setup failed", false))
+}
+
+fn apply_wechat_passphrase(connection: &Connection, key: &[u8; 32]) -> Result<(), DomainError> {
+    let passphrase = std::str::from_utf8(key)
+        .map_err(|_| DomainError::new("FIXTURE_ERROR", "invalid fixture passphrase", false))?;
+    connection
+        .pragma_update(None, "key", passphrase)
+        .map_err(|_| DomainError::new("FIXTURE_ERROR", "key setup failed", false))?;
+    connection
+        .pragma_update(None, "cipher_page_size", 4096_i64)
+        .map_err(|_| DomainError::new("FIXTURE_ERROR", "page setup failed", false))
 }

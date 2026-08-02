@@ -352,6 +352,7 @@ fn text_record(sequence: u64) -> NormalizedCommunicationRecord {
     NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
         sequence,
+        "Conversation One".to_owned(),
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
             message_id: format!("message-{sequence}"),
             conversation_id: "conversation-1".to_owned(),
@@ -385,6 +386,7 @@ fn media_record(path: &Path, declared: &[u8], sequence: u64) -> NormalizedCommun
     NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
         sequence,
+        "Conversation One".to_owned(),
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
             message_id: format!("message-{sequence}"),
             conversation_id: "conversation-1".to_owned(),
@@ -430,6 +432,7 @@ fn multi_media_record(
     NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
         sequence,
+        "Conversation One".to_owned(),
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
             message_id: format!("message-{sequence}"),
             conversation_id: "conversation-1".to_owned(),
@@ -909,12 +912,25 @@ async fn completed_media_is_streamed_to_its_hash_name_before_atomic_commit() {
     .expect("completed media reaches atomic commit");
     runtime.shutdown().await.unwrap();
 
+    let pending = harness
+        .database
+        .load_pending_communication_events(2)
+        .await
+        .expect("load message and conversation metadata events");
+    assert_eq!(pending.len(), 2);
+    assert!(pending
+        .iter()
+        .any(|event| event.event_type == "communication.message_recorded"));
+    assert!(pending
+        .iter()
+        .any(|event| event.event_type == "communication.conversation_observed"));
+
     let name = format!("{:x}", Sha256::digest(bytes));
     let copied = DbActorHandle::communication_spool_root(&harness.database_path).join(name);
     assert_eq!(fs::read(copied).expect("read committed spool file"), bytes);
     let connection = Connection::open(&harness.database_path).unwrap();
-    assert_eq!(row_count(&connection, "events_local"), 1);
-    assert_eq!(row_count(&connection, "sync_outbox"), 1);
+    assert_eq!(row_count(&connection, "events_local"), 2);
+    assert_eq!(row_count(&connection, "sync_outbox"), 2);
     assert_eq!(row_count(&connection, "communication_messages"), 1);
     assert_eq!(row_count(&connection, "communication_cursors"), 1);
     assert_eq!(row_count(&connection, "attachment_spool"), 1);
@@ -1245,6 +1261,7 @@ async fn incomplete_media_envelope_is_rejected_before_runtime_and_cannot_advance
     assert!(NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
         1,
+        "Conversation One".to_owned(),
         message,
         Vec::new(),
     )
@@ -1346,7 +1363,7 @@ async fn spool_hard_limit_pauses_copy_until_usage_is_strictly_below_resume_water
     wait_for(&harness.state.poll_calls, 3).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if harness.database.active_outbox_depth().await.unwrap() == 1 {
+            if harness.database.active_outbox_depth().await.unwrap() == 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1364,7 +1381,7 @@ async fn spool_hard_limit_pauses_copy_until_usage_is_strictly_below_resume_water
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(depth, 1, "collector error after resume: {error_code:?}");
+    assert_eq!(depth, 2, "collector error after resume: {error_code:?}");
     assert!(fs::read_dir(root)
         .unwrap()
         .filter_map(Result::ok)
@@ -1417,7 +1434,7 @@ async fn b2_batch_rechecks_depth_and_skips_media_after_crossing_high_water() {
 
     assert_eq!(
         harness.database.active_outbox_depth().await.unwrap(),
-        OUTBOX_HIGH_WATER + 1
+        OUTBOX_HIGH_WATER + 2
     );
     let connection = Connection::open(&harness.database_path).unwrap();
     assert_eq!(row_count(&connection, "communication_messages"), 1);
@@ -1488,7 +1505,7 @@ async fn b2_system_outbox_movement_stops_later_batch_record_before_copy() {
 
     assert_eq!(
         harness.database.active_outbox_depth().await.unwrap(),
-        OUTBOX_HIGH_WATER + 2
+        OUTBOX_HIGH_WATER + 3
     );
     let connection = Connection::open(&harness.database_path).unwrap();
     assert_eq!(row_count(&connection, "communication_messages"), 1);
@@ -1797,8 +1814,8 @@ fn control_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
                 "enabled": enabled,
                 "directions": ["incoming", "outgoing"],
                 "message_types": ["text", "audio", "image", "video"],
-                "conversation_scope": "direct_and_group_at_most_eight_members",
-                "max_group_members": 8,
+                "conversation_scope": "direct_and_group_at_most_fifteen_members",
+                "max_group_members": 15,
                 "sync_mode": "full",
                 "retention_days": 180
             }

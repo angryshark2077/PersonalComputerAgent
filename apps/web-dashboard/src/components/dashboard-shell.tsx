@@ -10,6 +10,8 @@ import { signOut } from "../lib/auth";
 
 export function DashboardShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
+  const chatsActive = pathname === "/chats" || pathname.includes("/chats/");
+  const devicesActive = !chatsActive && (pathname.startsWith("/devices") || pathname === "/");
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
 
@@ -30,8 +32,11 @@ export function DashboardShell({ children }: { children: ReactNode }) {
       <header className="dashboard-nav">
         <Link className="dashboard-brand" href="/">Personal Computer Agent</Link>
         <nav aria-label="Dashboard">
-          <Link className={pathname.startsWith("/devices") || pathname === "/" ? "is-active" : undefined} href="/">
+          <Link className={devicesActive ? "is-active" : undefined} href="/">
             Devices
+          </Link>
+          <Link className={chatsActive ? "is-active" : undefined} href="/chats">
+            Chats
           </Link>
         </nav>
         <div className="dashboard-account">

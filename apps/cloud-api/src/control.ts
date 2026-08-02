@@ -56,8 +56,8 @@ export function parseCollectorConfig(value: unknown): StoredCollectorConfig | nu
     typeof wechat.enabled !== "boolean" ||
     !isExact(wechat.directions, ["incoming", "outgoing"]) ||
     !isExact(wechat.message_types, ["text", "audio", "image", "video"]) ||
-    wechat.conversation_scope !== "direct_and_group_at_most_eight_members" ||
-    wechat.max_group_members !== 8 ||
+    wechat.conversation_scope !== "direct_and_group_at_most_fifteen_members" ||
+    wechat.max_group_members !== 15 ||
     wechat.sync_mode !== "full" ||
     wechat.retention_days !== 180
   ) {

@@ -188,6 +188,7 @@ fn message(
         source_sequence: 1,
         message_id: "message-1".to_owned(),
         conversation_id: "conversation-1".to_owned(),
+        conversation_display_name: "Conversation One".to_owned(),
         source_key: "account-1:conversation-1:1".to_owned(),
         occurred_at: "2026-08-02T00:00:00Z".to_owned(),
         local_account: LocalAccountProof::Verified,

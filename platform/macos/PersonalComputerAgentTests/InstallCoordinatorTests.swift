@@ -27,6 +27,7 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertEqual(result, .success(version: "1.0.0"))
         XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 1)
         XCTAssertEqual(fixture.credentialProvisioner.deviceCredentialProvisionCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.wechatCredentialProvisionCount, 1)
         XCTAssertEqual(
             fixture.credentialProvisioner.trustedApplicationURLs,
             [[
@@ -41,6 +42,13 @@ final class InstallCoordinatorTests: XCTestCase {
                 fixture.paths.installedBundleURL,
                 fixture.paths.installedAgentExecutableURL,
                 fixture.paths.installedBridgeExecutableURL,
+            ]]
+        )
+        XCTAssertEqual(
+            fixture.credentialProvisioner.wechatCredentialTrustedApplicationURLs,
+            [[
+                fixture.paths.installedAgentExecutableURL,
+                fixture.paths.installedWechatRepairExecutableURL,
             ]]
         )
         XCTAssertEqual(fixture.service.registerCount, 1)
@@ -529,6 +537,8 @@ private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisionin
     var trustedApplicationURLs: [[URL]] = []
     var deviceCredentialProvisionCount = 0
     var deviceCredentialTrustedApplicationURLs: [[URL]] = []
+    var wechatCredentialProvisionCount = 0
+    var wechatCredentialTrustedApplicationURLs: [[URL]] = []
     var error: InstallError?
 
     func ensureCredential(trustedApplicationURLs: [URL]) throws {
@@ -543,6 +553,15 @@ private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisionin
     func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws {
         deviceCredentialProvisionCount += 1
         deviceCredentialTrustedApplicationURLs.append(trustedApplicationURLs)
+        if let error {
+            self.error = nil
+            throw error
+        }
+    }
+
+    func ensureWechatCredentialPlaceholder(trustedApplicationURLs: [URL]) throws {
+        wechatCredentialProvisionCount += 1
+        wechatCredentialTrustedApplicationURLs.append(trustedApplicationURLs)
         if let error {
             self.error = nil
             throw error
@@ -1208,6 +1227,7 @@ final class BundleValidatorSigningTests: XCTestCase {
                     bundle.lastPathComponent: "ENVTEAM123",
                     "pca-agentd": "ENVTEAM123",
                     "PCAPlatformBridge": "ENVTEAM123",
+                    "pca-wechat-repair": "ENVTEAM123",
                 ]
             ),
             architectureChecker: FakeArchitectureChecker()
@@ -1222,11 +1242,12 @@ final class BundleValidatorSigningTests: XCTestCase {
         let executable = bundle.appendingPathComponent("Contents/MacOS/PersonalComputerAgent")
         let agent = bundle.appendingPathComponent("Contents/Resources/bin/pca-agentd")
         let bridge = bundle.appendingPathComponent("Contents/Resources/bin/PCAPlatformBridge")
+        let wechatRepair = bundle.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair")
         let launchAgent = bundle.appendingPathComponent("Contents/Library/LaunchAgents/com.pca.agentd.plist")
         try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: agent.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: launchAgent.deletingLastPathComponent(), withIntermediateDirectories: true)
-        for binary in [executable, agent, bridge] {
+        for binary in [executable, agent, bridge, wechatRepair] {
             try Data("binary".utf8).write(to: binary)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
         }

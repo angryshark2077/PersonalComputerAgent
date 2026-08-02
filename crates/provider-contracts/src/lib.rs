@@ -85,6 +85,7 @@ impl CompletedMediaSource {
 pub struct NormalizedCommunicationRecord {
     account_id: String,
     source_sequence: u64,
+    conversation_display_name: String,
     message: CommunicationMessageRecorded,
     completed_media: Vec<CompletedMediaSource>,
 }
@@ -99,6 +100,7 @@ impl NormalizedCommunicationRecord {
     pub fn try_new(
         account_id: String,
         source_sequence: u64,
+        conversation_display_name: String,
         message: CommunicationMessageRecorded,
         completed_media: Vec<CompletedMediaSource>,
     ) -> Result<Self, DomainError> {
@@ -106,6 +108,9 @@ impl NormalizedCommunicationRecord {
             || account_id.len() > 512
             || account_id.chars().any(char::is_control)
             || source_sequence == 0
+            || conversation_display_name.trim().is_empty()
+            || conversation_display_name.len() > 1024
+            || conversation_display_name.chars().any(char::is_control)
         {
             return Err(invalid_record());
         }
@@ -127,6 +132,7 @@ impl NormalizedCommunicationRecord {
         Ok(Self {
             account_id,
             source_sequence,
+            conversation_display_name,
             message,
             completed_media,
         })
@@ -140,6 +146,11 @@ impl NormalizedCommunicationRecord {
     #[must_use]
     pub const fn source_sequence(&self) -> u64 {
         self.source_sequence
+    }
+
+    #[must_use]
+    pub fn conversation_display_name(&self) -> &str {
+        &self.conversation_display_name
     }
 
     #[must_use]
@@ -158,12 +169,14 @@ impl NormalizedCommunicationRecord {
     ) -> (
         String,
         u64,
+        String,
         CommunicationMessageRecorded,
         Vec<CompletedMediaSource>,
     ) {
         (
             self.account_id,
             self.source_sequence,
+            self.conversation_display_name,
             self.message,
             self.completed_media,
         )

@@ -5,7 +5,7 @@
   "occurred_at": "2026-08-02T12:00:00.000Z",
   "direction": "incoming",
   "kind": "image",
-  "conversation": { "scope": "group", "member_count": 8 },
+  "conversation": { "scope": "group", "member_count": 15 },
   "attachments": [
     {
       "attachment_id": "attachment-1",

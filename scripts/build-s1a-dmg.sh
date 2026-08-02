@@ -76,10 +76,14 @@ PCA_APP_VERSION="$version" cargo build \
   --manifest-path "$repository_root/Cargo.toml" \
   --release \
   --target aarch64-apple-darwin \
-  -p pca-agentd
+  -p pca-agentd \
+  -p pca-wechat-repair
 install -m 0755 \
   "$repository_root/target/aarch64-apple-darwin/release/pca-agentd" \
   "$build_inputs/pca-agentd"
+install -m 0755 \
+  "$repository_root/target/aarch64-apple-darwin/release/pca-wechat-repair" \
+  "$build_inputs/pca-wechat-repair"
 
 swift build \
   --package-path "$project_dir" \
@@ -121,13 +125,15 @@ cp -R "$archived_app" "$app"
 
 agent="$app/Contents/Resources/bin/pca-agentd"
 bridge="$app/Contents/Resources/bin/PCAPlatformBridge"
+wechat_repair="$app/Contents/Resources/bin/pca-wechat-repair"
 main="$app/Contents/MacOS/PersonalComputerAgent"
-for binary in "$agent" "$bridge" "$main"; do
+for binary in "$agent" "$bridge" "$wechat_repair" "$main"; do
   [[ "$(lipo -archs "$binary")" == "arm64" ]] || { echo "non-arm64 executable produced" >&2; exit 1; }
 done
 
 codesign --force --options runtime --timestamp=none --sign "$identity" "$agent"
 codesign --force --options runtime --timestamp=none --sign "$identity" "$bridge"
+codesign --force --options runtime --timestamp=none --sign "$identity" "$wechat_repair"
 codesign \
   --force \
   --options runtime \

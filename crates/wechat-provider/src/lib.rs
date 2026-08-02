@@ -1,9 +1,14 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod eligibility;
 pub mod fixtures;
+#[cfg(target_os = "macos")]
+mod production;
 pub mod source;
 pub mod sqlcipher_source;
+
+#[cfg(target_os = "macos")]
+pub use production::MacOSWechatProviderFactory;
 
 use pca_domain::DomainError;
 use pca_provider_contracts::{

@@ -477,8 +477,8 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
                 "enabled": true,
                 "directions": ["incoming", "outgoing"],
                 "message_types": ["text", "audio", "image", "video"],
-                "conversation_scope": "direct_and_group_at_most_eight_members",
-                "max_group_members": 8,
+                "conversation_scope": "direct_and_group_at_most_fifteen_members",
+                "max_group_members": 15,
                 "sync_mode": "full",
                 "retention_days": 180
             }
@@ -495,7 +495,7 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
 
     for (field, invalid) in [
         ("retention_days", serde_json::json!(7)),
-        ("max_group_members", serde_json::json!(9)),
+        ("max_group_members", serde_json::json!(16)),
         ("sync_mode", serde_json::json!("metadata_only")),
         ("directions", serde_json::json!(["outgoing"])),
         ("message_types", serde_json::json!(["text"])),
@@ -963,8 +963,8 @@ fn exact_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
                 "enabled": enabled,
                 "directions": ["incoming", "outgoing"],
                 "message_types": ["text", "audio", "image", "video"],
-                "conversation_scope": "direct_and_group_at_most_eight_members",
-                "max_group_members": 8,
+                "conversation_scope": "direct_and_group_at_most_fifteen_members",
+                "max_group_members": 15,
                 "sync_mode": "full",
                 "retention_days": 180
             }

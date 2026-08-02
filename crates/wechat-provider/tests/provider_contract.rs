@@ -10,14 +10,14 @@ use pca_wechat_provider::fixtures::{
 async fn emits_only_confirmed_direct_or_small_group_records() {
     let mut provider = fixture_provider([
         outgoing_direct_text(),
-        incoming_small_group_video(8),
+        incoming_small_group_video(15),
         missing_local_account_proof(),
         unknown_direction(),
         outgoing_draft(),
         outgoing_failed(),
         unsupported_type(),
         group_with_unknown_member_count(),
-        group_with_member_count(9),
+        group_with_member_count(16),
         incomplete_video(),
         unknown_source_record(),
     ]);
@@ -41,7 +41,7 @@ async fn emits_only_confirmed_direct_or_small_group_records() {
     assert_eq!(emitted[1].message().kind(), MessageKind::Video);
     assert_eq!(
         emitted[1].message().conversation(),
-        &ConversationScope::Group { member_count: 8 }
+        &ConversationScope::Group { member_count: 15 }
     );
     assert_eq!(emitted[1].completed_media().len(), 1);
     assert!(emitted

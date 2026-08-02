@@ -231,7 +231,7 @@ test("pairing and v2 control contracts reject broadened inputs", () => {
   const broadenedWechatScope = fixture("agent-control-snapshot.v2.valid.json") as {
     collectors: { "communication.wechat": { max_group_members: number } };
   };
-  broadenedWechatScope.collectors["communication.wechat"].max_group_members = 9;
+  broadenedWechatScope.collectors["communication.wechat"].max_group_members = 16;
   assert.equal(
     validateContract("agent-control-snapshot", broadenedWechatScope).valid,
     false,
@@ -247,6 +247,13 @@ test("pairing and v2 control contracts reject broadened inputs", () => {
 });
 
 test("communication contracts accept only eligible messages and complete manifests", () => {
+  assert.equal(
+    validateContract(
+      "communication-conversation-observed",
+      fixture("communication-conversation-observed.valid.json"),
+    ).valid,
+    true,
+  );
   assert.equal(
     validateContract(
       "communication-message-recorded",

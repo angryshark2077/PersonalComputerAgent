@@ -108,6 +108,28 @@ function communicationText(deviceId: string) {
   };
 }
 
+function communicationConversation(deviceId: string) {
+  return {
+    event_id: "01986666-7666-8666-8666-666666666670",
+    workspace_id: owner.workspaceId,
+    device_id: deviceId,
+    event_type: "communication.conversation_observed",
+    source: "communication.wechat",
+    schema_version: 1,
+    occurred_at: "2026-08-02T00:00:00Z",
+    created_at: "2026-08-02T00:00:00Z",
+    sensitivity: "high",
+    payload: {
+      conversation_id: "conversation-1",
+      display_name: "Ding Maiya",
+      observed_at: "2026-08-02T00:00:00Z",
+      conversation: { scope: "direct" },
+    },
+    attachment_refs: [],
+    idempotency_key: "conversation-observed-1",
+  };
+}
+
 function communicationImage(deviceId: string) {
   return {
     event_id: "01986666-7666-8666-8666-666666666668",
@@ -180,7 +202,10 @@ test("paired device syncs a private communication event only through its dedicat
       batch_id: "01987777-7777-8777-8777-777777777779",
       device_id: credentials.device_id,
       protocol_version: 1,
-      events: [communicationText(credentials.device_id)],
+      events: [
+        communicationConversation(credentials.device_id),
+        communicationText(credentials.device_id),
+      ],
     }),
   };
 
@@ -194,7 +219,10 @@ test("paired device syncs a private communication event only through its dedicat
     server_time: string;
   };
   assert.equal(body.batch_id, "01987777-7777-8777-8777-777777777779");
-  assert.deepEqual(body.accepted, ["01986666-7666-8666-8666-666666666667"]);
+  assert.deepEqual(body.accepted, [
+    "01986666-7666-8666-8666-666666666670",
+    "01986666-7666-8666-8666-666666666667",
+  ]);
   assert.deepEqual(body.duplicates, []);
   assert.deepEqual(body.rejected, []);
   assert.notEqual(Number.isNaN(Date.parse(body.server_time)), true);
@@ -204,7 +232,10 @@ test("paired device syncs a private communication event only through its dedicat
   assert.equal(duplicate.status, 200, JSON.stringify(duplicateBody));
   assert.deepEqual(
     duplicateBody.duplicates,
-    ["01986666-7666-8666-8666-666666666667"],
+    [
+      "01986666-7666-8666-8666-666666666670",
+      "01986666-7666-8666-8666-666666666667",
+    ],
   );
 
   const wrongEndpoint = await api.request("/v1/agent/sync/events", request);
@@ -228,7 +259,10 @@ test("only the device owner can read projected communication conversations and m
       batch_id: "01987777-7777-8777-8777-777777777780",
       device_id: credentials.device_id,
       protocol_version: 1,
-      events: [communicationText(credentials.device_id)],
+      events: [
+        communicationConversation(credentials.device_id),
+        communicationText(credentials.device_id),
+      ],
     }),
   };
   assert.equal((await api.request("/v1/agent/sync/communication/events", request)).status, 200);
@@ -238,6 +272,7 @@ test("only the device owner can read projected communication conversations and m
   assert.deepEqual(await conversations.json(), {
     conversations: [{
       conversation_id: "conversation-1",
+      display_name: "Ding Maiya",
       scope: "direct",
       member_count: null,
       message_count: 1,
