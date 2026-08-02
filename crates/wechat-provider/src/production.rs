@@ -195,6 +195,10 @@ fn probe_source(paths: &SourcePaths) -> Result<SourceCapabilities, DomainError> 
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one read transaction coordinates text, identity, and media cursors"
+)]
 fn read_message_batch(
     paths: &SourcePaths,
     cursors: &Mutex<BTreeMap<String, i64>>,
@@ -501,6 +505,7 @@ fn read_database_text(
 
 #[allow(
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     reason = "image rows use the same fail-closed identity mapping as text rows"
 )]
 fn read_database_images(
@@ -607,8 +612,9 @@ fn read_database_images(
             if row.local_id <= 0 || row.create_time <= 0 {
                 continue;
             }
-            let content = decode_message_content(&row.compress_content, &row.message_content);
-            let image_md5 = content.as_deref().and_then(parse_image_md5);
+            let decoded_content =
+                decode_message_content(&row.compress_content, &row.message_content);
+            let image_md5 = decoded_content.as_deref().and_then(parse_image_md5);
             let dat_name = parse_image_dat_name(&row.packed_info_data);
             if image_md5.is_some() || dat_name.is_some() {
                 metadata_matches += 1;
@@ -983,11 +989,10 @@ fn stage_decrypted_image(bytes: &[u8], sha256: &str, mime_type: &str) -> Option<
         .join("pca-wechat-media");
     match root.symlink_metadata() {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-        Ok(_) => return None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(&root).ok()?;
         }
-        Err(_) => return None,
+        Ok(_) | Err(_) => return None,
     }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).ok()?;
     cleanup_staged_images(&root);
@@ -1032,7 +1037,7 @@ fn cleanup_staged_images(root: &Path) {
                 .modified()
                 .ok()
                 .and_then(|modified| now.duration_since(modified).ok())
-                .is_some_and(|age| age > Duration::from_secs(60 * 60))
+                .is_some_and(|age| age > Duration::from_hours(1))
         {
             let _ = fs::remove_file(path);
         }
@@ -2091,7 +2096,11 @@ mod tests {
         let mut block = GenericArray::clone_from_slice(&padded);
         cipher.encrypt_block(&mut block);
         let mut encrypted = vec![0x07, 0x08, b'V', b'2', 0x08, 0x07];
-        encrypted.extend_from_slice(&(aes_plain.len() as i32).to_le_bytes());
+        encrypted.extend_from_slice(
+            &i32::try_from(aes_plain.len())
+                .expect("fixture length")
+                .to_le_bytes(),
+        );
         encrypted.extend_from_slice(&2_i32.to_le_bytes());
         encrypted.push(0);
         encrypted.extend_from_slice(&block);

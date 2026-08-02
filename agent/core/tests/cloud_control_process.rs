@@ -549,6 +549,9 @@ async fn communication_revision_notifications_are_monotonic_and_invalid_control_
         .expect("valid revision is notified");
     assert_eq!(first.configuration_revision, 1);
     assert!(first.communication_wechat_enabled);
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
 
     tokio::time::advance(std::time::Duration::from_secs(30)).await;
     wait_for_calls(&client.calls, 2).await;

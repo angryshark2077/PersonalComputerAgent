@@ -40,7 +40,7 @@ pub const EXPAND_GROUP_LIMIT_MIGRATION: &str =
 /// Records verified Cloud completion time for seven-day local media cleanup.
 pub const ATTACHMENT_COMPLETION_RETENTION_MIGRATION: &str =
     include_str!("../migrations/0008_attachment_completion_retention.sql");
-/// Allows different WeChat message kinds to use the same conversation-local source sequence.
+/// Allows different `WeChat` message kinds to use the same conversation-local source sequence.
 pub const ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION: &str =
     include_str!("../migrations/0009_allow_message_kind_sequence_overlap.sql");
 

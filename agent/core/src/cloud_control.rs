@@ -25,6 +25,9 @@ use crate::communication::{
 };
 
 const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MEDIA_UPLOAD_TIMEOUT: Duration = Duration::from_mins(5);
+const MEDIA_BATCH_SIZE: u16 = 4;
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
 const CONTROL_OWNER_COMMAND_CAPACITY: usize = 8;
@@ -1093,9 +1096,9 @@ async fn run_control_loop(
         )
         .await
         {
-            Ok(()) => {
+            Ok(completed_media) => {
                 retry_attempt = 0;
-                wait = CONTROL_INTERVAL;
+                wait = next_control_wait(completed_media);
             }
             Err(ControlError::Transient) => {
                 retry_attempt = retry_attempt.saturating_add(1);
@@ -1180,7 +1183,7 @@ async fn control_once(
     publication: &ControlPublication,
     authorization: &CommunicationAuthorization,
     owner_epoch: u64,
-) -> Result<(), ControlError> {
+) -> Result<usize, ControlError> {
     let retention_ms =
         i64::try_from(LOCAL_MEDIA_RETENTION.as_millis()).map_err(|_| ControlError::Contract)?;
     let now_ms = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
@@ -1188,9 +1191,6 @@ async fn control_once(
     let _ = database
         .cleanup_completed_communication_attachments(now_ms.saturating_sub(retention_ms))
         .await;
-    // Media transfer is independently retryable: a failed attempt never fails control processing.
-    // Events acknowledged during this cycle become eligible on the next cycle.
-    let _ = sync_pending_communication_attachments(database, &credentials.credential, client).await;
     let outbox_depth = database
         .active_outbox_depth()
         .await
@@ -1246,34 +1246,47 @@ async fn control_once(
     }
     sync_pending_system_events(database, &credentials.credential, client).await?;
     sync_pending_communication_events(database, &credentials.credential, client).await?;
-    let Some(applied) = applied else {
-        return Ok(());
-    };
-    if applied.configuration_revision > current {
-        database
-            .save_control_revision(applied.configuration_revision)
-            .await
-            .map_err(|_| ControlError::Transient)?;
-    }
-    {
-        let mut state = state.lock().await;
-        state.applied_revision = Some(applied.configuration_revision);
-        state.communication_hydrated = true;
-    }
-    if applied.communication_wechat_enabled {
-        if !apply_communication_authorization(
-            authorization,
-            &credentials.credential,
-            applied,
-            owner_epoch,
-        )
-        .await?
-        {
-            return Err(ControlError::Transient);
+    if let Some(applied) = applied {
+        if applied.configuration_revision > current {
+            database
+                .save_control_revision(applied.configuration_revision)
+                .await
+                .map_err(|_| ControlError::Transient)?;
         }
-        publication.publish(owner_epoch, Some(applied)).await;
+        {
+            let mut state = state.lock().await;
+            state.applied_revision = Some(applied.configuration_revision);
+            state.communication_hydrated = true;
+        }
+        if applied.communication_wechat_enabled {
+            if !apply_communication_authorization(
+                authorization,
+                &credentials.credential,
+                applied,
+                owner_epoch,
+            )
+            .await?
+            {
+                return Err(ControlError::Transient);
+            }
+            publication.publish(owner_epoch, Some(applied)).await;
+        }
     }
-    Ok(())
+    // Media transfer is independently retryable and runs only after heartbeat, event sync, and
+    // control publication. A full successful batch schedules the next control cycle immediately.
+    let completed_media =
+        sync_pending_communication_attachments(database, &credentials.credential, client)
+            .await
+            .unwrap_or(0);
+    Ok(completed_media)
+}
+
+fn next_control_wait(completed_media: usize) -> Duration {
+    if completed_media == usize::from(MEDIA_BATCH_SIZE) {
+        Duration::ZERO
+    } else {
+        CONTROL_INTERVAL
+    }
 }
 
 async fn sync_pending_system_events(
@@ -1356,11 +1369,12 @@ async fn sync_pending_communication_attachments(
     database: &DbActorHandle,
     credentials: &DeviceCredential,
     client: &dyn ControlClient,
-) -> Result<(), ControlError> {
+) -> Result<usize, ControlError> {
     let attachments = database
-        .load_pending_communication_attachments(4)
+        .load_pending_communication_attachments(MEDIA_BATCH_SIZE)
         .await
         .map_err(|_| ControlError::Transient)?;
+    let attachment_count = attachments.len();
     for attachment in attachments {
         client
             .sync_communication_attachment(credentials, &attachment)
@@ -1370,7 +1384,7 @@ async fn sync_pending_communication_attachments(
             .await
             .map_err(|_| ControlError::Transient)?;
     }
-    Ok(())
+    Ok(attachment_count)
 }
 
 async fn apply_communication_authorization(
@@ -1479,7 +1493,7 @@ impl HttpControlClient {
     fn client() -> Result<Client, ControlError> {
         Client::builder()
             .https_only(true)
-            .timeout(Duration::from_secs(15))
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .pool_max_idle_per_host(0)
             .build()
             .map_err(|_| ControlError::Transient)
@@ -1638,7 +1652,10 @@ impl ControlClient for HttpControlClient {
             if upload_url.scheme() != "https" {
                 return Err(ControlError::Contract);
             }
-            let mut request = client.put(upload_url).body(attachment.bytes.clone());
+            let mut request = client
+                .put(upload_url)
+                .timeout(MEDIA_UPLOAD_TIMEOUT)
+                .body(attachment.bytes.clone());
             for (name, value) in upload.headers {
                 request = request.header(name, value);
             }
@@ -1800,9 +1817,10 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        retry_delay, sync_pending_communication_events, sync_pending_system_events,
-        AgentControlSnapshot, ControlClient, ControlError, ControlFuture, DeviceCredential,
-        HttpControlClient, SyncEventsResponse, CONTROL_INTERVAL, MAX_BACKOFF,
+        next_control_wait, retry_delay, sync_pending_communication_events,
+        sync_pending_system_events, AgentControlSnapshot, ControlClient, ControlError,
+        ControlFuture, DeviceCredential, HttpControlClient, SyncEventsResponse, CONTROL_INTERVAL,
+        CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT,
         PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
@@ -1906,6 +1924,20 @@ mod tests {
         assert_ne!(retry_delay(1), Duration::from_secs(1));
         assert!(retry_delay(20) <= MAX_BACKOFF);
         assert_eq!(CONTROL_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn completed_media_batches_continue_without_the_control_interval_delay() {
+        assert_eq!(CONTROL_REQUEST_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(MEDIA_UPLOAD_TIMEOUT, Duration::from_mins(5));
+        assert_eq!(
+            next_control_wait(usize::from(MEDIA_BATCH_SIZE)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            next_control_wait(usize::from(MEDIA_BATCH_SIZE - 1)),
+            CONTROL_INTERVAL
+        );
     }
 
     #[test]

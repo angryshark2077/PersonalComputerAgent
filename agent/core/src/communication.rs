@@ -1231,6 +1231,10 @@ fn should_retry(error: &DomainError) -> bool {
         )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one transaction prepares all normalized communication payload variants"
+)]
 async fn prepare_record(
     database_path: &Path,
     control: CommunicationControl,
