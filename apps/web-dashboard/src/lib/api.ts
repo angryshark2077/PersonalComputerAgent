@@ -111,6 +111,14 @@ export async function getDevices(
   return result.devices;
 }
 
+export function decodeDashboardRouteParam(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 export async function getWorkspaces(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,

@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { getCommunicationConversations, getCommunicationMessages } from "../src/lib/api.ts";
+import {
+  decodeDashboardRouteParam,
+  getCommunicationConversations,
+  getCommunicationMessages,
+} from "../src/lib/api.ts";
+
+test("decodes an encoded WeChat group identity exactly once", () => {
+  assert.equal(decodeDashboardRouteParam("room%40chatroom"), "room@chatroom");
+  assert.equal(decodeDashboardRouteParam("room@chatroom"), "room@chatroom");
+});
 
 test("loads owner-scoped conversations for one device", async () => {
   let requested = "";

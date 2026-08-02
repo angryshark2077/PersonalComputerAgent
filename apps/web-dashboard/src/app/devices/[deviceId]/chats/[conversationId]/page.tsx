@@ -8,6 +8,7 @@ import { DashboardShell } from "../../../../../components/dashboard-shell";
 import {
   DashboardApiError,
   cloudApiOrigin,
+  decodeDashboardRouteParam,
   getCommunicationConversations,
   getCommunicationMessages,
   type DashboardMessage,
@@ -16,8 +17,10 @@ import { getBrowserSession, redirectToSignIn } from "../../../../../lib/auth";
 
 export default function ChatMessagesPage() {
   const params = useParams<{ deviceId: string; conversationId: string }>();
+  const deviceId = decodeDashboardRouteParam(params.deviceId);
+  const conversationId = decodeDashboardRouteParam(params.conversationId);
   const [messages, setMessages] = useState<DashboardMessage[] | null>(null);
-  const [displayName, setDisplayName] = useState(params.conversationId);
+  const [displayName, setDisplayName] = useState(conversationId);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -32,30 +35,30 @@ export default function ChatMessagesPage() {
           getCommunicationMessages(
             window.fetch,
             origin,
-            params.deviceId,
-            params.conversationId,
+            deviceId,
+            conversationId,
           ),
-          getCommunicationConversations(window.fetch, origin, params.deviceId),
+          getCommunicationConversations(window.fetch, origin, deviceId),
         ]);
         setDisplayName(
           conversations.find(
-            (conversation) => conversation.conversation_id === params.conversationId,
-          )?.display_name ?? params.conversationId,
+            (conversation) => conversation.conversation_id === conversationId,
+          )?.display_name ?? conversationId,
         );
         setMessages(latest.toReversed());
       } catch (cause) {
         setError(messageFor(cause));
       }
     })();
-  }, [params.conversationId, params.deviceId]);
+  }, [conversationId, deviceId]);
 
   return (
     <DashboardShell>
-      <Link className="back-link" href={`/devices/${encodeURIComponent(params.deviceId)}/chats`}>Back to chats</Link>
+      <Link className="back-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>Back to chats</Link>
       <section className="page-heading">
         <p className="workspace-name">Latest 100 synchronized messages</p>
         <h1>{displayName}</h1>
-        <p className="conversation-id">{params.conversationId}</p>
+        <p className="conversation-id">{conversationId}</p>
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
       {messages === null ? <p className="status-note">Loading messages…</p> : (
