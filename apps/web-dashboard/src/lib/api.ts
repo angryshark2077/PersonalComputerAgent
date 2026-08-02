@@ -2,9 +2,12 @@ export interface CollectorConfig {
   network: { enabled: boolean };
   "communication.wechat": {
     enabled: boolean;
-    direction: "outgoing";
-    message_type: "text";
+    directions: ["incoming", "outgoing"];
+    message_types: ["text", "audio", "image", "video"];
+    conversation_scope: "direct_and_group_at_most_eight_members";
+    max_group_members: 8;
     sync_mode: "full";
+    retention_days: 180;
   };
 }
 

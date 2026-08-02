@@ -15,19 +15,22 @@ const snapshotWithWechatEnabled = () => ({
     network: { enabled: true },
     "communication.wechat": {
       enabled: true,
-      direction: "outgoing" as const,
-      message_type: "text" as const,
+      directions: ["incoming", "outgoing"] as ["incoming", "outgoing"],
+      message_types: ["text", "audio", "image", "video"] as ["text", "audio", "image", "video"],
+      conversation_scope: "direct_and_group_at_most_eight_members" as const,
+      max_group_members: 8 as const,
       sync_mode: "full" as const,
+      retention_days: 180 as const,
     },
   },
 });
 
-test("device configuration exposes no expanded WeChat scope", () => {
+test("device configuration exposes the approved WeChat scope", () => {
   const page = renderDeviceConfiguration(snapshotWithWechatEnabled());
 
-  assert.match(page, /Outgoing text only/);
-  assert.equal(page.includes("Incoming messages"), false);
-  assert.match(page, /90-day retention/);
+  assert.match(page, /Incoming and outgoing text, audio, images and video/);
+  assert.match(page, /groups up to 8 members/);
+  assert.match(page, /180-day retention/);
 });
 
 test("device configuration shows only the approved Network collection detail", () => {
