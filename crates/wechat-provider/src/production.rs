@@ -41,6 +41,7 @@ const INITIAL_HISTORY_SECONDS: u64 = 60 * 24 * 60 * 60;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_VIDEO_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const VOICE_SAMPLE_RATE: u32 = 24_000;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -233,6 +234,12 @@ fn read_message_batch(
     } else {
         BTreeMap::new()
     };
+    let video_hardlinks = if hardlink_path.is_file() {
+        with_database(&hardlink_path, &material, read_video_hardlinks).unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let video_files = index_video_files(&paths.account_root);
     let image_keys = derive_image_keys(&paths.account_root);
     let mut records = Vec::new();
     let mut image_rows_scanned = 0_usize;
@@ -315,6 +322,30 @@ fn read_message_batch(
                 .or_insert(sequence);
         }
         for record in audio_batch.records {
+            records.push(SourceRecord::Message(Box::new(record)));
+        }
+        if records.len() >= MAX_BATCH {
+            break;
+        }
+        let remaining = MAX_BATCH - records.len();
+        let video_batch = with_database(database, &material, |connection| {
+            read_database_videos(
+                connection,
+                &context,
+                &sessions,
+                &video_hardlinks,
+                &video_files,
+                remaining,
+            )
+        })
+        .map_err(|_| read_stage_error("WECHAT_VIDEO_READ_FAILED"))?;
+        for (cursor_key, sequence) in video_batch.cursor_updates {
+            cursor_guard
+                .entry(cursor_key)
+                .and_modify(|current| *current = (*current).max(sequence))
+                .or_insert(sequence);
+        }
+        for record in video_batch.records {
             records.push(SourceRecord::Message(Box::new(record)));
         }
         if records.len() >= MAX_BATCH {
@@ -821,6 +852,218 @@ struct AudioReadBatch {
     cursor_updates: Vec<(String, i64)>,
 }
 
+struct VideoReadBatch {
+    records: Vec<SourceMessageRecord>,
+    cursor_updates: Vec<(String, i64)>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "video rows share the reviewed message identity and scope mapping"
+)]
+fn read_database_videos(
+    connection: &Connection,
+    context: &TextReadContext<'_>,
+    sessions: &[Session],
+    video_hardlinks: &BTreeMap<String, String>,
+    video_files: &BTreeMap<String, PathBuf>,
+    limit: usize,
+) -> Result<VideoReadBatch, SqlcipherProbeFailure> {
+    let my_rowid = local_sender_rowid(connection, context.local_username)?
+        .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
+    let mut sender_statement = connection
+        .prepare("SELECT user_name FROM Name2Id WHERE rowid = ?1 LIMIT 1")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut records = Vec::new();
+    let mut cursor_updates = Vec::new();
+    let media_ready_cutoff = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(5 * 60),
+    )
+    .unwrap_or(i64::MAX);
+    for session in sessions {
+        if records.len() >= limit {
+            break;
+        }
+        let metadata = context
+            .conversation_metadata
+            .get(&session.username)
+            .cloned()
+            .unwrap_or_else(|| ConversationMetadata {
+                display_name: session.username.clone(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: BTreeMap::new(),
+                participant_avatar_urls: BTreeMap::new(),
+            });
+        let conversation = if session.username.ends_with("@chatroom") {
+            let Some(member_count) = metadata.member_count else {
+                continue;
+            };
+            if !(1..=15).contains(&member_count) {
+                continue;
+            }
+            SourceConversation::Group {
+                membership: GroupMembershipEvidence::Verified(member_count),
+            }
+        } else if is_direct_conversation(&session.username) {
+            SourceConversation::Direct
+        } else {
+            continue;
+        };
+        let table_name = message_table_name(&session.username);
+        if !table_exists(connection, &table_name)? {
+            continue;
+        }
+        let cursor_key = format!("{}:{}:video", context.database_name, session.username);
+        let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
+        let per_conversation = MAX_PER_CONVERSATION.min(limit - records.len());
+        let sql = format!(
+            "SELECT local_id, server_id, create_time, real_sender_id, status, \
+                    message_content, compress_content, packed_info_data \
+             FROM \"{table_name}\" \
+             WHERE local_type = 43 AND local_id > ?1 AND create_time >= ?2 \
+             ORDER BY local_id ASC"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let rows = statement
+            .query_map((after, context.cutoff), |row| {
+                Ok(ImageMessageRow {
+                    local_id: row.get(0)?,
+                    server_id: row.get(1)?,
+                    create_time: row.get(2)?,
+                    real_sender_id: row.get(3)?,
+                    status: row.get(4)?,
+                    message_content: row.get(5)?,
+                    compress_content: row.get(6)?,
+                    packed_info_data: row.get(7)?,
+                })
+            })
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let mut scanned_through = after;
+        let records_before_session = records.len();
+        for row in rows {
+            if records.len() - records_before_session >= per_conversation {
+                break;
+            }
+            let row = row.map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+            if row.local_id <= 0 || row.create_time <= 0 {
+                continue;
+            }
+            let decoded_content =
+                decode_message_content(&row.compress_content, &row.message_content);
+            let completed_video = resolve_video_path(
+                decoded_content.as_deref(),
+                &row.packed_info_data,
+                video_hardlinks,
+                video_files,
+            )
+            .and_then(|source| {
+                video_attachment(source, context.database_name, &table_name, row.local_id)
+            });
+            let Some((attachment, source_path)) = completed_video else {
+                if row.create_time > media_ready_cutoff {
+                    break;
+                }
+                scanned_through = row.local_id;
+                continue;
+            };
+            scanned_through = row.local_id;
+            let direction = if row.real_sender_id == my_rowid {
+                if row.server_id <= 0 || row.status < 0 {
+                    continue;
+                }
+                SourceDirection::Outgoing
+            } else {
+                SourceDirection::Incoming
+            };
+            let (sender_id, sender_display_name, sender_avatar_url) = match direction {
+                SourceDirection::Outgoing => {
+                    (context.local_username.to_owned(), "You".to_owned(), None)
+                }
+                SourceDirection::Incoming if session.username.ends_with("@chatroom") => {
+                    let sender_id = sender_statement
+                        .query_row([row.real_sender_id], |sender_row| {
+                            sender_row.get::<_, String>(0)
+                        })
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .filter(|value| valid_identity(value));
+                    let (sender_id, sender_display_name) = resolve_group_sender(
+                        sender_id,
+                        row.real_sender_id,
+                        &metadata.participant_names,
+                    );
+                    let avatar = metadata.participant_avatar_urls.get(&sender_id).cloned();
+                    (sender_id, sender_display_name, avatar)
+                }
+                SourceDirection::Incoming => (
+                    session.username.clone(),
+                    metadata.display_name.clone(),
+                    metadata.avatar_url.clone(),
+                ),
+                SourceDirection::Unknown => continue,
+            };
+            let occurred_at = OffsetDateTime::from_unix_timestamp(row.create_time)
+                .ok()
+                .and_then(|time| time.format(&Rfc3339).ok())
+                .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
+            let attachment_id = attachment.attachment_id().to_owned();
+            records.push(SourceMessageRecord {
+                account_id: context.account_id.to_owned(),
+                source_sequence: u64::try_from(row.local_id)
+                    .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                message_id: if row.server_id > 0 {
+                    row.server_id.to_string()
+                } else {
+                    format!("local-{}", row.local_id)
+                },
+                conversation_id: session.username.clone(),
+                conversation_display_name: metadata.display_name.clone(),
+                conversation_avatar_url: metadata.avatar_url.clone(),
+                sender_id,
+                sender_display_name,
+                sender_avatar_url,
+                source_key: format!(
+                    "wechat:{}:{table_name}:{}:video",
+                    context.database_name, row.local_id
+                ),
+                occurred_at,
+                local_account: LocalAccountProof::Verified,
+                direction,
+                kind: SourceMessageKind::Video,
+                conversation: conversation.clone(),
+                finality: match direction {
+                    SourceDirection::Incoming => SourceFinality::IncomingPersisted,
+                    SourceDirection::Outgoing => SourceFinality::OutgoingSent,
+                    SourceDirection::Unknown => SourceFinality::Unknown,
+                },
+                payload: SourcePayload::Media {
+                    attachment: Some(attachment),
+                    completed_source: Some(crate::source::SourceCompletedMedia {
+                        attachment_id,
+                        source_path,
+                    }),
+                },
+            });
+        }
+        if scanned_through > after {
+            cursor_updates.push((cursor_key, scanned_through));
+        }
+    }
+    Ok(VideoReadBatch {
+        records,
+        cursor_updates,
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::too_many_arguments,
@@ -1159,6 +1402,181 @@ fn voice_same_time_index(
         .query_row(&sql, (create_time, local_id), |row| row.get::<_, i64>(0))
         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
     usize::try_from(count).map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)
+}
+
+fn resolve_video_path<'a>(
+    content: Option<&str>,
+    packed_info: &Value,
+    hardlinks: &BTreeMap<String, String>,
+    files: &'a BTreeMap<String, PathBuf>,
+) -> Option<&'a PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(key) = parse_video_file_key(packed_info) {
+        candidates.push(key);
+    }
+    let md5s = content.map(parse_video_md5_candidates).unwrap_or_default();
+    for md5 in &md5s {
+        if let Some(key) = hardlinks.get(md5) {
+            candidates.push(key.clone());
+            if let Some(base) = key.strip_suffix("_raw") {
+                candidates.push(base.to_owned());
+            }
+        }
+        candidates.push(md5.clone());
+    }
+    for candidate in candidates {
+        if let Some(path) = files.get(&candidate) {
+            return Some(path);
+        }
+    }
+    let size = content.and_then(parse_video_length)?;
+    files.get(&format!("size:{size}"))
+}
+
+fn parse_video_md5_candidates(content: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for name in ["newmd5", "md5", "rawmd5", "originsourcemd5"] {
+        if let Some(md5) = parse_named_md5(content, name) {
+            if !candidates.contains(&md5) {
+                candidates.push(md5);
+            }
+        }
+    }
+    candidates
+}
+
+fn parse_named_md5(content: &str, name: &str) -> Option<String> {
+    let lowercase = content.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(relative) = lowercase[search_from..].find(name) {
+        let start = search_from + relative + name.len();
+        let Some(value) = content[start..].trim_start().strip_prefix('=') else {
+            search_from = start;
+            continue;
+        };
+        let value = value.trim_start();
+        let candidate = match value.as_bytes().first().copied() {
+            Some(b'\'') => value[1..].split('\'').next(),
+            Some(b'"') => value[1..].split('"').next(),
+            _ => value
+                .split(|character: char| character.is_whitespace() || character == '>')
+                .next(),
+        };
+        if let Some(md5) = candidate.and_then(valid_md5) {
+            return Some(md5);
+        }
+        search_from = start;
+    }
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = lowercase.find(&open)? + open.len();
+    let end = lowercase[start..].find(&close)?;
+    valid_md5(&content[start..start + end])
+}
+
+fn parse_video_length(content: &str) -> Option<u64> {
+    let lowercase = content.to_ascii_lowercase();
+    let video = lowercase.find("<videomsg")?;
+    let end = lowercase[video..].find('>')? + video;
+    let tag = &content[video..=end];
+    let lower_tag = &lowercase[video..=end];
+    let start = lower_tag.find("length")? + "length".len();
+    let value = tag[start..].trim_start().strip_prefix('=')?.trim_start();
+    let value = match value.as_bytes().first().copied() {
+        Some(b'\'') => value[1..].split('\'').next()?,
+        Some(b'"') => value[1..].split('"').next()?,
+        _ => value
+            .split(|character: char| character.is_whitespace() || character == '>')
+            .next()?,
+    };
+    value.parse::<u64>().ok().filter(|size| *size > 0)
+}
+
+fn parse_video_file_key(value: &Value) -> Option<String> {
+    let bytes = match value {
+        Value::Blob(bytes) => bytes.as_slice(),
+        Value::Text(text) => text.as_bytes(),
+        _ => return None,
+    };
+    let printable = bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                char::from(*byte)
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    printable
+        .split_ascii_whitespace()
+        .find(|token| token.to_ascii_lowercase().contains(".mp4"))
+        .and_then(video_file_key)
+}
+
+fn video_file_key(value: &str) -> Option<String> {
+    let filename = value.trim().rsplit(['/', '\\']).next()?;
+    let stem = filename.rsplit_once('.').map_or(filename, |(stem, _)| stem);
+    let normalized = stem.to_ascii_lowercase();
+    (normalized.len() >= 8
+        && normalized.len() <= 128
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
+    .then_some(normalized)
+}
+
+fn video_attachment(
+    source: &Path,
+    database_name: &str,
+    table_name: &str,
+    local_id: i64,
+) -> Option<(CommunicationAttachment, PathBuf)> {
+    let source = fs::canonicalize(source).ok()?;
+    let metadata = source.symlink_metadata().ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_VIDEO_BYTES
+    {
+        return None;
+    }
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&source)
+        .ok()?;
+    let mut header = [0_u8; 12];
+    input.read_exact(&mut header).ok()?;
+    if &header[4..8] != b"ftyp" {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(header);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut bytes_read = u64::try_from(header.len()).ok()?;
+    loop {
+        let count = input.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        bytes_read = bytes_read.checked_add(u64::try_from(count).ok()?)?;
+    }
+    if bytes_read != metadata.len() {
+        return None;
+    }
+    let table_hash = table_name.strip_prefix("Msg_")?;
+    let attachment_id = format!("wechat-video:{database_name}:{table_hash}:{local_id}");
+    let attachment = CommunicationAttachment::try_new(
+        attachment_id,
+        MessageKind::Video,
+        format!("{:x}", hasher.finalize()),
+        metadata.len(),
+        "video/mp4".to_owned(),
+    )
+    .ok()?;
+    Some((attachment, source))
 }
 
 fn query_voice_value(
@@ -1623,6 +2041,111 @@ fn read_image_hardlinks(
         }
     }
     Ok(paths)
+}
+
+fn read_video_hardlinks(
+    connection: &Connection,
+) -> Result<BTreeMap<String, String>, SqlcipherProbeFailure> {
+    let table = connection
+        .query_row(
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' AND name LIKE 'video_hardlink_info%' \
+             ORDER BY name DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+        .filter(|name| valid_sql_identifier(name))
+        .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
+    require_columns(connection, &table, &["md5", "file_name"])?;
+    let sql = format!(
+        "SELECT lower(md5), file_name FROM \"{table}\" \
+         WHERE length(md5)=32 ORDER BY rowid DESC LIMIT 100000"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut hardlinks = BTreeMap::new();
+    for row in rows {
+        let (md5, file_name) = row.map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let Some(md5) = valid_md5(&md5) else {
+            continue;
+        };
+        let Some(file_key) = video_file_key(&file_name) else {
+            continue;
+        };
+        hardlinks.entry(md5).or_insert(file_key);
+    }
+    Ok(hardlinks)
+}
+
+fn index_video_files(account_root: &Path) -> BTreeMap<String, PathBuf> {
+    let root = account_root.join("msg/video");
+    let Ok(months) = fs::read_dir(&root) else {
+        return BTreeMap::new();
+    };
+    let mut paths = BTreeMap::new();
+    let mut raw_aliases = Vec::new();
+    let mut sizes = BTreeMap::<u64, Option<PathBuf>>::new();
+    for month in months.flatten().take(120) {
+        let month_path = month.path();
+        let Ok(metadata) = month_path.symlink_metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(month_path) else {
+            continue;
+        };
+        for entry in entries.flatten().take(10_000) {
+            let path = entry.path();
+            let Ok(metadata) = path.symlink_metadata() else {
+                continue;
+            };
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() == 0
+                || metadata.len() > MAX_VIDEO_BYTES
+                || path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("mp4"))
+            {
+                continue;
+            }
+            let Some(key) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(video_file_key)
+            else {
+                continue;
+            };
+            paths.entry(key.clone()).or_insert_with(|| path.clone());
+            if let Some(base) = key.strip_suffix("_raw") {
+                raw_aliases.push((base.to_owned(), path.clone()));
+            }
+            sizes
+                .entry(metadata.len())
+                .and_modify(|candidate| *candidate = None)
+                .or_insert_with(|| Some(path));
+        }
+    }
+    for (base, path) in raw_aliases {
+        paths.entry(base).or_insert(path);
+    }
+    for (size, path) in sizes {
+        if let Some(path) = path {
+            paths.insert(format!("size:{size}"), path);
+        }
+    }
+    paths
 }
 
 fn valid_path_component(value: &str) -> bool {
@@ -2566,11 +3089,13 @@ mod tests {
     use super::{
         clean_account_directory_name, decode_value, decode_voice_attachment,
         decoded_image_attachment, decrypt_v4_image, derive_image_keys,
-        extend_message_database_routes, image_mime_type, index_decoded_images,
+        extend_message_database_routes, image_mime_type, index_decoded_images, index_video_files,
         is_direct_conversation, is_message_database, message_table_name, parse_group_nicknames,
-        read_conversation_metadata, read_database_images, read_voice_blob, resolve_group_sender,
-        retention_cutoff_from, stage_decrypted_image, voice_same_time_index, ConversationMetadata,
-        ImageKeys, Session, SourcePaths, TextReadContext,
+        parse_video_file_key, parse_video_length, parse_video_md5_candidates,
+        read_conversation_metadata, read_database_images, read_database_videos, read_voice_blob,
+        resolve_group_sender, resolve_video_path, retention_cutoff_from, stage_decrypted_image,
+        video_attachment, voice_same_time_index, ConversationMetadata, ImageKeys, Session,
+        SourcePaths, TextReadContext,
     };
     use pca_keychain::{WechatDatabaseKeyMaterial, WechatKeyMaterial};
 
@@ -2632,6 +3157,116 @@ mod tests {
             read_voice_blob(&connection, "wxid_friend", 13, 200, 0)
                 .expect("match later table and hex text"),
             Some(vec![5, 6])
+        );
+    }
+
+    #[test]
+    fn production_resolves_and_manifests_browser_video() {
+        let account = tempfile::tempdir().expect("create video fixture");
+        let directory = account.path().join("msg/video/2026-08");
+        std::fs::create_dir_all(&directory).expect("create video directory");
+        let file_key = "1234567890abcdef1234567890abcdef";
+        let video = directory.join(format!("{file_key}.mp4"));
+        let mut bytes = vec![0, 0, 0, 24];
+        bytes.extend_from_slice(b"ftypisom");
+        bytes.extend_from_slice(b"video fixture");
+        std::fs::write(&video, &bytes).expect("write MP4 fixture");
+        let files = index_video_files(account.path());
+        let source_md5 = "abcdefabcdefabcdefabcdefabcdefab";
+        let hardlinks =
+            std::collections::BTreeMap::from([(source_md5.to_owned(), file_key.to_owned())]);
+        let content = format!(
+            "<videomsg newmd5=\"{source_md5}\" length=\"{}\" />",
+            bytes.len()
+        );
+
+        assert_eq!(parse_video_md5_candidates(&content), vec![source_md5]);
+        assert_eq!(
+            parse_video_length(&content),
+            Some(u64::try_from(bytes.len()).expect("fixture size"))
+        );
+        assert_eq!(
+            parse_video_file_key(&Value::Text(format!("cache/{file_key}.mp4"))).as_deref(),
+            Some(file_key)
+        );
+        assert_eq!(
+            resolve_video_path(Some(&content), &Value::Null, &hardlinks, &files),
+            Some(&video)
+        );
+        let (attachment, source) =
+            video_attachment(&video, "message_0.db", "Msg_abc", 9).expect("create video manifest");
+        assert_eq!(attachment.mime_type(), "video/mp4");
+        assert_eq!(
+            attachment.size_bytes(),
+            u64::try_from(bytes.len()).expect("fixture size")
+        );
+        assert_eq!(source, video.canonicalize().expect("canonical video path"));
+    }
+
+    #[test]
+    fn production_emits_video_only_for_an_eligible_conversation() {
+        let connection = Connection::open_in_memory().expect("open video message fixture");
+        let conversation_id = "wxid_friend";
+        let table_name = message_table_name(conversation_id);
+        let file_key = "1234567890abcdef1234567890abcdef";
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE Name2Id (user_name TEXT);\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'wxid_local');\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (2, '{conversation_id}');\
+                 CREATE TABLE \"{table_name}\" (\
+                    local_id INTEGER, server_id INTEGER, create_time INTEGER,\
+                    real_sender_id INTEGER, status INTEGER, local_type INTEGER,\
+                    message_content TEXT, compress_content BLOB, packed_info_data TEXT\
+                 );\
+                 INSERT INTO \"{table_name}\" VALUES (7, 107, 1000, 2, 0, 43,\
+                    '<videomsg md5=\"{file_key}\" length=\"24\" />', X'', '');"
+            ))
+            .expect("create video message schema");
+        let account = tempfile::tempdir().expect("create video source fixture");
+        let directory = account.path().join("msg/video/1970-01");
+        std::fs::create_dir_all(&directory).expect("create video source directory");
+        let video = directory.join(format!("{file_key}.mp4"));
+        let mut bytes = vec![0, 0, 0, 24];
+        bytes.extend_from_slice(b"ftypisom");
+        bytes.extend_from_slice(b"fixture-data");
+        std::fs::write(video, bytes).expect("write video source");
+        let files = index_video_files(account.path());
+        let metadata = std::collections::BTreeMap::from([(
+            conversation_id.to_owned(),
+            ConversationMetadata {
+                display_name: "Friend".to_owned(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: std::collections::BTreeMap::new(),
+                participant_avatar_urls: std::collections::BTreeMap::new(),
+            },
+        )]);
+        let cursors = std::collections::BTreeMap::new();
+        let context = TextReadContext {
+            database_name: "message_0.db",
+            local_username: "wxid_local",
+            account_id: "account",
+            conversation_metadata: &metadata,
+            cursors: &cursors,
+            cutoff: 0,
+        };
+        let batch = read_database_videos(
+            &connection,
+            &context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            &std::collections::BTreeMap::new(),
+            &files,
+            20,
+        )
+        .expect("read video message");
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].source_sequence, 7);
+        assert_eq!(
+            batch.cursor_updates,
+            vec![(format!("message_0.db:{conversation_id}:video"), 7)]
         );
     }
 
