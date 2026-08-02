@@ -35,7 +35,16 @@ export interface R2Environment {
   R2_BUCKET_PUBLIC?: string;
 }
 
-export function createR2ObjectStore(environment: R2Environment): R2ObjectStore {
+export function createR2ObjectStore(environment: R2Environment): R2ObjectStore | undefined {
+  const values = [
+    environment.R2_ENDPOINT,
+    environment.R2_ACCESS_KEY_ID,
+    environment.R2_SECRET_ACCESS_KEY,
+    environment.R2_BUCKET,
+    environment.R2_BUCKET_PUBLIC,
+  ];
+  if (values.every((value) => value === undefined || value.length === 0)) return undefined;
+
   const endpoint = privateHttpsEndpoint(required(environment, "R2_ENDPOINT"));
   if (environment.R2_BUCKET_PUBLIC !== "false") {
     throw new Error("R2_BUCKET_PUBLIC must be false");

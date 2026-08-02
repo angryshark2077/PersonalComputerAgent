@@ -657,10 +657,11 @@ export function createProductionApp(environment: ProductionEnvironment = process
     account: { fields: { password: "passwordHash" } },
     databaseHooks: createOwnerWorkspaceBootstrapHooks(repository),
   });
+  const objectStore = createR2ObjectStore(environment);
   const app = createApp({
     repository,
     ownerAuthenticator: createBetterAuthOwnerAuthenticator(auth, repository),
-    objectStore: createR2ObjectStore(environment),
+    ...(objectStore === undefined ? {} : { objectStore }),
   });
   app.all("/api/auth/*", (context) => auth.handler(context.req.raw));
   return app;
