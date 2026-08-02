@@ -1,9 +1,10 @@
 //! Paired communication Provider lifecycle and private local media spooling.
 
 use std::{
+    collections::BTreeSet,
     fmt,
-    fs::{self, File, Metadata},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    fs::File,
+    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -13,7 +14,9 @@ use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use pca_db_local::{
     CommunicationAttachmentSpoolReference, CommunicationMessageCommit, DbActorHandle, DbError,
 };
-use pca_domain::{CollectorState, CollectorStatus, DomainError, EventEnvelope, Sensitivity};
+use pca_domain::{
+    CollectorState, CollectorStatus, DomainError, EventEnvelope, MessageKind, Sensitivity,
+};
 use pca_provider_contracts::{
     CommunicationProvider, CommunicationProviderFactory, CompletedMediaSource,
     NormalizedCommunicationRecord,
@@ -22,7 +25,7 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch, OwnedRwLockReadGuard, RwLock},
     task::JoinHandle,
     time,
 };
@@ -44,6 +47,7 @@ const RETRY_DELAYS: [Duration; 5] = [
 ];
 const COMMAND_CAPACITY: usize = 8;
 const COLLECTOR_KEY: &str = "communication.wechat";
+const STOP_FAILED: &str = "WECHAT_STOP_FAILED";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct CommunicationIdentity {
@@ -155,6 +159,7 @@ enum Command {
 enum Operation<T> {
     Completed(T),
     Command(Option<Command>),
+    Authorization(CommunicationControl),
 }
 
 enum PollWait {
@@ -165,8 +170,99 @@ enum PollWait {
 
 /// Joined owner of the single communication Provider task.
 pub struct CommunicationRuntime {
+    authorization: CommunicationAuthorization,
     commands: Option<mpsc::Sender<Command>>,
     worker: Option<JoinHandle<Result<(), CommunicationRuntimeError>>>,
+}
+
+#[derive(Clone, Copy)]
+struct AuthorizationState {
+    control: CommunicationControl,
+    highest_revision: u64,
+    generation: u64,
+}
+
+/// Authoritative, monotonic communication authorization observed directly by the runtime.
+#[derive(Clone)]
+pub struct CommunicationAuthorization {
+    state: Arc<RwLock<AuthorizationState>>,
+    updates: watch::Sender<AuthorizationState>,
+}
+
+impl CommunicationAuthorization {
+    #[must_use]
+    pub fn new() -> Self {
+        let initial = AuthorizationState {
+            control: CommunicationControl::unpaired(),
+            highest_revision: 0,
+            generation: 0,
+        };
+        let (updates, _) = watch::channel(initial);
+        Self {
+            state: Arc::new(RwLock::new(initial)),
+            updates,
+        }
+    }
+
+    /// Publishes an exact-v2 control only after its required durable revision is available.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stale or invalid control error without changing current authorization.
+    pub async fn apply_persisted(
+        &self,
+        control: CommunicationControl,
+    ) -> Result<(), CommunicationRuntimeError> {
+        if control.identity.is_none() || control.configuration_revision == 0 {
+            return Err(CommunicationRuntimeError::InvalidControl);
+        }
+        let mut state = self.state.write().await;
+        if control.configuration_revision == state.highest_revision && control == state.control {
+            return Ok(());
+        }
+        if control.configuration_revision <= state.highest_revision {
+            return Err(CommunicationRuntimeError::StaleControl);
+        }
+        state.highest_revision = control.configuration_revision;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(CommunicationRuntimeError::InvalidControl)?;
+        state.control = control;
+        self.updates.send_replace(*state);
+        Ok(())
+    }
+
+    /// Immediately invalidates every outstanding communication operation and commit attempt.
+    pub async fn disable(&self) {
+        let mut state = self.state.write().await;
+        state.generation = state.generation.saturating_add(1);
+        state.control = CommunicationControl::unpaired();
+        self.updates.send_replace(*state);
+    }
+
+    fn subscribe(&self) -> watch::Receiver<AuthorizationState> {
+        self.updates.subscribe()
+    }
+
+    async fn commit_permit(
+        &self,
+        control: CommunicationControl,
+    ) -> Option<CommunicationCommitPermit> {
+        let state = Arc::clone(&self.state).read_owned().await;
+        (state.control == control && state.control.active())
+            .then_some(CommunicationCommitPermit { _state: state })
+    }
+}
+
+struct CommunicationCommitPermit {
+    _state: OwnedRwLockReadGuard<AuthorizationState>,
+}
+
+impl Default for CommunicationAuthorization {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommunicationRuntime {
@@ -181,6 +277,26 @@ impl CommunicationRuntime {
         factory: Arc<dyn CommunicationProviderFactory>,
         initial_control: CommunicationControl,
     ) -> Result<Self, CommunicationRuntimeError> {
+        let authorization = CommunicationAuthorization::new();
+        if initial_control.identity.is_some() {
+            authorization.apply_persisted(initial_control).await?;
+        }
+        Self::start_authorized(database, database_path, factory, authorization).await
+    }
+
+    /// Starts a runtime that observes a shared Cloud/pairing authorization generation directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the initial fail-closed state cannot be persisted.
+    pub async fn start_authorized(
+        database: Arc<DbActorHandle>,
+        database_path: PathBuf,
+        factory: Arc<dyn CommunicationProviderFactory>,
+        authorization: CommunicationAuthorization,
+    ) -> Result<Self, CommunicationRuntimeError> {
+        let authorization_receiver = authorization.subscribe();
+        let initial_control = authorization_receiver.borrow().control;
         persist_collector_state(&database, initial_control, None).await?;
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let worker = tokio::spawn(run_supervisor(
@@ -189,8 +305,11 @@ impl CommunicationRuntime {
             factory,
             initial_control,
             receiver,
+            authorization.clone(),
+            authorization_receiver,
         ));
         Ok(Self {
+            authorization,
             commands: Some(commands),
             worker: Some(worker),
         })
@@ -205,6 +324,11 @@ impl CommunicationRuntime {
         &self,
         control: CommunicationControl,
     ) -> Result<(), CommunicationRuntimeError> {
+        if control.identity.is_none() {
+            self.authorization.disable().await;
+        } else {
+            self.authorization.apply_persisted(control).await?;
+        }
         let (response_sender, response_receiver) = oneshot::channel();
         self.commands
             .as_ref()
@@ -237,6 +361,7 @@ impl CommunicationRuntime {
 }
 
 #[allow(
+    clippy::single_match_else,
     clippy::too_many_lines,
     reason = "serial Provider cancellation, retry, backpressure, and persistence share one owner"
 )]
@@ -246,21 +371,39 @@ async fn run_supervisor(
     factory: Arc<dyn CommunicationProviderFactory>,
     mut control: CommunicationControl,
     mut commands: mpsc::Receiver<Command>,
+    authorization_gate: CommunicationAuthorization,
+    mut authorization: watch::Receiver<AuthorizationState>,
 ) -> Result<(), CommunicationRuntimeError> {
     let mut highest_revision = control.configuration_revision;
     let mut outbox_paused = false;
     let mut spool_paused = false;
     let mut retry_index = 0_usize;
+    let mut retry_revision = control.configuration_revision;
 
     'supervisor: loop {
+        if control.configuration_revision != retry_revision {
+            retry_index = 0;
+            retry_revision = control.configuration_revision;
+        }
         if !control.active() {
-            match commands.recv().await {
-                Some(command) => {
-                    apply_command(&database, &mut control, &mut highest_revision, command).await?;
-                    continue;
+            tokio::select! {
+                biased;
+                changed = authorization.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                    control = authorization.borrow_and_update().control;
+                    highest_revision = highest_revision.max(control.configuration_revision);
+                    persist_collector_state(&database, control, None).await?;
                 }
-                None => return Ok(()),
+                command = commands.recv() => match command {
+                    Some(command) => {
+                        apply_command(&database, &mut control, &mut highest_revision, command).await?;
+                    }
+                    None => return Ok(()),
+                }
             }
+            continue;
         }
 
         let depth = database.active_outbox_depth().await?;
@@ -289,7 +432,7 @@ async fn run_supervisor(
             Ok(provider) => provider,
             Err(error) => {
                 persist_collector_state(&database, control, Some(&error)).await?;
-                if error.retryable {
+                if should_retry(&error) {
                     let delay = RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)];
                     retry_index = (retry_index + 1).min(RETRY_DELAYS.len() - 1);
                     if wait_or_command(
@@ -319,24 +462,69 @@ async fn run_supervisor(
             }
         };
 
-        let discovered = match discover_or_command(provider.as_mut(), &mut commands).await {
-            Operation::Completed(result) => result,
-            Operation::Command(command) => {
-                let _ = provider.stop();
-                match command {
-                    Some(command) => {
-                        apply_command(&database, &mut control, &mut highest_revision, command)
-                            .await?;
-                        continue 'supervisor;
+        let discovered =
+            match discover_or_command(provider.as_mut(), &mut commands, &mut authorization).await {
+                Operation::Completed(result) => result,
+                Operation::Authorization(next) => {
+                    let stop_result = provider.stop();
+                    control = next;
+                    highest_revision = highest_revision.max(control.configuration_revision);
+                    persist_collector_state(&database, control, None).await?;
+                    if stop_result.is_err() {
+                        return quarantine_provider(
+                            provider.as_mut(),
+                            &database,
+                            &mut control,
+                            &mut highest_revision,
+                            &mut commands,
+                            &mut authorization,
+                        )
+                        .await;
                     }
-                    None => return Ok(()),
+                    continue 'supervisor;
                 }
-            }
-        };
+                Operation::Command(command) => {
+                    let stop_result = provider.stop();
+                    match command {
+                        Some(command) => {
+                            apply_command(&database, &mut control, &mut highest_revision, command)
+                                .await?;
+                            if stop_result.is_err() {
+                                return quarantine_provider(
+                                    provider.as_mut(),
+                                    &database,
+                                    &mut control,
+                                    &mut highest_revision,
+                                    &mut commands,
+                                    &mut authorization,
+                                )
+                                .await;
+                            }
+                            continue 'supervisor;
+                        }
+                        None => {
+                            if stop_result.is_err() {
+                                persist_collector_code(&database, control, STOP_FAILED).await?;
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            };
         if let Err(error) = discovered {
-            let _ = provider.stop();
+            if provider.stop().is_err() {
+                return quarantine_provider(
+                    provider.as_mut(),
+                    &database,
+                    &mut control,
+                    &mut highest_revision,
+                    &mut commands,
+                    &mut authorization,
+                )
+                .await;
+            }
             persist_collector_state(&database, control, Some(&error)).await?;
-            if error.retryable {
+            if should_retry(&error) {
                 let delay = RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)];
                 retry_index = (retry_index + 1).min(RETRY_DELAYS.len() - 1);
                 if wait_or_command(
@@ -365,6 +553,7 @@ async fn run_supervisor(
             return Ok(());
         }
         retry_index = 0;
+        retry_revision = control.configuration_revision;
         persist_collector_state(&database, control, None).await?;
 
         loop {
@@ -376,53 +565,45 @@ async fn run_supervisor(
                 OUTBOX_LOW_WATER,
             );
             if outbox_paused {
-                let _ = provider.stop();
+                if provider.stop().is_err() {
+                    return quarantine_provider(
+                        provider.as_mut(),
+                        &database,
+                        &mut control,
+                        &mut highest_revision,
+                        &mut commands,
+                        &mut authorization,
+                    )
+                    .await;
+                }
                 continue 'supervisor;
             }
 
-            let records = match poll_or_command(provider.as_mut(), &mut commands).await {
-                Operation::Completed(result) => result,
-                Operation::Command(command) => {
-                    let _ = provider.stop();
-                    match command {
-                        Some(command) => {
-                            apply_command(&database, &mut control, &mut highest_revision, command)
-                                .await?;
-                            continue 'supervisor;
+            let records =
+                match poll_or_command(provider.as_mut(), &mut commands, &mut authorization).await {
+                    Operation::Completed(result) => result,
+                    Operation::Authorization(next) => {
+                        let stop_result = provider.stop();
+                        control = next;
+                        highest_revision = highest_revision.max(control.configuration_revision);
+                        persist_collector_state(&database, control, None).await?;
+                        if stop_result.is_err() {
+                            return quarantine_provider(
+                                provider.as_mut(),
+                                &database,
+                                &mut control,
+                                &mut highest_revision,
+                                &mut commands,
+                                &mut authorization,
+                            )
+                            .await;
                         }
-                        None => return Ok(()),
+                        continue 'supervisor;
                     }
-                }
-            };
-
-            match records {
-                Ok(records) => {
-                    let mut persistence_failed = false;
-                    for record in records {
-                        let preparation =
-                            prepare_record(&database_path, control, record, &mut spool_paused);
-                        tokio::pin!(preparation);
-                        let commit = tokio::select! {
-                            biased;
-                            command = commands.recv() => {
-                                let _ = provider.stop();
-                                match command {
-                                    Some(command) => {
-                                        apply_command(&database, &mut control, &mut highest_revision, command).await?;
-                                        continue 'supervisor;
-                                    }
-                                    None => return Ok(()),
-                                }
-                            }
-                            result = &mut preparation => result,
-                        };
-                        let Ok(commit) = commit else {
-                            persistence_failed = true;
-                            break;
-                        };
-                        match commands.try_recv() {
-                            Ok(command) => {
-                                let _ = provider.stop();
+                    Operation::Command(command) => {
+                        let stop_result = provider.stop();
+                        match command {
+                            Some(command) => {
                                 apply_command(
                                     &database,
                                     &mut control,
@@ -430,16 +611,155 @@ async fn run_supervisor(
                                     command,
                                 )
                                 .await?;
+                                if stop_result.is_err() {
+                                    return quarantine_provider(
+                                        provider.as_mut(),
+                                        &database,
+                                        &mut control,
+                                        &mut highest_revision,
+                                        &mut commands,
+                                        &mut authorization,
+                                    )
+                                    .await;
+                                }
+                                continue 'supervisor;
+                            }
+                            None => {
+                                if stop_result.is_err() {
+                                    persist_collector_code(&database, control, STOP_FAILED).await?;
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                };
+
+            match records {
+                Ok(records) => {
+                    let mut persistence_failed = false;
+                    let mut batch_paused = false;
+                    for record in records {
+                        let depth = database.active_outbox_depth().await?;
+                        update_hysteresis(
+                            &mut outbox_paused,
+                            depth,
+                            OUTBOX_HIGH_WATER,
+                            OUTBOX_LOW_WATER,
+                        );
+                        if outbox_paused {
+                            batch_paused = true;
+                            break;
+                        }
+                        let preparation =
+                            prepare_record(&database_path, control, record, &mut spool_paused);
+                        tokio::pin!(preparation);
+                        let commit = tokio::select! {
+                            biased;
+                            changed = authorization.changed() => {
+                                let stop_result = provider.stop();
+                                if changed.is_err() {
+                                    return Ok(());
+                                }
+                                control = authorization.borrow_and_update().control;
+                                highest_revision = highest_revision.max(control.configuration_revision);
+                                persist_collector_state(&database, control, None).await?;
+                                if stop_result.is_err() {
+                                    return quarantine_provider(
+                                        provider.as_mut(),
+                                        &database,
+                                        &mut control,
+                                        &mut highest_revision,
+                                        &mut commands,
+                                        &mut authorization,
+                                    ).await;
+                                }
+                                continue 'supervisor;
+                            }
+                            command = commands.recv() => {
+                                let stop_result = provider.stop();
+                                match command {
+                                    Some(command) => {
+                                        apply_command(&database, &mut control, &mut highest_revision, command).await?;
+                                        if stop_result.is_err() {
+                                            return quarantine_provider(
+                                                provider.as_mut(),
+                                                &database,
+                                                &mut control,
+                                                &mut highest_revision,
+                                                &mut commands,
+                                                &mut authorization,
+                                            ).await;
+                                        }
+                                        continue 'supervisor;
+                                    }
+                                    None => {
+                                        if stop_result.is_err() {
+                                            persist_collector_code(&database, control, STOP_FAILED).await?;
+                                        }
+                                        return Ok(());
+                                    },
+                                }
+                            }
+                            result = &mut preparation => result,
+                        };
+                        let Ok(mut prepared) = commit else {
+                            persistence_failed = true;
+                            break;
+                        };
+                        match commands.try_recv() {
+                            Ok(command) => {
+                                let stop_result = provider.stop();
+                                apply_command(
+                                    &database,
+                                    &mut control,
+                                    &mut highest_revision,
+                                    command,
+                                )
+                                .await?;
+                                if stop_result.is_err() {
+                                    return quarantine_provider(
+                                        provider.as_mut(),
+                                        &database,
+                                        &mut control,
+                                        &mut highest_revision,
+                                        &mut commands,
+                                        &mut authorization,
+                                    )
+                                    .await;
+                                }
                                 continue 'supervisor;
                             }
                             Err(mpsc::error::TryRecvError::Disconnected) => {
-                                let _ = provider.stop();
+                                if provider.stop().is_err() {
+                                    persist_collector_code(&database, control, STOP_FAILED).await?;
+                                }
                                 return Ok(());
                             }
                             Err(mpsc::error::TryRecvError::Empty) => {}
                         }
+                        let Some(_permit) = authorization_gate.commit_permit(control).await else {
+                            let stop_result = provider.stop();
+                            if authorization.has_changed().unwrap_or(false) {
+                                control = authorization.borrow_and_update().control;
+                                highest_revision =
+                                    highest_revision.max(control.configuration_revision);
+                                persist_collector_state(&database, control, None).await?;
+                            }
+                            if stop_result.is_err() {
+                                return quarantine_provider(
+                                    provider.as_mut(),
+                                    &database,
+                                    &mut control,
+                                    &mut highest_revision,
+                                    &mut commands,
+                                    &mut authorization,
+                                )
+                                .await;
+                            }
+                            continue 'supervisor;
+                        };
                         if database
-                            .commit_communication_message(&commit)
+                            .commit_communication_message(&prepared.commit)
                             .await
                             .map_err(|_| LocalPersistenceError::Database)
                             .is_err()
@@ -447,6 +767,21 @@ async fn run_supervisor(
                             persistence_failed = true;
                             break;
                         }
+                        prepared.spool.disarm();
+                    }
+                    if batch_paused {
+                        if provider.stop().is_err() {
+                            return quarantine_provider(
+                                provider.as_mut(),
+                                &database,
+                                &mut control,
+                                &mut highest_revision,
+                                &mut commands,
+                                &mut authorization,
+                            )
+                            .await;
+                        }
+                        continue 'supervisor;
                     }
                     if persistence_failed {
                         persist_collector_code(
@@ -460,9 +795,19 @@ async fn run_supervisor(
                     }
                 }
                 Err(error) => {
-                    let _ = provider.stop();
+                    if provider.stop().is_err() {
+                        return quarantine_provider(
+                            provider.as_mut(),
+                            &database,
+                            &mut control,
+                            &mut highest_revision,
+                            &mut commands,
+                            &mut authorization,
+                        )
+                        .await;
+                    }
                     persist_collector_state(&database, control, Some(&error)).await?;
-                    if error.retryable {
+                    if should_retry(&error) {
                         let delay = RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)];
                         retry_index = (retry_index + 1).min(RETRY_DELAYS.len() - 1);
                         if wait_or_command(
@@ -503,11 +848,23 @@ async fn run_supervisor(
             {
                 PollWait::Elapsed => {}
                 PollWait::CommandApplied => {
-                    let _ = provider.stop();
+                    if provider.stop().is_err() {
+                        return quarantine_provider(
+                            provider.as_mut(),
+                            &database,
+                            &mut control,
+                            &mut highest_revision,
+                            &mut commands,
+                            &mut authorization,
+                        )
+                        .await;
+                    }
                     continue 'supervisor;
                 }
                 PollWait::Closed => {
-                    let _ = provider.stop();
+                    if provider.stop().is_err() {
+                        persist_collector_code(&database, control, STOP_FAILED).await?;
+                    }
                     return Ok(());
                 }
             }
@@ -518,9 +875,17 @@ async fn run_supervisor(
 async fn discover_or_command(
     provider: &mut dyn CommunicationProvider,
     commands: &mut mpsc::Receiver<Command>,
+    authorization: &mut watch::Receiver<AuthorizationState>,
 ) -> Operation<Result<(), DomainError>> {
     tokio::select! {
         biased;
+        changed = authorization.changed() => {
+            if changed.is_err() {
+                Operation::Command(None)
+            } else {
+                Operation::Authorization(authorization.borrow_and_update().control)
+            }
+        },
         command = commands.recv() => Operation::Command(command),
         result = provider.discover() => Operation::Completed(result),
     }
@@ -529,9 +894,17 @@ async fn discover_or_command(
 async fn poll_or_command(
     provider: &mut dyn CommunicationProvider,
     commands: &mut mpsc::Receiver<Command>,
+    authorization: &mut watch::Receiver<AuthorizationState>,
 ) -> Operation<Result<Vec<NormalizedCommunicationRecord>, DomainError>> {
     tokio::select! {
         biased;
+        changed = authorization.changed() => {
+            if changed.is_err() {
+                Operation::Command(None)
+            } else {
+                Operation::Authorization(authorization.borrow_and_update().control)
+            }
+        },
         command = commands.recv() => Operation::Command(command),
         result = provider.poll_once() => Operation::Completed(result),
     }
@@ -544,7 +917,9 @@ async fn apply_command(
     command: Command,
 ) -> Result<(), CommunicationRuntimeError> {
     let Command::Apply { control, response } = command;
-    let result = if control.identity.is_none() {
+    let result = if control == *current {
+        Ok(())
+    } else if control.identity.is_none() {
         *current = control;
         persist_collector_state(database, control, None).await
     } else if control.configuration_revision <= *highest_revision {
@@ -560,6 +935,40 @@ async fn apply_command(
         return Err(CommunicationRuntimeError::WorkerStopped);
     }
     Ok(())
+}
+
+async fn quarantine_provider(
+    provider: &mut dyn CommunicationProvider,
+    database: &DbActorHandle,
+    control: &mut CommunicationControl,
+    highest_revision: &mut u64,
+    commands: &mut mpsc::Receiver<Command>,
+    authorization: &mut watch::Receiver<AuthorizationState>,
+) -> Result<(), CommunicationRuntimeError> {
+    persist_collector_code(database, *control, STOP_FAILED).await?;
+    loop {
+        tokio::select! {
+            biased;
+            changed = authorization.changed() => {
+                if changed.is_err() {
+                    let _ = provider.stop();
+                    return Ok(());
+                }
+                *control = authorization.borrow_and_update().control;
+                *highest_revision = (*highest_revision).max(control.configuration_revision);
+                persist_collector_code(database, *control, STOP_FAILED).await?;
+            }
+            command = commands.recv() => {
+                if let Some(command) = command {
+                    apply_command(database, control, highest_revision, command).await?;
+                    persist_collector_code(database, *control, STOP_FAILED).await?;
+                } else {
+                    let _ = provider.stop();
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 async fn wait_or_command(
@@ -625,17 +1034,25 @@ fn update_hysteresis(paused: &mut bool, value: u64, high: u64, low: u64) {
     }
 }
 
+fn should_retry(error: &DomainError) -> bool {
+    error.retryable
+        && matches!(
+            error.code.as_str(),
+            "WECHAT_WAITING_SOURCE" | "WECHAT_DATABASE_UNAVAILABLE" | "WECHAT_PROBE_TIMEOUT"
+        )
+}
+
 async fn prepare_record(
     database_path: &Path,
     control: CommunicationControl,
     record: NormalizedCommunicationRecord,
     spool_paused: &mut bool,
-) -> Result<CommunicationMessageCommit, LocalPersistenceError> {
+) -> Result<PreparedRecord, LocalPersistenceError> {
     let identity = control
         .identity
         .ok_or(LocalPersistenceError::InvalidRecord)?;
     let (account_id, source_sequence, message, completed_media) = record.into_parts();
-    let attachment_spool = copy_completed_media(
+    let prepared_media = copy_completed_media(
         database_path,
         message.attachments(),
         &completed_media,
@@ -667,13 +1084,26 @@ async fn prepare_record(
             .collect(),
         idempotency_key: Some(message.source_key().to_owned()),
     };
-    Ok(CommunicationMessageCommit {
-        account_id,
-        source_sequence,
-        event,
-        message,
-        attachment_spool,
+    Ok(PreparedRecord {
+        commit: CommunicationMessageCommit {
+            account_id,
+            source_sequence,
+            event,
+            message,
+            attachment_spool: prepared_media.references,
+        },
+        spool: prepared_media.spool,
     })
+}
+
+struct PreparedRecord {
+    commit: CommunicationMessageCommit,
+    spool: AttemptSpoolLease,
+}
+
+struct PreparedMedia {
+    references: Vec<CommunicationAttachmentSpoolReference>,
+    spool: AttemptSpoolLease,
 }
 
 #[derive(Debug)]
@@ -690,13 +1120,22 @@ async fn copy_completed_media(
     attachments: &[pca_domain::CommunicationAttachment],
     completed_media: &[CompletedMediaSource],
     spool_paused: &mut bool,
-) -> Result<Vec<CommunicationAttachmentSpoolReference>, LocalPersistenceError> {
+) -> Result<PreparedMedia, LocalPersistenceError> {
     if attachments.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PreparedMedia {
+            references: Vec::new(),
+            spool: AttemptSpoolLease::empty(),
+        });
+    }
+    if attachments
+        .iter()
+        .any(|attachment| !mime_matches_kind(attachment.kind(), attachment.mime_type()))
+    {
+        return Err(LocalPersistenceError::InvalidRecord);
     }
     let root_path = DbActorHandle::communication_spool_root(database_path);
     let root = open_spool_root(&root_path)?;
-    let usage = spool_usage(&root_path, &root)?;
+    let usage = spool_usage(&root)?;
     if *spool_paused {
         if usage >= SPOOL_RESUME_BELOW_BYTES {
             return Err(LocalPersistenceError::Quota);
@@ -716,6 +1155,7 @@ async fn copy_completed_media(
     }
 
     let mut references = Vec::with_capacity(attachments.len());
+    let mut spool = AttemptSpoolLease::new(&root)?;
     for attachment in attachments {
         let source = completed_media
             .iter()
@@ -723,6 +1163,7 @@ async fn copy_completed_media(
             .ok_or(LocalPersistenceError::InvalidRecord)?;
         copy_one(
             &root,
+            &mut spool,
             source.source_path(),
             attachment.sha256(),
             attachment.size_bytes(),
@@ -733,11 +1174,28 @@ async fn copy_completed_media(
             file_name: attachment.sha256().to_owned(),
         });
     }
-    Ok(references)
+    Ok(PreparedMedia { references, spool })
 }
 
+fn mime_matches_kind(kind: MessageKind, mime_type: &str) -> bool {
+    let family = match kind {
+        MessageKind::Audio => "audio/",
+        MessageKind::Image => "image/",
+        MessageKind::Video => "video/",
+        MessageKind::Text => return false,
+    };
+    mime_type
+        .strip_prefix(family)
+        .is_some_and(|subtype| !subtype.is_empty())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "stream validation and no-replace publication share one attempt-owned lease"
+)]
 async fn copy_one(
     root: &File,
+    spool: &mut AttemptSpoolLease,
     source_path: &Path,
     expected_hash: &str,
     expected_size: u64,
@@ -766,7 +1224,7 @@ async fn copy_one(
     )
     .map(File::from)
     .map_err(|_| LocalPersistenceError::Filesystem)?;
-    let mut cleanup = PartialFile::new(root, temporary_name)?;
+    spool.track(temporary_name.clone());
     let mut source = tokio::fs::File::from_std(source);
     let mut temporary = tokio::fs::File::from_std(temporary);
     let mut hasher = Sha256::new();
@@ -804,9 +1262,31 @@ async fn copy_one(
         return Err(LocalPersistenceError::InvalidRecord);
     }
     drop(temporary);
-    rustix::fs::renameat(root, cleanup.name(), root, expected_hash)
-        .map_err(|_| LocalPersistenceError::Filesystem)?;
-    cleanup.disarm();
+    match rustix::fs::linkat(
+        root,
+        temporary_name.as_str(),
+        root,
+        expected_hash,
+        AtFlags::empty(),
+    ) {
+        Ok(()) => spool.track(expected_hash.to_owned()),
+        Err(error) if error == rustix::io::Errno::EXIST => {
+            let existing = rustix::fs::openat(
+                root,
+                expected_hash,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| LocalPersistenceError::Filesystem)?;
+            validate_open_file(existing, expected_hash, expected_size).await?;
+            spool.remove_owned(temporary_name.as_str())?;
+            root.sync_all()
+                .map_err(|_| LocalPersistenceError::Filesystem)?;
+            return Ok(());
+        }
+        Err(_) => return Err(LocalPersistenceError::Filesystem),
+    }
     root.sync_all()
         .map_err(|_| LocalPersistenceError::Filesystem)?;
     let final_file = rustix::fs::openat(
@@ -817,7 +1297,10 @@ async fn copy_one(
     )
     .map(File::from)
     .map_err(|_| LocalPersistenceError::Filesystem)?;
-    validate_open_file(final_file, expected_hash, expected_size).await
+    validate_open_file(final_file, expected_hash, expected_size).await?;
+    spool.remove_owned(temporary_name.as_str())?;
+    root.sync_all()
+        .map_err(|_| LocalPersistenceError::Filesystem)
 }
 
 async fn validate_open_file(
@@ -906,13 +1389,38 @@ fn open_source_without_symlinks(path: &Path) -> Result<File, LocalPersistenceErr
 }
 
 fn open_spool_root(path: &Path) -> Result<File, LocalPersistenceError> {
-    let root = rustix::fs::open(
-        path,
+    if !path.is_absolute() {
+        return Err(LocalPersistenceError::Filesystem);
+    }
+    let mut directory = rustix::fs::open(
+        "/",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map(File::from)
     .map_err(|_| LocalPersistenceError::Filesystem)?;
+    let mut opened_component = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                directory = rustix::fs::openat(
+                    &directory,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|_| LocalPersistenceError::Filesystem)?;
+                opened_component = true;
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(LocalPersistenceError::Filesystem);
+            }
+        }
+    }
+    if !opened_component {
+        return Err(LocalPersistenceError::Filesystem);
+    }
+    let root = File::from(directory);
     let metadata = root
         .metadata()
         .map_err(|_| LocalPersistenceError::Filesystem)?;
@@ -922,69 +1430,93 @@ fn open_spool_root(path: &Path) -> Result<File, LocalPersistenceError> {
     Ok(root)
 }
 
-fn spool_usage(path: &Path, root: &File) -> Result<u64, LocalPersistenceError> {
-    let opened = root
-        .metadata()
-        .map_err(|_| LocalPersistenceError::Filesystem)?;
-    ensure_same_root(path, &opened)?;
+fn spool_usage(root: &File) -> Result<u64, LocalPersistenceError> {
+    let entries =
+        rustix::fs::Dir::read_from(root).map_err(|_| LocalPersistenceError::Filesystem)?;
     let mut total = 0_u64;
-    for entry in fs::read_dir(path).map_err(|_| LocalPersistenceError::Filesystem)? {
+    for entry in entries {
         let entry = entry.map_err(|_| LocalPersistenceError::Filesystem)?;
-        let metadata =
-            fs::symlink_metadata(entry.path()).map_err(|_| LocalPersistenceError::Filesystem)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let file = rustix::fs::openat(
+            root,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| LocalPersistenceError::Filesystem)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| LocalPersistenceError::Filesystem)?;
+        if !metadata.is_file() {
             return Err(LocalPersistenceError::Filesystem);
         }
         total = total
             .checked_add(metadata.len())
             .ok_or(LocalPersistenceError::Quota)?;
     }
-    ensure_same_root(path, &opened)?;
     Ok(total)
 }
 
-fn ensure_same_root(path: &Path, opened: &Metadata) -> Result<(), LocalPersistenceError> {
-    let current = fs::symlink_metadata(path).map_err(|_| LocalPersistenceError::Filesystem)?;
-    if current.file_type().is_symlink()
-        || !current.is_dir()
-        || current.dev() != opened.dev()
-        || current.ino() != opened.ino()
-    {
-        return Err(LocalPersistenceError::Filesystem);
-    }
-    Ok(())
-}
-
-struct PartialFile {
-    root: File,
-    name: String,
+struct AttemptSpoolLease {
+    root: Option<File>,
+    owned: BTreeSet<String>,
     armed: bool,
 }
 
-impl PartialFile {
-    fn new(root: &File, name: String) -> Result<Self, LocalPersistenceError> {
+impl AttemptSpoolLease {
+    fn empty() -> Self {
+        Self {
+            root: None,
+            owned: BTreeSet::new(),
+            armed: true,
+        }
+    }
+
+    fn new(root: &File) -> Result<Self, LocalPersistenceError> {
         Ok(Self {
-            root: root
-                .try_clone()
-                .map_err(|_| LocalPersistenceError::Filesystem)?,
-            name,
+            root: Some(
+                root.try_clone()
+                    .map_err(|_| LocalPersistenceError::Filesystem)?,
+            ),
+            owned: BTreeSet::new(),
             armed: true,
         })
     }
 
-    fn name(&self) -> &str {
-        &self.name
+    fn track(&mut self, name: String) {
+        self.owned.insert(name);
+    }
+
+    fn remove_owned(&mut self, name: &str) -> Result<(), LocalPersistenceError> {
+        let root = self
+            .root
+            .as_ref()
+            .ok_or(LocalPersistenceError::Filesystem)?;
+        rustix::fs::unlinkat(root, name, AtFlags::empty())
+            .map_err(|_| LocalPersistenceError::Filesystem)?;
+        self.owned.remove(name);
+        Ok(())
     }
 
     fn disarm(&mut self) {
+        self.owned.clear();
         self.armed = false;
     }
 }
 
-impl Drop for PartialFile {
+impl Drop for AttemptSpoolLease {
     fn drop(&mut self) {
         if self.armed {
-            let _ = rustix::fs::unlinkat(&self.root, self.name.as_str(), AtFlags::empty());
+            if let Some(root) = self.root.as_ref() {
+                for name in &self.owned {
+                    let _ = rustix::fs::unlinkat(root, name.as_str(), AtFlags::empty());
+                }
+                let _ = root.sync_all();
+            }
         }
     }
 }

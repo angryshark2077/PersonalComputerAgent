@@ -18,6 +18,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::communication::{
+    CommunicationAuthorization, CommunicationControl, CommunicationIdentity,
+};
+
 const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
@@ -350,6 +354,7 @@ pub fn apply_snapshot(
 struct ControlState {
     unpaired: bool,
     applied_revision: Option<u64>,
+    communication_hydrated: bool,
 }
 
 /// Starts the authenticated Cloud-control worker.
@@ -358,6 +363,7 @@ pub struct CloudControlRuntime;
 /// Handle for observing and stopping the bounded Cloud-control worker.
 pub struct CloudControlHandle {
     state: Arc<Mutex<ControlState>>,
+    authorization: CommunicationAuthorization,
     communication_controls: watch::Sender<Option<AppliedControl>>,
     shutdown: Option<watch::Sender<bool>>,
     worker: Option<JoinHandle<Result<(), CloudControlRuntimeError>>>,
@@ -392,18 +398,43 @@ impl CloudControlRuntime {
         client: Arc<dyn ControlClient>,
         pairing_state_sender: watch::Sender<bool>,
     ) -> Result<Option<CloudControlHandle>, CloudControlRuntimeError> {
-        if !synchronize_pairing_state(&database, store.as_ref()).await? {
+        Self::start_from_keychain_with_pairing_state_and_authorization(
+            database,
+            store,
+            client,
+            pairing_state_sender,
+            CommunicationAuthorization::new(),
+        )
+        .await
+    }
+
+    /// Loads Keychain state and starts control over the App-owned communication gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Keychain access, pairing reconciliation, or worker startup fails.
+    pub async fn start_from_keychain_with_pairing_state_and_authorization(
+        database: Arc<DbActorHandle>,
+        store: Arc<dyn CredentialStore>,
+        client: Arc<dyn ControlClient>,
+        pairing_state_sender: watch::Sender<bool>,
+        authorization: CommunicationAuthorization,
+    ) -> Result<Option<CloudControlHandle>, CloudControlRuntimeError> {
+        if !synchronize_pairing_state_with_authorization(&database, store.as_ref(), &authorization)
+            .await?
+        {
             pairing_state_sender.send_replace(false);
             return Ok(None);
         }
         let credential = load_device_credential(store.as_ref())?.ok_or(
             CloudControlRuntimeError::Keychain(CredentialError::InvalidCredential),
         )?;
-        Self::start_with_pairing_state(
+        Self::start_with_pairing_state_and_authorization(
             database,
             LoadedDeviceCredentials::new(credential, store),
             client,
             pairing_state_sender,
+            authorization,
         )
         .await
         .map(Some)
@@ -420,7 +451,14 @@ impl CloudControlRuntime {
         client: Arc<dyn ControlClient>,
     ) -> Result<CloudControlHandle, CloudControlRuntimeError> {
         let (pairing_state_sender, _) = watch::channel(false);
-        Self::start_with_pairing_state(database, credentials, client, pairing_state_sender).await
+        Self::start_with_pairing_state_and_authorization(
+            database,
+            credentials,
+            client,
+            pairing_state_sender,
+            CommunicationAuthorization::new(),
+        )
+        .await
     }
 
     /// Validates local state, starts control, and reports paired/revoked transitions.
@@ -434,11 +472,34 @@ impl CloudControlRuntime {
         client: Arc<dyn ControlClient>,
         pairing_state_sender: watch::Sender<bool>,
     ) -> Result<CloudControlHandle, CloudControlRuntimeError> {
+        Self::start_with_pairing_state_and_authorization(
+            database,
+            credentials,
+            client,
+            pairing_state_sender,
+            CommunicationAuthorization::new(),
+        )
+        .await
+    }
+
+    /// Starts Cloud control over the App-owned communication authorization gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when local pairing state cannot be validated or persisted.
+    pub async fn start_with_pairing_state_and_authorization(
+        database: Arc<DbActorHandle>,
+        credentials: LoadedDeviceCredentials,
+        client: Arc<dyn ControlClient>,
+        pairing_state_sender: watch::Sender<bool>,
+        authorization: CommunicationAuthorization,
+    ) -> Result<CloudControlHandle, CloudControlRuntimeError> {
         let applied_revision = ensure_pairing_state(&database, credentials.credential()).await?;
         pairing_state_sender.send_replace(true);
         let state = Arc::new(Mutex::new(ControlState {
             unpaired: false,
             applied_revision: Some(applied_revision),
+            communication_hydrated: false,
         }));
         let (communication_controls, _) = watch::channel(None);
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -450,9 +511,11 @@ impl CloudControlRuntime {
             shutdown_receiver,
             pairing_state_sender,
             communication_controls.clone(),
+            authorization.clone(),
         ));
         Ok(CloudControlHandle {
             state,
+            authorization,
             communication_controls,
             shutdown: Some(shutdown_sender),
             worker: Some(worker),
@@ -473,12 +536,26 @@ pub async fn synchronize_pairing_state(
     database: &DbActorHandle,
     store: &dyn CredentialStore,
 ) -> Result<bool, CloudControlRuntimeError> {
+    synchronize_pairing_state_with_authorization(
+        database,
+        store,
+        &CommunicationAuthorization::new(),
+    )
+    .await
+}
+
+pub(crate) async fn synchronize_pairing_state_with_authorization(
+    database: &DbActorHandle,
+    store: &dyn CredentialStore,
+    authorization: &CommunicationAuthorization,
+) -> Result<bool, CloudControlRuntimeError> {
     match load_device_credential(store) {
         Ok(Some(credential)) => {
             ensure_pairing_state(database, &credential).await?;
             Ok(true)
         }
         Ok(None) | Err(CredentialError::InvalidCredential) => {
+            authorization.disable().await;
             database
                 .clear_pairing_state_and_disable_sensitive_collectors()
                 .await?;
@@ -511,6 +588,7 @@ impl CloudControlHandle {
     ///
     /// Returns an error if the worker ends unexpectedly or reports a runtime failure.
     pub async fn shutdown(mut self) -> Result<(), CloudControlRuntimeError> {
+        self.authorization.disable().await;
         self.communication_controls.send_replace(None);
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send_replace(true);
@@ -581,6 +659,10 @@ async fn ensure_pairing_state(
     Ok(revision)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the control owner receives one shared authorization gate and its existing runtime dependencies"
+)]
 async fn run_control_loop(
     database: Arc<DbActorHandle>,
     mut credentials: LoadedDeviceCredentials,
@@ -589,6 +671,7 @@ async fn run_control_loop(
     mut shutdown: watch::Receiver<bool>,
     pairing_state_sender: watch::Sender<bool>,
     communication_controls: watch::Sender<Option<AppliedControl>>,
+    authorization: CommunicationAuthorization,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut retry_attempt = 0_u8;
     let mut wait = Duration::ZERO;
@@ -606,6 +689,7 @@ async fn run_control_loop(
             client.as_ref(),
             &state,
             &communication_controls,
+            &authorization,
         )
         .await
         {
@@ -618,6 +702,7 @@ async fn run_control_loop(
                 wait = retry_delay(retry_attempt);
             }
             Err(ControlError::Contract) => {
+                authorization.disable().await;
                 communication_controls.send_replace(None);
                 retry_attempt = retry_attempt.saturating_add(1);
                 wait = retry_delay(retry_attempt);
@@ -634,6 +719,7 @@ async fn run_control_loop(
                                 &state,
                                 &pairing_state_sender,
                                 &communication_controls,
+                                &authorization,
                             )
                             .await;
                         }
@@ -650,6 +736,7 @@ async fn run_control_loop(
                             &state,
                             &pairing_state_sender,
                             &communication_controls,
+                            &authorization,
                         )
                         .await;
                     }
@@ -658,6 +745,7 @@ async fn run_control_loop(
                         wait = retry_delay(retry_attempt);
                     }
                     Err(ControlError::Contract) => {
+                        authorization.disable().await;
                         communication_controls.send_replace(None);
                         retry_attempt = retry_attempt.saturating_add(1);
                         wait = retry_delay(retry_attempt);
@@ -671,6 +759,7 @@ async fn run_control_loop(
                     &state,
                     &pairing_state_sender,
                     &communication_controls,
+                    &authorization,
                 )
                 .await;
             }
@@ -684,6 +773,7 @@ async fn control_once(
     client: &dyn ControlClient,
     state: &Arc<Mutex<ControlState>>,
     communication_controls: &watch::Sender<Option<AppliedControl>>,
+    authorization: &CommunicationAuthorization,
 ) -> Result<(), ControlError> {
     let outbox_depth = database
         .active_outbox_depth()
@@ -693,24 +783,58 @@ async fn control_once(
         .heartbeat_and_control(&credentials.credential, outbox_depth)
         .await?;
     if snapshot.revoked {
+        authorization.disable().await;
+        communication_controls.send_replace(None);
         return Err(ControlError::Revoked);
     }
     if snapshot.device_id != credentials.credential.device_id()
         || snapshot.workspace_id != credentials.credential.workspace_id()
     {
+        authorization.disable().await;
+        communication_controls.send_replace(None);
         return Err(ControlError::Contract);
     }
+    let (current, hydrated) = {
+        let state = state.lock().await;
+        (
+            state.applied_revision.unwrap_or(0),
+            state.communication_hydrated,
+        )
+    };
+    let applied = if snapshot.configuration_revision == current && !hydrated {
+        snapshot.validate_exact_scopes()?;
+        Some(AppliedControl {
+            configuration_revision: snapshot.configuration_revision,
+            network_enabled: snapshot.collectors.network.enabled,
+            communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+        })
+    } else {
+        apply_snapshot(current, &snapshot)?
+    };
+    if applied.is_some_and(|applied| !applied.communication_wechat_enabled) {
+        apply_communication_authorization(authorization, &credentials.credential, applied.unwrap())
+            .await?;
+        communication_controls.send_replace(applied);
+    }
     sync_pending_system_events(database, &credentials.credential, client).await?;
-    let current = state.lock().await.applied_revision.unwrap_or(0);
-    let Some(applied) = apply_snapshot(current, &snapshot)? else {
+    let Some(applied) = applied else {
         return Ok(());
     };
-    database
-        .save_control_revision(applied.configuration_revision)
-        .await
-        .map_err(|_| ControlError::Transient)?;
-    state.lock().await.applied_revision = Some(applied.configuration_revision);
-    communication_controls.send_replace(Some(applied));
+    if applied.configuration_revision > current {
+        database
+            .save_control_revision(applied.configuration_revision)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+    }
+    {
+        let mut state = state.lock().await;
+        state.applied_revision = Some(applied.configuration_revision);
+        state.communication_hydrated = true;
+    }
+    if applied.communication_wechat_enabled {
+        apply_communication_authorization(authorization, &credentials.credential, applied).await?;
+        communication_controls.send_replace(Some(applied));
+    }
     Ok(())
 }
 
@@ -751,13 +875,36 @@ async fn sync_pending_system_events(
         .map_err(|_| ControlError::Transient)
 }
 
+async fn apply_communication_authorization(
+    authorization: &CommunicationAuthorization,
+    credentials: &DeviceCredential,
+    applied: AppliedControl,
+) -> Result<(), ControlError> {
+    let identity =
+        CommunicationIdentity::try_new(credentials.workspace_id(), credentials.device_id())
+            .map_err(|_| ControlError::Contract)?;
+    let control = CommunicationControl::paired(
+        identity,
+        applied.configuration_revision,
+        applied.communication_wechat_enabled,
+    )
+    .map_err(|_| ControlError::Contract)?;
+    authorization
+        .apply_persisted(control)
+        .await
+        .map_err(|_| ControlError::Contract)
+}
+
 async fn revoke(
     database: &DbActorHandle,
     credentials: &LoadedDeviceCredentials,
     state: &Arc<Mutex<ControlState>>,
     pairing_state_sender: &watch::Sender<bool>,
     communication_controls: &watch::Sender<Option<AppliedControl>>,
+    authorization: &CommunicationAuthorization,
 ) -> Result<(), CloudControlRuntimeError> {
+    authorization.disable().await;
+    communication_controls.send_replace(None);
     {
         let mut state = state.lock().await;
         state.unpaired = true;
@@ -767,7 +914,6 @@ async fn revoke(
     database
         .clear_pairing_state_and_disable_sensitive_collectors()
         .await?;
-    communication_controls.send_replace(None);
     pairing_state_sender.send_replace(false);
     keychain_result?;
     Ok(())

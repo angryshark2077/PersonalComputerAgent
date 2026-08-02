@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use pca_agentd::cloud_control::{
@@ -11,13 +12,13 @@ use pca_agentd::cloud_control::{
     ControlClient, ControlError, ControlFuture,
 };
 use pca_db_local::{DbActorHandle, PairingState};
-use pca_domain::{CollectorState, CollectorStatus};
+use pca_domain::{CollectorState, CollectorStatus, EventEnvelope, Sensitivity};
 use pca_keychain::{
     CredentialError, CredentialStore, DeviceCredential, DEVICE_CREDENTIAL_ACCOUNT,
     DEVICE_CREDENTIAL_SERVICE,
 };
 use tempfile::TempDir;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 #[derive(Default)]
 struct MemoryStore {
@@ -76,6 +77,46 @@ impl ControlClient for RevokedClient {
 struct SequenceClient {
     calls: AtomicUsize,
     snapshots: Mutex<VecDeque<Result<AgentControlSnapshot, ControlError>>>,
+}
+
+struct BlockingSyncClient {
+    calls: AtomicUsize,
+    snapshots: Mutex<VecDeque<Result<AgentControlSnapshot, ControlError>>>,
+    sync_entered: Notify,
+    sync_release: Notify,
+}
+
+impl ControlClient for BlockingSyncClient {
+    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .snapshots
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Err(ControlError::Transient));
+        Box::pin(async move { result })
+    }
+
+    fn sync_system_events<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: &'a [EventEnvelope],
+    ) -> ControlFuture<'a, pca_agentd::cloud_control::SyncEventsResponse> {
+        Box::pin(async move {
+            self.sync_entered.notify_waiters();
+            self.sync_release.notified().await;
+            Err(ControlError::Transient)
+        })
+    }
 }
 
 impl ControlClient for SequenceClient {
@@ -463,6 +504,136 @@ async fn communication_revision_notifications_are_monotonic_and_invalid_control_
             drop(error);
             panic!("control runtime released database after shutdown");
         }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn persisted_enabled_revision_is_restored_even_when_published_before_subscription() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    database
+        .save_pairing_state(&PairingState::paired(
+            loaded.credential().device_id(),
+            loaded.credential().workspace_id(),
+            "keychain://pca/device/current",
+            7,
+            "https://pca-cloud-api-production.up.railway.app",
+        ))
+        .await
+        .unwrap();
+    database.save_control_revision(7).await.unwrap();
+    let client = Arc::new(SequenceClient {
+        calls: AtomicUsize::new(0),
+        snapshots: Mutex::new(VecDeque::from([Ok(exact_snapshot(7, true))])),
+    });
+    let runtime = CloudControlRuntime::start(
+        Arc::clone(&database),
+        loaded,
+        Arc::clone(&client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+
+    wait_for_calls(&client.calls, 1).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    let controls = runtime.communication_controls();
+    let restored = controls
+        .borrow()
+        .as_ref()
+        .copied()
+        .expect("equal persisted revision is published for restart hydration");
+    assert_eq!(restored.configuration_revision, 7);
+    assert!(restored.communication_wechat_enabled);
+
+    runtime.shutdown().await.unwrap();
+    match Arc::try_unwrap(database) {
+        Ok(database) => database.shutdown().await.unwrap(),
+        Err(error) => {
+            drop(error);
+            panic!("control runtime released database after shutdown");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn valid_disable_gates_communication_before_blocked_system_sync() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    database
+        .save_pairing_state(&PairingState::paired(
+            loaded.credential().device_id(),
+            loaded.credential().workspace_id(),
+            "keychain://pca/device/current",
+            1,
+            "https://pca-cloud-api-production.up.railway.app",
+        ))
+        .await
+        .unwrap();
+    let client = Arc::new(BlockingSyncClient {
+        calls: AtomicUsize::new(0),
+        snapshots: Mutex::new(VecDeque::from([
+            Ok(exact_snapshot(1, true)),
+            Ok(exact_snapshot(2, false)),
+        ])),
+        sync_entered: Notify::new(),
+        sync_release: Notify::new(),
+    });
+    let runtime = CloudControlRuntime::start(
+        Arc::clone(&database),
+        loaded,
+        Arc::clone(&client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+    let mut controls = runtime.communication_controls();
+    controls.changed().await.unwrap();
+    assert!(controls
+        .borrow_and_update()
+        .as_ref()
+        .is_some_and(|control| control.communication_wechat_enabled));
+
+    database
+        .append_event_with_outbox(&system_event("system-before-disable"))
+        .await
+        .unwrap();
+    let sync_entered = client.sync_entered.notified();
+    tokio::pin!(sync_entered);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    sync_entered.as_mut().await;
+
+    assert!(controls.borrow().as_ref().is_some_and(|control| {
+        control.configuration_revision == 2 && !control.communication_wechat_enabled
+    }));
+
+    client.sync_release.notify_waiters();
+    runtime.shutdown().await.unwrap();
+    match Arc::try_unwrap(database) {
+        Ok(database) => database.shutdown().await.unwrap(),
+        Err(error) => {
+            drop(error);
+            panic!("control runtime released database after shutdown");
+        }
+    }
+}
+
+fn system_event(event_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        event_id: event_id.to_owned(),
+        workspace_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+        device_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+        event_type: "system.metric_sampled".to_owned(),
+        source: "system".to_owned(),
+        schema_version: 1,
+        occurred_at: "2026-08-02T00:00:00Z".to_owned(),
+        created_at: "2026-08-02T00:00:00Z".to_owned(),
+        sensitivity: Sensitivity::Normal,
+        payload: serde_json::Map::new(),
+        attachment_refs: Vec::new(),
+        idempotency_key: Some(format!("system:{event_id}")),
     }
 }
 

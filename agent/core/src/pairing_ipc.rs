@@ -23,10 +23,11 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::cloud_control::{
-    synchronize_pairing_state, AgentPairingService, CloudControlHandle, CloudControlRuntime,
-    ControlClient, HttpControlClient, PairingCallbackHandoff, PairingClient, PairingStartHandoff,
-    PRODUCTION_CLOUD_API_ORIGIN,
+    synchronize_pairing_state_with_authorization, AgentPairingService, CloudControlHandle,
+    CloudControlRuntime, ControlClient, HttpControlClient, PairingCallbackHandoff, PairingClient,
+    PairingStartHandoff, PRODUCTION_CLOUD_API_ORIGIN,
 };
+use crate::communication::CommunicationAuthorization;
 
 const PAIRING_IPC_PROTOCOL_VERSION: u32 = 1;
 
@@ -51,6 +52,7 @@ pub struct PairingIpcServer {
     pending: Mutex<Option<PendingPairing>>,
     control: Mutex<Option<CloudControlHandle>>,
     pairing_state_sender: watch::Sender<bool>,
+    communication_authorization: CommunicationAuthorization,
 }
 
 struct PendingPairing {
@@ -262,6 +264,7 @@ impl PairingIpcServer {
         database: Arc<DbActorHandle>,
         store: Arc<dyn CredentialStore>,
         pairing_state_sender: watch::Sender<bool>,
+        communication_authorization: CommunicationAuthorization,
     ) -> Self {
         Self {
             socket,
@@ -270,6 +273,7 @@ impl PairingIpcServer {
             pending: Mutex::new(None),
             control: Mutex::new(None),
             pairing_state_sender,
+            communication_authorization,
         }
     }
 
@@ -319,9 +323,13 @@ impl PairingIpcServer {
 
         let response = match request.operation {
             PairingIpcOperation::Status => {
-                let paired = synchronize_pairing_state(self.database.as_ref(), self.store.as_ref())
-                    .await
-                    .unwrap_or(false);
+                let paired = synchronize_pairing_state_with_authorization(
+                    self.database.as_ref(),
+                    self.store.as_ref(),
+                    &self.communication_authorization,
+                )
+                .await
+                .unwrap_or(false);
                 json!({ "paired": paired })
             }
             PairingIpcOperation::Begin => {
@@ -363,6 +371,7 @@ impl PairingIpcServer {
                 }
             }
             PairingIpcOperation::Complete => {
+                self.communication_authorization.disable().await;
                 let payload = request.complete_payload().map_err(|_| ())?;
                 match self.pending.lock().await.take() {
                     None => error_response("PAIRING_UNAVAILABLE"),
@@ -375,11 +384,12 @@ impl PairingIpcServer {
                         .await
                     {
                         Ok(completion) => {
-                            match CloudControlRuntime::start_from_keychain_with_pairing_state(
+                            match CloudControlRuntime::start_from_keychain_with_pairing_state_and_authorization(
                                 Arc::clone(&self.database),
                                 Arc::clone(&self.store),
                                 pending.client.clone() as Arc<dyn ControlClient>,
                                 self.pairing_state_sender.clone(),
+                                self.communication_authorization.clone(),
                             )
                             .await
                             {

@@ -13,8 +13,8 @@ use pca_agentd::{
         PRODUCTION_CLOUD_API_ORIGIN,
     },
     communication::{
-        CommunicationControl, CommunicationIdentity, CommunicationRuntime,
-        UnavailableCommunicationProviderFactory,
+        CommunicationAuthorization, CommunicationControl, CommunicationIdentity,
+        CommunicationRuntime, UnavailableCommunicationProviderFactory,
     },
     pairing_ipc::{PairingIpcServer, PairingIpcServerError, PairingSocket},
 };
@@ -244,6 +244,7 @@ impl RuntimeResources {
         let (bridge_status_sender, mut bridge_status_receiver) =
             watch::channel(BridgeStatus::Disconnected);
         let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
+        let communication_authorization = CommunicationAuthorization::new();
 
         // A build with process hooks has no production Keychain identity; keeping those harnesses
         // explicitly unpaired prevents test-only identities from becoming a release input.
@@ -258,6 +259,7 @@ impl RuntimeResources {
                 ),
                 Arc::clone(&credential_store),
                 pairing_state_sender.clone(),
+                communication_authorization.clone(),
             )
             .await
             .ok()
@@ -294,6 +296,7 @@ impl RuntimeResources {
                 ),
                 credential_store,
                 pairing_state_sender,
+                communication_authorization.clone(),
                 pairing_shutdown_receiver,
             )
             .await?,
@@ -335,7 +338,7 @@ impl RuntimeResources {
 
         self.start_system_collector(config, pairing_valid).await?;
         self.communication_runtime = Some(
-            CommunicationRuntime::start(
+            CommunicationRuntime::start_authorized(
                 Arc::clone(
                     self.database
                         .as_ref()
@@ -343,7 +346,7 @@ impl RuntimeResources {
                 ),
                 config.paths.database_file.clone(),
                 Arc::new(UnavailableCommunicationProviderFactory),
-                CommunicationControl::unpaired(),
+                communication_authorization.clone(),
             )
             .await
             .map_err(|_| FailureStage::CommunicationCollector)?,
@@ -395,6 +398,7 @@ impl RuntimeResources {
                         .map_err(|_| FailureStage::State)?;
                         self.restart_system_collector(config, paired).await?;
                         if !paired {
+                            communication_authorization.disable().await;
                             self.apply_communication_control(None).await?;
                         }
                         self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
@@ -745,12 +749,19 @@ async fn start_pairing_server(
     database: Arc<DbActorHandle>,
     credential_store: Arc<dyn CredentialStore>,
     pairing_state_sender: watch::Sender<bool>,
+    communication_authorization: CommunicationAuthorization,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), PairingIpcServerError>>, FailureStage> {
     let socket = PairingSocket::bind(&config.paths.pairing_socket_file)
         .await
         .map_err(|_| FailureStage::PairingConfiguration)?;
-    let server = PairingIpcServer::new(socket, database, credential_store, pairing_state_sender);
+    let server = PairingIpcServer::new(
+        socket,
+        database,
+        credential_store,
+        pairing_state_sender,
+        communication_authorization,
+    );
     Ok(tokio::spawn(server.serve(shutdown)))
 }
 
@@ -758,15 +769,17 @@ async fn start_paired_control(
     database: Arc<DbActorHandle>,
     credential_store: Arc<dyn CredentialStore>,
     pairing_state_sender: watch::Sender<bool>,
+    communication_authorization: CommunicationAuthorization,
 ) -> Result<Option<CloudControlHandle>, FailureStage> {
     let origin =
         Url::parse(PRODUCTION_CLOUD_API_ORIGIN).map_err(|_| FailureStage::ControlConfiguration)?;
     let client = HttpControlClient::new(origin).map_err(|_| FailureStage::ControlConfiguration)?;
-    CloudControlRuntime::start_from_keychain_with_pairing_state(
+    CloudControlRuntime::start_from_keychain_with_pairing_state_and_authorization(
         database,
         credential_store,
         Arc::new(client) as Arc<dyn ControlClient>,
         pairing_state_sender,
+        communication_authorization,
     )
     .await
     .map_err(|_| FailureStage::ControlConfiguration)

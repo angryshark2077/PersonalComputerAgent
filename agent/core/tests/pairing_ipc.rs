@@ -5,6 +5,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use pca_agentd::communication::CommunicationAuthorization;
 use pca_agentd::pairing_ipc::{
     PairingIpcRequest, PairingIpcServer, PairingSocket, PairingSocketError,
 };
@@ -164,7 +165,13 @@ async fn authenticated_status_reports_an_unpaired_agent() {
         .expect("Bridge secret");
     let socket = PairingSocket::bind(&socket_path).await.expect("socket");
     let (pairing_state_sender, _) = watch::channel(false);
-    let server = PairingIpcServer::new(socket, Arc::clone(&database), store, pairing_state_sender);
+    let server = PairingIpcServer::new(
+        socket,
+        Arc::clone(&database),
+        store,
+        pairing_state_sender,
+        CommunicationAuthorization::new(),
+    );
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let server_task = tokio::spawn(server.serve(shutdown_receiver));
 
