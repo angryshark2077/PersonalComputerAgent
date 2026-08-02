@@ -263,6 +263,9 @@ git commit -m "feat: persist wechat messages atomically"
 - Create: `agent/core/src/communication.rs`
 - Modify: `agent/core/tests/cloud_control_process.rs`
 - Create: `agent/core/tests/communication_process.rs`
+- Modify: `crates/provider-contracts/src/lib.rs`
+- Modify: `crates/wechat-provider/src/{lib,source,eligibility}.rs`
+- Modify: `crates/wechat-provider/tests/provider_contract.rs`
 
 **Consumes:** Tasks 1–4.
 
@@ -290,12 +293,18 @@ Create `CommunicationRuntime` that owns the Provider task and cancels it on revo
 disabled config, or shutdown. It restarts only after bounded backoff for retryable `WECHAT_*`
 states. Copy completed source media into the private spool before `DbActor` commit; on quota or
 high-water error, do not advance cursor and retain no message body in memory. The supervisor must
-not import reqwest or Cloud client code.
+not import reqwest or Cloud client code. Extend the Provider boundary with one normalized,
+non-`Debug` record envelope carrying the validated message, WeChat account id, source sequence and
+completed-media descriptors required by Agent persistence; Agent Core must not interpret WeChat
+private schema or derive these fields from `source_key`. Enforce a **6 GiB** hard spool limit and
+resume media copying only below **5 GiB**; reject a copy before it starts when its declared size
+would cross the hard limit.
 
 - [ ] **Step 4: Run GREEN**
 
 Run: `cargo test -p pca-agent-core --test communication_process && cargo test -p pca-agent-core --test cloud_control_process`  
-Expected: PASS; control revision changes enable/disable safely and existing system collector still works.
+Expected: PASS; control revision changes enable/disable safely, 6 GiB/5 GiB spool hysteresis is
+deterministic, and the existing system collector still works.
 
 - [ ] **Step 5: Commit**
 
@@ -502,8 +511,9 @@ Expected: FAIL because upload state transitions do not exist.
 For each accepted event, request a prepare URL, stream the spool file with a timeout and byte
 limit, then call complete. Persist `prepared`, `uploading`, `completed`, and retry metadata in
 SQLite; retry only retryable network failures with the existing bounded policy. Revalidate file
-size and SHA-256 before upload. Delete a spool file only after Cloud completion and only when it is
-not otherwise retained. A VPN/proxy switch creates a fresh request path on retry. Before each
+size and SHA-256 before upload. Persist the Cloud/R2-verified `completed_at`; never delete a spool
+file in the upload operation. A separate local cleanup may delete it only after
+`completed_at + 7 days`. A VPN/proxy switch creates a fresh request path on retry. Before each
 pending event and attachment batch, fetch Owner-authorized Communication Tombstones from the Cloud
 endpoint and atomically mark matching local source keys terminal; tombstoned content must never be
 prepared, uploaded or re-synced.
@@ -547,6 +557,9 @@ test("expiry tombstones message before deleting its private object", async () =>
 });
 ```
 
+Add a Rust local-media case proving that a Cloud/R2-completed spool file exists through day 7 and
+is deleted after the 7-day grace without deleting the local message projection.
+
 - [ ] **Step 2: Run RED**
 
 Run: `pnpm --dir apps/cloud-worker test -- retention`  
@@ -558,13 +571,16 @@ Create a Worker-owned retention service with injected clock, repository and obje
 It selects due records in bounded pages, removes them from query eligibility, writes a Tombstone,
 deletes R2 with retries, and clears Cloud message body/display fields/search copies. Expose a
 device-authenticated, cursor-paginated Tombstone endpoint from Cloud API. Local cleanup deletes
-due body/spool data; the Agent applies fetched Tombstones before attempting sync. A device
+Cloud/R2-completed spool files after their 7-day local grace, while local message bodies/projections
+remain until the 180-day content deadline. At 180 days it deletes due body/spool data; the Agent
+applies fetched Tombstones before attempting sync. A device
 receiving a Tombstone must mark matching Outbox/message source keys terminal and must not upload.
 
 - [ ] **Step 4: Run GREEN**
 
 Run: `pnpm --dir apps/cloud-worker test -- retention && cargo test -p pca-db-local --test communication_retention`  
-Expected: PASS for 180-day expiry, repeated job invocation, object-delete failure and offline-device non-revival.
+Expected: PASS for 7-day completed-local-media cleanup, 180-day content expiry, repeated job
+invocation, object-delete failure and offline-device non-revival.
 
 - [ ] **Step 5: Commit**
 

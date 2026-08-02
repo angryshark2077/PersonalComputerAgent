@@ -1,7 +1,7 @@
 # WeChat 双向多媒体采集设计
 
 **日期：** 2026-08-02  
-**状态：** 待用户审核  
+**状态：** 已批准，实施中
 **替代：** `2026-07-31-wechat-outbound-message-collector-design.md` 的实施范围；旧文档保留为历史决策记录。  
 **前置条件：** 已完成 S1B 真实配对、设备鉴权、控制面配置、Local Event/Outbox 和系统指标同步。
 
@@ -16,7 +16,9 @@ Provider。它只读 WeChat 的本地消息数据库、WAL 与已落地媒体文
 - 收到和发出的消息；
 - 文本、语音、图片、视频；
 - 一对一会话，以及 Provider 能可靠确认总成员数 **小于或等于 8** 的群；
-- 本地、Cloud 索引和 R2 原件保存 180 天；
+- 本地消息正文/投影、Cloud 索引和 R2 原件保存 180 天；Mac 本地媒体 spool
+  硬上限为 **6 GiB**，使用量降到 **5 GiB** 以下后恢复复制；Cloud 事件已接受且
+  R2 对象完成 hash、字节数和 MIME 校验后，本地媒体再保留 7 天并删除；
 - 原件放入私有 Cloudflare R2 Bucket，Dashboard 使用短期签名 URL 预览或播放。
 
 以下内容不在范围内：键盘钩子、IME、草稿、剪贴板、通知内容、屏幕/Accessibility
@@ -109,9 +111,12 @@ KeyMaterial 仅存在 macOS Keychain；SQLite 仅保存 credential reference、�
 和 attachment hash 约束保证重复 WAL 通知、重启、崩溃恢复和重试最多产生一次消息投影。
 
 为保证原件在断网时不被 WeChat 清理，Agent 在同一落盘成功路径把完整媒体拷贝到
-PCA 私有 attachment spool；spool 目录权限仅允许当前用户，受配额和 Outbox 高/低水位
-共同限制。若没有空间、无法复制或 Outbox 已到高水位，则不推进该 Cursor、不在内存保留
-正文/媒体，稍后重新读取。Cloud 确认对象完成且本地保留策略允许后，才删除临时上传副本。
+PCA 私有 attachment spool；spool 目录权限仅允许当前用户，并采用 **6 GiB 硬上限 / 5 GiB
+恢复水位**，同时受 Outbox 高/低水位限制。当前用量加待复制文件会超过 6 GiB、没有空间、
+无法复制或 Outbox 已到高水位时，不推进该 Cursor、不在内存保留正文/媒体，稍后重新读取。
+Cloud 事件已接受且 R2 对象经 hash、字节数和 MIME 校验标记完成后，以完成时间起算 7 天；
+到期才幂等删除 Mac 本地媒体文件。上传未完成、校验失败或完成状态不确定时绝不删除。
+本地消息正文/投影、Cloud 索引和 R2 原件仍按 180 天策略处理。
 
 ## 6. 云端同步、R2 与查询
 
@@ -132,8 +137,10 @@ Cloud 表拆分为 conversations、messages、message_attachments、object recor
 
 ## 7. 180 天保留与删除
 
-每日保留任务按 `occurred_at` 计算到期时间，先让内容退出 Dashboard/API 查询和签名资格，
-再创建 Tombstone，物理删除 R2 原件、Cloud 正文/显示名/搜索副本和本地正文/媒体副本。
+本地媒体清理任务只处理 Cloud/R2 已确认完成且 `completed_at + 7 days` 到期的 spool 文件；
+它不删除本地消息正文/投影，也不缩短 Cloud/R2 的 180 天保留期。每日内容保留任务按
+`occurred_at` 计算 180 天到期时间，先让内容退出 Dashboard/API 查询和签名资格，再创建
+Tombstone，物理删除 R2 原件、Cloud 正文/显示名/搜索副本和剩余本地正文/媒体副本。
 删除操作可重试、幂等，并分别记录对象删除失败而不重新暴露内容。到期后可保留不含内容的
 审计与删除事实。用户显式删除沿同一 Tombstone 路径执行；离线设备收到 Tombstone 后不得
 重新上传旧 Outbox 或复活内容。
