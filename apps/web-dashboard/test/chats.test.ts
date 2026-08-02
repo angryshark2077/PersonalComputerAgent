@@ -6,6 +6,7 @@ import {
   chatReadStorageKey,
   getCommunicationConversations,
   getCommunicationMessages,
+  getCommunicationObjectReadUrl,
   initializeChatReadAt,
   isConversationUnread,
 } from "../src/lib/api.ts";
@@ -68,5 +69,22 @@ test("loads older messages with a stable timestamp and event cursor", async () =
   assert.equal(
     requested,
     "https://cloud.example/v1/devices/device/communication/conversations/room%40chatroom/messages?limit=100&before=2026-08-02T10%3A00%3A00.000Z&before_event_id=01986666-7666-8666-8666-666666666667",
+  );
+});
+
+test("loads a short private read URL for one completed media object", async () => {
+  let requested = "";
+  const url = await getCommunicationObjectReadUrl(async (input) => {
+    requested = String(input);
+    return new Response(JSON.stringify({
+      url: "https://private.example/signed",
+      expires_at: "2026-08-02T10:05:00.000Z",
+    }), { status: 200 });
+  }, "https://cloud.example", "device/id", "object/id");
+
+  assert.equal(url, "https://private.example/signed");
+  assert.equal(
+    requested,
+    "https://cloud.example/v1/devices/device%2Fid/communication/objects/object%2Fid/read",
   );
 });

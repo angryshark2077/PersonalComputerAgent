@@ -22,6 +22,9 @@ EXPECTED_MIGRATIONS = {
         "0004_s1b_cloud_api_origin.sql",
         "0005_wechat_messages.sql",
         "0006_harden_attachment_spool.sql",
+        "0007_expand_group_limit.sql",
+        "0008_attachment_completion_retention.sql",
+        "0009_allow_message_kind_sequence_overlap.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",
@@ -33,6 +36,9 @@ EXPECTED_MIGRATIONS = {
         "0006_communication_event_inbox.sql",
         "0007_communication_projections.sql",
         "0008_communication_objects.sql",
+        "0009_communication_conversation_names.sql",
+        "0010_communication_message_senders.sql",
+        "0011_communication_avatars.sql",
     ],
 }
 

@@ -128,7 +128,7 @@ struct StoredWechatDatabaseKeyMaterial {
 ///
 /// The relative path is non-secret routing metadata. Key and salt bytes remain redacted from
 /// `Debug` and can only be read by the native read-only database adapter.
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct WechatDatabaseKeyMaterial {
     database_path: Option<String>,
     raw_key: [u8; WECHAT_RAW_KEY_LENGTH],
@@ -311,6 +311,34 @@ impl WechatKeyMaterial {
                 .as_deref()
                 .is_none_or(|relative| database_path.ends_with(relative))
         })
+    }
+
+    /// Adds an exact database route using key bytes already validated for another database.
+    ///
+    /// Passphrase-backed WCDB handles reuse the passphrase directly. Raw-key records receive the
+    /// destination database salt before validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidCredential`] when the source route is absent or the
+    /// destination route is invalid or duplicated.
+    pub fn with_database_route_from(
+        &self,
+        source_database_path: &Path,
+        destination_path: &str,
+        destination_salt: [u8; WECHAT_SQLCIPHER_SALT_LENGTH],
+    ) -> Result<Self, CredentialError> {
+        let source = self
+            .key_for_database(source_database_path)
+            .ok_or(CredentialError::InvalidCredential)?;
+        let destination = if source.salt.is_some() {
+            WechatDatabaseKeyMaterial::new(destination_path, source.raw_key, destination_salt)?
+        } else {
+            WechatDatabaseKeyMaterial::new_passphrase(destination_path, source.raw_key)?
+        };
+        let mut database_keys = self.database_keys.clone();
+        database_keys.push(destination);
+        Self::new_for_databases(&self.account_id, database_keys)
     }
 
     /// Encodes this value solely for storage in the fixed Keychain item.

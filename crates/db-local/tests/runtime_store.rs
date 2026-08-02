@@ -241,7 +241,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 7);
+    assert_eq!(health.schema_version, 9);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -329,7 +329,7 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        7
+        9
     );
     db.shutdown().await.expect("close upgraded database");
 
@@ -900,7 +900,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0008', 'future', '9.0.0', 1, 1, 'completed')",
+             VALUES ('0010', 'future', '10.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -911,8 +911,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 8,
-            max_supported: 7
+            found: 10,
+            max_supported: 9
         })
     ));
 }
@@ -935,7 +935,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 7);
+    assert_eq!(health.schema_version, 9);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(
@@ -1068,4 +1068,17 @@ async fn system_sync_batch_excludes_lifecycle_events_and_acks_only_accepted_syst
         .expect("reload pending system events")
         .is_empty());
     assert_eq!(db.active_outbox_depth().await.expect("outbox depth"), 1);
+}
+
+#[tokio::test]
+async fn clean_database_has_no_pending_communication_attachments() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    assert!(db
+        .load_pending_communication_attachments(4)
+        .await
+        .expect("load empty attachment queue")
+        .is_empty());
 }

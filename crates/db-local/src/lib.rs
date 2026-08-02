@@ -37,6 +37,12 @@ pub const HARDEN_ATTACHMENT_SPOOL_MIGRATION: &str =
 /// Expands the verified small-group limit while preserving existing communication rows.
 pub const EXPAND_GROUP_LIMIT_MIGRATION: &str =
     include_str!("../migrations/0007_expand_group_limit.sql");
+/// Records verified Cloud completion time for seven-day local media cleanup.
+pub const ATTACHMENT_COMPLETION_RETENTION_MIGRATION: &str =
+    include_str!("../migrations/0008_attachment_completion_retention.sql");
+/// Allows different WeChat message kinds to use the same conversation-local source sequence.
+pub const ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION: &str =
+    include_str!("../migrations/0009_allow_message_kind_sequence_overlap.sql");
 
 /// A private spool-file reference corresponding to one validated media manifest.
 ///
@@ -47,6 +53,18 @@ pub struct CommunicationAttachmentSpoolReference {
     pub attachment_id: String,
     /// Fixed lower-case SHA-256 filename, stored directly below the private spool root.
     pub file_name: String,
+}
+
+/// One acknowledged communication attachment ready for a bounded Cloud upload attempt.
+///
+/// The byte body deliberately has no `Debug` implementation so diagnostics cannot print media.
+pub struct PendingCommunicationAttachment {
+    pub event_id: String,
+    pub attachment_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
 }
 
 /// The complete local atomic-write input for one eligible communication message.
@@ -122,9 +140,9 @@ pub struct DbHealth {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASELINE_MIGRATION, HARDEN_ATTACHMENT_SPOOL_MIGRATION, S1A_RUNTIME_MIGRATION,
-        S1B_CLOUD_API_ORIGIN_MIGRATION, S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION,
-        WECHAT_MESSAGES_MIGRATION,
+        ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION, BASELINE_MIGRATION,
+        HARDEN_ATTACHMENT_SPOOL_MIGRATION, S1A_RUNTIME_MIGRATION, S1B_CLOUD_API_ORIGIN_MIGRATION,
+        S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION, WECHAT_MESSAGES_MIGRATION,
     };
 
     #[test]
@@ -177,5 +195,13 @@ mod tests {
     #[test]
     fn attachment_spool_fix_requires_the_sha256_filename() {
         assert!(HARDEN_ATTACHMENT_SPOOL_MIGRATION.contains("spool_relative_path <> NEW.sha256"));
+    }
+
+    #[test]
+    fn message_kind_sequence_overlap_keeps_source_key_as_the_idempotency_boundary() {
+        assert!(!ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION
+            .contains("UNIQUE (account_id, external_conversation_id, source_sequence)"));
+        assert!(ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION
+            .contains("UNIQUE (account_id, source_key)"));
     }
 }

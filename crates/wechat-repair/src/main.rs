@@ -19,6 +19,7 @@ use std::{
     time::Duration,
 };
 
+use pca_domain::MessageKind;
 use pca_keychain::{
     load_wechat_key_material, MacOSKeychainStore, WechatDatabaseKeyMaterial, WechatKeyMaterial,
 };
@@ -78,7 +79,26 @@ fn probe_messages() -> Result<(), RepairError> {
             provider.poll_once().await
         })
         .map_err(|_| RepairError::MessageProbeFailed)?;
-    println!("Eligible text records: {}", records.len());
+    let mut text = 0;
+    let mut image = 0;
+    let mut audio = 0;
+    let mut video = 0;
+    for record in &records {
+        match record.message().kind() {
+            MessageKind::Text => text += 1,
+            MessageKind::Image => image += 1,
+            MessageKind::Audio => audio += 1,
+            MessageKind::Video => video += 1,
+        }
+    }
+    println!(
+        "Eligible records: total={} text={} image={} audio={} video={}",
+        records.len(),
+        text,
+        image,
+        audio,
+        video
+    );
     Ok(())
 }
 
@@ -101,6 +121,10 @@ fn probe_schema() -> Result<(), RepairError> {
 
 fn run() -> Result<(), RepairError> {
     let source = discover_source()?;
+    if reuse_existing_key_for_hardlink(&source)? {
+        println!("Validated the existing WCDB credential for hardlink.db.");
+        return Ok(());
+    }
     let candidates = collect_candidates()?;
     println!(
         "Found {} bounded WCDB key candidates; validating required databases.",
@@ -142,9 +166,44 @@ fn run() -> Result<(), RepairError> {
     Ok(())
 }
 
+fn reuse_existing_key_for_hardlink(source: &Source) -> Result<bool, RepairError> {
+    const MESSAGE_PATH: &str = "db_storage/message/message_0.db";
+    const HARDLINK_PATH: &str = "db_storage/hardlink/hardlink.db";
+
+    let Some(material) =
+        load_wechat_key_material(&MacOSKeychainStore).map_err(|_| RepairError::Keychain)?
+    else {
+        return Ok(false);
+    };
+    let message = source
+        .databases
+        .iter()
+        .find(|database| database.relative_path == MESSAGE_PATH)
+        .ok_or(RepairError::SourceUnavailable)?;
+    let hardlink = source
+        .databases
+        .iter()
+        .find(|database| database.relative_path == HARDLINK_PATH)
+        .ok_or(RepairError::SourceUnavailable)?;
+    let extended = if material.key_for_database(&hardlink.absolute_path).is_some() {
+        material
+    } else {
+        material
+            .with_database_route_from(&message.absolute_path, HARDLINK_PATH, hardlink.salt)
+            .map_err(|_| RepairError::Keychain)?
+    };
+    if validate_recovered_key(&hardlink.absolute_path, &extended, Duration::from_secs(2)).is_err() {
+        return Ok(false);
+    }
+    MacOSKeychainStore
+        .store_validated_wechat_key_material(&extended)
+        .map_err(|_| RepairError::Keychain)?;
+    Ok(true)
+}
+
 struct Source {
     account_root: PathBuf,
-    databases: [SourceDatabase; 3],
+    databases: [SourceDatabase; 4],
 }
 
 struct SourceDatabase {
@@ -237,6 +296,7 @@ fn discover_source() -> Result<Source, RepairError> {
             path.join("db_storage/session/session.db").is_file()
                 && path.join("db_storage/contact/contact.db").is_file()
                 && path.join("db_storage/message/message_0.db").is_file()
+                && path.join("db_storage/hardlink/hardlink.db").is_file()
         });
     let account_root = accounts.next().ok_or(RepairError::SourceUnavailable)?;
     if accounts.next().is_some() {
@@ -246,6 +306,7 @@ fn discover_source() -> Result<Source, RepairError> {
         source_database(&account_root, "db_storage/session/session.db")?,
         source_database(&account_root, "db_storage/contact/contact.db")?,
         source_database(&account_root, "db_storage/message/message_0.db")?,
+        source_database(&account_root, "db_storage/hardlink/hardlink.db")?,
     ];
     Ok(Source {
         account_root,

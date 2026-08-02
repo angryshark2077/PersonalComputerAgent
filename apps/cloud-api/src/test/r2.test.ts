@@ -33,3 +33,26 @@ test("R2 configuration rejects non-private or insecure storage", () => {
     /must be false/,
   );
 });
+
+test("R2 upload signatures keep the integrity metadata in the signed request headers", async () => {
+  const store = createR2ObjectStore({
+    R2_ENDPOINT: "https://storage.example",
+    R2_ACCESS_KEY_ID: "key",
+    R2_SECRET_ACCESS_KEY: "secret",
+    R2_BUCKET: "media",
+    R2_BUCKET_PUBLIC: "false",
+  });
+  if (store === undefined) assert.fail("R2 object store was not created");
+
+  const upload = await store.signUpload({
+    objectKey: "communication/object",
+    expectedSha256: "a".repeat(64),
+    expectedSizeBytes: 17,
+    expectedMimeType: "image/jpeg",
+  });
+  const url = new URL(upload.url);
+
+  assert.equal(url.searchParams.has("x-amz-meta-sha256"), false);
+  assert.match(url.searchParams.get("X-Amz-SignedHeaders") ?? "", /(?:^|;)x-amz-meta-sha256(?:;|$)/);
+  assert.equal(upload.headers["x-amz-meta-sha256"], "a".repeat(64));
+});

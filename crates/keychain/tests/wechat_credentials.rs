@@ -140,6 +140,32 @@ fn preserves_a_database_scoped_wechat_passphrase_without_a_raw_key_salt() {
 }
 
 #[test]
+fn extends_a_passphrase_credential_with_an_exact_database_route() {
+    let expected_key = [0x24; 32];
+    let message =
+        WechatDatabaseKeyMaterial::new_passphrase("db_storage/message/message_0.db", expected_key)
+            .expect("message passphrase");
+    let material = WechatKeyMaterial::new_for_databases("local-account-proof", vec![message])
+        .expect("database key set");
+
+    let extended = material
+        .with_database_route_from(
+            Path::new("/private/account/db_storage/message/message_0.db"),
+            "db_storage/hardlink/hardlink.db",
+            [0x35; 16],
+        )
+        .expect("hardlink route");
+
+    let hardlink = extended
+        .key_for_database(Path::new(
+            "/private/account/db_storage/hardlink/hardlink.db",
+        ))
+        .expect("exact hardlink key");
+    assert_eq!(hardlink.raw_key(), &expected_key);
+    assert_eq!(hardlink.salt(), None);
+}
+
+#[test]
 fn rejects_noncanonical_or_duplicate_database_paths() {
     assert_eq!(
         WechatDatabaseKeyMaterial::new("../message.db", [0x31; 32], [0x41; 16]).unwrap_err(),

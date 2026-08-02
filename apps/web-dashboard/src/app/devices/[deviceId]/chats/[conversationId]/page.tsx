@@ -12,6 +12,7 @@ import {
   decodeDashboardRouteParam,
   getCommunicationConversations,
   getCommunicationMessages,
+  getCommunicationObjectReadUrl,
   type DashboardMessage,
 } from "../../../../../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../../../../../lib/auth";
@@ -142,7 +143,7 @@ export default function ChatMessagesPage() {
                     <article className="message-bubble">
                       {message.kind === "text"
                         ? <p className="message-text">{message.text}</p>
-                        : <MediaSummary message={message} />}
+                        : <MediaSummary deviceId={deviceId} message={message} />}
                       <p className="message-meta">
                         {message.direction === "incoming" ? "Received" : "Sent"} · {formatTime(message.occurred_at)}
                       </p>
@@ -170,9 +171,32 @@ function initial(name: string): string {
   return Array.from(name.trim())[0]?.toUpperCase() ?? "?";
 }
 
-function MediaSummary({ message }: { message: DashboardMessage }) {
+function MediaSummary({ deviceId, message }: { deviceId: string; message: DashboardMessage }) {
   const attachment = message.attachments[0];
+  const [mediaUrl, setMediaUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (message.kind !== "image" || attachment?.object_state !== "completed" || attachment.object_id === null) {
+      return;
+    }
+    let active = true;
+    void getCommunicationObjectReadUrl(
+      window.fetch,
+      cloudApiOrigin(),
+      deviceId,
+      attachment.object_id,
+    ).then((url) => {
+      if (active) setMediaUrl(url);
+    }).catch(() => {
+      if (active) setMediaUrl(null);
+    });
+    return () => {
+      active = false;
+    };
+  }, [attachment?.object_id, attachment?.object_state, deviceId, message.kind]);
   if (attachment === undefined) return <p className="message-attachment">{message.kind} · file unavailable</p>;
+  if (message.kind === "image" && mediaUrl !== null) {
+    return <img className="message-image" src={mediaUrl} alt="Synchronized WeChat image" loading="lazy" />;
+  }
   return (
     <p className="message-attachment">
       {message.kind} · {(attachment.size_bytes / (1024 ** 2)).toFixed(1)} MiB · {attachment.object_state ?? "pending upload"}

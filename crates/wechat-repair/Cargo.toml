@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 libc = "=0.2.189"
+pca-domain = { path = "../domain" }
 pca-keychain = { path = "../keychain" }
 pca-provider-contracts = { path = "../provider-contracts" }
 pca-wechat-provider = { path = "../wechat-provider" }

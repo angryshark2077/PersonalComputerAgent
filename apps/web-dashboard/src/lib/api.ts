@@ -212,6 +212,22 @@ export async function getCommunicationMessages(
   return result.messages;
 }
 
+export async function getCommunicationObjectReadUrl(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+  objectId: string,
+): Promise<string> {
+  const result = await jsonRequest<{ url: string; expires_at: string }>(
+    fetcher,
+    apiUrl(
+      cloudApiOrigin,
+      `/v1/devices/${encodeURIComponent(deviceId)}/communication/objects/${encodeURIComponent(objectId)}/read`,
+    ),
+  );
+  return result.url;
+}
+
 export async function updateCollectorConfig(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,

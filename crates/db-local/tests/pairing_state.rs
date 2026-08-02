@@ -50,7 +50,7 @@ async fn pairing_state_is_absent_until_validated_credentials_are_saved() {
     assert!(db.save_control_revision(1).await.is_err());
     assert_eq!(
         db.health().await.expect("database health").schema_version,
-        7
+        9
     );
 }
 

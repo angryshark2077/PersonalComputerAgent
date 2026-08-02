@@ -243,6 +243,46 @@ async fn source_key_creates_one_message_outbox_cursor_and_spool_reference() {
 }
 
 #[tokio::test]
+async fn cloud_completed_media_is_deleted_only_after_the_local_retention_cutoff() {
+    let (_directory, path) = database_path();
+    let store = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let commit = valid_commit(&path);
+    let spool_file =
+        DbActorHandle::communication_spool_root(&path).join(&commit.attachment_spool[0].file_name);
+    store
+        .commit_communication_message(&commit)
+        .await
+        .expect("commit communication message");
+    store
+        .acknowledge_communication_events(std::slice::from_ref(&commit.event.event_id))
+        .await
+        .expect("acknowledge communication event");
+    store
+        .complete_communication_attachment("attachment-1")
+        .await
+        .expect("complete attachment");
+
+    assert_eq!(
+        store
+            .cleanup_completed_communication_attachments(i64::MIN)
+            .await
+            .expect("retain recent body"),
+        0
+    );
+    assert!(spool_file.is_file());
+    assert_eq!(
+        store
+            .cleanup_completed_communication_attachments(i64::MAX)
+            .await
+            .expect("delete expired body"),
+        1
+    );
+    assert!(!spool_file.exists());
+}
+
+#[tokio::test]
 async fn source_path_outside_private_spool_root_leaves_no_partial_communication_rows() {
     let (_directory, path) = database_path();
     let store = DbActorHandle::open(&path, "0.1.0")
@@ -469,7 +509,7 @@ async fn duplicate_rejects_when_persisted_spool_metadata_differs() {
 }
 
 #[tokio::test]
-async fn same_conversation_sequence_with_different_source_key_is_rejected() {
+async fn same_conversation_sequence_with_different_source_key_is_allowed() {
     let (_directory, path) = database_path();
     let store = DbActorHandle::open(&path, "0.1.0")
         .await
@@ -488,12 +528,13 @@ async fn same_conversation_sequence_with_different_source_key_is_rejected() {
         "attachment-2",
     );
     conflicting.source_sequence = first.source_sequence;
+    conflicting.attachment_spool[0].attachment_id = "attachment-2".to_owned();
 
-    assert!(store
+    store
         .commit_communication_message(&conflicting)
         .await
-        .is_err());
-    assert_eq!(row_counts(&path), (1, 1, 1, 1, 1, 1));
+        .expect("different source keys may share a conversation-local sequence");
+    assert_eq!(row_counts(&path), (2, 1, 2, 2, 1, 2));
     assert_eq!(cursor_sequence(&path), 1);
 }
 

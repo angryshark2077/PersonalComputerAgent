@@ -1,10 +1,11 @@
-use std::{collections::HashSet, fs::File, os::unix::fs::MetadataExt, path::Path};
+use std::{collections::HashSet, fs::File, io::Read, os::unix::fs::MetadataExt, path::Path};
 
 use pca_domain::{
     AgentStatus, BridgeStatus, CollectorState, CollectorStatus, CommunicationAttachment,
     ConversationScope, Direction, EventCommit, EventEnvelope, MessageKind, Sensitivity,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[cfg(feature = "process-test-hooks")]
@@ -19,7 +20,7 @@ use std::{
 use crate::actor::{ProcessTestBarrier, ProcessTestHooks};
 use crate::{
     migrations::MAX_SUPPORTED_SCHEMA_VERSION, CommunicationMessageCommit, DbError, DbHealth,
-    PairingState,
+    PairingState, PendingCommunicationAttachment,
 };
 
 struct SerializedEvent<'a> {
@@ -1311,6 +1312,155 @@ pub(crate) fn acknowledge_communication_events(
         .map_err(|error| DbError::sqlite("commit communication event acknowledgement", error))
 }
 
+pub(crate) fn load_pending_communication_attachments(
+    connection: &Connection,
+    spool_root: &Path,
+    limit: u16,
+) -> Result<Vec<PendingCommunicationAttachment>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT m.event_id, s.attachment_id, s.sha256, s.size_bytes, s.mime_type,
+                    s.spool_relative_path
+             FROM attachment_spool AS s
+             INNER JOIN communication_messages AS m
+                ON m.local_message_id = s.local_message_id
+             INNER JOIN sync_outbox AS o ON o.event_id = m.event_id
+             WHERE o.state = 'acked' AND s.transfer_state <> 'completed'
+             ORDER BY s.created_at_ms, s.attachment_id
+             LIMIT ?1",
+        )
+        .map_err(|error| DbError::sqlite("prepare pending attachment query", error))?;
+    let rows = statement
+        .query_map([i64::from(limit)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|error| DbError::sqlite("query pending attachments", error))?;
+    let mut pending = Vec::new();
+    for row in rows {
+        let (event_id, attachment_id, sha256, size_bytes, mime_type, file_name) =
+            row.map_err(|error| DbError::sqlite("read pending attachment", error))?;
+        let expected_size = u64::try_from(size_bytes).map_err(|_| {
+            DbError::sqlite("read pending attachment", "attachment size is invalid")
+        })?;
+        let mut file = open_communication_spool_file(spool_root, &file_name)?;
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(expected_size).map_err(|_| {
+                DbError::sqlite("read pending attachment", "attachment is too large")
+            })?);
+        file.read_to_end(&mut bytes)
+            .map_err(|error| DbError::sqlite("read pending attachment body", error))?;
+        if u64::try_from(bytes.len()).ok() != Some(expected_size)
+            || format!("{:x}", Sha256::digest(&bytes)) != sha256
+        {
+            return Err(DbError::sqlite(
+                "verify pending attachment body",
+                "attachment body does not match immutable manifest",
+            ));
+        }
+        pending.push(PendingCommunicationAttachment {
+            event_id,
+            attachment_id,
+            sha256,
+            size_bytes: expected_size,
+            mime_type,
+            bytes,
+        });
+    }
+    Ok(pending)
+}
+
+pub(crate) fn complete_communication_attachment(
+    connection: &Connection,
+    attachment_id: &str,
+) -> Result<(), DbError> {
+    let updated = connection
+        .execute(
+            "UPDATE attachment_spool
+             SET transfer_state = 'completed',
+                 completed_at_ms = CAST(unixepoch('now', 'subsec') * 1000 AS INTEGER)
+             WHERE attachment_id = ?1 AND transfer_state <> 'completed'",
+            [attachment_id],
+        )
+        .map_err(|error| DbError::sqlite("complete communication attachment", error))?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "complete communication attachment",
+            "attachment was not pending",
+        ))
+    }
+}
+
+pub(crate) fn cleanup_completed_communication_attachments(
+    connection: &Connection,
+    spool_root: &Path,
+    cutoff_ms: i64,
+) -> Result<u64, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT current.spool_relative_path
+             FROM attachment_spool AS current
+             WHERE current.transfer_state = 'completed'
+               AND current.completed_at_ms IS NOT NULL
+               AND current.completed_at_ms <= ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM attachment_spool AS other
+                   WHERE other.spool_relative_path = current.spool_relative_path
+                     AND (
+                         other.transfer_state <> 'completed'
+                         OR other.completed_at_ms IS NULL
+                         OR other.completed_at_ms > ?1
+                     )
+               )",
+        )
+        .map_err(|error| DbError::sqlite("prepare completed attachment cleanup", error))?;
+    let files = statement
+        .query_map([cutoff_ms], |row| row.get::<_, String>(0))
+        .map_err(|error| DbError::sqlite("query completed attachment cleanup", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DbError::sqlite("read completed attachment cleanup", error))?;
+    let mut removed = 0_u64;
+    for file_name in files {
+        validate_spool_file_name(&file_name)?;
+        match remove_communication_spool_file(spool_root, &file_name) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DbError::sqlite(
+                    "delete completed communication attachment",
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn remove_communication_spool_file(
+    spool_root: &Path,
+    file_name: &str,
+) -> Result<(), std::io::Error> {
+    let directory = rustix::fs::open(
+        spool_root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)?;
+    rustix::fs::unlinkat(&directory, file_name, rustix::fs::AtFlags::empty())
+        .map_err(std::io::Error::from)
+}
+
 fn format_timestamp(milliseconds: i64) -> Result<String, DbError> {
     let nanos = i128::from(milliseconds)
         .checked_mul(1_000_000)
@@ -1385,7 +1535,7 @@ pub(crate) fn smoke_queries(connection: &Connection) -> Result<(), DbError> {
         "SELECT account_id, external_conversation_id, last_source_sequence, updated_at_ms
          FROM communication_cursors LIMIT 1",
         "SELECT attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
-                spool_relative_path, transfer_state, created_at_ms
+                spool_relative_path, transfer_state, created_at_ms, completed_at_ms
          FROM attachment_spool LIMIT 1",
         "SELECT account_id, source_key, tombstoned_at_ms FROM local_tombstones LIMIT 1",
     ] {

@@ -11,7 +11,10 @@ use pca_domain::{AgentStatus, BridgeStatus, CollectorState, EventCommit, EventEn
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{migrations, repository, CommunicationMessageCommit, DbError, DbHealth, PairingState};
+use crate::{
+    migrations, repository, CommunicationMessageCommit, DbError, DbHealth, PairingState,
+    PendingCommunicationAttachment,
+};
 
 const REQUEST_CAPACITY: usize = 64;
 
@@ -171,6 +174,18 @@ enum Request {
         event_ids: Vec<String>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    LoadPendingCommunicationAttachments {
+        limit: u16,
+        response: oneshot::Sender<Result<Vec<PendingCommunicationAttachment>, DbError>>,
+    },
+    CompleteCommunicationAttachment {
+        attachment_id: String,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    CleanupCompletedCommunicationAttachments {
+        cutoff_ms: i64,
+        response: oneshot::Sender<Result<u64, DbError>>,
+    },
 }
 
 impl Request {
@@ -187,14 +202,19 @@ impl Request {
             | Self::Checkpoint { response }
             | Self::AcknowledgeSystemEvents { response, .. }
             | Self::CommitCommunicationMessage { response, .. }
-            | Self::AcknowledgeCommunicationEvents { response, .. } => response.is_closed(),
+            | Self::AcknowledgeCommunicationEvents { response, .. }
+            | Self::CompleteCommunicationAttachment { response, .. } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
             Self::LoadPairingState { response } => response.is_closed(),
             Self::Health { response } => response.is_closed(),
             Self::CountEventAndOutbox { response, .. } => response.is_closed(),
-            Self::ActiveOutboxDepth { response } => response.is_closed(),
+            Self::ActiveOutboxDepth { response }
+            | Self::CleanupCompletedCommunicationAttachments { response, .. } => {
+                response.is_closed()
+            }
             Self::LoadPendingSystemEvents { response, .. }
             | Self::LoadPendingCommunicationEvents { response, .. } => response.is_closed(),
+            Self::LoadPendingCommunicationAttachments { response, .. } => response.is_closed(),
         }
     }
 }
@@ -658,6 +678,61 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Loads acknowledged attachment bodies for bounded upload attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, query, spool-open, or immutable-manifest verification error.
+    pub async fn load_pending_communication_attachments(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<PendingCommunicationAttachment>, DbError> {
+        validate_communication_limit("load pending communication attachments", limit)?;
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::LoadPendingCommunicationAttachments {
+            limit,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Marks one exact attachment completed after Cloud verifies its immutable manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or database error, including when the attachment is not pending.
+    pub async fn complete_communication_attachment(
+        &self,
+        attachment_id: &str,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::CompleteCommunicationAttachment {
+            attachment_id: attachment_id.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Deletes Cloud-confirmed media bodies at or before the caller-provided retention cutoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, query, path-validation, or filesystem deletion error.
+    pub async fn cleanup_completed_communication_attachments(
+        &self,
+        cutoff_ms: i64,
+    ) -> Result<u64, DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::CleanupCompletedCommunicationAttachments {
+            cutoff_ms,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Closes the request queue, waits without blocking the async executor, and joins the owner.
     ///
     /// Requests whose response futures were canceled are skipped before they touch `SQLite`.
@@ -869,6 +944,32 @@ fn run(
                 let _ = response.send(repository::acknowledge_communication_events(
                     &mut connection,
                     &event_ids,
+                ));
+            }
+            Request::LoadPendingCommunicationAttachments { limit, response } => {
+                let _ = response.send(repository::load_pending_communication_attachments(
+                    &connection,
+                    communication_spool_root,
+                    limit,
+                ));
+            }
+            Request::CompleteCommunicationAttachment {
+                attachment_id,
+                response,
+            } => {
+                let _ = response.send(repository::complete_communication_attachment(
+                    &connection,
+                    &attachment_id,
+                ));
+            }
+            Request::CleanupCompletedCommunicationAttachments {
+                cutoff_ms,
+                response,
+            } => {
+                let _ = response.send(repository::cleanup_completed_communication_attachments(
+                    &connection,
+                    communication_spool_root,
+                    cutoff_ms,
                 ));
             }
         }

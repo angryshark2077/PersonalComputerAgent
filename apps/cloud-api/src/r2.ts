@@ -77,7 +77,10 @@ class S3R2ObjectStore implements R2ObjectStore {
         ContentLength: descriptor.expectedSizeBytes,
         Metadata: { sha256: descriptor.expectedSha256 },
       }),
-      { expiresIn: r2SignedUrlLifetimeSeconds },
+      {
+        expiresIn: r2SignedUrlLifetimeSeconds,
+        unhoistableHeaders: new Set(["x-amz-meta-sha256"]),
+      },
     );
     return {
       url,

@@ -1,8 +1,10 @@
-use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
+};
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use pca_db_local::{DbActorHandle, DbError, PairingState};
+use pca_db_local::{DbActorHandle, DbError, PairingState, PendingCommunicationAttachment};
 use pca_domain::{CommunicationScopeV2, EventEnvelope};
 use pca_keychain::{
     delete_device_credential, load_device_credential, store_device_credential, CredentialError,
@@ -26,6 +28,7 @@ const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
 const CONTROL_OWNER_COMMAND_CAPACITY: usize = 8;
+const LOCAL_MEDIA_RETENTION: Duration = Duration::from_hours(168);
 pub const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.up.railway.app";
 
 /// Future returned by the small Cloud-control port.
@@ -68,6 +71,14 @@ pub trait ControlClient: Send + Sync {
     ) -> ControlFuture<'a, SyncEventsResponse> {
         Box::pin(async { Err(ControlError::Contract) })
     }
+
+    fn sync_communication_attachment<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: &'a PendingCommunicationAttachment,
+    ) -> ControlFuture<'a, ()> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -82,6 +93,25 @@ pub struct SyncEventsResponse {
 struct SyncEventRejection {
     #[serde(rename = "event_id")]
     _event_id: String,
+}
+
+#[derive(Deserialize)]
+struct PreparedCommunicationObject {
+    object_id: String,
+    state: String,
+    upload: Option<PreparedCommunicationUpload>,
+}
+
+#[derive(Deserialize)]
+struct PreparedCommunicationUpload {
+    url: String,
+    headers: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct CompletedCommunicationObject {
+    object_id: String,
+    state: String,
 }
 
 /// Cloud pairing operations owned by Agent Core. The local Setup transport is deliberately
@@ -1151,6 +1181,16 @@ async fn control_once(
     authorization: &CommunicationAuthorization,
     owner_epoch: u64,
 ) -> Result<(), ControlError> {
+    let retention_ms =
+        i64::try_from(LOCAL_MEDIA_RETENTION.as_millis()).map_err(|_| ControlError::Contract)?;
+    let now_ms = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| ControlError::Contract)?;
+    let _ = database
+        .cleanup_completed_communication_attachments(now_ms.saturating_sub(retention_ms))
+        .await;
+    // Media transfer is independently retryable: a failed attempt never fails control processing.
+    // Events acknowledged during this cycle become eligible on the next cycle.
+    let _ = sync_pending_communication_attachments(database, &credentials.credential, client).await;
     let outbox_depth = database
         .active_outbox_depth()
         .await
@@ -1310,6 +1350,27 @@ async fn sync_pending_communication_events(
         .acknowledge_communication_events(&event_ids)
         .await
         .map_err(|_| ControlError::Transient)
+}
+
+async fn sync_pending_communication_attachments(
+    database: &DbActorHandle,
+    credentials: &DeviceCredential,
+    client: &dyn ControlClient,
+) -> Result<(), ControlError> {
+    let attachments = database
+        .load_pending_communication_attachments(4)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    for attachment in attachments {
+        client
+            .sync_communication_attachment(credentials, &attachment)
+            .await?;
+        database
+            .complete_communication_attachment(&attachment.attachment_id)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+    }
+    Ok(())
 }
 
 async fn apply_communication_authorization(
@@ -1543,6 +1604,66 @@ impl ControlClient for HttpControlClient {
                 return Err(ControlError::Contract);
             }
             Ok(parsed)
+        })
+    }
+
+    fn sync_communication_attachment<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        attachment: &'a PendingCommunicationAttachment,
+    ) -> ControlFuture<'a, ()> {
+        Box::pin(async move {
+            let client = Self::client()?;
+            let prepared = parse_response::<PreparedCommunicationObject>(
+                client
+                    .post(self.endpoint("v1/agent/communication/objects/prepare")?)
+                    .bearer_auth(credentials.access_credential())
+                    .json(&serde_json::json!({
+                        "event_id": attachment.event_id,
+                        "attachment_id": attachment.attachment_id,
+                    }))
+                    .send()
+                    .await
+                    .map_err(|_| ControlError::Transient)?,
+            )
+            .await?;
+            if prepared.state == "completed" {
+                return Ok(());
+            }
+            if prepared.state != "prepared" {
+                return Err(ControlError::Contract);
+            }
+            let upload = prepared.upload.ok_or(ControlError::Contract)?;
+            let upload_url = Url::parse(&upload.url).map_err(|_| ControlError::Contract)?;
+            if upload_url.scheme() != "https" {
+                return Err(ControlError::Contract);
+            }
+            let mut request = client.put(upload_url).body(attachment.bytes.clone());
+            for (name, value) in upload.headers {
+                request = request.header(name, value);
+            }
+            let upload_response = request.send().await.map_err(|_| ControlError::Transient)?;
+            if !upload_response.status().is_success() {
+                return if upload_response.status().is_server_error() {
+                    Err(ControlError::Transient)
+                } else {
+                    Err(ControlError::Contract)
+                };
+            }
+            let completed = parse_response::<CompletedCommunicationObject>(
+                Self::client()?
+                    .post(self.endpoint("v1/agent/communication/objects/complete")?)
+                    .bearer_auth(credentials.access_credential())
+                    .json(&serde_json::json!({ "object_id": prepared.object_id }))
+                    .send()
+                    .await
+                    .map_err(|_| ControlError::Transient)?,
+            )
+            .await?;
+            if completed.object_id != prepared.object_id || completed.state != "completed" {
+                return Err(ControlError::Contract);
+            }
+            Ok(())
         })
     }
 }
