@@ -18,6 +18,7 @@ use tokio::{
     task::JoinHandle,
     time,
 };
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::communication::{
@@ -1652,10 +1653,16 @@ impl ControlClient for HttpControlClient {
             if upload_url.scheme() != "https" {
                 return Err(ControlError::Contract);
             }
+            let file = attachment
+                .try_clone_file()
+                .map_err(|_| ControlError::Transient)?;
+            let body =
+                reqwest::Body::wrap_stream(ReaderStream::new(tokio::fs::File::from_std(file)));
             let mut request = client
                 .put(upload_url)
                 .timeout(MEDIA_UPLOAD_TIMEOUT)
-                .body(attachment.bytes.clone());
+                .header(reqwest::header::CONTENT_LENGTH, attachment.size_bytes)
+                .body(body);
             for (name, value) in upload.headers {
                 request = request.header(name, value);
             }

@@ -44,13 +44,14 @@ pca-keychain = { path = "../../crates/keychain" }
 pca-provider-contracts = { path = "../../crates/provider-contracts" }
 pca-system-collector = { path = "../../crates/system-collector" }
 pca-wechat-provider = { path = "../../crates/wechat-provider" }
-reqwest = { version = "=0.11.27", default-features = false, features = ["__internal_proxy_sys_no_cache", "json", "rustls-tls"] }
+reqwest = { version = "=0.11.27", default-features = false, features = ["__internal_proxy_sys_no_cache", "json", "rustls-tls", "stream"] }
 rustix = { version = "=0.38.44", features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "=0.10.9"
 time = { version = "=0.3.36", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [lints]

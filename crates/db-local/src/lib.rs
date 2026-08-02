@@ -57,14 +57,27 @@ pub struct CommunicationAttachmentSpoolReference {
 
 /// One acknowledged communication attachment ready for a bounded Cloud upload attempt.
 ///
-/// The byte body deliberately has no `Debug` implementation so diagnostics cannot print media.
+/// The validated file handle deliberately has no `Debug` implementation so diagnostics cannot
+/// print media or private local paths. Callers stream from a cloned handle instead of retaining
+/// the complete attachment in memory.
 pub struct PendingCommunicationAttachment {
     pub event_id: String,
     pub attachment_id: String,
     pub sha256: String,
     pub size_bytes: u64,
     pub mime_type: String,
-    pub bytes: Vec<u8>,
+    file: std::fs::File,
+}
+
+impl PendingCommunicationAttachment {
+    /// Clones the already-open, immutable spool file for one upload attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error when the file descriptor cannot be duplicated.
+    pub fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
+        self.file.try_clone()
+    }
 }
 
 /// The complete local atomic-write input for one eligible communication message.

@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fs::File, io::Read, os::unix::fs::MetadataExt, path::Path};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    os::unix::fs::MetadataExt,
+    path::Path,
+};
 
 use pca_domain::{
     AgentStatus, BridgeStatus, CollectorState, CollectorStatus, CommunicationAttachment,
@@ -1350,27 +1356,40 @@ pub(crate) fn load_pending_communication_attachments(
             DbError::sqlite("read pending attachment", "attachment size is invalid")
         })?;
         let mut file = open_communication_spool_file(spool_root, &file_name)?;
-        let mut bytes =
-            Vec::with_capacity(usize::try_from(expected_size).map_err(|_| {
-                DbError::sqlite("read pending attachment", "attachment is too large")
-            })?);
-        file.read_to_end(&mut bytes)
-            .map_err(|error| DbError::sqlite("read pending attachment body", error))?;
-        if u64::try_from(bytes.len()).ok() != Some(expected_size)
-            || format!("{:x}", Sha256::digest(&bytes)) != sha256
-        {
+        let mut hasher = Sha256::new();
+        let mut bytes_read = 0_u64;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| DbError::sqlite("read pending attachment body", error))?;
+            if read == 0 {
+                break;
+            }
+            bytes_read = bytes_read
+                .checked_add(u64::try_from(read).map_err(|_| {
+                    DbError::sqlite("read pending attachment", "attachment size is invalid")
+                })?)
+                .ok_or_else(|| {
+                    DbError::sqlite("read pending attachment", "attachment size is invalid")
+                })?;
+            hasher.update(&buffer[..read]);
+        }
+        if bytes_read != expected_size || format!("{:x}", hasher.finalize()) != sha256 {
             return Err(DbError::sqlite(
                 "verify pending attachment body",
                 "attachment body does not match immutable manifest",
             ));
         }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| DbError::sqlite("rewind pending attachment body", error))?;
         pending.push(PendingCommunicationAttachment {
             event_id,
             attachment_id,
             sha256,
             size_bytes: expected_size,
             mime_type,
-            bytes,
+            file,
         });
     }
     Ok(pending)

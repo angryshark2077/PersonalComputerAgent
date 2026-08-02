@@ -1,4 +1,5 @@
 use std::{
+    io::{Read, Write},
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
@@ -1081,4 +1082,63 @@ async fn clean_database_has_no_pending_communication_attachments() {
         .await
         .expect("load empty attachment queue")
         .is_empty());
+}
+
+#[tokio::test]
+async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body() {
+    let (directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let spool = directory.0.join("communication-spool");
+    let temporary = spool.join("streaming-fixture");
+    let mut file = std::fs::File::create(&temporary).expect("create large spool fixture");
+    let chunk = vec![0x5a_u8; 1024 * 1024];
+    let mut hasher = Sha256::new();
+    for _ in 0..128 {
+        file.write_all(&chunk).expect("write large spool fixture");
+        hasher.update(&chunk);
+    }
+    drop(file);
+    let sha256 = format!("{:x}", hasher.finalize());
+    std::fs::rename(&temporary, spool.join(&sha256)).expect("publish spool fixture");
+
+    let connection = Connection::open(&path).expect("open fixture database");
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO events_local VALUES (
+                'stream-event', 'workspace-1', 'device-1', 'communication.message_recorded',
+                'wechat', 1, 1, 1, 'high', '{{}}', '[]', NULL
+             );
+             INSERT INTO sync_outbox VALUES ('event:stream-event', 'stream-event', 'acked', 1);
+             INSERT INTO communication_conversations VALUES (
+                'account-1', 'conversation-1', 'direct', NULL, 1, 1
+             );
+             INSERT INTO communication_messages VALUES (
+                1, 'stream-event', 'account-1', 'conversation-1', 1, 'source-1',
+                'incoming', 'video', 1, NULL, 1
+             );
+             INSERT INTO attachment_spool (
+                attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                spool_relative_path, transfer_state, created_at_ms, completed_at_ms
+             ) VALUES (
+                'stream-attachment', 1, 'video', '{sha256}', 134217728, 'video/mp4',
+                '{sha256}', 'pending', 1, NULL
+             );"
+        ))
+        .expect("insert pending attachment fixture");
+    drop(connection);
+
+    let pending = db
+        .load_pending_communication_attachments(1)
+        .await
+        .expect("load validated file handle");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].size_bytes, 128 * 1024 * 1024);
+    let mut cloned = pending[0].try_clone_file().expect("clone file handle");
+    let mut prefix = [0_u8; 16];
+    cloned
+        .read_exact(&mut prefix)
+        .expect("stream fixture prefix");
+    assert_eq!(prefix, [0x5a; 16]);
 }
