@@ -382,6 +382,46 @@ async fn source_key_with_changed_immutable_event_fields_is_rejected() {
 }
 
 #[tokio::test]
+async fn source_key_replay_allows_sender_metadata_to_be_observed_separately() {
+    let (_directory, path) = database_path();
+    let store = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let commit = valid_commit(&path);
+    store
+        .commit_communication_message(&commit)
+        .await
+        .expect("commit first message");
+
+    let mut replay = commit.clone();
+    replay.message = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
+        message_id: "message-1".to_owned(),
+        conversation_id: "conversation-1".to_owned(),
+        sender_id: "wxid_resolved_sender".to_owned(),
+        sender_display_name: "Resolved Sender".to_owned(),
+        source_key: "source-key-1".to_owned(),
+        occurred_at: "2026-08-02T12:00:00Z".to_owned(),
+        direction: Direction::Incoming,
+        kind: MessageKind::Image,
+        conversation: ConversationScope::Direct,
+        text: None,
+        attachments: commit.message.attachments().to_vec(),
+    })
+    .expect("replayed message with resolved sender");
+    let Value::Object(payload) = serde_json::to_value(&replay.message).expect("message payload")
+    else {
+        panic!("message payload is an object");
+    };
+    replay.event.payload = payload;
+
+    store
+        .commit_communication_message(&replay)
+        .await
+        .expect("sender metadata does not rewrite immutable message event");
+    assert_eq!(row_counts(&path), (1, 1, 1, 1, 1, 1));
+}
+
+#[tokio::test]
 async fn source_key_with_changed_spool_file_name_is_rejected_without_cursor_advance() {
     let (_directory, path) = database_path();
     let store = DbActorHandle::open(&path, "0.1.0")

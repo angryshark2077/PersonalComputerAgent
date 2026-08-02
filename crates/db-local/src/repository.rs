@@ -106,7 +106,7 @@ pub(crate) fn commit_communication_message(
         .transaction()
         .map_err(|error| DbError::sqlite("start communication message transaction", error))?;
     if communication_message_exists(&transaction, commit)? {
-        validate_existing_event(&transaction, &serialized)?;
+        validate_existing_communication_event(&transaction, &serialized)?;
         validate_existing_outbox(&transaction, &serialized)?;
         validate_existing_attachment_spool(&transaction, commit)?;
         return Ok(());
@@ -649,6 +649,66 @@ fn validate_existing_event(
                 "event ID {} conflicts with different immutable fields",
                 event.event_id
             ),
+        ))
+    }
+}
+
+fn validate_existing_communication_event(
+    transaction: &Transaction<'_>,
+    serialized: &SerializedEvent<'_>,
+) -> Result<(), DbError> {
+    let event = serialized.event;
+    let existing_payload = transaction
+        .query_row(
+            "SELECT payload_json FROM events_local
+             WHERE event_id = ?1
+               AND workspace_id = ?2
+               AND device_id = ?3
+               AND event_type = ?4
+               AND source = ?5
+               AND schema_version = ?6
+               AND occurred_at_ms = CAST(unixepoch(?7, 'subsec') * 1000 AS INTEGER)
+               AND created_at_ms = CAST(unixepoch(?8, 'subsec') * 1000 AS INTEGER)
+               AND sensitivity = ?9
+               AND attachment_refs_json = ?10
+               AND idempotency_key IS ?11",
+            params![
+                event.event_id,
+                event.workspace_id,
+                event.device_id,
+                event.event_type,
+                event.source,
+                event.schema_version,
+                event.occurred_at,
+                event.created_at,
+                sensitivity_name(event.sensitivity),
+                serialized.attachment_refs_json,
+                event.idempotency_key,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| DbError::sqlite("validate existing communication event", error))?
+        .ok_or_else(|| {
+            DbError::sqlite(
+                "validate existing communication event",
+                "stable communication event conflicts with different immutable fields",
+            )
+        })?;
+    let mut existing_payload =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&existing_payload)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let mut candidate_payload = serialized.event.payload.clone();
+    for field in ["sender_id", "sender_display_name"] {
+        existing_payload.remove(field);
+        candidate_payload.remove(field);
+    }
+    if existing_payload == candidate_payload {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "validate existing communication event",
+            "stable communication event conflicts with different message content",
         ))
     }
 }
