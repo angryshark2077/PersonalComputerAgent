@@ -5,6 +5,7 @@ import { MemoryControlRepository } from "@pca/db-cloud/src/repository.js";
 
 import { createApp, type OwnerPrincipal } from "../index.js";
 import { pkceChallenge } from "../pairing.js";
+import type { R2ObjectDescriptor, R2ObjectHead, R2ObjectStore } from "../r2.js";
 
 const owner: OwnerPrincipal = {
   userId: "01983333-7333-8333-8333-333333333333",
@@ -137,6 +138,34 @@ function communicationImage(deviceId: string) {
     attachment_refs: ["attachment-1"],
     idempotency_key: "opaque-source-key-2",
   };
+}
+
+class FakeR2ObjectStore implements R2ObjectStore {
+  latest: R2ObjectDescriptor | null = null;
+  uploaded = false;
+  headOverride: R2ObjectHead | undefined;
+
+  async signUpload(descriptor: R2ObjectDescriptor) {
+    this.latest = descriptor;
+    return {
+      url: "https://private-media.example/upload",
+      headers: { "content-type": descriptor.expectedMimeType },
+    };
+  }
+
+  async headObject() {
+    if (this.headOverride !== undefined) return this.headOverride;
+    if (!this.uploaded || this.latest === null) return null;
+    return {
+      sizeBytes: this.latest.expectedSizeBytes,
+      mimeType: this.latest.expectedMimeType,
+      sha256: this.latest.expectedSha256,
+    };
+  }
+
+  async signRead() {
+    return { url: "https://private-media.example/read", expiresAt: new Date("2026-08-02T00:06:00Z") };
+  }
 }
 
 test("paired device syncs a private communication event only through its dedicated endpoint", async () => {
@@ -273,6 +302,8 @@ test("communication attachment manifests are projected without exposing object a
         sha256: "a".repeat(64),
         size_bytes: 1024,
         mime_type: "image/jpeg",
+        object_id: null,
+        object_state: null,
       }],
     }],
   });
@@ -296,6 +327,100 @@ test("communication sync rejects an idempotency key that is not the opaque sourc
     }),
   });
   assert.equal(response.status, 400);
+});
+
+test("only a completed attachment receives a short Owner read URL", async () => {
+  const store = new FakeR2ObjectStore();
+  const repository = new MemoryControlRepository([
+    { workspaceId: owner.workspaceId, userId: owner.userId },
+    { workspaceId: otherOwner.workspaceId, userId: otherOwner.userId },
+  ]);
+  const api = createApp({ repository, ownerAuthenticator: async () => owner, objectStore: store });
+  const { credentials } = await pairedApiWith(api);
+  assert.equal((await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777783",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationImage(credentials.device_id)],
+    }),
+  })).status, 200);
+
+  const prepared = await api.request("/v1/agent/communication/objects/prepare", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      event_id: "01986666-7666-8666-8666-666666666668",
+      attachment_id: "attachment-1",
+    }),
+  });
+  const preparedBody = await prepared.json() as { object_id: string; state: string; upload: { url: string } };
+  assert.equal(prepared.status, 200);
+  assert.equal(preparedBody.state, "prepared");
+  assert.equal(preparedBody.upload.url, "https://private-media.example/upload");
+  assert.equal(
+    (await api.request(`/v1/devices/${credentials.device_id}/communication/objects/${preparedBody.object_id}/read`)).status,
+    404,
+  );
+
+  store.uploaded = true;
+  store.headOverride = {
+    sizeBytes: 1024,
+    mimeType: "image/jpeg",
+    sha256: "b".repeat(64),
+  };
+  assert.equal((await api.request("/v1/agent/communication/objects/complete", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({ object_id: preparedBody.object_id }),
+  })).status, 409);
+  store.headOverride = undefined;
+  const completed = await api.request("/v1/agent/communication/objects/complete", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({ object_id: preparedBody.object_id }),
+  });
+  assert.deepEqual(await completed.json(), { object_id: preparedBody.object_id, state: "completed" });
+  assert.deepEqual(
+    await (await api.request(
+      `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages`,
+    )).json(),
+    {
+      messages: [{
+        event_id: "01986666-7666-8666-8666-666666666668",
+        message_id: "message-2",
+        occurred_at: "2026-08-02T00:01:00.000Z",
+        direction: "outgoing",
+        kind: "image",
+        text: null,
+        attachments: [{
+          attachment_id: "attachment-1",
+          kind: "image",
+          sha256: "a".repeat(64),
+          size_bytes: 1024,
+          mime_type: "image/jpeg",
+          object_id: preparedBody.object_id,
+          object_state: "completed",
+        }],
+      }],
+    },
+  );
+  assert.deepEqual(
+    await (await api.request(
+      `/v1/devices/${credentials.device_id}/communication/objects/${preparedBody.object_id}/read`,
+    )).json(),
+    { url: "https://private-media.example/read", expires_at: "2026-08-02T00:06:00.000Z" },
+  );
+
+  const otherApi = createApp({ repository, ownerAuthenticator: async () => otherOwner, objectStore: store });
+  assert.equal(
+    (await otherApi.request(
+      `/v1/devices/${credentials.device_id}/communication/objects/${preparedBody.object_id}/read`,
+    )).status,
+    403,
+  );
 });
 
 test("paired device uploads one strict system metric idempotently and its owner can read it", async () => {

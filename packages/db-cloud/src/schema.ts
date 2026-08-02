@@ -466,6 +466,11 @@ export const communicationMessages = pgTable(
       table.deviceId,
       table.messageId,
     ),
+    uniqueIndex("communication_messages_workspace_device_event_unique").on(
+      table.workspaceId,
+      table.deviceId,
+      table.eventId,
+    ),
     index("idx_communication_messages_device_conversation_chronology").on(
       table.workspaceId,
       table.deviceId,
@@ -490,9 +495,7 @@ export const communicationMessages = pgTable(
 export const communicationMessageAttachments = pgTable(
   "communication_message_attachments",
   {
-    eventId: uuid("event_id")
-      .notNull()
-      .references(() => communicationMessages.eventId, { onDelete: "cascade" }),
+    eventId: uuid("event_id").notNull(),
     attachmentId: text("attachment_id").notNull(),
     kind: text("kind").notNull(),
     sha256: char("sha256", { length: 64 }).notNull(),
@@ -504,6 +507,57 @@ export const communicationMessageAttachments = pgTable(
     check("communication_message_attachments_kind", sql`${table.kind} IN ('audio', 'image', 'video')`),
     check("communication_message_attachments_hash", sql`${table.sha256} ~ '^[a-f0-9]{64}$'`),
     check("communication_message_attachments_size", sql`${table.sizeBytes} > 0`),
+  ],
+);
+
+export const communicationObjects = pgTable(
+  "communication_objects",
+  {
+    objectId: uuid("object_id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    eventId: uuid("event_id")
+      .notNull()
+      .references(() => communicationMessages.eventId, { onDelete: "cascade" }),
+    attachmentId: text("attachment_id").notNull(),
+    objectKey: text("object_key").notNull(),
+    expectedSha256: char("expected_sha256", { length: 64 }).notNull(),
+    expectedSizeBytes: bigint("expected_size_bytes", { mode: "number" }).notNull(),
+    expectedMimeType: text("expected_mime_type").notNull(),
+    state: text("state").notNull(),
+    preparedAt: timestampColumn("prepared_at").notNull(),
+    completedAt: timestampColumn("completed_at"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId, table.eventId],
+      foreignColumns: [
+        communicationMessages.workspaceId,
+        communicationMessages.deviceId,
+        communicationMessages.eventId,
+      ],
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.eventId, table.attachmentId],
+      foreignColumns: [communicationMessageAttachments.eventId, communicationMessageAttachments.attachmentId],
+    }).onDelete("cascade"),
+    unique("communication_objects_event_attachment_unique").on(table.eventId, table.attachmentId),
+    uniqueIndex("communication_objects_key_unique").on(table.objectKey),
+    index("idx_communication_objects_owner")
+      .on(table.workspaceId, table.deviceId, table.objectId)
+      .where(sql`${table.state} = 'completed'`),
+    check("communication_objects_key", sql`${table.objectKey} ~ '^communication/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'`),
+    check("communication_objects_hash", sql`${table.expectedSha256} ~ '^[a-f0-9]{64}$'`),
+    check("communication_objects_size", sql`${table.expectedSizeBytes} > 0`),
+    check("communication_objects_state", sql`${table.state} IN ('prepared', 'completed')`),
+    check(
+      "communication_objects_completed_at",
+      sql`(${table.state} = 'prepared' AND ${table.completedAt} IS NULL) OR (${table.state} = 'completed' AND ${table.completedAt} IS NOT NULL)`,
+    ),
   ],
 );
 
@@ -525,5 +579,6 @@ export const cloudSchema = {
   communicationConversations,
   communicationMessages,
   communicationMessageAttachments,
+  communicationObjects,
   systemEvents,
 };

@@ -20,6 +20,7 @@ EXPECTED_TABLES = [
     "communication_events",
     "communication_message_attachments",
     "communication_messages",
+    "communication_objects",
     "device_credential_generations",
     "device_heartbeats",
     "device_revocation_audit",
@@ -277,6 +278,7 @@ def verify(repository_root: Path) -> None:
         repository_root / "packages/db-cloud/migrations/0005_s2_system_events.sql",
         repository_root / "packages/db-cloud/migrations/0006_communication_event_inbox.sql",
         repository_root / "packages/db-cloud/migrations/0007_communication_projections.sql",
+        repository_root / "packages/db-cloud/migrations/0008_communication_objects.sql",
     ]
     for migration in migrations:
         if not migration.is_file():

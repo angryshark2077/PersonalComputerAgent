@@ -24,6 +24,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertSystemEventSchema(pool);
     await assertCommunicationEventSchema(pool);
     await assertCommunicationProjectionSchema(pool);
+    await assertCommunicationObjectSchema(pool);
     await assertCommunicationProjectionBackfill(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
@@ -31,7 +32,8 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertSystemEventSchema(pool);
     await assertCommunicationEventSchema(pool);
     await assertCommunicationProjectionSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007"]);
+    await assertCommunicationObjectSchema(pool);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -83,6 +85,13 @@ async function assertCommunicationEventSchema(pool: Pool) {
 async function assertCommunicationProjectionSchema(pool: Pool) {
   const result = await pool.query<{ exists: boolean }>(
     "SELECT to_regclass('public.communication_messages') IS NOT NULL AS exists",
+  );
+  assert.equal(result.rows[0]?.exists, true);
+}
+
+async function assertCommunicationObjectSchema(pool: Pool) {
+  const result = await pool.query<{ exists: boolean }>(
+    "SELECT to_regclass('public.communication_objects') IS NOT NULL AS exists",
   );
   assert.equal(result.rows[0]?.exists, true);
 }

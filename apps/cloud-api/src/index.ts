@@ -9,6 +9,7 @@ import { Pool } from "pg";
 
 import {
   DrizzleControlRepository,
+  type CommunicationObjectRecord,
   type ControlRepository,
 } from "@pca/db-cloud/src/repository.js";
 import {
@@ -26,6 +27,7 @@ import {
   type OwnerAuthenticator,
 } from "./auth.js";
 import { parseCollectorConfig, parseHeartbeat } from "./control.js";
+import { createR2ObjectStore, type R2ObjectHead, type R2ObjectStore } from "./r2.js";
 import { parseCommunicationSyncBatch, parseSyncBatch } from "./sync.js";
 import {
   accessCredentialLifetimeMs,
@@ -50,6 +52,7 @@ export interface CreateAppOptions {
   ownerAuthenticator?: OwnerAuthenticator;
   pairingRateLimiter?: PairingRateLimiter;
   clientAddress?: (request: Request) => string | undefined;
+  objectStore?: R2ObjectStore;
 }
 
 export function createApp(options: CreateAppOptions): Hono {
@@ -263,6 +266,97 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.post("/v1/agent/communication/objects/prepare", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const input = parseObjectReference(await context.req.json().catch(() => null));
+    if (input === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication object request.");
+    }
+    if (options.objectStore === undefined) {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private media storage is unavailable.");
+    }
+    let object: CommunicationObjectRecord;
+    try {
+      object = await options.repository.prepareCommunicationObject(device.workspaceId, device.deviceId, {
+        objectId: randomUUID(),
+        objectKey: `communication/${randomUUID()}`,
+        eventId: input.eventId,
+        attachmentId: input.attachmentId,
+        now: new Date(),
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+    if (object.state === "completed") {
+      return context.json({ object_id: object.objectId, state: "completed" });
+    }
+    try {
+      const upload = await options.objectStore.signUpload(object);
+      return context.json({
+        object_id: object.objectId,
+        state: "prepared",
+        upload: {
+          url: upload.url,
+          headers: upload.headers,
+          expires_at: new Date(Date.now() + 300_000).toISOString(),
+        },
+      });
+    } catch (error) {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private media storage is unavailable.");
+    }
+  });
+
+  app.post("/v1/agent/communication/objects/complete", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const input = parseObjectId(await context.req.json().catch(() => null));
+    if (input === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication object completion.");
+    }
+    if (options.objectStore === undefined) {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private media storage is unavailable.");
+    }
+    let object: CommunicationObjectRecord;
+    try {
+      object = await options.repository.loadDeviceCommunicationObject(
+        device.workspaceId,
+        device.deviceId,
+        input.objectId,
+      );
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+    if (object.state === "completed") {
+      return context.json({ object_id: object.objectId, state: "completed" });
+    }
+    let actual: R2ObjectHead | null;
+    try {
+      actual = await options.objectStore.headObject(object.objectKey);
+    } catch {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private media storage is unavailable.");
+    }
+    if (
+      actual === null
+      || actual.sizeBytes !== object.expectedSizeBytes
+      || actual.mimeType !== object.expectedMimeType
+      || actual.sha256 !== object.expectedSha256
+    ) {
+      return errorResponse(context, 409, "OBJECT_INVALID", "The uploaded media does not match its manifest.");
+    }
+    try {
+      const completed = await options.repository.completeCommunicationObject(
+        device.workspaceId,
+        device.deviceId,
+        object.objectId,
+        new Date(),
+      );
+      return context.json({ object_id: completed.objectId, state: completed.state });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.get("/v1/workspaces", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
@@ -366,6 +460,31 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.get("/v1/devices/:deviceId/communication/objects/:objectId/read", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    if (options.objectStore === undefined) {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private media storage is unavailable.");
+    }
+    let object: CommunicationObjectRecord;
+    try {
+      object = await options.repository.loadOwnerCompletedCommunicationObject(
+        principal.workspaceId,
+        principal.userId,
+        context.req.param("deviceId"),
+        context.req.param("objectId"),
+      );
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+    try {
+      const read = await options.objectStore.signRead(object.objectKey);
+      return context.json({ url: read.url, expires_at: read.expiresAt.toISOString() });
+    } catch {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private media storage is unavailable.");
+    }
+  });
+
   app.get("/v1/devices/:deviceId/communication/conversations/:conversationId/messages", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
@@ -395,6 +514,8 @@ export function createApp(options: CreateAppOptions): Hono {
             sha256: attachment.sha256,
             size_bytes: attachment.sizeBytes,
             mime_type: attachment.mimeType,
+            object_id: attachment.objectId,
+            object_state: attachment.objectState,
           })),
         })),
       });
@@ -486,10 +607,36 @@ function parseCommunicationLimit(value: string | undefined): number | null {
   return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
 }
 
+function parseObjectReference(value: unknown): { eventId: string; attachmentId: string } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  return Object.keys(body).length === 2
+    && isUuid(body.event_id)
+    && typeof body.attachment_id === "string"
+    && body.attachment_id.length > 0
+    ? { eventId: body.event_id, attachmentId: body.attachment_id }
+    : null;
+}
+
+function parseObjectId(value: unknown): { objectId: string } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  return Object.keys(body).length === 1 && isUuid(body.object_id) ? { objectId: body.object_id } : null;
+}
+
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 export interface ProductionEnvironment {
   DATABASE_URL?: string;
   BETTER_AUTH_SECRET?: string;
   BETTER_AUTH_URL?: string;
+  R2_ENDPOINT?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_BUCKET?: string;
+  R2_BUCKET_PUBLIC?: string;
 }
 
 export function createProductionApp(environment: ProductionEnvironment = process.env): Hono {
@@ -513,6 +660,7 @@ export function createProductionApp(environment: ProductionEnvironment = process
   const app = createApp({
     repository,
     ownerAuthenticator: createBetterAuthOwnerAuthenticator(auth, repository),
+    objectStore: createR2ObjectStore(environment),
   });
   app.all("/api/auth/*", (context) => auth.handler(context.req.raw));
   return app;

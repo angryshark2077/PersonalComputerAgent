@@ -273,6 +273,11 @@ test("production composition does not require trusted proxy configuration for pa
     DATABASE_URL: "postgresql://localhost:1/pca",
     BETTER_AUTH_SECRET: "test-secret-that-is-long-enough-to-be-valid",
     BETTER_AUTH_URL: "http://localhost:3000",
+    R2_ENDPOINT: "https://example.r2.cloudflarestorage.com",
+    R2_ACCESS_KEY_ID: "test-access-key",
+    R2_SECRET_ACCESS_KEY: "test-secret-key",
+    R2_BUCKET: "private-media",
+    R2_BUCKET_PUBLIC: "false",
   });
 
   assert.ok(api);
@@ -283,6 +288,11 @@ test("production composition wires persistent PostgreSQL and Better Auth", () =>
     DATABASE_URL: "postgresql://localhost:1/pca",
     BETTER_AUTH_SECRET: "test-secret-that-is-long-enough-to-be-valid",
     BETTER_AUTH_URL: "http://localhost:3000",
+    R2_ENDPOINT: "https://example.r2.cloudflarestorage.com",
+    R2_ACCESS_KEY_ID: "test-access-key",
+    R2_SECRET_ACCESS_KEY: "test-secret-key",
+    R2_BUCKET: "private-media",
+    R2_BUCKET_PUBLIC: "false",
   });
   assert.ok(api);
 });

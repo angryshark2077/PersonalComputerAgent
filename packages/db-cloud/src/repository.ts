@@ -10,6 +10,7 @@ import {
   communicationEvents,
   communicationMessageAttachments,
   communicationMessages,
+  communicationObjects,
   collectorConfigAudit,
   collectorConfigs,
   deviceCredentialGenerations,
@@ -227,6 +228,34 @@ export interface CommunicationAttachmentProjection {
   mimeType: string;
 }
 
+export interface CommunicationMessageAttachmentRecord extends CommunicationAttachmentProjection {
+  objectId: string | null;
+  objectState: "prepared" | "completed" | null;
+}
+
+export interface CommunicationObjectRecord {
+  objectId: string;
+  workspaceId: string;
+  deviceId: string;
+  eventId: string;
+  attachmentId: string;
+  objectKey: string;
+  expectedSha256: string;
+  expectedSizeBytes: number;
+  expectedMimeType: string;
+  state: "prepared" | "completed";
+  preparedAt: Date;
+  completedAt: Date | null;
+}
+
+export interface PrepareCommunicationObjectInput {
+  objectId: string;
+  objectKey: string;
+  eventId: string;
+  attachmentId: string;
+  now: Date;
+}
+
 export interface CommunicationConversationRecord {
   conversationId: string;
   scope: "direct" | "group";
@@ -242,7 +271,7 @@ export interface CommunicationMessageRecord {
   direction: "incoming" | "outgoing";
   kind: "text" | "audio" | "image" | "video";
   text: string | null;
-  attachments: CommunicationAttachmentProjection[];
+  attachments: CommunicationMessageAttachmentRecord[];
 }
 
 export interface ControlRepository {
@@ -305,6 +334,28 @@ export interface ControlRepository {
     userId: string,
     limit: number,
   ): Promise<CommunicationMessageRecord[]>;
+  prepareCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    input: PrepareCommunicationObjectInput,
+  ): Promise<CommunicationObjectRecord>;
+  loadDeviceCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    objectId: string,
+  ): Promise<CommunicationObjectRecord>;
+  completeCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    objectId: string,
+    completedAt: Date,
+  ): Promise<CommunicationObjectRecord>;
+  loadOwnerCompletedCommunicationObject(
+    workspaceId: string,
+    userId: string,
+    deviceId: string,
+    objectId: string,
+  ): Promise<CommunicationObjectRecord>;
 }
 
 export interface OwnerMembership {
@@ -355,6 +406,7 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #systemEvents = new Map<string, SystemEventRecord>();
   readonly #communicationEvents = new Map<string, CommunicationEventRecord>();
   readonly #communicationIdempotency = new Set<string>();
+  readonly #communicationObjects = new Map<string, CommunicationObjectRecord>();
 
   constructor(memberships: readonly OwnerMembership[] = []) {
     for (const membership of memberships) {
@@ -779,7 +831,86 @@ export class MemoryControlRepository implements ControlRepository {
       )
       .sort((left, right) => right.message.occurredAt.getTime() - left.message.occurredAt.getTime())
       .slice(0, limit)
-      .map((event) => communicationMessageRecord(event));
+      .map((event) => communicationMessageRecord(event, this.#communicationObjects));
+  }
+
+  async prepareCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    input: PrepareCommunicationObjectInput,
+  ): Promise<CommunicationObjectRecord> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const event = this.#communicationEvents.get(input.eventId);
+    const attachment = event?.workspaceId === workspaceId && event.deviceId === deviceId
+      ? event.message.attachments.find((candidate) => candidate.attachmentId === input.attachmentId)
+      : undefined;
+    if (attachment === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    const existing = [...this.#communicationObjects.values()].find((object) =>
+      object.eventId === input.eventId && object.attachmentId === input.attachmentId,
+    );
+    if (existing !== undefined) return { ...existing };
+    const object: CommunicationObjectRecord = {
+      objectId: input.objectId,
+      workspaceId,
+      deviceId,
+      eventId: input.eventId,
+      attachmentId: input.attachmentId,
+      objectKey: input.objectKey,
+      expectedSha256: attachment.sha256,
+      expectedSizeBytes: attachment.sizeBytes,
+      expectedMimeType: attachment.mimeType,
+      state: "prepared",
+      preparedAt: input.now,
+      completedAt: null,
+    };
+    this.#communicationObjects.set(object.objectId, object);
+    return { ...object };
+  }
+
+  async loadDeviceCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    objectId: string,
+  ): Promise<CommunicationObjectRecord> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const object = this.#communicationObjects.get(objectId);
+    if (object === undefined || object.workspaceId !== workspaceId || object.deviceId !== deviceId) {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    return { ...object };
+  }
+
+  async completeCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    objectId: string,
+    completedAt: Date,
+  ): Promise<CommunicationObjectRecord> {
+    const object = await this.loadDeviceCommunicationObject(workspaceId, deviceId, objectId);
+    if (object.state === "completed") return object;
+    const completed: CommunicationObjectRecord = { ...object, state: "completed", completedAt };
+    this.#communicationObjects.set(objectId, completed);
+    return { ...completed };
+  }
+
+  async loadOwnerCompletedCommunicationObject(
+    workspaceId: string,
+    userId: string,
+    deviceId: string,
+    objectId: string,
+  ): Promise<CommunicationObjectRecord> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    const object = this.#communicationObjects.get(objectId);
+    if (
+      object === undefined
+      || object.workspaceId !== workspaceId
+      || object.deviceId !== deviceId
+      || object.state !== "completed"
+    ) {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    return { ...object };
   }
 
   async listOwnerSystemMetrics(
@@ -1668,8 +1799,17 @@ export class DrizzleControlRepository implements ControlRepository {
             sha256: communicationMessageAttachments.sha256,
             sizeBytes: communicationMessageAttachments.sizeBytes,
             mimeType: communicationMessageAttachments.mimeType,
+            objectId: communicationObjects.objectId,
+            objectState: communicationObjects.state,
           })
           .from(communicationMessageAttachments)
+          .leftJoin(
+            communicationObjects,
+            and(
+              eq(communicationObjects.eventId, communicationMessageAttachments.eventId),
+              eq(communicationObjects.attachmentId, communicationMessageAttachments.attachmentId),
+            ),
+          )
           .where(eq(communicationMessageAttachments.eventId, message.eventId));
         return {
           eventId: message.eventId,
@@ -1681,9 +1821,161 @@ export class DrizzleControlRepository implements ControlRepository {
           attachments: attachments.map((attachment) => ({
             ...attachment,
             kind: attachment.kind as CommunicationAttachmentProjection["kind"],
+            objectState: attachment.objectState as CommunicationMessageAttachmentRecord["objectState"],
           })),
         };
       }));
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async prepareCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    input: PrepareCommunicationObjectInput,
+  ): Promise<CommunicationObjectRecord> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      return await this.database.transaction(async (transaction) => {
+        const [existing] = await transaction
+          .select()
+          .from(communicationObjects)
+          .where(
+            and(
+              eq(communicationObjects.workspaceId, workspaceId),
+              eq(communicationObjects.deviceId, deviceId),
+              eq(communicationObjects.eventId, input.eventId),
+              eq(communicationObjects.attachmentId, input.attachmentId),
+            ),
+          )
+          .limit(1);
+        if (existing !== undefined) return communicationObjectRecord(existing);
+
+        const [attachment] = await transaction
+          .select({
+            sha256: communicationMessageAttachments.sha256,
+            sizeBytes: communicationMessageAttachments.sizeBytes,
+            mimeType: communicationMessageAttachments.mimeType,
+          })
+          .from(communicationMessageAttachments)
+          .innerJoin(
+            communicationMessages,
+            eq(communicationMessages.eventId, communicationMessageAttachments.eventId),
+          )
+          .where(
+            and(
+              eq(communicationMessages.workspaceId, workspaceId),
+              eq(communicationMessages.deviceId, deviceId),
+              eq(communicationMessageAttachments.eventId, input.eventId),
+              eq(communicationMessageAttachments.attachmentId, input.attachmentId),
+            ),
+          )
+          .limit(1);
+        if (attachment === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+
+        const [created] = await transaction
+          .insert(communicationObjects)
+          .values({
+            objectId: input.objectId,
+            workspaceId,
+            deviceId,
+            eventId: input.eventId,
+            attachmentId: input.attachmentId,
+            objectKey: input.objectKey,
+            expectedSha256: attachment.sha256,
+            expectedSizeBytes: attachment.sizeBytes,
+            expectedMimeType: attachment.mimeType,
+            state: "prepared",
+            preparedAt: input.now,
+            completedAt: null,
+          })
+          .returning();
+        if (created === undefined) throw new ControlRepositoryError("CONFLICT");
+        return communicationObjectRecord(created);
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async loadDeviceCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    objectId: string,
+  ): Promise<CommunicationObjectRecord> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      const [object] = await this.database
+        .select()
+        .from(communicationObjects)
+        .where(
+          and(
+            eq(communicationObjects.workspaceId, workspaceId),
+            eq(communicationObjects.deviceId, deviceId),
+            eq(communicationObjects.objectId, objectId),
+          ),
+        )
+        .limit(1);
+      if (object === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      return communicationObjectRecord(object);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async completeCommunicationObject(
+    workspaceId: string,
+    deviceId: string,
+    objectId: string,
+    completedAt: Date,
+  ): Promise<CommunicationObjectRecord> {
+    try {
+      const existing = await this.loadDeviceCommunicationObject(workspaceId, deviceId, objectId);
+      if (existing.state === "completed") return existing;
+      const [completed] = await this.database
+        .update(communicationObjects)
+        .set({ state: "completed", completedAt })
+        .where(
+          and(
+            eq(communicationObjects.workspaceId, workspaceId),
+            eq(communicationObjects.deviceId, deviceId),
+            eq(communicationObjects.objectId, objectId),
+            eq(communicationObjects.state, "prepared"),
+          ),
+        )
+        .returning();
+      return completed === undefined
+        ? await this.loadDeviceCommunicationObject(workspaceId, deviceId, objectId)
+        : communicationObjectRecord(completed);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async loadOwnerCompletedCommunicationObject(
+    workspaceId: string,
+    userId: string,
+    deviceId: string,
+    objectId: string,
+  ): Promise<CommunicationObjectRecord> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const [object] = await this.database
+        .select()
+        .from(communicationObjects)
+        .where(
+          and(
+            eq(communicationObjects.workspaceId, workspaceId),
+            eq(communicationObjects.deviceId, deviceId),
+            eq(communicationObjects.objectId, objectId),
+            eq(communicationObjects.state, "completed"),
+          ),
+        )
+        .limit(1);
+      if (object === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      return communicationObjectRecord(object);
     } catch (error) {
       throw repositoryError(error);
     }
@@ -1841,7 +2133,10 @@ function cloneCommunicationMessageProjection(
   };
 }
 
-function communicationMessageRecord(event: CommunicationEventRecord): CommunicationMessageRecord {
+function communicationMessageRecord(
+  event: CommunicationEventRecord,
+  objects: ReadonlyMap<string, CommunicationObjectRecord>,
+): CommunicationMessageRecord {
   return {
     eventId: event.eventId,
     messageId: event.message.messageId,
@@ -1849,7 +2144,36 @@ function communicationMessageRecord(event: CommunicationEventRecord): Communicat
     direction: event.message.direction,
     kind: event.message.kind,
     text: event.message.text,
-    attachments: event.message.attachments.map((attachment) => ({ ...attachment })),
+    attachments: event.message.attachments.map((attachment) => {
+      const object = [...objects.values()].find((candidate) =>
+        candidate.eventId === event.eventId && candidate.attachmentId === attachment.attachmentId,
+      );
+      return {
+        ...attachment,
+        objectId: object?.objectId ?? null,
+        objectState: object?.state ?? null,
+      };
+    }),
+  };
+}
+
+function communicationObjectRecord(row: {
+  objectId: string;
+  workspaceId: string;
+  deviceId: string;
+  eventId: string;
+  attachmentId: string;
+  objectKey: string;
+  expectedSha256: string;
+  expectedSizeBytes: number;
+  expectedMimeType: string;
+  state: string;
+  preparedAt: Date;
+  completedAt: Date | null;
+}): CommunicationObjectRecord {
+  return {
+    ...row,
+    state: row.state as CommunicationObjectRecord["state"],
   };
 }
 
