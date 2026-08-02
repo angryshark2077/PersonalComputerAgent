@@ -8,8 +8,11 @@ use std::{
 };
 
 use pca_agentd::cloud_control::{
-    apply_snapshot, AgentControlSnapshot, CloudControlRuntime, CloudControlRuntimeError,
-    ControlClient, ControlError, ControlFuture,
+    apply_snapshot, AgentControlSnapshot, CloudControlOwner, CloudControlRuntime,
+    CloudControlRuntimeError, ControlClient, ControlError, ControlFuture,
+};
+use pca_agentd::communication::{
+    CommunicationAuthorization, CommunicationRuntime, UnavailableCommunicationProviderFactory,
 };
 use pca_db_local::{DbActorHandle, PairingState};
 use pca_domain::{CollectorState, CollectorStatus, EventEnvelope, Sensitivity};
@@ -84,6 +87,68 @@ struct BlockingSyncClient {
     snapshots: Mutex<VecDeque<Result<AgentControlSnapshot, ControlError>>>,
     sync_entered: Notify,
     sync_release: Notify,
+}
+
+#[derive(Default)]
+struct WorkerConcurrency {
+    active: AtomicUsize,
+    maximum: AtomicUsize,
+}
+
+struct BlockingOwnerClient {
+    calls: AtomicUsize,
+    release: Notify,
+    concurrency: Arc<WorkerConcurrency>,
+    snapshot: AgentControlSnapshot,
+}
+
+struct ActiveWorkerCall(Arc<WorkerConcurrency>);
+
+impl Drop for ActiveWorkerCall {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl ControlClient for BlockingOwnerClient {
+    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        Box::pin(async move {
+            let active = self.concurrency.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.concurrency.maximum.fetch_max(active, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveWorkerCall(Arc::clone(&self.concurrency));
+            self.release.notified().await;
+            Ok(self.snapshot.clone())
+        })
+    }
+}
+
+#[derive(Default)]
+struct TransientCountingClient {
+    calls: AtomicUsize,
+}
+
+impl ControlClient for TransientCountingClient {
+    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(ControlError::Transient) })
+    }
 }
 
 impl ControlClient for BlockingSyncClient {
@@ -620,6 +685,240 @@ async fn valid_disable_gates_communication_before_blocked_system_sync() {
     }
 }
 
+#[tokio::test]
+async fn cloud_owner_joins_startup_worker_before_pairing_replacement_starts() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    let concurrency = Arc::new(WorkerConcurrency::default());
+    let startup = Arc::new(BlockingOwnerClient {
+        calls: AtomicUsize::new(0),
+        release: Notify::new(),
+        concurrency: Arc::clone(&concurrency),
+        snapshot: exact_snapshot(1, true),
+    });
+    let pairing = Arc::new(BlockingOwnerClient {
+        calls: AtomicUsize::new(0),
+        release: Notify::new(),
+        concurrency: Arc::clone(&concurrency),
+        snapshot: exact_snapshot(2, true),
+    });
+    let (pairing_state_sender, _) = watch::channel(false);
+    let (owner, commands) = CloudControlOwner::start(
+        Arc::clone(&database),
+        pairing_state_sender,
+        CommunicationAuthorization::new(),
+    );
+
+    commands
+        .replace_identity(
+            loaded.clone(),
+            Arc::clone(&startup) as Arc<dyn ControlClient>,
+        )
+        .await
+        .unwrap();
+    wait_for_calls(&startup.calls, 1).await;
+    let replace = tokio::spawn({
+        let commands = commands.clone();
+        let loaded = loaded.clone();
+        let pairing = Arc::clone(&pairing);
+        async move {
+            commands
+                .replace_identity(loaded, pairing as Arc<dyn ControlClient>)
+                .await
+        }
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(pairing.calls.load(Ordering::SeqCst), 0);
+
+    startup.release.notify_waiters();
+    replace.await.unwrap().unwrap();
+    wait_for_calls(&pairing.calls, 1).await;
+    assert_eq!(concurrency.maximum.load(Ordering::SeqCst), 1);
+
+    pairing.release.notify_waiters();
+    owner.shutdown().await.unwrap();
+    shutdown_database(database).await;
+}
+
+#[tokio::test]
+async fn cloud_owner_repeated_pairing_replacement_never_overlaps_workers() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    let concurrency = Arc::new(WorkerConcurrency::default());
+    let clients = (1..=3)
+        .map(|revision| {
+            Arc::new(BlockingOwnerClient {
+                calls: AtomicUsize::new(0),
+                release: Notify::new(),
+                concurrency: Arc::clone(&concurrency),
+                snapshot: exact_snapshot(revision, true),
+            })
+        })
+        .collect::<Vec<_>>();
+    let (pairing_state_sender, _) = watch::channel(false);
+    let (owner, commands) = CloudControlOwner::start(
+        Arc::clone(&database),
+        pairing_state_sender,
+        CommunicationAuthorization::new(),
+    );
+
+    commands
+        .replace_identity(
+            loaded.clone(),
+            Arc::clone(&clients[0]) as Arc<dyn ControlClient>,
+        )
+        .await
+        .unwrap();
+    wait_for_calls(&clients[0].calls, 1).await;
+    for index in 1..clients.len() {
+        let replace = tokio::spawn({
+            let commands = commands.clone();
+            let loaded = loaded.clone();
+            let client = Arc::clone(&clients[index]);
+            async move {
+                commands
+                    .replace_identity(loaded, client as Arc<dyn ControlClient>)
+                    .await
+            }
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(clients[index].calls.load(Ordering::SeqCst), 0);
+        clients[index - 1].release.notify_waiters();
+        replace.await.unwrap().unwrap();
+        wait_for_calls(&clients[index].calls, 1).await;
+        assert_eq!(concurrency.maximum.load(Ordering::SeqCst), 1);
+    }
+
+    clients[2].release.notify_waiters();
+    owner.shutdown().await.unwrap();
+    shutdown_database(database).await;
+}
+
+#[tokio::test]
+async fn cloud_owner_stale_worker_cannot_publish_or_reauthorize_after_epoch_handoff() {
+    let (temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    let authorization = CommunicationAuthorization::new();
+    let communication = CommunicationRuntime::start_authorized(
+        Arc::clone(&database),
+        temp.path().join("agent.sqlite"),
+        Arc::new(UnavailableCommunicationProviderFactory),
+        authorization.clone(),
+    )
+    .await
+    .unwrap();
+    let concurrency = Arc::new(WorkerConcurrency::default());
+    let old = Arc::new(BlockingOwnerClient {
+        calls: AtomicUsize::new(0),
+        release: Notify::new(),
+        concurrency: Arc::clone(&concurrency),
+        snapshot: exact_snapshot(1, true),
+    });
+    let replacement = Arc::new(BlockingOwnerClient {
+        calls: AtomicUsize::new(0),
+        release: Notify::new(),
+        concurrency,
+        snapshot: exact_snapshot(2, true),
+    });
+    let (pairing_state_sender, _) = watch::channel(false);
+    let (owner, commands) =
+        CloudControlOwner::start(Arc::clone(&database), pairing_state_sender, authorization);
+    let mut controls = owner.communication_controls();
+    commands
+        .replace_identity(loaded.clone(), Arc::clone(&old) as Arc<dyn ControlClient>)
+        .await
+        .unwrap();
+    wait_for_calls(&old.calls, 1).await;
+    controls.borrow_and_update();
+
+    let replace = tokio::spawn({
+        let commands = commands.clone();
+        let replacement = Arc::clone(&replacement);
+        async move {
+            commands
+                .replace_identity(loaded, replacement as Arc<dyn ControlClient>)
+                .await
+        }
+    });
+    controls.changed().await.unwrap();
+    assert!(controls.borrow_and_update().is_none());
+    old.release.notify_waiters();
+    replace.await.unwrap().unwrap();
+    wait_for_calls(&replacement.calls, 1).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        controls.borrow().is_none(),
+        "stale worker publication escaped"
+    );
+    let communication_state = database
+        .load_collector_states()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|state| state.collector_key == "communication.wechat")
+        .unwrap();
+    assert_eq!(communication_state.status, CollectorStatus::Disabled);
+
+    replacement.release.notify_waiters();
+    owner.shutdown().await.unwrap();
+    communication.shutdown().await.unwrap();
+    shutdown_database(database).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cloud_owner_closed_command_and_worker_shutdown_channels_terminate_without_busy_loop() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    let owner_client = Arc::new(TransientCountingClient::default());
+    let (pairing_state_sender, _) = watch::channel(false);
+    let (owner, commands) = CloudControlOwner::start(
+        Arc::clone(&database),
+        pairing_state_sender,
+        CommunicationAuthorization::new(),
+    );
+    commands
+        .replace_identity(
+            loaded.clone(),
+            Arc::clone(&owner_client) as Arc<dyn ControlClient>,
+        )
+        .await
+        .unwrap();
+    wait_for_calls(&owner_client.calls, 1).await;
+    drop(commands);
+    tokio::time::advance(Duration::from_hours(1)).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(owner_client.calls.load(Ordering::SeqCst), 1);
+    owner.shutdown().await.unwrap();
+
+    let worker_client = Arc::new(TransientCountingClient::default());
+    let worker = CloudControlRuntime::start(
+        Arc::clone(&database),
+        loaded,
+        Arc::clone(&worker_client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+    wait_for_calls(&worker_client.calls, 1).await;
+    drop(worker);
+    tokio::time::advance(Duration::from_hours(1)).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(worker_client.calls.load(Ordering::SeqCst), 1);
+}
+
 fn system_event(event_id: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: event_id.to_owned(),
@@ -667,4 +966,14 @@ async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
         tokio::task::yield_now().await;
     }
     panic!("control client did not reach {expected} calls");
+}
+
+async fn shutdown_database(database: Arc<DbActorHandle>) {
+    match Arc::try_unwrap(database) {
+        Ok(database) => database.shutdown().await.unwrap(),
+        Err(database) => {
+            drop(database);
+            panic!("runtime released database before test cleanup");
+        }
+    }
 }

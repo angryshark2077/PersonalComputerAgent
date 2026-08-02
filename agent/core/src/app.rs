@@ -9,7 +9,7 @@ use pca_agent_runtime::{
 };
 use pca_agentd::{
     cloud_control::{
-        AppliedControl, CloudControlHandle, CloudControlRuntime, ControlClient, HttpControlClient,
+        AppliedControl, CloudControlCommands, CloudControlOwner, ControlClient, HttpControlClient,
         PRODUCTION_CLOUD_API_ORIGIN,
     },
     communication::{
@@ -194,7 +194,7 @@ struct RuntimeResources {
     bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
     pairing_shutdown: Option<watch::Sender<bool>>,
     pairing_task: Option<JoinHandle<Result<(), PairingIpcServerError>>>,
-    control: Option<CloudControlHandle>,
+    control: Option<CloudControlOwner>,
     heartbeat: Option<LocalHeartbeatWriter>,
     state: RuntimeStateMachine,
     schema_version: Option<u32>,
@@ -245,33 +245,28 @@ impl RuntimeResources {
             watch::channel(BridgeStatus::Disconnected);
         let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
         let communication_authorization = CommunicationAuthorization::new();
+        let (control, control_commands) = CloudControlOwner::start(
+            Arc::clone(
+                self.database
+                    .as_ref()
+                    .expect("database exists until cleanup"),
+            ),
+            pairing_state_sender.clone(),
+            communication_authorization.clone(),
+        );
+        let mut communication_control_receiver = control.communication_controls();
 
         // A build with process hooks has no production Keychain identity; keeping those harnesses
         // explicitly unpaired prevents test-only identities from becoming a release input.
-        self.control = if cfg!(feature = "process-test-hooks") {
-            None
+        let pairing_valid = if cfg!(feature = "process-test-hooks") {
+            false
         } else {
-            start_paired_control(
-                Arc::clone(
-                    self.database
-                        .as_ref()
-                        .expect("database exists until cleanup"),
-                ),
-                Arc::clone(&credential_store),
-                pairing_state_sender.clone(),
-                communication_authorization.clone(),
-            )
-            .await
-            .ok()
-            .flatten()
+            start_paired_control(Arc::clone(&credential_store), &control_commands)
+                .await
+                .ok()
+                .unwrap_or(false)
         };
-        let (inactive_control_sender, inactive_control_receiver) = watch::channel(None);
-        let mut communication_control_receiver = self.control.as_ref().map_or(
-            inactive_control_receiver,
-            CloudControlHandle::communication_controls,
-        );
-        let _inactive_control_sender = inactive_control_sender;
-        let pairing_valid = self.control.is_some();
+        self.control = Some(control);
         let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
         let bridge_task = start_bridge(
             config,
@@ -295,7 +290,7 @@ impl RuntimeResources {
                         .expect("database exists until cleanup"),
                 ),
                 credential_store,
-                pairing_state_sender,
+                control_commands,
                 communication_authorization.clone(),
                 pairing_shutdown_receiver,
             )
@@ -748,7 +743,7 @@ async fn start_pairing_server(
     config: &RunConfig,
     database: Arc<DbActorHandle>,
     credential_store: Arc<dyn CredentialStore>,
-    pairing_state_sender: watch::Sender<bool>,
+    control_commands: CloudControlCommands,
     communication_authorization: CommunicationAuthorization,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), PairingIpcServerError>>, FailureStage> {
@@ -759,30 +754,23 @@ async fn start_pairing_server(
         socket,
         database,
         credential_store,
-        pairing_state_sender,
+        control_commands,
         communication_authorization,
     );
     Ok(tokio::spawn(server.serve(shutdown)))
 }
 
 async fn start_paired_control(
-    database: Arc<DbActorHandle>,
     credential_store: Arc<dyn CredentialStore>,
-    pairing_state_sender: watch::Sender<bool>,
-    communication_authorization: CommunicationAuthorization,
-) -> Result<Option<CloudControlHandle>, FailureStage> {
+    control_commands: &CloudControlCommands,
+) -> Result<bool, FailureStage> {
     let origin =
         Url::parse(PRODUCTION_CLOUD_API_ORIGIN).map_err(|_| FailureStage::ControlConfiguration)?;
     let client = HttpControlClient::new(origin).map_err(|_| FailureStage::ControlConfiguration)?;
-    CloudControlRuntime::start_from_keychain_with_pairing_state_and_authorization(
-        database,
-        credential_store,
-        Arc::new(client) as Arc<dyn ControlClient>,
-        pairing_state_sender,
-        communication_authorization,
-    )
-    .await
-    .map_err(|_| FailureStage::ControlConfiguration)
+    control_commands
+        .replace_from_keychain(credential_store, Arc::new(client) as Arc<dyn ControlClient>)
+        .await
+        .map_err(|_| FailureStage::ControlConfiguration)
 }
 
 fn collector_identity_from_pairing_state(

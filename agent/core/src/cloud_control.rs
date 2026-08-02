@@ -12,7 +12,7 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
     time,
 };
@@ -25,6 +25,7 @@ use crate::communication::{
 const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
+const CONTROL_OWNER_COMMAND_CAPACITY: usize = 8;
 pub const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.up.railway.app";
 
 /// Future returned by the small Cloud-control port.
@@ -365,6 +366,70 @@ pub struct CloudControlHandle {
     state: Arc<Mutex<ControlState>>,
     authorization: CommunicationAuthorization,
     communication_controls: watch::Sender<Option<AppliedControl>>,
+    publication: ControlPublication,
+    owner_epoch: u64,
+    shutdown: Option<watch::Sender<bool>>,
+    worker: Option<JoinHandle<Result<(), CloudControlRuntimeError>>>,
+}
+
+#[derive(Clone)]
+struct ControlPublication {
+    state: Arc<Mutex<ControlPublicationState>>,
+}
+
+struct ControlPublicationState {
+    owner_epoch: u64,
+    sender: watch::Sender<Option<AppliedControl>>,
+}
+
+impl ControlPublication {
+    fn new(sender: watch::Sender<Option<AppliedControl>>, owner_epoch: u64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ControlPublicationState {
+                owner_epoch,
+                sender,
+            })),
+        }
+    }
+
+    async fn replace_owner(&self, owner_epoch: u64) {
+        let mut state = self.state.lock().await;
+        state.owner_epoch = owner_epoch;
+        state.sender.send_replace(None);
+    }
+
+    async fn publish(&self, owner_epoch: u64, control: Option<AppliedControl>) -> bool {
+        let state = self.state.lock().await;
+        if state.owner_epoch != owner_epoch {
+            return false;
+        }
+        state.sender.send_replace(control);
+        true
+    }
+}
+
+enum CloudControlOwnerCommand {
+    ReplaceIdentity {
+        credentials: LoadedDeviceCredentials,
+        client: Arc<dyn ControlClient>,
+        response: oneshot::Sender<Result<(), CloudControlRuntimeError>>,
+    },
+    ReplaceFromKeychain {
+        store: Arc<dyn CredentialStore>,
+        client: Arc<dyn ControlClient>,
+        response: oneshot::Sender<Result<bool, CloudControlRuntimeError>>,
+    },
+}
+
+/// Serialized command sender for the process-lifetime Cloud-control owner.
+#[derive(Clone)]
+pub struct CloudControlCommands {
+    commands: mpsc::Sender<CloudControlOwnerCommand>,
+}
+
+/// Process-lifetime owner of at most one joined Cloud-control worker.
+pub struct CloudControlOwner {
+    communication_controls: watch::Sender<Option<AppliedControl>>,
     shutdown: Option<watch::Sender<bool>>,
     worker: Option<JoinHandle<Result<(), CloudControlRuntimeError>>>,
 }
@@ -494,33 +559,327 @@ impl CloudControlRuntime {
         pairing_state_sender: watch::Sender<bool>,
         authorization: CommunicationAuthorization,
     ) -> Result<CloudControlHandle, CloudControlRuntimeError> {
-        let applied_revision = ensure_pairing_state(&database, credentials.credential()).await?;
-        pairing_state_sender.send_replace(true);
-        let state = Arc::new(Mutex::new(ControlState {
-            unpaired: false,
-            applied_revision: Some(applied_revision),
-            communication_hydrated: false,
-        }));
+        let owner_epoch = authorization.owner_epoch().await;
         let (communication_controls, _) = watch::channel(None);
-        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-        let worker = tokio::spawn(run_control_loop(
+        let publication = ControlPublication::new(communication_controls.clone(), owner_epoch);
+        start_control_worker(
             database,
             credentials,
             client,
-            Arc::clone(&state),
-            shutdown_receiver,
             pairing_state_sender,
-            communication_controls.clone(),
-            authorization.clone(),
-        ));
-        Ok(CloudControlHandle {
-            state,
             authorization,
             communication_controls,
-            shutdown: Some(shutdown_sender),
-            worker: Some(worker),
-        })
+            publication,
+            owner_epoch,
+        )
+        .await
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the worker receives the process-owned authorization and publication epoch"
+)]
+async fn start_control_worker(
+    database: Arc<DbActorHandle>,
+    credentials: LoadedDeviceCredentials,
+    client: Arc<dyn ControlClient>,
+    pairing_state_sender: watch::Sender<bool>,
+    authorization: CommunicationAuthorization,
+    communication_controls: watch::Sender<Option<AppliedControl>>,
+    publication: ControlPublication,
+    owner_epoch: u64,
+) -> Result<CloudControlHandle, CloudControlRuntimeError> {
+    let applied_revision = ensure_pairing_state(&database, credentials.credential()).await?;
+    pairing_state_sender.send_replace(true);
+    let state = Arc::new(Mutex::new(ControlState {
+        unpaired: false,
+        applied_revision: Some(applied_revision),
+        communication_hydrated: false,
+    }));
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let worker = tokio::spawn(run_control_loop(
+        database,
+        credentials,
+        client,
+        Arc::clone(&state),
+        shutdown_receiver,
+        pairing_state_sender,
+        publication.clone(),
+        authorization.clone(),
+        owner_epoch,
+    ));
+    Ok(CloudControlHandle {
+        state,
+        authorization,
+        communication_controls,
+        publication,
+        owner_epoch,
+        shutdown: Some(shutdown_sender),
+        worker: Some(worker),
+    })
+}
+
+impl CloudControlOwner {
+    #[must_use]
+    pub fn start(
+        database: Arc<DbActorHandle>,
+        pairing_state_sender: watch::Sender<bool>,
+        authorization: CommunicationAuthorization,
+    ) -> (Self, CloudControlCommands) {
+        let (communication_controls, _) = watch::channel(None);
+        let publication = ControlPublication::new(communication_controls.clone(), 0);
+        let (commands, command_receiver) = mpsc::channel(CONTROL_OWNER_COMMAND_CAPACITY);
+        let (shutdown, shutdown_receiver) = watch::channel(false);
+        let worker = tokio::spawn(run_control_owner(
+            database,
+            pairing_state_sender,
+            authorization,
+            communication_controls.clone(),
+            publication,
+            command_receiver,
+            shutdown_receiver,
+        ));
+        (
+            Self {
+                communication_controls,
+                shutdown: Some(shutdown),
+                worker: Some(worker),
+            },
+            CloudControlCommands { commands },
+        )
+    }
+
+    #[must_use]
+    pub fn communication_controls(&self) -> watch::Receiver<Option<AppliedControl>> {
+        self.communication_controls.subscribe()
+    }
+
+    /// Stops and joins the current Cloud worker and its process-lifetime owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted owner or worker lifecycle failure.
+    pub async fn shutdown(mut self) -> Result<(), CloudControlRuntimeError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.send_replace(true);
+        }
+        match self.worker.take() {
+            Some(worker) => worker
+                .await
+                .map_err(|_| CloudControlRuntimeError::WorkerStopped)?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl CloudControlCommands {
+    /// Serially replaces the active identity after the prior worker has fully joined.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted lifecycle failure without starting an overlapping worker.
+    pub async fn replace_identity(
+        &self,
+        credentials: LoadedDeviceCredentials,
+        client: Arc<dyn ControlClient>,
+    ) -> Result<(), CloudControlRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(CloudControlOwnerCommand::ReplaceIdentity {
+                credentials,
+                client,
+                response,
+            })
+            .await
+            .map_err(|_| CloudControlRuntimeError::WorkerStopped)?;
+        receiver
+            .await
+            .map_err(|_| CloudControlRuntimeError::WorkerStopped)?
+    }
+
+    /// Reconciles startup Keychain state through the same serialized owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted Keychain, database, or lifecycle failure.
+    pub async fn replace_from_keychain(
+        &self,
+        store: Arc<dyn CredentialStore>,
+        client: Arc<dyn ControlClient>,
+    ) -> Result<bool, CloudControlRuntimeError> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(CloudControlOwnerCommand::ReplaceFromKeychain {
+                store,
+                client,
+                response,
+            })
+            .await
+            .map_err(|_| CloudControlRuntimeError::WorkerStopped)?;
+        receiver
+            .await
+            .map_err(|_| CloudControlRuntimeError::WorkerStopped)?
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the owner serializes one worker over its shared lifecycle dependencies"
+)]
+async fn run_control_owner(
+    database: Arc<DbActorHandle>,
+    pairing_state_sender: watch::Sender<bool>,
+    authorization: CommunicationAuthorization,
+    communication_controls: watch::Sender<Option<AppliedControl>>,
+    publication: ControlPublication,
+    mut commands: mpsc::Receiver<CloudControlOwnerCommand>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), CloudControlRuntimeError> {
+    let mut current = None;
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow_and_update() {
+                    break;
+                }
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                match command {
+                    CloudControlOwnerCommand::ReplaceIdentity {
+                        credentials,
+                        client,
+                        response,
+                    } => {
+                        let result = replace_owned_control(
+                            &database,
+                            credentials,
+                            client,
+                            &pairing_state_sender,
+                            &authorization,
+                            &communication_controls,
+                            &publication,
+                            &mut current,
+                        )
+                        .await;
+                        let _ = response.send(result);
+                    }
+                    CloudControlOwnerCommand::ReplaceFromKeychain {
+                        store,
+                        client,
+                        response,
+                    } => {
+                        let result = replace_owned_control_from_keychain(
+                            &database,
+                            store,
+                            client,
+                            &pairing_state_sender,
+                            &authorization,
+                            &communication_controls,
+                            &publication,
+                            &mut current,
+                        )
+                        .await;
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        }
+    }
+
+    invalidate_and_stop_owned_control(&authorization, &publication, &mut current)
+        .await
+        .map(|_| ())
+}
+
+async fn invalidate_and_stop_owned_control(
+    authorization: &CommunicationAuthorization,
+    publication: &ControlPublication,
+    current: &mut Option<CloudControlHandle>,
+) -> Result<u64, CloudControlRuntimeError> {
+    let owner_epoch = authorization.replace_owner().await;
+    publication.replace_owner(owner_epoch).await;
+    if let Some(worker) = current.take() {
+        worker.shutdown().await?;
+    }
+    Ok(owner_epoch)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "identity handoff uses the owner-shared lifecycle dependencies"
+)]
+async fn replace_owned_control(
+    database: &Arc<DbActorHandle>,
+    credentials: LoadedDeviceCredentials,
+    client: Arc<dyn ControlClient>,
+    pairing_state_sender: &watch::Sender<bool>,
+    authorization: &CommunicationAuthorization,
+    communication_controls: &watch::Sender<Option<AppliedControl>>,
+    publication: &ControlPublication,
+    current: &mut Option<CloudControlHandle>,
+) -> Result<(), CloudControlRuntimeError> {
+    let owner_epoch =
+        invalidate_and_stop_owned_control(authorization, publication, current).await?;
+    *current = Some(
+        start_control_worker(
+            Arc::clone(database),
+            credentials,
+            client,
+            pairing_state_sender.clone(),
+            authorization.clone(),
+            communication_controls.clone(),
+            publication.clone(),
+            owner_epoch,
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "startup reconciliation uses the owner-shared lifecycle dependencies"
+)]
+async fn replace_owned_control_from_keychain(
+    database: &Arc<DbActorHandle>,
+    store: Arc<dyn CredentialStore>,
+    client: Arc<dyn ControlClient>,
+    pairing_state_sender: &watch::Sender<bool>,
+    authorization: &CommunicationAuthorization,
+    communication_controls: &watch::Sender<Option<AppliedControl>>,
+    publication: &ControlPublication,
+    current: &mut Option<CloudControlHandle>,
+) -> Result<bool, CloudControlRuntimeError> {
+    let owner_epoch =
+        invalidate_and_stop_owned_control(authorization, publication, current).await?;
+    if !synchronize_pairing_state_with_authorization(database, store.as_ref(), authorization)
+        .await?
+    {
+        pairing_state_sender.send_replace(false);
+        return Ok(false);
+    }
+    let credential = load_device_credential(store.as_ref())?.ok_or(
+        CloudControlRuntimeError::Keychain(CredentialError::InvalidCredential),
+    )?;
+    *current = Some(
+        start_control_worker(
+            Arc::clone(database),
+            LoadedDeviceCredentials::new(credential, store),
+            client,
+            pairing_state_sender.clone(),
+            authorization.clone(),
+            communication_controls.clone(),
+            publication.clone(),
+            owner_epoch,
+        )
+        .await?,
+    );
+    Ok(true)
 }
 
 /// Reconciles the non-secret `SQLite` pointer with the Keychain record at Agent startup.
@@ -588,8 +947,9 @@ impl CloudControlHandle {
     ///
     /// Returns an error if the worker ends unexpectedly or reports a runtime failure.
     pub async fn shutdown(mut self) -> Result<(), CloudControlRuntimeError> {
-        self.authorization.disable().await;
-        self.communication_controls.send_replace(None);
+        if self.authorization.disable_for_owner(self.owner_epoch).await {
+            self.publication.publish(self.owner_epoch, None).await;
+        }
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send_replace(true);
         }
@@ -670,8 +1030,9 @@ async fn run_control_loop(
     state: Arc<Mutex<ControlState>>,
     mut shutdown: watch::Receiver<bool>,
     pairing_state_sender: watch::Sender<bool>,
-    communication_controls: watch::Sender<Option<AppliedControl>>,
+    publication: ControlPublication,
     authorization: CommunicationAuthorization,
+    owner_epoch: u64,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut retry_attempt = 0_u8;
     let mut wait = Duration::ZERO;
@@ -688,8 +1049,9 @@ async fn run_control_loop(
             &mut credentials,
             client.as_ref(),
             &state,
-            &communication_controls,
+            &publication,
             &authorization,
+            owner_epoch,
         )
         .await
         {
@@ -702,8 +1064,9 @@ async fn run_control_loop(
                 wait = retry_delay(retry_attempt);
             }
             Err(ControlError::Contract) => {
-                authorization.disable().await;
-                communication_controls.send_replace(None);
+                if authorization.disable_for_owner(owner_epoch).await {
+                    publication.publish(owner_epoch, None).await;
+                }
                 retry_attempt = retry_attempt.saturating_add(1);
                 wait = retry_delay(retry_attempt);
             }
@@ -718,8 +1081,9 @@ async fn run_control_loop(
                                 &credentials,
                                 &state,
                                 &pairing_state_sender,
-                                &communication_controls,
+                                &publication,
                                 &authorization,
+                                owner_epoch,
                             )
                             .await;
                         }
@@ -735,8 +1099,9 @@ async fn run_control_loop(
                             &credentials,
                             &state,
                             &pairing_state_sender,
-                            &communication_controls,
+                            &publication,
                             &authorization,
+                            owner_epoch,
                         )
                         .await;
                     }
@@ -745,8 +1110,9 @@ async fn run_control_loop(
                         wait = retry_delay(retry_attempt);
                     }
                     Err(ControlError::Contract) => {
-                        authorization.disable().await;
-                        communication_controls.send_replace(None);
+                        if authorization.disable_for_owner(owner_epoch).await {
+                            publication.publish(owner_epoch, None).await;
+                        }
                         retry_attempt = retry_attempt.saturating_add(1);
                         wait = retry_delay(retry_attempt);
                     }
@@ -758,8 +1124,9 @@ async fn run_control_loop(
                     &credentials,
                     &state,
                     &pairing_state_sender,
-                    &communication_controls,
+                    &publication,
                     &authorization,
+                    owner_epoch,
                 )
                 .await;
             }
@@ -772,8 +1139,9 @@ async fn control_once(
     credentials: &mut LoadedDeviceCredentials,
     client: &dyn ControlClient,
     state: &Arc<Mutex<ControlState>>,
-    communication_controls: &watch::Sender<Option<AppliedControl>>,
+    publication: &ControlPublication,
     authorization: &CommunicationAuthorization,
+    owner_epoch: u64,
 ) -> Result<(), ControlError> {
     let outbox_depth = database
         .active_outbox_depth()
@@ -783,15 +1151,19 @@ async fn control_once(
         .heartbeat_and_control(&credentials.credential, outbox_depth)
         .await?;
     if snapshot.revoked {
-        authorization.disable().await;
-        communication_controls.send_replace(None);
+        if !authorization.disable_for_owner(owner_epoch).await {
+            return Err(ControlError::Transient);
+        }
+        publication.publish(owner_epoch, None).await;
         return Err(ControlError::Revoked);
     }
     if snapshot.device_id != credentials.credential.device_id()
         || snapshot.workspace_id != credentials.credential.workspace_id()
     {
-        authorization.disable().await;
-        communication_controls.send_replace(None);
+        if !authorization.disable_for_owner(owner_epoch).await {
+            return Err(ControlError::Transient);
+        }
+        publication.publish(owner_epoch, None).await;
         return Err(ControlError::Contract);
     }
     let (current, hydrated) = {
@@ -812,9 +1184,17 @@ async fn control_once(
         apply_snapshot(current, &snapshot)?
     };
     if applied.is_some_and(|applied| !applied.communication_wechat_enabled) {
-        apply_communication_authorization(authorization, &credentials.credential, applied.unwrap())
-            .await?;
-        communication_controls.send_replace(applied);
+        if !apply_communication_authorization(
+            authorization,
+            &credentials.credential,
+            applied.unwrap(),
+            owner_epoch,
+        )
+        .await?
+        {
+            return Err(ControlError::Transient);
+        }
+        publication.publish(owner_epoch, applied).await;
     }
     sync_pending_system_events(database, &credentials.credential, client).await?;
     let Some(applied) = applied else {
@@ -832,8 +1212,17 @@ async fn control_once(
         state.communication_hydrated = true;
     }
     if applied.communication_wechat_enabled {
-        apply_communication_authorization(authorization, &credentials.credential, applied).await?;
-        communication_controls.send_replace(Some(applied));
+        if !apply_communication_authorization(
+            authorization,
+            &credentials.credential,
+            applied,
+            owner_epoch,
+        )
+        .await?
+        {
+            return Err(ControlError::Transient);
+        }
+        publication.publish(owner_epoch, Some(applied)).await;
     }
     Ok(())
 }
@@ -879,7 +1268,8 @@ async fn apply_communication_authorization(
     authorization: &CommunicationAuthorization,
     credentials: &DeviceCredential,
     applied: AppliedControl,
-) -> Result<(), ControlError> {
+    owner_epoch: u64,
+) -> Result<bool, ControlError> {
     let identity =
         CommunicationIdentity::try_new(credentials.workspace_id(), credentials.device_id())
             .map_err(|_| ControlError::Contract)?;
@@ -890,7 +1280,7 @@ async fn apply_communication_authorization(
     )
     .map_err(|_| ControlError::Contract)?;
     authorization
-        .apply_persisted(control)
+        .apply_persisted_for_owner(owner_epoch, control)
         .await
         .map_err(|_| ControlError::Contract)
 }
@@ -900,11 +1290,14 @@ async fn revoke(
     credentials: &LoadedDeviceCredentials,
     state: &Arc<Mutex<ControlState>>,
     pairing_state_sender: &watch::Sender<bool>,
-    communication_controls: &watch::Sender<Option<AppliedControl>>,
+    publication: &ControlPublication,
     authorization: &CommunicationAuthorization,
+    owner_epoch: u64,
 ) -> Result<(), CloudControlRuntimeError> {
-    authorization.disable().await;
-    communication_controls.send_replace(None);
+    if !authorization.disable_for_owner(owner_epoch).await {
+        return Ok(());
+    }
+    publication.publish(owner_epoch, None).await;
     {
         let mut state = state.lock().await;
         state.unpaired = true;
@@ -922,7 +1315,7 @@ async fn revoke(
 async fn wait_or_shutdown(wait: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
         () = time::sleep(wait) => false,
-        changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow_and_update(),
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow_and_update(),
     }
 }
 

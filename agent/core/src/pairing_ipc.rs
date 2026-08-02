@@ -11,7 +11,7 @@ use pca_bridge_client::{
     framing::{read_frame_bytes, write_frame},
 };
 use pca_db_local::DbActorHandle;
-use pca_keychain::{load_bridge_shared_secret, CredentialStore};
+use pca_keychain::{load_bridge_shared_secret, load_device_credential, CredentialStore};
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -23,9 +23,9 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::cloud_control::{
-    synchronize_pairing_state_with_authorization, AgentPairingService, CloudControlHandle,
-    CloudControlRuntime, ControlClient, HttpControlClient, PairingCallbackHandoff, PairingClient,
-    PairingStartHandoff, PRODUCTION_CLOUD_API_ORIGIN,
+    synchronize_pairing_state_with_authorization, AgentPairingService, CloudControlCommands,
+    ControlClient, HttpControlClient, LoadedDeviceCredentials, PairingCallbackHandoff,
+    PairingClient, PairingStartHandoff, PRODUCTION_CLOUD_API_ORIGIN,
 };
 use crate::communication::CommunicationAuthorization;
 
@@ -50,8 +50,7 @@ pub struct PairingIpcServer {
     database: Arc<DbActorHandle>,
     store: Arc<dyn CredentialStore>,
     pending: Mutex<Option<PendingPairing>>,
-    control: Mutex<Option<CloudControlHandle>>,
-    pairing_state_sender: watch::Sender<bool>,
+    control_commands: CloudControlCommands,
     communication_authorization: CommunicationAuthorization,
 }
 
@@ -263,7 +262,7 @@ impl PairingIpcServer {
         socket: PairingSocket,
         database: Arc<DbActorHandle>,
         store: Arc<dyn CredentialStore>,
-        pairing_state_sender: watch::Sender<bool>,
+        control_commands: CloudControlCommands,
         communication_authorization: CommunicationAuthorization,
     ) -> Self {
         Self {
@@ -271,8 +270,7 @@ impl PairingIpcServer {
             database,
             store,
             pending: Mutex::new(None),
-            control: Mutex::new(None),
-            pairing_state_sender,
+            control_commands,
             communication_authorization,
         }
     }
@@ -299,9 +297,6 @@ impl PairingIpcServer {
                     }
                 }
             }
-        }
-        if let Some(control) = self.control.lock().await.take() {
-            let _ = control.shutdown().await;
         }
         self.socket
             .shutdown()
@@ -371,7 +366,6 @@ impl PairingIpcServer {
                 }
             }
             PairingIpcOperation::Complete => {
-                self.communication_authorization.disable().await;
                 let payload = request.complete_payload().map_err(|_| ())?;
                 match self.pending.lock().await.take() {
                     None => error_response("PAIRING_UNAVAILABLE"),
@@ -384,23 +378,29 @@ impl PairingIpcServer {
                         .await
                     {
                         Ok(completion) => {
-                            match CloudControlRuntime::start_from_keychain_with_pairing_state_and_authorization(
-                                Arc::clone(&self.database),
-                                Arc::clone(&self.store),
-                                pending.client.clone() as Arc<dyn ControlClient>,
-                                self.pairing_state_sender.clone(),
-                                self.communication_authorization.clone(),
-                            )
-                            .await
-                            {
-                                Ok(Some(control)) => {
-                                    *self.control.lock().await = Some(control);
-                                    json!({
-                                        "device_id": completion.device_id,
-                                        "workspace_id": completion.workspace_id,
-                                    })
-                                }
-                                _ => error_response("CONTROL_UNAVAILABLE"),
+                            let credential =
+                                load_device_credential(self.store.as_ref()).ok().flatten();
+                            match credential {
+                                Some(credential) => match self
+                                    .control_commands
+                                    .replace_identity(
+                                        LoadedDeviceCredentials::new(
+                                            credential,
+                                            Arc::clone(&self.store),
+                                        ),
+                                        pending.client.clone() as Arc<dyn ControlClient>,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        json!({
+                                            "device_id": completion.device_id,
+                                            "workspace_id": completion.workspace_id,
+                                        })
+                                    }
+                                    Err(_) => error_response("CONTROL_UNAVAILABLE"),
+                                },
+                                None => error_response("CONTROL_UNAVAILABLE"),
                             }
                         }
                         Err(_) => error_response("PAIRING_UNAVAILABLE"),

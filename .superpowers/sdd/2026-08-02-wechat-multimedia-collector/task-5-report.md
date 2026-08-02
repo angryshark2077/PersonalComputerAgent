@@ -162,3 +162,51 @@ The workspace crash-marker test intentionally launches a child that prints an in
 
 - The reviewer's duplicate/existing-hash quota-overcharge Minor was **not** naturally addressed. The ownership lease correctly distinguishes and preserves pre-existing hashes, but quota admission still sums every declared attachment before deduplication. This remains deferred in the review ledger and does not reopen any of the eight required findings.
 - The verified versioned production source factory remains unavailable and production remains intentionally fail closed, as recorded above. No source-row extraction was added in this fix round.
+
+## Independent review fix round 2
+
+Reviewed base: `276b989`.
+
+### Finding closure
+
+1. **Single Cloud-control ownership and serialized identity handoff — closed.** App creates one process-lifetime `CloudControlOwner` and passes only a clonable bounded command sender to startup reconciliation and Pairing IPC. The owner retains one stable communication-control publication channel across replacements. Every replacement increments the shared owner epoch, invalidates communication and publishes `None`, shuts down and joins the prior worker, and only then starts the replacement. Authorization updates and stable publications are accepted only from the matching epoch, so a late old-worker response cannot reauthorize communication or replace the stable control. Repeated pairing replacements are serialized and never overlap. Closing the command or shutdown channel terminates the owner and the lower worker without a busy loop.
+2. **Authorization-aware communication waits — closed.** Retry, Outbox hysteresis, terminal/new-control, and inter-poll waits select directly on the authoritative authorization watch. The supervisor also reconciles its local control with the authoritative state at the loop boundary before factory creation. Disable, revoke, or identity replacement therefore transitions the collector to disabled immediately and prevents any additional factory creation, discovery, or polling while disabled. A later start requires a newly validated control installed through the shared authorization/serialized Cloud-owner path.
+3. **Repeated Provider stop failures — closed.** The first `stop()` failure persists only redacted degraded `WECHAT_STOP_FAILED` and quarantines the existing provider permanently. Later authorization changes, disable/revoke, explicit shutdown, and command-channel close call `stop()` again without creating a replacement. A joined shutdown after stop failure returns the redacted `communication provider stop failed` error while the owner task terminates deterministically. Channel close retries stop and exits rather than spinning.
+
+### Round-2 RED evidence
+
+- The first owner-handoff command, `cargo test -p pca-agentd --test cloud_control_process cloud_owner_joins_startup_worker_before_pairing_replacement_starts -- --exact --nocapture`, exited 101 with `E0432` because `CloudControlOwner` did not exist.
+- The first authorization-wait command, `cargo test -p pca-agentd --test communication_process authoritative_disable_interrupts_ -- --nocapture --test-threads=1`, exited 101 with 0 passed and 3 failed. Retry, Outbox hysteresis, and terminal waits each timed out because the collector never reached `Disabled` after authoritative invalidation.
+- `cargo test -p pca-agentd --test communication_process failed_provider_stop_blocks_enabled_replacement_and_prevents_overlap -- --exact --nocapture --test-threads=1` exited 101 because the stop counter never reached the required second attempt after disable. The channel-close regression already proved the existing close path attempted stop once; the completed implementation additionally preserves and surfaces the repeated failure on joined shutdown.
+
+### Round-2 GREEN evidence
+
+- `cargo test -p pca-agentd --test cloud_control_process cloud_owner_ -- --nocapture` exited 0: 4 passed, 0 failed.
+- `cargo test -p pca-agentd --test communication_process authoritative_disable_interrupts_ -- --test-threads=1` exited 0: 3 passed, 0 failed.
+- The two focused stop commands each exited 0: 2 passed in total, 0 failed.
+- The complete `communication_process` suite then exited 0: 30 passed, 0 failed.
+
+### Round-2 final verification
+
+All requested commands were rerun after the completed round-2 implementation:
+
+| Command | Final result |
+| --- | --- |
+| `cargo test -p pca-agentd --test communication_process -- --test-threads=1` | exit 0; 30 passed, 0 failed |
+| `cargo test -p pca-agentd --test cloud_control_process` | exit 0; 12 passed, 0 failed |
+| `cargo test -p pca-agentd --test pairing_ipc` | exit 0; 4 passed, 0 failed |
+| `cargo test -p pca-wechat-provider` | exit 0; 15 passed, 0 failed; doc tests passed |
+| `cargo test -p pca-agentd` | exit 0; 80 passed, 0 failed; doc tests passed |
+| `cargo test --workspace` | exit 0; all workspace and doc tests passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo fmt --check` | exit 0 |
+| `git diff --check` | exit 0 |
+
+As in prior verification, the workspace crash-marker test deliberately launches a child that prints an inner panic and `FAILED`; the enclosing assertion passed and the workspace command exited 0.
+
+### Round-2 self-review and open findings
+
+- Single-owner mutation check: starting a replacement before joining the old worker, retaining a Pairing-owned worker handle, or accepting an old epoch would fail the four `cloud_owner_*` regressions.
+- Wait mutation check: removing authorization from retry, hysteresis, or terminal selects would fail the three disable-interruption regressions and permit additional factory calls.
+- Stop mutation check: ignoring a later stop failure, creating a replacement, or returning success from joined shutdown would fail the quarantine regressions.
+- No round-2 finding remains open. The previously documented unavailable production source factory and deferred duplicate-hash quota Minor remain unchanged and outside these three findings.

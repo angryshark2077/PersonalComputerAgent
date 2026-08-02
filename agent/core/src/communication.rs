@@ -125,6 +125,7 @@ pub enum CommunicationRuntimeError {
     StaleControl,
     QueueClosed,
     WorkerStopped,
+    ProviderStopFailed,
     Clock,
 }
 
@@ -136,6 +137,7 @@ impl fmt::Display for CommunicationRuntimeError {
             Self::StaleControl => formatter.write_str("communication control revision is stale"),
             Self::QueueClosed => formatter.write_str("communication command queue is closed"),
             Self::WorkerStopped => formatter.write_str("communication worker stopped"),
+            Self::ProviderStopFailed => formatter.write_str("communication provider stop failed"),
             Self::Clock => formatter.write_str("communication clock unavailable"),
         }
     }
@@ -180,6 +182,7 @@ struct AuthorizationState {
     control: CommunicationControl,
     highest_revision: u64,
     generation: u64,
+    owner_epoch: u64,
 }
 
 /// Authoritative, monotonic communication authorization observed directly by the runtime.
@@ -196,6 +199,7 @@ impl CommunicationAuthorization {
             control: CommunicationControl::unpaired(),
             highest_revision: 0,
             generation: 0,
+            owner_epoch: 0,
         };
         let (updates, _) = watch::channel(initial);
         Self {
@@ -239,6 +243,59 @@ impl CommunicationAuthorization {
         state.generation = state.generation.saturating_add(1);
         state.control = CommunicationControl::unpaired();
         self.updates.send_replace(*state);
+    }
+
+    pub(crate) async fn replace_owner(&self) -> u64 {
+        let mut state = self.state.write().await;
+        state.owner_epoch = state.owner_epoch.saturating_add(1);
+        state.highest_revision = 0;
+        state.generation = state.generation.saturating_add(1);
+        state.control = CommunicationControl::unpaired();
+        self.updates.send_replace(*state);
+        state.owner_epoch
+    }
+
+    pub(crate) async fn owner_epoch(&self) -> u64 {
+        self.state.read().await.owner_epoch
+    }
+
+    pub(crate) async fn apply_persisted_for_owner(
+        &self,
+        owner_epoch: u64,
+        control: CommunicationControl,
+    ) -> Result<bool, CommunicationRuntimeError> {
+        if control.identity.is_none() || control.configuration_revision == 0 {
+            return Err(CommunicationRuntimeError::InvalidControl);
+        }
+        let mut state = self.state.write().await;
+        if state.owner_epoch != owner_epoch {
+            return Ok(false);
+        }
+        if control.configuration_revision == state.highest_revision && control == state.control {
+            return Ok(true);
+        }
+        if control.configuration_revision <= state.highest_revision {
+            return Err(CommunicationRuntimeError::StaleControl);
+        }
+        state.highest_revision = control.configuration_revision;
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(CommunicationRuntimeError::InvalidControl)?;
+        state.control = control;
+        self.updates.send_replace(*state);
+        Ok(true)
+    }
+
+    pub(crate) async fn disable_for_owner(&self, owner_epoch: u64) -> bool {
+        let mut state = self.state.write().await;
+        if state.owner_epoch != owner_epoch {
+            return false;
+        }
+        state.generation = state.generation.saturating_add(1);
+        state.control = CommunicationControl::unpaired();
+        self.updates.send_replace(*state);
+        true
     }
 
     fn subscribe(&self) -> watch::Receiver<AuthorizationState> {
@@ -381,6 +438,12 @@ async fn run_supervisor(
     let mut retry_revision = control.configuration_revision;
 
     'supervisor: loop {
+        let authoritative_control = authorization.borrow().control;
+        if control != authoritative_control {
+            control = authoritative_control;
+            highest_revision = highest_revision.max(control.configuration_revision);
+            persist_collector_state(&database, control, None).await?;
+        }
         if control.configuration_revision != retry_revision {
             retry_index = 0;
             retry_revision = control.configuration_revision;
@@ -419,6 +482,7 @@ async fn run_supervisor(
                 &mut control,
                 &mut highest_revision,
                 &mut commands,
+                &mut authorization,
                 MONITOR_INTERVAL,
             )
             .await?
@@ -440,6 +504,7 @@ async fn run_supervisor(
                         &mut control,
                         &mut highest_revision,
                         &mut commands,
+                        &mut authorization,
                         delay,
                     )
                     .await?
@@ -453,6 +518,7 @@ async fn run_supervisor(
                     &mut control,
                     &mut highest_revision,
                     &mut commands,
+                    &mut authorization,
                 )
                 .await?
                 {
@@ -532,6 +598,7 @@ async fn run_supervisor(
                     &mut control,
                     &mut highest_revision,
                     &mut commands,
+                    &mut authorization,
                     delay,
                 )
                 .await?
@@ -545,6 +612,7 @@ async fn run_supervisor(
                 &mut control,
                 &mut highest_revision,
                 &mut commands,
+                &mut authorization,
             )
             .await?
             {
@@ -815,6 +883,7 @@ async fn run_supervisor(
                             &mut control,
                             &mut highest_revision,
                             &mut commands,
+                            &mut authorization,
                             delay,
                         )
                         .await?
@@ -828,6 +897,7 @@ async fn run_supervisor(
                         &mut control,
                         &mut highest_revision,
                         &mut commands,
+                        &mut authorization,
                     )
                     .await?
                     {
@@ -842,6 +912,7 @@ async fn run_supervisor(
                 &mut control,
                 &mut highest_revision,
                 &mut commands,
+                &mut authorization,
                 POLL_INTERVAL,
             )
             .await?
@@ -951,20 +1022,33 @@ async fn quarantine_provider(
             biased;
             changed = authorization.changed() => {
                 if changed.is_err() {
-                    let _ = provider.stop();
-                    return Ok(());
+                    if provider.stop().is_err() {
+                        persist_collector_code(database, *control, STOP_FAILED).await?;
+                    }
+                    return Err(CommunicationRuntimeError::ProviderStopFailed);
                 }
                 *control = authorization.borrow_and_update().control;
                 *highest_revision = (*highest_revision).max(control.configuration_revision);
+                if provider.stop().is_err() {
+                    persist_collector_code(database, *control, STOP_FAILED).await?;
+                }
                 persist_collector_code(database, *control, STOP_FAILED).await?;
             }
             command = commands.recv() => {
                 if let Some(command) = command {
+                    let command_changes_control = match &command {
+                        Command::Apply { control: next, .. } => next != control,
+                    };
                     apply_command(database, control, highest_revision, command).await?;
+                    if command_changes_control && provider.stop().is_err() {
+                        persist_collector_code(database, *control, STOP_FAILED).await?;
+                    }
                     persist_collector_code(database, *control, STOP_FAILED).await?;
                 } else {
-                    let _ = provider.stop();
-                    return Ok(());
+                    if provider.stop().is_err() {
+                        persist_collector_code(database, *control, STOP_FAILED).await?;
+                    }
+                    return Err(CommunicationRuntimeError::ProviderStopFailed);
                 }
             }
         }
@@ -976,10 +1060,20 @@ async fn wait_or_command(
     control: &mut CommunicationControl,
     highest_revision: &mut u64,
     commands: &mut mpsc::Receiver<Command>,
+    authorization: &mut watch::Receiver<AuthorizationState>,
     delay: Duration,
 ) -> Result<bool, CommunicationRuntimeError> {
     tokio::select! {
         biased;
+        changed = authorization.changed() => {
+            if changed.is_err() {
+                return Ok(false);
+            }
+            *control = authorization.borrow_and_update().control;
+            *highest_revision = (*highest_revision).max(control.configuration_revision);
+            persist_collector_state(database, *control, None).await?;
+            Ok(true)
+        },
         command = commands.recv() => match command {
             Some(command) => {
                 apply_command(database, control, highest_revision, command).await?;
@@ -996,10 +1090,20 @@ async fn wait_for_poll_or_command(
     control: &mut CommunicationControl,
     highest_revision: &mut u64,
     commands: &mut mpsc::Receiver<Command>,
+    authorization: &mut watch::Receiver<AuthorizationState>,
     delay: Duration,
 ) -> Result<PollWait, CommunicationRuntimeError> {
     tokio::select! {
         biased;
+        changed = authorization.changed() => {
+            if changed.is_err() {
+                return Ok(PollWait::Closed);
+            }
+            *control = authorization.borrow_and_update().control;
+            *highest_revision = (*highest_revision).max(control.configuration_revision);
+            persist_collector_state(database, *control, None).await?;
+            Ok(PollWait::CommandApplied)
+        },
         command = commands.recv() => match command {
             Some(command) => {
                 apply_command(database, control, highest_revision, command).await?;
@@ -1016,13 +1120,26 @@ async fn wait_for_new_control(
     control: &mut CommunicationControl,
     highest_revision: &mut u64,
     commands: &mut mpsc::Receiver<Command>,
+    authorization: &mut watch::Receiver<AuthorizationState>,
 ) -> Result<bool, CommunicationRuntimeError> {
-    match commands.recv().await {
-        Some(command) => {
-            apply_command(database, control, highest_revision, command).await?;
+    tokio::select! {
+        biased;
+        changed = authorization.changed() => {
+            if changed.is_err() {
+                return Ok(false);
+            }
+            *control = authorization.borrow_and_update().control;
+            *highest_revision = (*highest_revision).max(control.configuration_revision);
+            persist_collector_state(database, *control, None).await?;
             Ok(true)
         }
-        None => Ok(false),
+        command = commands.recv() => match command {
+            Some(command) => {
+                apply_command(database, control, highest_revision, command).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        },
     }
 }
 

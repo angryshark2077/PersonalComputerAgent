@@ -21,8 +21,9 @@ use pca_agentd::communication::{
 };
 use pca_db_local::{DbActorHandle, PairingState};
 use pca_domain::{
-    CommunicationAttachment, CommunicationMessageRecorded, CommunicationMessageRecordedInput,
-    ConversationScope, Direction, DomainError, EventEnvelope, MessageKind, Sensitivity,
+    CollectorStatus, CommunicationAttachment, CommunicationMessageRecorded,
+    CommunicationMessageRecordedInput, ConversationScope, Direction, DomainError, EventEnvelope,
+    MessageKind, Sensitivity,
 };
 use pca_keychain::{CredentialError, CredentialStore, DeviceCredential};
 use pca_provider_contracts::{
@@ -584,6 +585,104 @@ async fn retryable_provider_failure_uses_bounded_backoff_but_terminal_failure_do
     assert_eq!(terminal.state.factory_calls.load(Ordering::SeqCst), 1);
     assert_eq!(terminal.state.discover_calls.load(Ordering::SeqCst), 1);
     terminal_runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn authoritative_disable_interrupts_retry_wait_without_an_app_command() {
+    let harness = Harness::new().await;
+    harness
+        .state
+        .discover_results
+        .lock()
+        .unwrap()
+        .push_back(Err(DomainError::new(
+            "WECHAT_WAITING_SOURCE",
+            "redacted",
+            true,
+        )));
+    let authorization = CommunicationAuthorization::new();
+    authorization.apply_persisted(enabled(1)).await.unwrap();
+    let time_guard = prevent_virtual_time_auto_advance();
+    let runtime = CommunicationRuntime::start_authorized(
+        Arc::clone(&harness.database),
+        harness.database_path.clone(),
+        harness.factory(),
+        authorization.clone(),
+    )
+    .await
+    .unwrap();
+    wait_for(&harness.state.discover_calls, 1).await;
+    wait_for(&harness.state.stop_calls, 1).await;
+
+    authorization.disable().await;
+    wait_for_collector_status(&harness.database, CollectorStatus::Disabled).await;
+    tokio::time::advance(Duration::from_hours(1)).await;
+    settle().await;
+    assert_eq!(harness.state.factory_calls.load(Ordering::SeqCst), 1);
+
+    runtime.shutdown().await.unwrap();
+    time_guard.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn authoritative_disable_interrupts_outbox_hysteresis_without_an_app_command() {
+    let harness = Harness::new().await;
+    seed_outbox(&harness.database_path, OUTBOX_HIGH_WATER + 1);
+    let authorization = CommunicationAuthorization::new();
+    authorization.apply_persisted(enabled(1)).await.unwrap();
+    let time_guard = prevent_virtual_time_auto_advance();
+    let runtime = CommunicationRuntime::start_authorized(
+        Arc::clone(&harness.database),
+        harness.database_path.clone(),
+        harness.factory(),
+        authorization.clone(),
+    )
+    .await
+    .unwrap();
+    settle().await;
+    assert_eq!(harness.state.factory_calls.load(Ordering::SeqCst), 0);
+
+    authorization.disable().await;
+    wait_for_collector_status(&harness.database, CollectorStatus::Disabled).await;
+    trim_outbox(&harness.database_path, OUTBOX_LOW_WATER - 1);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    settle().await;
+    assert_eq!(harness.state.factory_calls.load(Ordering::SeqCst), 0);
+
+    runtime.shutdown().await.unwrap();
+    time_guard.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn authoritative_disable_interrupts_terminal_wait_without_an_app_command() {
+    let harness = Harness::new().await;
+    harness
+        .state
+        .discover_results
+        .lock()
+        .unwrap()
+        .push_back(Err(DomainError::new(
+            "WECHAT_CAPABILITY_UNAVAILABLE",
+            "redacted",
+            false,
+        )));
+    let authorization = CommunicationAuthorization::new();
+    authorization.apply_persisted(enabled(1)).await.unwrap();
+    let runtime = CommunicationRuntime::start_authorized(
+        Arc::clone(&harness.database),
+        harness.database_path.clone(),
+        harness.factory(),
+        authorization.clone(),
+    )
+    .await
+    .unwrap();
+    wait_for(&harness.state.discover_calls, 1).await;
+
+    authorization.disable().await;
+    wait_for_collector_status(&harness.database, CollectorStatus::Disabled).await;
+    assert_eq!(harness.state.factory_calls.load(Ordering::SeqCst), 1);
+
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -1428,16 +1527,23 @@ async fn newer_disabled_or_unpaired_control_cancels_in_flight_provider_without_c
 async fn failed_provider_stop_blocks_enabled_replacement_and_prevents_overlap() {
     let harness = Harness::new().await;
     harness.state.block_poll.store(true, Ordering::SeqCst);
-    harness
-        .state
-        .stop_results
-        .lock()
-        .unwrap()
-        .push_back(Err(DomainError::new(
+    harness.state.stop_results.lock().unwrap().extend([
+        Err(DomainError::new(
             "WECHAT_PRIVATE_STOP_DETAIL",
             "redacted",
             false,
-        )));
+        )),
+        Err(DomainError::new(
+            "WECHAT_PRIVATE_STOP_DETAIL",
+            "redacted",
+            false,
+        )),
+        Err(DomainError::new(
+            "WECHAT_PRIVATE_STOP_DETAIL",
+            "redacted",
+            false,
+        )),
+    ]);
     let runtime = harness.start(enabled(1)).await;
     wait_for(&harness.state.poll_calls, 1).await;
 
@@ -1458,10 +1564,34 @@ async fn failed_provider_stop_blocks_enabled_replacement_and_prevents_overlap() 
         .await
         .expect("the quarantined owner remains alive to process disable");
     wait_for_stop_quarantine(&harness.database, 3).await;
-    assert_eq!(harness.state.stop_calls.load(Ordering::SeqCst), 1);
+    wait_for(&harness.state.stop_calls, 2).await;
     assert_eq!(harness.state.factory_calls.load(Ordering::SeqCst), 1);
 
-    runtime.shutdown().await.unwrap();
+    let error = runtime
+        .shutdown()
+        .await
+        .expect_err("repeated stop failure is surfaced by joined shutdown");
+    assert_eq!(error.to_string(), "communication provider stop failed");
+    assert_eq!(harness.state.stop_calls.load(Ordering::SeqCst), 3);
+    harness.assert_no_communication_commit().await;
+}
+
+#[tokio::test]
+async fn quarantined_provider_retries_stop_when_command_channel_closes() {
+    let harness = Harness::new().await;
+    harness.state.block_poll.store(true, Ordering::SeqCst);
+    harness.state.stop_results.lock().unwrap().extend([
+        Err(DomainError::new("WECHAT_STOP_PRIVATE", "redacted", false)),
+        Err(DomainError::new("WECHAT_STOP_PRIVATE", "redacted", false)),
+    ]);
+    let runtime = harness.start(enabled(1)).await;
+    wait_for(&harness.state.poll_calls, 1).await;
+    runtime.apply_control(enabled(2)).await.unwrap();
+    wait_for_stop_quarantine(&harness.database, 2).await;
+
+    drop(runtime);
+    wait_for(&harness.state.stop_calls, 2).await;
+    assert_eq!(harness.state.factory_calls.load(Ordering::SeqCst), 1);
     harness.assert_no_communication_commit().await;
 }
 
@@ -1745,6 +1875,23 @@ async fn wait_for_collector_code(database: &DbActorHandle, expected: &str) {
         tokio::task::yield_now().await;
     }
     panic!("collector did not record {expected}");
+}
+
+async fn wait_for_collector_status(database: &DbActorHandle, expected: CollectorStatus) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let state = database
+            .load_collector_states()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|state| state.collector_key == "communication.wechat");
+        if state.is_some_and(|state| state.status == expected) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("collector did not reach {expected:?}");
 }
 
 async fn wait_for_stop_quarantine(database: &DbActorHandle, revision: u64) {

@@ -5,10 +5,10 @@ use std::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use pca_agentd::communication::CommunicationAuthorization;
 use pca_agentd::pairing_ipc::{
     PairingIpcRequest, PairingIpcServer, PairingSocket, PairingSocketError,
 };
+use pca_agentd::{cloud_control::CloudControlOwner, communication::CommunicationAuthorization};
 use pca_bridge_client::auth::create_proof;
 use pca_bridge_client::framing::{read_frame, write_frame};
 use pca_db_local::DbActorHandle;
@@ -165,12 +165,18 @@ async fn authenticated_status_reports_an_unpaired_agent() {
         .expect("Bridge secret");
     let socket = PairingSocket::bind(&socket_path).await.expect("socket");
     let (pairing_state_sender, _) = watch::channel(false);
+    let authorization = CommunicationAuthorization::new();
+    let (control_owner, control_commands) = CloudControlOwner::start(
+        Arc::clone(&database),
+        pairing_state_sender,
+        authorization.clone(),
+    );
     let server = PairingIpcServer::new(
         socket,
         Arc::clone(&database),
         store,
-        pairing_state_sender,
-        CommunicationAuthorization::new(),
+        control_commands,
+        authorization,
     );
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let server_task = tokio::spawn(server.serve(shutdown_receiver));
@@ -208,6 +214,10 @@ async fn authenticated_status_reports_an_unpaired_agent() {
         .expect("server shutdown timeout")
         .expect("server task")
         .expect("server shutdown");
+    control_owner
+        .shutdown()
+        .await
+        .expect("control owner shutdown");
     let Ok(database) = Arc::try_unwrap(database) else {
         panic!("server released database");
     };
