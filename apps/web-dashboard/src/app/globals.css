@@ -102,6 +102,8 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 
 .status-note { color: #667085; font-size: 14px; margin: 0; }
 
+.collector-status { color: #475467; font-size: 14px; }
+
 .back-link { color: #475467; display: inline-block; font-size: 14px; font-weight: 650; margin-bottom: 24px; text-decoration: none; }
 
 .back-link:hover { color: #155eef; }

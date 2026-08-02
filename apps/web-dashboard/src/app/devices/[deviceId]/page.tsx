@@ -172,8 +172,9 @@ function CollectorScopeCard({
     <section className="dashboard-panel collector-card" aria-label={name}>
       <h2>{name}</h2>
       <p>{detail}</p>
+      <p className="collector-status">Current status: <strong>{enabled ? "Enabled" : "Disabled"}</strong></p>
       <button className="primary-button" type="button" aria-pressed={enabled} disabled={disabled} onClick={onToggle}>
-        {enabled ? "Enabled" : "Disabled"}
+        {enabled ? `Disable ${name}` : `Enable ${name}`}
       </button>
     </section>
   );

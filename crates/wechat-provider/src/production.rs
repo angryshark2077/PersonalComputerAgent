@@ -342,14 +342,8 @@ fn read_database_text(
                         })
                         .optional()
                         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
-                        .filter(|value| valid_identity(value))
-                        .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
-                    let sender_display_name = metadata
-                        .participant_names
-                        .get(&sender_id)
-                        .cloned()
-                        .unwrap_or_else(|| sender_id.clone());
-                    (sender_id, sender_display_name)
+                        .filter(|value| valid_identity(value));
+                    resolve_group_sender(sender_id, row.real_sender_id, &metadata.participant_names)
                 }
                 SourceDirection::Incoming => {
                     (session.username.clone(), metadata.display_name.clone())
@@ -560,6 +554,24 @@ fn valid_identity(value: &str) -> bool {
         && value.len() <= 512
         && !value.chars().any(char::is_control)
         && !value.ends_with("@chatroom")
+}
+
+fn resolve_group_sender(
+    sender_id: Option<String>,
+    sender_rowid: i64,
+    participant_names: &BTreeMap<String, String>,
+) -> (String, String) {
+    let Some(sender_id) = sender_id else {
+        return (
+            format!("wechat-rowid:{sender_rowid}"),
+            "Unknown member".to_owned(),
+        );
+    };
+    let display_name = participant_names
+        .get(&sender_id)
+        .cloned()
+        .unwrap_or_else(|| sender_id.clone());
+    (sender_id, display_name)
 }
 
 fn parse_group_nicknames(buffer: &[u8], candidates: &[String]) -> BTreeMap<String, String> {
@@ -874,7 +886,7 @@ mod tests {
     use super::{
         clean_account_directory_name, decode_value, is_direct_conversation, is_message_database,
         message_table_name, parse_group_nicknames, read_conversation_metadata,
-        retention_cutoff_from, Session,
+        resolve_group_sender, retention_cutoff_from, Session,
     };
     use rusqlite::{types::Value, Connection};
     use std::path::Path;
@@ -972,6 +984,22 @@ mod tests {
         buffer.extend_from_slice(b"Alice");
         let names = parse_group_nicknames(&buffer, &["wxid_other".to_owned()]);
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn production_group_sender_keeps_reading_when_one_row_has_no_identity_mapping() {
+        let names = std::collections::BTreeMap::from([(
+            "wxid_member1".to_owned(),
+            "Group Alias".to_owned(),
+        )]);
+        assert_eq!(
+            resolve_group_sender(Some("wxid_member1".to_owned()), 7, &names),
+            ("wxid_member1".to_owned(), "Group Alias".to_owned())
+        );
+        assert_eq!(
+            resolve_group_sender(None, 8, &names),
+            ("wechat-rowid:8".to_owned(), "Unknown member".to_owned())
+        );
     }
 
     #[test]
