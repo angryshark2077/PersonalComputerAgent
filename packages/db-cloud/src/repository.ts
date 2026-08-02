@@ -1,5 +1,5 @@
 import type { AgentControlSnapshot, SystemMetricPayload } from "@pca/contracts/src/types.js";
-import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -313,6 +313,11 @@ export interface CommunicationMessageRecord {
   attachments: CommunicationMessageAttachmentRecord[];
 }
 
+export interface CommunicationMessageCursor {
+  occurredAt: Date;
+  eventId: string;
+}
+
 export interface ControlRepository {
   createPairingSession(input: PairingSessionInput): Promise<PairingSession>;
   authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string>;
@@ -372,6 +377,7 @@ export interface ControlRepository {
     workspaceId: string,
     userId: string,
     limit: number,
+    before: CommunicationMessageCursor | null,
   ): Promise<CommunicationMessageRecord[]>;
   prepareCommunicationObject(
     workspaceId: string,
@@ -908,6 +914,7 @@ export class MemoryControlRepository implements ControlRepository {
     workspaceId: string,
     userId: string,
     limit: number,
+    before: CommunicationMessageCursor | null,
   ): Promise<CommunicationMessageRecord[]> {
     this.#requireOwnerMembership(workspaceId, userId);
     this.#requireDevice(deviceId, workspaceId, true);
@@ -916,9 +923,16 @@ export class MemoryControlRepository implements ControlRepository {
         event.workspaceId === workspaceId
         && event.deviceId === deviceId
         && event.eventType === "communication.message_recorded"
-        && event.message.conversationId === conversationId,
+        && event.message.conversationId === conversationId
+        && (before === null
+          || event.message.occurredAt < before.occurredAt
+          || (event.message.occurredAt.getTime() === before.occurredAt.getTime()
+            && event.eventId < before.eventId)),
       )
-      .sort((left, right) => right.message.occurredAt.getTime() - left.message.occurredAt.getTime())
+      .sort((left, right) =>
+        right.message.occurredAt.getTime() - left.message.occurredAt.getTime()
+        || right.eventId.localeCompare(left.eventId),
+      )
       .slice(0, limit)
       .map((event) => communicationMessageRecord(event, this.#communicationObjects));
   }
@@ -1898,6 +1912,7 @@ export class DrizzleControlRepository implements ControlRepository {
     workspaceId: string,
     userId: string,
     limit: number,
+    before: CommunicationMessageCursor | null,
   ): Promise<CommunicationMessageRecord[]> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
@@ -1919,9 +1934,16 @@ export class DrizzleControlRepository implements ControlRepository {
             eq(communicationMessages.workspaceId, workspaceId),
             eq(communicationMessages.deviceId, deviceId),
             eq(communicationMessages.conversationId, conversationId),
+            before === null ? undefined : or(
+              lt(communicationMessages.occurredAt, before.occurredAt),
+              and(
+                eq(communicationMessages.occurredAt, before.occurredAt),
+                lt(communicationMessages.eventId, before.eventId),
+              ),
+            ),
           ),
         )
-        .orderBy(desc(communicationMessages.occurredAt))
+        .orderBy(desc(communicationMessages.occurredAt), desc(communicationMessages.eventId))
         .limit(limit);
       return Promise.all(messages.map(async (message) => {
         const attachments = await this.database

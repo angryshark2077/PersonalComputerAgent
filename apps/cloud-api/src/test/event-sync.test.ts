@@ -336,6 +336,58 @@ test("only the device owner can read projected communication conversations and m
   );
 });
 
+test("owner pages backward through communication messages without duplicates", async () => {
+  const { api, credentials } = await pairedApi();
+  const newer = communicationText(credentials.device_id);
+  const older = communicationText(credentials.device_id);
+  older.event_id = "01986666-7666-8666-8666-666666666665";
+  older.occurred_at = "2026-08-01T23:59:00Z";
+  older.created_at = "2026-08-01T23:59:00Z";
+  older.payload = {
+    ...older.payload,
+    message_id: "message-older",
+    source_key: "opaque-source-key-older",
+    occurred_at: "2026-08-01T23:59:00Z",
+    text: "older body",
+  };
+  older.idempotency_key = "opaque-source-key-older";
+  const sync = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777790",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationConversation(credentials.device_id), older, newer],
+    }),
+  });
+  assert.equal(sync.status, 200);
+
+  const first = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages?limit=1`,
+  );
+  const firstBody = await first.json() as { messages: Array<{ event_id: string; occurred_at: string }> };
+  assert.deepEqual(firstBody.messages.map((message) => message.event_id), [newer.event_id]);
+
+  const cursor = new URLSearchParams({
+    limit: "1",
+    before: firstBody.messages[0]!.occurred_at,
+    before_event_id: firstBody.messages[0]!.event_id,
+  });
+  const second = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages?${cursor}`,
+  );
+  const secondBody = await second.json() as { messages: Array<{ event_id: string }> };
+  assert.deepEqual(secondBody.messages.map((message) => message.event_id), [older.event_id]);
+
+  assert.equal((await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages?before=${encodeURIComponent(newer.occurred_at)}`,
+  )).status, 400);
+});
+
 test("communication attachment manifests are projected without exposing object access", async () => {
   const { api, credentials } = await pairedApi();
   const response = await api.request("/v1/agent/sync/communication/events", {

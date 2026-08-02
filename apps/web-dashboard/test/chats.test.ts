@@ -54,3 +54,19 @@ test("loads owner-scoped messages with encoded conversation identity", async () 
     "https://cloud.example/v1/devices/device/communication/conversations/room%2Fname/messages?limit=50",
   );
 });
+
+test("loads older messages with a stable timestamp and event cursor", async () => {
+  let requested = "";
+  await getCommunicationMessages(async (input) => {
+    requested = String(input);
+    return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+  }, "https://cloud.example", "device", "room@chatroom", 100, {
+    occurred_at: "2026-08-02T10:00:00.000Z",
+    event_id: "01986666-7666-8666-8666-666666666667",
+  });
+
+  assert.equal(
+    requested,
+    "https://cloud.example/v1/devices/device/communication/conversations/room%40chatroom/messages?limit=100&before=2026-08-02T10%3A00%3A00.000Z&before_event_id=01986666-7666-8666-8666-666666666667",
+  );
+});

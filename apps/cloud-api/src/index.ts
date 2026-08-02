@@ -490,7 +490,11 @@ export function createApp(options: CreateAppOptions): Hono {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
     const limit = parseCommunicationLimit(context.req.query("limit"));
-    if (limit === null) {
+    const before = parseCommunicationMessageCursor(
+      context.req.query("before"),
+      context.req.query("before_event_id"),
+    );
+    if (limit === null || before === undefined) {
       return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication limit.");
     }
     try {
@@ -500,6 +504,7 @@ export function createApp(options: CreateAppOptions): Hono {
         principal.workspaceId,
         principal.userId,
         limit,
+        before,
       );
       return context.json({
         messages: messages.map((message) => ({
@@ -608,6 +613,16 @@ function parseCommunicationLimit(value: string | undefined): number | null {
   if (value === undefined) return 50;
   const limit = Number(value);
   return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
+}
+
+function parseCommunicationMessageCursor(
+  occurredAt: string | undefined,
+  eventId: string | undefined,
+): { occurredAt: Date; eventId: string } | null | undefined {
+  if (occurredAt === undefined && eventId === undefined) return null;
+  if (occurredAt === undefined || eventId === undefined || !isUuid(eventId)) return undefined;
+  const parsed = new Date(occurredAt);
+  return Number.isNaN(parsed.getTime()) ? undefined : { occurredAt: parsed, eventId };
 }
 
 function parseObjectReference(value: unknown): { eventId: string; attachmentId: string } | null {

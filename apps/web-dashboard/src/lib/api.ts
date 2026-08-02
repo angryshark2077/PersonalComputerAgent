@@ -193,12 +193,18 @@ export async function getCommunicationMessages(
   deviceId: string,
   conversationId: string,
   limit = 100,
+  before?: Pick<DashboardMessage, "occurred_at" | "event_id">,
 ): Promise<DashboardMessage[]> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (before !== undefined) {
+    query.set("before", before.occurred_at);
+    query.set("before_event_id", before.event_id);
+  }
   const result = await jsonRequest<{ messages: DashboardMessage[] }>(
     fetcher,
     apiUrl(
       cloudApiOrigin,
-      `/v1/devices/${encodeURIComponent(deviceId)}/communication/conversations/${encodeURIComponent(conversationId)}/messages?limit=${limit}`,
+      `/v1/devices/${encodeURIComponent(deviceId)}/communication/conversations/${encodeURIComponent(conversationId)}/messages?${query}`,
     ),
   );
   return result.messages;

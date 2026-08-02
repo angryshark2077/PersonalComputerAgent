@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { DashboardShell } from "../../../../../components/dashboard-shell";
 import {
@@ -23,8 +23,12 @@ export default function ChatMessagesPage() {
   const [messages, setMessages] = useState<DashboardMessage[] | null>(null);
   const [displayName, setDisplayName] = useState(conversationId);
   const [conversationScope, setConversationScope] = useState<"direct" | "group">("direct");
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const messagePanel = useRef<HTMLElement | null>(null);
+  const didInitialScroll = useRef(false);
+  const loadingOlderMessagesRef = useRef(false);
 
   useEffect(() => {
     const origin = cloudApiOrigin();
@@ -48,6 +52,7 @@ export default function ChatMessagesPage() {
         );
         setDisplayName(conversation?.display_name ?? conversationId);
         setConversationScope(conversation?.scope ?? "direct");
+        setHasOlderMessages(latest.length === 100);
         setMessages(latest.toReversed());
         window.localStorage.setItem(
           chatReadStorageKey(deviceId, conversationId),
@@ -60,10 +65,42 @@ export default function ChatMessagesPage() {
   }, [conversationId, deviceId]);
 
   useEffect(() => {
-    if (messages !== null) {
+    if (messages !== null && !didInitialScroll.current) {
+      didInitialScroll.current = true;
       messagePanel.current?.scrollTo({ top: messagePanel.current.scrollHeight });
     }
   }, [messages]);
+
+  const loadOlderMessages = useCallback(async () => {
+    const panel = messagePanel.current;
+    const oldest = messages?.[0];
+    if (panel === null || oldest === undefined || !hasOlderMessages || loadingOlderMessagesRef.current) return;
+    loadingOlderMessagesRef.current = true;
+    setLoadingOlderMessages(true);
+    setError(null);
+    const previousHeight = panel.scrollHeight;
+    try {
+      const older = await getCommunicationMessages(
+        window.fetch,
+        cloudApiOrigin(),
+        deviceId,
+        conversationId,
+        100,
+        oldest,
+      );
+      setHasOlderMessages(older.length === 100);
+      setMessages((current) => current === null ? older.toReversed() : [...older.toReversed(), ...current]);
+      window.requestAnimationFrame(() => {
+        const currentPanel = messagePanel.current;
+        if (currentPanel !== null) currentPanel.scrollTop = currentPanel.scrollHeight - previousHeight;
+      });
+    } catch (cause) {
+      setError(messageFor(cause));
+    } finally {
+      loadingOlderMessagesRef.current = false;
+      setLoadingOlderMessages(false);
+    }
+  }, [conversationId, deviceId, hasOlderMessages, messages]);
 
   return (
     <DashboardShell>
@@ -74,7 +111,18 @@ export default function ChatMessagesPage() {
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
       {messages === null ? <p className="status-note">Loading messages…</p> : (
-        <section ref={messagePanel} className="dashboard-panel message-scroll" aria-label="Conversation messages">
+        <section
+          ref={messagePanel}
+          className="dashboard-panel message-scroll"
+          aria-label="Conversation messages"
+          onScroll={(event) => {
+            if (event.currentTarget.scrollTop <= 40) void loadOlderMessages();
+          }}
+        >
+          {loadingOlderMessages ? <p className="message-page-status">Loading older messages…</p> : null}
+          {!hasOlderMessages && messages.length > 0
+            ? <p className="message-page-status">Beginning of synchronized history</p>
+            : null}
           {messages.length === 0 ? <p className="empty-state">No synchronized messages.</p> : (
             <ol className="message-list">
               {messages.map((message) => (
