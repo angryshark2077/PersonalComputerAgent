@@ -185,10 +185,12 @@ fn read_text_batch(
     cursors: &Mutex<BTreeMap<String, i64>>,
 ) -> Result<Vec<SourceRecord>, DomainError> {
     let material = load_material(paths)?;
-    let sessions = with_database(&paths.session_database, &material, read_sessions)?;
+    let sessions = with_database(&paths.session_database, &material, read_sessions)
+        .map_err(|_| read_stage_error("WECHAT_SESSION_READ_FAILED"))?;
     let conversation_metadata = with_database(&paths.contact_database, &material, |connection| {
         read_conversation_metadata(connection, &sessions)
-    })?;
+    })
+    .map_err(|_| read_stage_error("WECHAT_CONTACT_READ_FAILED"))?;
     let cutoff = retention_cutoff();
     let mut records = Vec::new();
     let mut cursor_guard = cursors.lock().map_err(|_| capability_unavailable())?;
@@ -213,7 +215,8 @@ fn read_text_batch(
         };
         let batch = with_database(database, &material, |connection| {
             read_database_text(connection, &context, &sessions, remaining)
-        })?;
+        })
+        .map_err(|_| read_stage_error("WECHAT_MESSAGE_READ_FAILED"))?;
         for (cursor_key, sequence, record) in batch {
             cursor_guard
                 .entry(cursor_key)
@@ -465,7 +468,9 @@ fn read_conversation_metadata(
         .prepare("SELECT ext_buffer FROM chat_room WHERE username = ?1 LIMIT 1")
         .ok();
     for session in sessions {
-        let display_name = read_display_name(&mut contact_statement, &session.username)?
+        let display_name = read_display_name(&mut contact_statement, &session.username)
+            .ok()
+            .flatten()
             .or_else(|| {
                 stranger_statement.as_mut().and_then(|statement| {
                     read_display_name(statement, &session.username)
@@ -475,9 +480,10 @@ fn read_conversation_metadata(
             })
             .unwrap_or_else(|| session.username.clone());
         let (member_count, participant_names) = if session.username.ends_with("@chatroom") {
-            let count: i64 = count_statement
+            let count = count_statement
                 .query_row([&session.username], |row| row.get(0))
-                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+                .ok()
+                .and_then(|count: i64| u8::try_from(count).ok());
             let members = member_statement
                 .as_mut()
                 .and_then(|statement| {
@@ -523,7 +529,7 @@ fn read_conversation_metadata(
                     .unwrap_or_else(|| member.clone());
                 participant_names.insert(member, name);
             }
-            (u8::try_from(count).ok(), participant_names)
+            (count, participant_names)
         } else {
             (None, BTreeMap::new())
         };
@@ -680,6 +686,10 @@ fn valid_display_name(value: String) -> Option<String> {
     let value = value.trim().to_owned();
     (!value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control))
         .then_some(value)
+}
+
+fn read_stage_error(code: &str) -> DomainError {
+    DomainError::new(code, "WeChat read stage failed", true)
 }
 
 fn load_material(paths: &SourcePaths) -> Result<WechatKeyMaterial, DomainError> {
