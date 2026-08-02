@@ -69,7 +69,6 @@ export default function ChatMessagesPage() {
     <DashboardShell>
       <Link className="back-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>Back to chats</Link>
       <section className="page-heading">
-        <p className="workspace-name">Latest 100 synchronized messages</p>
         <h1>{displayName}</h1>
         <p className="conversation-id">{conversationId}</p>
       </section>
