@@ -425,7 +425,7 @@ valid = (value["agent_status"] in {"unpaired", "running"} and value["bridge_stat
          and heartbeat.timestamp() >= activation_lower_bound
          and path.stat().st_mtime >= activation_lower_bound
          and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
-         and value["app_version"] == expected_version and value["schema_version"] == 2)
+         and value["app_version"] == expected_version and value["schema_version"] == 7)
 if not valid: raise SystemExit(1)
 print(pid)
 PY
@@ -484,6 +484,7 @@ SQL
 then
   fail "SQLite helper failed: $database_check"
 fi
-[[ "$database_check" == $'ok\n0000:completed\n0001:completed' ]] || fail "SQLite integrity or exact S1A migration ledger is invalid"
+[[ "$database_check" == $'ok\n0000:completed\n0001:completed\n0002:completed\n0003:completed\n0004:completed\n0005:completed\n0006:completed\n0007:completed' ]] \
+  || fail "SQLite integrity or exact S1A migration ledger is invalid"
 
 echo "S1A LIVE VERIFIED: version=$app_version agent_pid=$agent_pid bridge_pid=$bridge_pid uid=$expected_uid"
