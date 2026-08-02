@@ -40,6 +40,8 @@ const MAX_PER_CONVERSATION: usize = 20;
 const INITIAL_HISTORY_SECONDS: u64 = 60 * 24 * 60 * 60;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+const VOICE_SAMPLE_RATE: u32 = 24_000;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MacOSWechatProviderFactory;
@@ -57,6 +59,7 @@ struct SourcePaths {
     session_database: PathBuf,
     contact_database: PathBuf,
     message_databases: Vec<PathBuf>,
+    media_databases: Vec<PathBuf>,
     local_username: String,
     account_id: String,
 }
@@ -110,6 +113,13 @@ impl MacOSWechatSource {
         if message_databases.is_empty() {
             return Err(source_unavailable());
         }
+        let mut media_databases = fs::read_dir(account_root.join(MESSAGE_DIRECTORY))
+            .map_err(|_| source_unavailable())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| is_media_database(path))
+            .collect::<Vec<_>>();
+        media_databases.sort();
         let account_id = account_id_for_root(&account_root);
         Ok(Self {
             paths: Arc::new(SourcePaths {
@@ -117,6 +127,7 @@ impl MacOSWechatSource {
                 session_database: account_root.join(SESSION_DATABASE),
                 contact_database: account_root.join(CONTACT_DATABASE),
                 message_databases,
+                media_databases,
                 local_username,
                 account_id,
             }),
@@ -155,7 +166,7 @@ impl WechatSource for MacOSWechatSource {
 }
 
 fn probe_source(paths: &SourcePaths) -> Result<SourceCapabilities, DomainError> {
-    let material = load_material(paths)?;
+    let material = extend_message_database_routes(paths, load_material(paths)?)?;
     with_database(&paths.session_database, &material, |connection| {
         require_columns(connection, "SessionTable", &["username", "last_timestamp"])
     })?;
@@ -203,7 +214,7 @@ fn read_message_batch(
     paths: &SourcePaths,
     cursors: &Mutex<BTreeMap<String, i64>>,
 ) -> Result<Vec<SourceRecord>, DomainError> {
-    let material = load_material(paths)?;
+    let material = extend_message_database_routes(paths, load_material(paths)?)?;
     let sessions = with_database(&paths.session_database, &material, read_sessions)
         .map_err(|_| read_stage_error("WECHAT_SESSION_READ_FAILED"))?;
     let conversation_metadata = with_database(&paths.contact_database, &material, |connection| {
@@ -286,6 +297,30 @@ fn read_message_batch(
             break;
         }
         let remaining = MAX_BATCH - records.len();
+        let audio_batch = with_database(database, &material, |connection| {
+            read_database_audio(
+                connection,
+                &context,
+                &sessions,
+                &paths.media_databases,
+                &material,
+                remaining,
+            )
+        })
+        .map_err(|_| read_stage_error("WECHAT_AUDIO_READ_FAILED"))?;
+        for (cursor_key, sequence) in audio_batch.cursor_updates {
+            cursor_guard
+                .entry(cursor_key)
+                .and_modify(|current| *current = (*current).max(sequence))
+                .or_insert(sequence);
+        }
+        for record in audio_batch.records {
+            records.push(SourceRecord::Message(Box::new(record)));
+        }
+        if records.len() >= MAX_BATCH {
+            break;
+        }
+        let remaining = MAX_BATCH - records.len();
         let batch = with_database(database, &material, |connection| {
             read_database_text(connection, &context, &sessions, remaining)
         })
@@ -300,7 +335,8 @@ fn read_message_batch(
     }
     if std::env::var_os("PCA_WECHAT_MEDIA_DIAGNOSTIC").is_some() {
         eprintln!(
-            "WeChat image scan: decoded={} encrypted={} hardlinks={} keys={} rows={} cache_matches={} metadata={} direct_dat={} indexed_dat={} hardlink_dat={} records={}",
+            "WeChat media scan: media_dbs={} decoded={} encrypted={} hardlinks={} keys={} rows={} cache_matches={} metadata={} direct_dat={} indexed_dat={} hardlink_dat={} records={}",
+            paths.media_databases.len(),
             decoded_images
                 .values()
                 .filter(|path| path.is_some())
@@ -780,6 +816,410 @@ struct ImageReadBatch {
     hardlink_matches: usize,
 }
 
+struct AudioReadBatch {
+    records: Vec<SourceMessageRecord>,
+    cursor_updates: Vec<(String, i64)>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "voice rows share the reviewed message identity and scope mapping"
+)]
+fn read_database_audio(
+    connection: &Connection,
+    context: &TextReadContext<'_>,
+    sessions: &[Session],
+    media_databases: &[PathBuf],
+    material: &WechatKeyMaterial,
+    limit: usize,
+) -> Result<AudioReadBatch, SqlcipherProbeFailure> {
+    let my_rowid = local_sender_rowid(connection, context.local_username)?
+        .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
+    let mut sender_statement = connection
+        .prepare("SELECT user_name FROM Name2Id WHERE rowid = ?1 LIMIT 1")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut records = Vec::new();
+    let mut cursor_updates = Vec::new();
+    for session in sessions {
+        if records.len() >= limit {
+            break;
+        }
+        let metadata = context
+            .conversation_metadata
+            .get(&session.username)
+            .cloned()
+            .unwrap_or_else(|| ConversationMetadata {
+                display_name: session.username.clone(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: BTreeMap::new(),
+                participant_avatar_urls: BTreeMap::new(),
+            });
+        let conversation = if session.username.ends_with("@chatroom") {
+            let Some(member_count) = metadata.member_count else {
+                continue;
+            };
+            if !(1..=15).contains(&member_count) {
+                continue;
+            }
+            SourceConversation::Group {
+                membership: GroupMembershipEvidence::Verified(member_count),
+            }
+        } else if is_direct_conversation(&session.username) {
+            SourceConversation::Direct
+        } else {
+            continue;
+        };
+        let table_name = message_table_name(&session.username);
+        if !table_exists(connection, &table_name)? {
+            continue;
+        }
+        let cursor_key = format!("{}:{}:audio", context.database_name, session.username);
+        let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
+        let per_conversation = MAX_PER_CONVERSATION.min(limit - records.len());
+        let sql = format!(
+            "SELECT local_id, server_id, create_time, real_sender_id, status FROM \"{table_name}\" \
+             WHERE local_type = 34 AND local_id > ?1 AND create_time >= ?2 \
+             ORDER BY local_id ASC LIMIT ?3"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let rows = statement
+            .query_map(
+                (
+                    after,
+                    context.cutoff,
+                    i64::try_from(per_conversation).unwrap_or(20),
+                ),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let mut scanned_through = after;
+        for row in rows {
+            let (local_id, server_id, create_time, real_sender_id, status) =
+                row.map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+            if local_id <= 0 || create_time <= 0 {
+                continue;
+            }
+            scanned_through = local_id;
+            let same_time_index =
+                voice_same_time_index(connection, &table_name, create_time, local_id)?;
+            let silk = media_databases.iter().find_map(|database| {
+                with_recovered_database(database, material, DATABASE_TIMEOUT, |media| {
+                    read_voice_blob(
+                        media,
+                        &session.username,
+                        server_id,
+                        create_time,
+                        same_time_index,
+                    )
+                })
+                .ok()
+                .flatten()
+            });
+            let Some((attachment, source_path)) = silk.and_then(|silk| {
+                decode_voice_attachment(silk, context.database_name, &table_name, local_id)
+            }) else {
+                continue;
+            };
+            let direction = if real_sender_id == my_rowid {
+                if server_id <= 0 || status < 0 {
+                    continue;
+                }
+                SourceDirection::Outgoing
+            } else {
+                SourceDirection::Incoming
+            };
+            let (sender_id, sender_display_name, sender_avatar_url) = match direction {
+                SourceDirection::Outgoing => {
+                    (context.local_username.to_owned(), "You".to_owned(), None)
+                }
+                SourceDirection::Incoming if session.username.ends_with("@chatroom") => {
+                    let sender_id = sender_statement
+                        .query_row([real_sender_id], |row| row.get::<_, String>(0))
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .filter(|value| valid_identity(value));
+                    let (sender_id, sender_display_name) = resolve_group_sender(
+                        sender_id,
+                        real_sender_id,
+                        &metadata.participant_names,
+                    );
+                    let avatar = metadata.participant_avatar_urls.get(&sender_id).cloned();
+                    (sender_id, sender_display_name, avatar)
+                }
+                SourceDirection::Incoming => (
+                    session.username.clone(),
+                    metadata.display_name.clone(),
+                    metadata.avatar_url.clone(),
+                ),
+                SourceDirection::Unknown => continue,
+            };
+            let occurred_at = OffsetDateTime::from_unix_timestamp(create_time)
+                .ok()
+                .and_then(|time| time.format(&Rfc3339).ok())
+                .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
+            let attachment_id = attachment.attachment_id().to_owned();
+            records.push(SourceMessageRecord {
+                account_id: context.account_id.to_owned(),
+                source_sequence: u64::try_from(local_id)
+                    .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                message_id: if server_id > 0 {
+                    server_id.to_string()
+                } else {
+                    format!("local-{local_id}")
+                },
+                conversation_id: session.username.clone(),
+                conversation_display_name: metadata.display_name.clone(),
+                conversation_avatar_url: metadata.avatar_url.clone(),
+                sender_id,
+                sender_display_name,
+                sender_avatar_url,
+                source_key: format!(
+                    "wechat:{}:{table_name}:{local_id}:audio",
+                    context.database_name
+                ),
+                occurred_at,
+                local_account: LocalAccountProof::Verified,
+                direction,
+                kind: SourceMessageKind::Audio,
+                conversation: conversation.clone(),
+                finality: match direction {
+                    SourceDirection::Incoming => SourceFinality::IncomingPersisted,
+                    SourceDirection::Outgoing => SourceFinality::OutgoingSent,
+                    SourceDirection::Unknown => SourceFinality::Unknown,
+                },
+                payload: SourcePayload::Media {
+                    attachment: Some(attachment),
+                    completed_source: Some(crate::source::SourceCompletedMedia {
+                        attachment_id,
+                        source_path,
+                    }),
+                },
+            });
+        }
+        if scanned_through > after {
+            cursor_updates.push((cursor_key, scanned_through));
+        }
+    }
+    Ok(AudioReadBatch {
+        records,
+        cursor_updates,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "voice lookup keeps the ordered exact, conversation-time, and time-only fallbacks together"
+)]
+fn read_voice_blob(
+    connection: &Connection,
+    conversation_id: &str,
+    server_id: i64,
+    create_time: i64,
+    same_time_index: usize,
+) -> Result<Option<Vec<u8>>, SqlcipherProbeFailure> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' AND name LIKE 'VoiceInfo%' ORDER BY name",
+        )
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let name_table = connection
+        .query_row(
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' AND name LIKE 'Name2Id%' ORDER BY name LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+        .filter(|name| valid_sql_identifier(name));
+    let chat_name_id = if let Some(name_table) = &name_table {
+        let sql = format!("SELECT rowid FROM \"{name_table}\" WHERE user_name=?1 LIMIT 1");
+        connection
+            .query_row(&sql, [conversation_id], |row| row.get::<_, i64>(0))
+            .optional()
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+    } else {
+        None
+    };
+
+    for table in tables
+        .into_iter()
+        .filter(|table| valid_sql_identifier(table))
+    {
+        let columns = table_columns(connection, &table)?;
+        let pick = |names: &[&str]| {
+            names.iter().find_map(|name| {
+                columns
+                    .iter()
+                    .find(|column| column.eq_ignore_ascii_case(name))
+                    .filter(|column| valid_sql_identifier(column))
+                    .cloned()
+            })
+        };
+        let Some(data) = pick(&["voice_data", "buf", "voicebuf", "data"]) else {
+            continue;
+        };
+        let chat = pick(&["chat_name_id", "chatnameid", "chat_nameid"]);
+        let server = pick(&[
+            "msg_svr_id",
+            "msgsvrid",
+            "svr_id",
+            "svrid",
+            "server_id",
+            "serverid",
+        ]);
+        let time = pick(&["create_time", "createtime", "time"]);
+
+        if server_id > 0 {
+            if let (Some(chat), Some(chat_name_id), Some(server)) =
+                (chat.as_ref(), chat_name_id, server.as_ref())
+            {
+                let sql = format!(
+                    "SELECT \"{data}\" FROM \"{table}\" \
+                     WHERE \"{chat}\"=?1 AND \"{server}\"=?2 LIMIT 1"
+                );
+                if let Some(blob) =
+                    query_voice_value(connection, &sql, rusqlite::params![chat_name_id, server_id])?
+                {
+                    return Ok(Some(blob));
+                }
+            }
+            if let Some(server) = server.as_ref() {
+                let sql =
+                    format!("SELECT \"{data}\" FROM \"{table}\" WHERE \"{server}\"=?1 LIMIT 1");
+                if let Some(blob) =
+                    query_voice_value(connection, &sql, rusqlite::params![server_id])?
+                {
+                    return Ok(Some(blob));
+                }
+            }
+        }
+
+        if let (Some(chat), Some(chat_name_id), Some(time)) =
+            (chat.as_ref(), chat_name_id, time.as_ref())
+        {
+            let sql = format!(
+                "SELECT \"{data}\" FROM \"{table}\" \
+                 WHERE \"{chat}\"=?1 AND \"{time}\"=?2 ORDER BY rowid LIMIT 100"
+            );
+            let blobs = query_voice_values(
+                connection,
+                &sql,
+                rusqlite::params![chat_name_id, create_time],
+            )?;
+            if let Some(blob) = blobs.get(same_time_index.min(blobs.len().saturating_sub(1))) {
+                return Ok(Some(blob.clone()));
+            }
+        }
+
+        if let Some(time) = time.as_ref() {
+            let sql = format!(
+                "SELECT \"{data}\" FROM \"{table}\" \
+                 WHERE \"{time}\"=?1 ORDER BY rowid LIMIT 100"
+            );
+            let blobs = query_voice_values(connection, &sql, rusqlite::params![create_time])?;
+            if let Some(blob) = blobs.get(same_time_index.min(blobs.len().saturating_sub(1))) {
+                return Ok(Some(blob.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn voice_same_time_index(
+    connection: &Connection,
+    table: &str,
+    create_time: i64,
+    local_id: i64,
+) -> Result<usize, SqlcipherProbeFailure> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM \"{table}\" \
+         WHERE local_type=34 AND create_time=?1 AND local_id<?2"
+    );
+    let count = connection
+        .query_row(&sql, (create_time, local_id), |row| row.get::<_, i64>(0))
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    usize::try_from(count).map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)
+}
+
+fn query_voice_value(
+    connection: &Connection,
+    sql: &str,
+    parameters: impl rusqlite::Params,
+) -> Result<Option<Vec<u8>>, SqlcipherProbeFailure> {
+    let value = connection
+        .query_row(sql, parameters, |row| row.get::<_, Value>(0))
+        .optional()
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    Ok(value.and_then(voice_value_bytes))
+}
+
+fn query_voice_values(
+    connection: &Connection,
+    sql: &str,
+    parameters: impl rusqlite::Params,
+) -> Result<Vec<Vec<u8>>, SqlcipherProbeFailure> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let values = statement
+        .query_map(parameters, |row| row.get::<_, Value>(0))
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    Ok(values.into_iter().filter_map(voice_value_bytes).collect())
+}
+
+fn voice_value_bytes(value: Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Blob(bytes) if !bytes.is_empty() => Some(bytes),
+        Value::Text(text) => decode_hex(&text),
+        _ => None,
+    }
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    let value = value.trim();
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            u8::try_from((high << 4) | low).ok()
+        })
+        .collect()
+}
+
+fn valid_sql_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 fn derive_image_keys(account_root: &Path) -> Option<ImageKeys> {
     let raw_account = account_root.file_name()?.to_str()?.to_owned();
     let mut account_candidates = BTreeSet::from([raw_account.clone()]);
@@ -984,6 +1424,10 @@ fn decrypt_v4_image(encrypted: &[u8], keys: &ImageKeys) -> Option<Vec<u8>> {
 }
 
 fn stage_decrypted_image(bytes: &[u8], sha256: &str, mime_type: &str) -> Option<PathBuf> {
+    stage_media(bytes, sha256, mime_type)
+}
+
+fn stage_media(bytes: &[u8], sha256: &str, mime_type: &str) -> Option<PathBuf> {
     let root = fs::canonicalize(env::temp_dir())
         .ok()?
         .join("pca-wechat-media");
@@ -1001,6 +1445,7 @@ fn stage_decrypted_image(bytes: &[u8], sha256: &str, mime_type: &str) -> Option<
         "image/png" => "png",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        "audio/wav" => "wav",
         _ => return None,
     };
     let path = root.join(format!("{sha256}.{extension}"));
@@ -1019,6 +1464,56 @@ fn stage_decrypted_image(bytes: &[u8], sha256: &str, mime_type: &str) -> Option<
         return None;
     }
     Some(path)
+}
+
+fn decode_voice_attachment(
+    silk: Vec<u8>,
+    database_name: &str,
+    table_name: &str,
+    local_id: i64,
+) -> Option<(CommunicationAttachment, PathBuf)> {
+    if silk.is_empty() || silk.len() > usize::try_from(MAX_AUDIO_BYTES).ok()? {
+        return None;
+    }
+    let pcm = silk_rs::decode_silk(silk, i32::try_from(VOICE_SAMPLE_RATE).ok()?).ok()?;
+    let wav = pcm_to_wav(&pcm, VOICE_SAMPLE_RATE)?;
+    let sha256 = format!("{:x}", Sha256::digest(&wav));
+    let source_path = stage_media(&wav, &sha256, "audio/wav")?;
+    let table_hash = table_name.strip_prefix("Msg_")?;
+    let attachment_id = format!("wechat-audio:{database_name}:{table_hash}:{local_id}");
+    let attachment = CommunicationAttachment::try_new(
+        attachment_id,
+        MessageKind::Audio,
+        sha256,
+        u64::try_from(wav.len()).ok()?,
+        "audio/wav".to_owned(),
+    )
+    .ok()?;
+    Some((attachment, source_path))
+}
+
+fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Option<Vec<u8>> {
+    if pcm.is_empty() || !pcm.len().is_multiple_of(2) {
+        return None;
+    }
+    let data_size = u32::try_from(pcm.len()).ok()?;
+    let riff_size = 36_u32.checked_add(data_size)?;
+    let byte_rate = sample_rate.checked_mul(2)?;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    Some(wav)
 }
 
 fn cleanup_staged_images(root: &Path) {
@@ -1693,6 +2188,39 @@ fn load_material(paths: &SourcePaths) -> Result<WechatKeyMaterial, DomainError> 
     Ok(material)
 }
 
+fn extend_message_database_routes(
+    paths: &SourcePaths,
+    mut material: WechatKeyMaterial,
+) -> Result<WechatKeyMaterial, DomainError> {
+    let source_database = paths.account_root.join("db_storage/message/message_0.db");
+    for database in paths
+        .message_databases
+        .iter()
+        .chain(paths.media_databases.iter())
+    {
+        if material.key_for_database(database).is_some() {
+            continue;
+        }
+        let relative = database
+            .strip_prefix(&paths.account_root)
+            .ok()
+            .and_then(Path::to_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(source_unavailable)?;
+        let mut salt = [0_u8; 16];
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(database)
+            .and_then(|mut file| file.read_exact(&mut salt))
+            .map_err(|_| source_unavailable())?;
+        material = material
+            .with_database_route_from(&source_database, relative, salt)
+            .map_err(|_| capability_unavailable())?;
+    }
+    Ok(material)
+}
+
 fn with_database<T>(
     path: &Path,
     material: &WechatKeyMaterial,
@@ -1927,6 +2455,16 @@ fn is_message_database(path: &Path) -> bool {
         })
 }
 
+fn is_media_database(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("media_"))
+        .and_then(|name| name.strip_suffix(".db"))
+        .is_some_and(|index| {
+            !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
 fn is_direct_conversation(username: &str) -> bool {
     const SYSTEM: [&str; 11] = [
         "filehelper",
@@ -2026,18 +2564,122 @@ fn capability_unavailable() -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_account_directory_name, decode_value, decoded_image_attachment, decrypt_v4_image,
-        derive_image_keys, image_mime_type, index_decoded_images, is_direct_conversation,
-        is_message_database, message_table_name, parse_group_nicknames, read_conversation_metadata,
-        read_database_images, resolve_group_sender, retention_cutoff_from, stage_decrypted_image,
-        ConversationMetadata, ImageKeys, Session, TextReadContext,
+        clean_account_directory_name, decode_value, decode_voice_attachment,
+        decoded_image_attachment, decrypt_v4_image, derive_image_keys,
+        extend_message_database_routes, image_mime_type, index_decoded_images,
+        is_direct_conversation, is_message_database, message_table_name, parse_group_nicknames,
+        read_conversation_metadata, read_database_images, read_voice_blob, resolve_group_sender,
+        retention_cutoff_from, stage_decrypted_image, voice_same_time_index, ConversationMetadata,
+        ImageKeys, Session, SourcePaths, TextReadContext,
     };
+    use pca_keychain::{WechatDatabaseKeyMaterial, WechatKeyMaterial};
+
+    #[test]
+    fn production_decodes_silk_voice_to_browser_wav() {
+        let pcm = vec![0_i16; 2_400]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let silk = silk_rs::encode_silk(pcm, 24_000, 24_000, true).expect("encode Silk fixture");
+        let (attachment, path) = decode_voice_attachment(silk, "message_0.db", "Msg_abc", 7)
+            .expect("decode voice fixture");
+        let wav = std::fs::read(&path).expect("read staged WAV");
+        assert_eq!(attachment.mime_type(), "audio/wav");
+        assert!(wav.starts_with(b"RIFF"));
+        assert_eq!(&wav[8..12], b"WAVE");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_matches_voice_across_tables_and_same_second_rows() {
+        let connection = Connection::open_in_memory().expect("open voice fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE Name2Id(user_name TEXT NOT NULL); \
+                 INSERT INTO Name2Id(rowid, user_name) VALUES(7, 'wxid_friend'); \
+                 CREATE TABLE VoiceInfo_0(unrelated BLOB); \
+                 CREATE TABLE VoiceInfo_1( \
+                    chat_name_id INTEGER, create_time INTEGER, msg_svr_id INTEGER, voice_data BLOB \
+                 ); \
+                 INSERT INTO VoiceInfo_1 VALUES(7, 100, 11, X'0102'); \
+                 INSERT INTO VoiceInfo_1 VALUES(7, 100, 12, X'0304'); \
+                 CREATE TABLE VoiceInfo_2( \
+                    chat_name_id INTEGER, create_time INTEGER, msg_svr_id INTEGER, data TEXT \
+                 ); \
+                 INSERT INTO VoiceInfo_2 VALUES(7, 200, 13, '0506'); \
+                 CREATE TABLE Msg_fixture( \
+                    local_id INTEGER, local_type INTEGER, create_time INTEGER \
+                 ); \
+                 INSERT INTO Msg_fixture VALUES(20, 34, 100); \
+                 INSERT INTO Msg_fixture VALUES(21, 34, 100);",
+            )
+            .expect("create voice fixture schema");
+
+        assert_eq!(
+            read_voice_blob(&connection, "wxid_friend", 12, 100, 0).expect("match exact server id"),
+            Some(vec![3, 4])
+        );
+        assert_eq!(
+            voice_same_time_index(&connection, "Msg_fixture", 100, 21)
+                .expect("derive same-time index"),
+            1
+        );
+        assert_eq!(
+            read_voice_blob(&connection, "wxid_friend", 0, 100, 1).expect("match same-time index"),
+            Some(vec![3, 4])
+        );
+        assert_eq!(
+            read_voice_blob(&connection, "wxid_friend", 13, 200, 0)
+                .expect("match later table and hex text"),
+            Some(vec![5, 6])
+        );
+    }
+
+    #[test]
+    fn production_derives_media_database_route_from_validated_message_key() {
+        let fixture = tempfile::tempdir().expect("create route fixture");
+        let account = fixture.path().join("wxid_example");
+        let directory = account.join("db_storage/message");
+        std::fs::create_dir_all(&directory).expect("create database directory");
+        let message = directory.join("message_0.db");
+        let media = directory.join("media_0.db");
+        std::fs::write(&message, [1_u8; 32]).expect("write message fixture");
+        std::fs::write(&media, [2_u8; 32]).expect("write media fixture");
+        let paths = SourcePaths {
+            account_root: account,
+            session_database: PathBuf::new(),
+            contact_database: PathBuf::new(),
+            message_databases: vec![message.clone()],
+            media_databases: vec![media.clone()],
+            local_username: "wxid_example".to_owned(),
+            account_id: "account-proof".to_owned(),
+        };
+        let message_key = WechatDatabaseKeyMaterial::new(
+            "db_storage/message/message_0.db",
+            [7_u8; 32],
+            [1_u8; 16],
+        )
+        .expect("create message route");
+        let material = WechatKeyMaterial::new_for_databases("account-proof", vec![message_key])
+            .expect("create routed material");
+
+        let extended =
+            extend_message_database_routes(&paths, material).expect("derive media route");
+        let media_key = extended
+            .key_for_database(&media)
+            .expect("media route exists");
+        assert_eq!(media_key.raw_key(), &[7_u8; 32]);
+        assert_eq!(media_key.salt(), Some(&[2_u8; 16]));
+    }
     use aes::Aes128;
     use cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use md5::{Digest as _, Md5};
     use rusqlite::{types::Value, Connection};
     use sha2::Sha256;
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     #[test]
     fn production_naming_rules_match_wechat_four_schema() {

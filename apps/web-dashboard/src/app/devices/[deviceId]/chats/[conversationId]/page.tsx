@@ -175,7 +175,7 @@ function MediaSummary({ deviceId, message }: { deviceId: string; message: Dashbo
   const attachment = message.attachments[0];
   const [mediaUrl, setMediaUrl] = useState<string | null>(null);
   useEffect(() => {
-    if (message.kind !== "image" || attachment?.object_state !== "completed" || attachment.object_id === null) {
+    if (message.kind === "text" || attachment?.object_state !== "completed" || attachment.object_id === null) {
       return;
     }
     let active = true;
@@ -196,6 +196,12 @@ function MediaSummary({ deviceId, message }: { deviceId: string; message: Dashbo
   if (attachment === undefined) return <p className="message-attachment">{message.kind} · file unavailable</p>;
   if (message.kind === "image" && mediaUrl !== null) {
     return <img className="message-image" src={mediaUrl} alt="Synchronized WeChat image" loading="lazy" />;
+  }
+  if (message.kind === "audio" && mediaUrl !== null) {
+    return <audio className="message-audio" src={mediaUrl} controls preload="none" />;
+  }
+  if (message.kind === "video" && mediaUrl !== null) {
+    return <video className="message-video" src={mediaUrl} controls preload="metadata" />;
   }
   return (
     <p className="message-attachment">
