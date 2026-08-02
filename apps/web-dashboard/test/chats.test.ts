@@ -6,6 +6,7 @@ import {
   chatReadStorageKey,
   getCommunicationConversations,
   getCommunicationMessages,
+  initializeChatReadAt,
   isConversationUnread,
 } from "../src/lib/api.ts";
 
@@ -16,6 +17,11 @@ test("decodes an encoded WeChat group identity exactly once", () => {
 
 test("chat unread state is isolated by device and conversation", () => {
   assert.equal(chatReadStorageKey("device-a", "room@chatroom"), "pca.chat-read:device-a:room@chatroom");
+  assert.equal(initializeChatReadAt("2026-08-02T10:00:00Z", null), "2026-08-02T10:00:00Z");
+  assert.equal(
+    initializeChatReadAt("2026-08-02T10:00:00Z", "2026-08-02T09:00:00Z"),
+    "2026-08-02T09:00:00Z",
+  );
   assert.equal(isConversationUnread("2026-08-02T10:00:00Z", null), true);
   assert.equal(isConversationUnread("2026-08-02T10:00:00Z", "2026-08-02T09:00:00Z"), true);
   assert.equal(isConversationUnread("2026-08-02T10:00:00Z", "2026-08-02T10:00:00Z"), false);

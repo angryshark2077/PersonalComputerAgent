@@ -125,6 +125,10 @@ export function chatReadStorageKey(deviceId: string, conversationId: string): st
   return `pca.chat-read:${deviceId}:${conversationId}`;
 }
 
+export function initializeChatReadAt(lastMessageAt: string, storedReadAt: string | null): string {
+  return storedReadAt ?? lastMessageAt;
+}
+
 export function isConversationUnread(lastMessageAt: string, readAt: string | null): boolean {
   if (readAt === null) return true;
   const last = Date.parse(lastMessageAt);

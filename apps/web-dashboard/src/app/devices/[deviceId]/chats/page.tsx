@@ -10,6 +10,7 @@ import {
   chatReadStorageKey,
   cloudApiOrigin,
   getCommunicationConversations,
+  initializeChatReadAt,
   isConversationUnread,
   type DashboardConversation,
 } from "../../../../lib/api";
@@ -45,10 +46,15 @@ export default function DeviceChatsPage() {
       try {
         const latest = await getCommunicationConversations(window.fetch, origin, params.deviceId);
         setConversations(latest);
-        setReadTimes(Object.fromEntries(latest.map((conversation) => [
-          conversation.conversation_id,
-          window.localStorage.getItem(chatReadStorageKey(params.deviceId, conversation.conversation_id)),
-        ])));
+        setReadTimes(Object.fromEntries(latest.map((conversation) => {
+          const key = chatReadStorageKey(params.deviceId, conversation.conversation_id);
+          const readAt = initializeChatReadAt(
+            conversation.last_message_at,
+            window.localStorage.getItem(key),
+          );
+          window.localStorage.setItem(key, readAt);
+          return [conversation.conversation_id, readAt];
+        })));
       } catch (cause) {
         setError(messageFor(cause));
       }
