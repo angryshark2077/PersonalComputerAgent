@@ -450,6 +450,7 @@ export function createApp(options: CreateAppOptions): Hono {
         conversations: conversations.map((conversation) => ({
           conversation_id: conversation.conversationId,
           display_name: conversation.displayName,
+          avatar_url: conversation.avatarUrl,
           scope: conversation.scope,
           member_count: conversation.memberCount,
           message_count: conversation.messageCount,
@@ -512,6 +513,7 @@ export function createApp(options: CreateAppOptions): Hono {
           message_id: message.messageId,
           sender_id: message.senderId,
           sender_display_name: message.senderDisplayName,
+          sender_avatar_url: message.senderAvatarUrl,
           occurred_at: message.occurredAt.toISOString(),
           direction: message.direction,
           kind: message.kind,

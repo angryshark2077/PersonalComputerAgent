@@ -118,6 +118,12 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 
 .conversation-link:hover { background: #f7f9fe; }
 
+.conversation-identity { align-items: center; display: flex; gap: 12px; min-width: 0; }
+
+.chat-avatar { background: #e7ecf5; border-radius: 10px; flex: 0 0 auto; height: 42px; object-fit: cover; width: 42px; }
+
+.chat-avatar.is-placeholder { align-items: center; color: #475467; display: inline-flex; font-size: 16px; font-weight: 700; justify-content: center; }
+
 .conversation-main { min-width: 0; }
 
 .conversation-title { display: inline; font-size: 14px; font-weight: 700; margin: 0 0 5px; }
@@ -134,11 +140,15 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 
 .message-scroll { max-height: calc(100vh - 250px); min-height: 320px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 
-.message-row { display: flex; }
+.message-row { align-items: flex-end; display: flex; gap: 8px; }
 
-.message-row.is-outgoing { justify-content: flex-end; }
+.message-row.is-outgoing { flex-direction: row-reverse; justify-content: flex-start; }
 
-.message-bubble { background: #f0f3f8; border-radius: 12px; max-width: min(72%, 680px); padding: 11px 13px; }
+.message-content { max-width: min(72%, 680px); }
+
+.message-avatar { border-radius: 9px; height: 34px; width: 34px; }
+
+.message-bubble { background: #f0f3f8; border-radius: 12px; padding: 11px 13px; }
 
 .message-row.is-outgoing .message-bubble { background: #dce8ff; }
 
@@ -195,5 +205,5 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
   .dashboard-account p { display: none; }
   .conversation-link { align-items: flex-start; flex-direction: column; gap: 8px; }
   .conversation-meta { text-align: left; }
-  .message-bubble { max-width: 88%; }
+  .message-content { max-width: 82%; }
 }

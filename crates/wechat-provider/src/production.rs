@@ -263,8 +263,10 @@ fn read_database_text(
             .cloned()
             .unwrap_or_else(|| ConversationMetadata {
                 display_name: session.username.clone(),
+                avatar_url: None,
                 member_count: None,
                 participant_names: BTreeMap::new(),
+                participant_avatar_urls: BTreeMap::new(),
             });
         let conversation = if session.username.ends_with("@chatroom") {
             let Some(member_count) = metadata.member_count else {
@@ -330,8 +332,10 @@ fn read_database_text(
             } else {
                 SourceDirection::Incoming
             };
-            let (sender_id, sender_display_name) = match direction {
-                SourceDirection::Outgoing => (context.local_username.to_owned(), "You".to_owned()),
+            let (sender_id, sender_display_name, sender_avatar_url) = match direction {
+                SourceDirection::Outgoing => {
+                    (context.local_username.to_owned(), "You".to_owned(), None)
+                }
                 SourceDirection::Incoming if session.username.ends_with("@chatroom") => {
                     let sender_id = sender_statement
                         .query_row([row.real_sender_id], |sender_row| {
@@ -341,11 +345,20 @@ fn read_database_text(
                         .ok()
                         .flatten()
                         .filter(|value| valid_identity(value));
-                    resolve_group_sender(sender_id, row.real_sender_id, &metadata.participant_names)
+                    let (sender_id, sender_display_name) = resolve_group_sender(
+                        sender_id,
+                        row.real_sender_id,
+                        &metadata.participant_names,
+                    );
+                    let sender_avatar_url =
+                        metadata.participant_avatar_urls.get(&sender_id).cloned();
+                    (sender_id, sender_display_name, sender_avatar_url)
                 }
-                SourceDirection::Incoming => {
-                    (session.username.clone(), metadata.display_name.clone())
-                }
+                SourceDirection::Incoming => (
+                    session.username.clone(),
+                    metadata.display_name.clone(),
+                    metadata.avatar_url.clone(),
+                ),
                 SourceDirection::Unknown => continue,
             };
             let Some(body) = decode_message_content(&row.compress_content, &row.message_content)
@@ -375,8 +388,10 @@ fn read_database_text(
                     message_id,
                     conversation_id: session.username.clone(),
                     conversation_display_name: metadata.display_name.clone(),
+                    conversation_avatar_url: metadata.avatar_url.clone(),
                     sender_id,
                     sender_display_name,
+                    sender_avatar_url,
                     source_key,
                     occurred_at,
                     local_account: LocalAccountProof::Verified,
@@ -403,8 +418,10 @@ struct Session {
 #[derive(Clone)]
 struct ConversationMetadata {
     display_name: String,
+    avatar_url: Option<String>,
     member_count: Option<u8>,
     participant_names: BTreeMap<String, String>,
+    participant_avatar_urls: BTreeMap<String, String>,
 }
 
 struct MessageRow {
@@ -446,6 +463,8 @@ fn read_conversation_metadata(
 ) -> Result<BTreeMap<String, ConversationMetadata>, SqlcipherProbeFailure> {
     let contact_names = read_display_names(connection, "contact")?;
     let stranger_names = read_display_names(connection, "stranger").unwrap_or_default();
+    let contact_avatar_urls = read_avatar_urls(connection, "contact").unwrap_or_default();
+    let stranger_avatar_urls = read_avatar_urls(connection, "stranger").unwrap_or_default();
     let group_members = read_group_members(connection).unwrap_or_default();
     let room_buffers = read_room_buffers(connection).unwrap_or_default();
     let mut metadata = BTreeMap::new();
@@ -455,41 +474,108 @@ fn read_conversation_metadata(
             .or_else(|| stranger_names.get(&session.username))
             .cloned()
             .unwrap_or_else(|| session.username.clone());
-        let (member_count, participant_names) = if session.username.ends_with("@chatroom") {
-            let members = group_members
-                .get(&session.username)
-                .cloned()
-                .unwrap_or_default();
-            let count = u8::try_from(members.len()).ok();
-            let group_nicknames = room_buffers
-                .get(&session.username)
-                .map(Vec::as_slice)
-                .map(|buffer| parse_group_nicknames(buffer, &members))
-                .unwrap_or_default();
-            let mut participant_names = BTreeMap::new();
-            for member in members {
-                let name = group_nicknames
-                    .get(&member)
+        let avatar_url = contact_avatar_urls
+            .get(&session.username)
+            .or_else(|| stranger_avatar_urls.get(&session.username))
+            .cloned();
+        let (member_count, participant_names, participant_avatar_urls) =
+            if session.username.ends_with("@chatroom") {
+                let members = group_members
+                    .get(&session.username)
                     .cloned()
-                    .or_else(|| contact_names.get(&member).cloned())
-                    .or_else(|| stranger_names.get(&member).cloned())
-                    .unwrap_or_else(|| member.clone());
-                participant_names.insert(member, name);
-            }
-            (count, participant_names)
-        } else {
-            (None, BTreeMap::new())
-        };
+                    .unwrap_or_default();
+                let count = u8::try_from(members.len()).ok();
+                let group_nicknames = room_buffers
+                    .get(&session.username)
+                    .map(Vec::as_slice)
+                    .map(|buffer| parse_group_nicknames(buffer, &members))
+                    .unwrap_or_default();
+                let mut participant_names = BTreeMap::new();
+                let mut participant_avatar_urls = BTreeMap::new();
+                for member in members {
+                    let name = group_nicknames
+                        .get(&member)
+                        .cloned()
+                        .or_else(|| contact_names.get(&member).cloned())
+                        .or_else(|| stranger_names.get(&member).cloned())
+                        .unwrap_or_else(|| member.clone());
+                    participant_names.insert(member.clone(), name);
+                    if let Some(avatar_url) = contact_avatar_urls
+                        .get(&member)
+                        .or_else(|| stranger_avatar_urls.get(&member))
+                        .cloned()
+                    {
+                        participant_avatar_urls.insert(member.clone(), avatar_url);
+                    }
+                }
+                (count, participant_names, participant_avatar_urls)
+            } else {
+                (None, BTreeMap::new(), BTreeMap::new())
+            };
         metadata.insert(
             session.username.clone(),
             ConversationMetadata {
                 display_name,
+                avatar_url,
                 member_count,
                 participant_names,
+                participant_avatar_urls,
             },
         );
     }
     Ok(metadata)
+}
+
+fn read_avatar_urls(
+    connection: &Connection,
+    table: &str,
+) -> Result<BTreeMap<String, String>, SqlcipherProbeFailure> {
+    let columns = table_columns(connection, table)?;
+    let big = columns.iter().any(|column| column == "big_head_url");
+    let small = columns.iter().any(|column| column == "small_head_url");
+    if !big && !small {
+        return Ok(BTreeMap::new());
+    }
+    let big_expression = if big { "big_head_url" } else { "NULL" };
+    let small_expression = if small { "small_head_url" } else { "NULL" };
+    let sql = format!("SELECT username, {big_expression}, {small_expression} FROM \"{table}\"");
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut avatars = BTreeMap::new();
+    for (username, big, small) in rows.flatten() {
+        if username.is_empty() || username.chars().any(char::is_control) {
+            continue;
+        }
+        if let Some(url) = [big, small]
+            .into_iter()
+            .flatten()
+            .find_map(normalize_avatar_url)
+        {
+            avatars.insert(username, url);
+        }
+    }
+    Ok(avatars)
+}
+
+fn normalize_avatar_url(value: String) -> Option<String> {
+    let value = value.trim();
+    let normalized = value
+        .strip_prefix("http://")
+        .map_or_else(|| value.to_owned(), |rest| format!("https://{rest}"));
+    (normalized.starts_with("https://")
+        && normalized.len() <= 4096
+        && !normalized.chars().any(char::is_control))
+    .then_some(normalized)
 }
 
 fn read_display_names(
@@ -720,14 +806,7 @@ fn require_columns(
     table: &str,
     required: &[&str],
 ) -> Result<(), SqlcipherProbeFailure> {
-    let mut statement = connection
-        .prepare("SELECT name FROM pragma_table_info(?1)")
-        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
-    let columns = statement
-        .query_map([table], |row| row.get::<_, String>(0))
-        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let columns = table_columns(connection, table)?;
     if required
         .iter()
         .all(|required| columns.iter().any(|column| column == required))
@@ -736,6 +815,21 @@ fn require_columns(
     } else {
         Err(SqlcipherProbeFailure::UnsupportedSchema)
     }
+}
+
+fn table_columns(
+    connection: &Connection,
+    table: &str,
+) -> Result<Vec<String>, SqlcipherProbeFailure> {
+    let mut statement = connection
+        .prepare("SELECT name FROM pragma_table_info(?1)")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let columns = statement
+        .query_map([table], |row| row.get::<_, String>(0))
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    Ok(columns)
 }
 
 fn local_sender_rowid(
@@ -948,14 +1042,14 @@ mod tests {
         let connection = Connection::open_in_memory().expect("open contact fixture");
         connection
             .execute_batch(
-                "CREATE TABLE contact (username TEXT, remark TEXT, nick_name TEXT, alias TEXT);\
+                "CREATE TABLE contact (username TEXT, remark TEXT, nick_name TEXT, alias TEXT, big_head_url TEXT, small_head_url TEXT);\
                  CREATE TABLE stranger (username TEXT, remark TEXT, nick_name TEXT, alias TEXT);\
                  CREATE TABLE name2id (username TEXT);\
                  CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);\
                  CREATE TABLE chat_room (username TEXT, ext_buffer BLOB);\
-                 INSERT INTO contact VALUES ('wxid_friend', 'Friend Remark', 'Friend Nick', 'friend_alias');\
-                 INSERT INTO contact VALUES ('room@chatroom', '', 'Group Name', 'room_alias');\
-                 INSERT INTO contact VALUES ('wxid_member1', 'Member Remark', 'Member Nick', 'member_alias');\
+                 INSERT INTO contact VALUES ('wxid_friend', 'Friend Remark', 'Friend Nick', 'friend_alias', 'https://avatar.example/friend-big.jpg', 'https://avatar.example/friend-small.jpg');\
+                 INSERT INTO contact VALUES ('room@chatroom', '', 'Group Name', 'room_alias', '', 'http://avatar.example/group-small.jpg');\
+                 INSERT INTO contact VALUES ('wxid_member1', 'Member Remark', 'Member Nick', 'member_alias', 'https://avatar.example/member.jpg', '');\
                  INSERT INTO name2id(rowid, username) VALUES (100, 'room@chatroom');",
             )
             .expect("create contact fixture");
@@ -994,11 +1088,23 @@ mod tests {
         let metadata = read_conversation_metadata(&connection, &sessions).expect("read metadata");
 
         assert_eq!(metadata["wxid_friend"].display_name, "Friend Remark");
+        assert_eq!(
+            metadata["wxid_friend"].avatar_url.as_deref(),
+            Some("https://avatar.example/friend-big.jpg")
+        );
         assert_eq!(metadata["room@chatroom"].display_name, "Group Name");
+        assert_eq!(
+            metadata["room@chatroom"].avatar_url.as_deref(),
+            Some("https://avatar.example/group-small.jpg")
+        );
         assert_eq!(metadata["room@chatroom"].member_count, Some(15));
         assert_eq!(
             metadata["room@chatroom"].participant_names["wxid_member1"],
             "Group Alias"
+        );
+        assert_eq!(
+            metadata["room@chatroom"].participant_avatar_urls["wxid_member1"],
+            "https://avatar.example/member.jpg"
         );
         assert_eq!(
             metadata["room@chatroom"].participant_names["wxid_member2"],

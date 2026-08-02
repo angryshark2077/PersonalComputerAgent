@@ -13,6 +13,8 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<NormalizedCommuni
     let SourceRecord::Message(record) = record else {
         return None;
     };
+    let record_source_conversation_avatar = record.conversation_avatar_url.clone();
+    let record_source_sender_avatar = record.sender_avatar_url.clone();
 
     if record.local_account != LocalAccountProof::Verified {
         return None;
@@ -86,5 +88,11 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<NormalizedCommuni
         message,
         completed_media,
     )
+    .and_then(|record| {
+        record.with_avatar_metadata(
+            record_source_conversation_avatar,
+            record_source_sender_avatar,
+        )
+    })
     .ok()
 }

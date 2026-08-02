@@ -226,6 +226,7 @@ export type CommunicationEventRecord =
 export interface CommunicationConversationProjection {
   conversationId: string;
   displayName: string;
+  avatarUrl: string | null;
   observedAt: Date;
   scope: "direct" | "group";
   memberCount: number | null;
@@ -236,6 +237,7 @@ export interface CommunicationMessageProjection {
   conversationId: string;
   senderId: string;
   senderDisplayName: string;
+  senderAvatarUrl: string | null;
   sourceKey: string;
   occurredAt: Date;
   direction: "incoming" | "outgoing";
@@ -253,6 +255,7 @@ export interface CommunicationMessageSenderProjection {
   sourceKey: string;
   senderId: string;
   senderDisplayName: string;
+  avatarUrl: string | null;
   observedAt: Date;
 }
 
@@ -295,6 +298,7 @@ export interface PrepareCommunicationObjectInput {
 export interface CommunicationConversationRecord {
   conversationId: string;
   displayName: string;
+  avatarUrl: string | null;
   scope: "direct" | "group";
   memberCount: number | null;
   messageCount: number;
@@ -308,6 +312,7 @@ export interface CommunicationMessageRecord {
   direction: "incoming" | "outgoing";
   senderId: string;
   senderDisplayName: string;
+  senderAvatarUrl: string | null;
   kind: "text" | "audio" | "image" | "video";
   text: string | null;
   attachments: CommunicationMessageAttachmentRecord[];
@@ -816,6 +821,7 @@ export class MemoryControlRepository implements ControlRepository {
             ) {
               stored.message.senderId = event.sender.senderId;
               stored.message.senderDisplayName = event.sender.senderDisplayName;
+              stored.message.senderAvatarUrl = event.sender.avatarUrl ?? stored.message.senderAvatarUrl;
             }
           }
           if (idempotencyKey !== null) this.#communicationIdempotency.add(idempotencyKey);
@@ -826,6 +832,7 @@ export class MemoryControlRepository implements ControlRepository {
           ? {
               conversationId: event.message.conversationId,
               displayName: event.message.conversationId,
+              avatarUrl: null,
               observedAt: event.message.occurredAt,
               scope: event.message.conversation.scope,
               memberCount: event.message.conversation.memberCount,
@@ -856,7 +863,10 @@ export class MemoryControlRepository implements ControlRepository {
             attachmentRefs: [],
             conversation: { ...event.conversation },
           });
-          this.#communicationConversations.set(conversationKey, { ...event.conversation });
+          this.#communicationConversations.set(conversationKey, {
+            ...event.conversation,
+            avatarUrl: event.conversation.avatarUrl ?? existingConversation?.avatarUrl ?? null,
+          });
         }
         if (idempotencyKey !== null) {
           this.#communicationIdempotency.add(idempotencyKey);
@@ -890,6 +900,7 @@ export class MemoryControlRepository implements ControlRepository {
         conversations.set(event.message.conversationId, {
           conversationId: event.message.conversationId,
           displayName: metadata?.displayName ?? event.message.conversationId,
+          avatarUrl: metadata?.avatarUrl ?? null,
           scope: event.message.conversation.scope,
           memberCount: event.message.conversation.memberCount,
           messageCount: 1,
@@ -1735,6 +1746,7 @@ export class DrizzleControlRepository implements ControlRepository {
               .set({
                 senderId: event.sender.senderId,
                 senderDisplayName: event.sender.senderDisplayName,
+                senderAvatarUrl: sql`COALESCE(${event.sender.avatarUrl}, ${communicationMessages.senderAvatarUrl})`,
               })
               .where(
                 and(
@@ -1751,6 +1763,7 @@ export class DrizzleControlRepository implements ControlRepository {
             ? {
                 conversationId: event.message.conversationId,
                 displayName: event.message.conversationId,
+                avatarUrl: null,
                 observedAt: event.message.occurredAt,
                 scope: event.message.conversation.scope,
                 memberCount: event.message.conversation.memberCount,
@@ -1787,6 +1800,7 @@ export class DrizzleControlRepository implements ControlRepository {
               deviceId,
               conversationId: projection.conversationId,
               displayName: projection.displayName,
+              avatarUrl: projection.avatarUrl,
               scope: projection.scope,
               memberCount: projection.memberCount,
               lastMessageAt: projection.observedAt,
@@ -1801,6 +1815,9 @@ export class DrizzleControlRepository implements ControlRepository {
                 displayName: event.eventType === "communication.conversation_observed"
                   ? projection.displayName
                   : communicationConversations.displayName,
+                avatarUrl: event.eventType === "communication.conversation_observed"
+                  ? sql`COALESCE(EXCLUDED.avatar_url, ${communicationConversations.avatarUrl})`
+                  : communicationConversations.avatarUrl,
                 memberCount: sql`CASE
                   WHEN EXCLUDED.last_message_at >= ${communicationConversations.lastMessageAt}
                     THEN EXCLUDED.member_count
@@ -1819,6 +1836,7 @@ export class DrizzleControlRepository implements ControlRepository {
             messageId: event.message.messageId,
             senderId: event.message.senderId,
             senderDisplayName: event.message.senderDisplayName,
+            senderAvatarUrl: null,
             sourceKey: event.message.sourceKey,
             occurredAt: event.message.occurredAt,
             direction: event.message.direction,
@@ -1864,6 +1882,7 @@ export class DrizzleControlRepository implements ControlRepository {
         .select({
           conversationId: communicationConversations.conversationId,
           displayName: communicationConversations.displayName,
+          avatarUrl: communicationConversations.avatarUrl,
           scope: communicationConversations.scope,
           memberCount: communicationConversations.memberCount,
           lastMessageAt: communicationConversations.lastMessageAt,
@@ -1887,6 +1906,7 @@ export class DrizzleControlRepository implements ControlRepository {
         .groupBy(
           communicationConversations.conversationId,
           communicationConversations.displayName,
+          communicationConversations.avatarUrl,
           communicationConversations.scope,
           communicationConversations.memberCount,
           communicationConversations.lastMessageAt,
@@ -1896,6 +1916,7 @@ export class DrizzleControlRepository implements ControlRepository {
       return rows.map((row) => ({
         conversationId: row.conversationId,
         displayName: row.displayName || row.conversationId,
+        avatarUrl: row.avatarUrl,
         scope: row.scope as "direct" | "group",
         memberCount: row.memberCount,
         messageCount: row.messageCount,
@@ -1923,6 +1944,7 @@ export class DrizzleControlRepository implements ControlRepository {
           messageId: communicationMessages.messageId,
           senderId: communicationMessages.senderId,
           senderDisplayName: communicationMessages.senderDisplayName,
+          senderAvatarUrl: communicationMessages.senderAvatarUrl,
           occurredAt: communicationMessages.occurredAt,
           direction: communicationMessages.direction,
           kind: communicationMessages.kind,
@@ -1970,6 +1992,7 @@ export class DrizzleControlRepository implements ControlRepository {
           messageId: message.messageId,
           senderId: message.senderId,
           senderDisplayName: message.senderDisplayName,
+          senderAvatarUrl: message.senderAvatarUrl,
           occurredAt: message.occurredAt,
           direction: message.direction as CommunicationMessageRecord["direction"],
           kind: message.kind as CommunicationMessageRecord["kind"],
@@ -2298,6 +2321,7 @@ function communicationMessageRecord(
     messageId: event.message.messageId,
     senderId: event.message.senderId,
     senderDisplayName: event.message.senderDisplayName,
+    senderAvatarUrl: event.message.senderAvatarUrl,
     occurredAt: event.message.occurredAt,
     direction: event.message.direction,
     kind: event.message.kind,

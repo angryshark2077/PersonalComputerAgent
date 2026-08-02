@@ -164,6 +164,7 @@ function parseCommunicationConversation(
   const value = payload as {
     conversation_id: string;
     display_name: string;
+    avatar_url?: string;
     observed_at: string;
     conversation: { scope: "direct" | "group"; member_count?: number };
   };
@@ -174,6 +175,7 @@ function parseCommunicationConversation(
   return {
     conversationId: value.conversation_id,
     displayName: value.display_name.trim(),
+    avatarUrl: value.avatar_url ?? null,
     observedAt,
     scope: value.conversation.scope,
     memberCount: value.conversation.scope === "group" ? value.conversation.member_count ?? null : null,
@@ -225,6 +227,7 @@ function parseCommunicationMessage(
     conversationId: message.conversation_id,
     senderId: message.sender_id,
     senderDisplayName: message.sender_display_name.trim(),
+    senderAvatarUrl: null,
     sourceKey: message.source_key,
     occurredAt,
     direction: message.direction,
@@ -247,6 +250,7 @@ function parseCommunicationMessageSender(
     source_key: string;
     sender_id: string;
     sender_display_name: string;
+    avatar_url?: string;
     observed_at: string;
   };
   const observedAt = new Date(value.observed_at);
@@ -258,6 +262,7 @@ function parseCommunicationMessageSender(
     sourceKey: value.source_key,
     senderId: value.sender_id,
     senderDisplayName: value.sender_display_name.trim(),
+    avatarUrl: value.avatar_url ?? null,
     observedAt,
   };
 }

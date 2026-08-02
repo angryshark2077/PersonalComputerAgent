@@ -84,13 +84,19 @@ export default function DeviceChatsPage() {
                     className="conversation-link"
                     href={`/devices/${encodeURIComponent(params.deviceId)}/chats/${encodeURIComponent(conversation.conversation_id)}`}
                   >
-                    <div className="conversation-main">
-                      <p className="conversation-title">{conversationTitle(conversation)}</p>
-                      {isConversationUnread(
-                        conversation.last_message_at,
-                        readTimes[conversation.conversation_id] ?? null,
-                      ) ? <span className="unread-dot" aria-label="Unread messages" /> : null}
-                      <p className="conversation-id">{conversation.conversation_id}</p>
+                    <div className="conversation-identity">
+                      <Avatar
+                        name={conversation.display_name}
+                        url={conversation.avatar_url}
+                      />
+                      <div className="conversation-main">
+                        <p className="conversation-title">{conversationTitle(conversation)}</p>
+                        {isConversationUnread(
+                          conversation.last_message_at,
+                          readTimes[conversation.conversation_id] ?? null,
+                        ) ? <span className="unread-dot" aria-label="Unread messages" /> : null}
+                        <p className="conversation-id">{conversation.conversation_id}</p>
+                      </div>
                     </div>
                     <div className="conversation-meta">
                       <div>{conversation.message_count} messages</div>
@@ -105,6 +111,18 @@ export default function DeviceChatsPage() {
       )}
     </DashboardShell>
   );
+}
+
+function Avatar({ name, url }: { name: string; url: string | null }) {
+  return url === null ? (
+    <span className="chat-avatar is-placeholder" aria-hidden="true">{initial(name)}</span>
+  ) : (
+    <img className="chat-avatar" src={url} alt="" loading="lazy" referrerPolicy="no-referrer" />
+  );
+}
+
+function initial(name: string): string {
+  return Array.from(name.trim())[0]?.toUpperCase() ?? "?";
 }
 
 function conversationTitle(conversation: DashboardConversation): string {

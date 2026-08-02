@@ -22,6 +22,7 @@ export default function ChatMessagesPage() {
   const conversationId = decodeDashboardRouteParam(params.conversationId);
   const [messages, setMessages] = useState<DashboardMessage[] | null>(null);
   const [displayName, setDisplayName] = useState(conversationId);
+  const [conversationAvatarUrl, setConversationAvatarUrl] = useState<string | null>(null);
   const [conversationScope, setConversationScope] = useState<"direct" | "group">("direct");
   const [hasOlderMessages, setHasOlderMessages] = useState(false);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
@@ -51,6 +52,7 @@ export default function ChatMessagesPage() {
           (candidate) => candidate.conversation_id === conversationId,
         );
         setDisplayName(conversation?.display_name ?? conversationId);
+        setConversationAvatarUrl(conversation?.avatar_url ?? null);
         setConversationScope(conversation?.scope ?? "direct");
         setHasOlderMessages(latest.length === 100);
         setMessages(latest.toReversed());
@@ -127,17 +129,25 @@ export default function ChatMessagesPage() {
             <ol className="message-list">
               {messages.map((message) => (
                 <li className={`message-row is-${message.direction}`} key={message.event_id}>
-                  <article className="message-bubble">
+                  <Avatar
+                    name={message.direction === "outgoing" ? "我" : message.sender_display_name}
+                    url={message.direction === "incoming"
+                      ? message.sender_avatar_url ?? (conversationScope === "direct" ? conversationAvatarUrl : null)
+                      : null}
+                  />
+                  <div className="message-content">
                     {conversationScope === "group"
                       ? <p className="message-sender">{message.sender_display_name}</p>
                       : null}
-                    {message.kind === "text"
-                      ? <p className="message-text">{message.text}</p>
-                      : <MediaSummary message={message} />}
-                    <p className="message-meta">
-                      {message.direction === "incoming" ? "Received" : "Sent"} · {formatTime(message.occurred_at)}
-                    </p>
-                  </article>
+                    <article className="message-bubble">
+                      {message.kind === "text"
+                        ? <p className="message-text">{message.text}</p>
+                        : <MediaSummary message={message} />}
+                      <p className="message-meta">
+                        {message.direction === "incoming" ? "Received" : "Sent"} · {formatTime(message.occurred_at)}
+                      </p>
+                    </article>
+                  </div>
                 </li>
               ))}
             </ol>
@@ -146,6 +156,18 @@ export default function ChatMessagesPage() {
       )}
     </DashboardShell>
   );
+}
+
+function Avatar({ name, url }: { name: string; url: string | null }) {
+  return url === null ? (
+    <span className="chat-avatar message-avatar is-placeholder" aria-hidden="true">{initial(name)}</span>
+  ) : (
+    <img className="chat-avatar message-avatar" src={url} alt="" loading="lazy" referrerPolicy="no-referrer" />
+  );
+}
+
+function initial(name: string): string {
+  return Array.from(name.trim())[0]?.toUpperCase() ?? "?";
 }
 
 function MediaSummary({ message }: { message: DashboardMessage }) {

@@ -86,6 +86,8 @@ pub struct NormalizedCommunicationRecord {
     account_id: String,
     source_sequence: u64,
     conversation_display_name: String,
+    conversation_avatar_url: Option<String>,
+    sender_avatar_url: Option<String>,
     message: CommunicationMessageRecorded,
     completed_media: Vec<CompletedMediaSource>,
 }
@@ -133,9 +135,35 @@ impl NormalizedCommunicationRecord {
             account_id,
             source_sequence,
             conversation_display_name,
+            conversation_avatar_url: None,
+            sender_avatar_url: None,
             message,
             completed_media,
         })
+    }
+
+    /// Attaches optional presentation metadata without changing the immutable message payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted record error when either URL is not a bounded HTTPS URL.
+    pub fn with_avatar_metadata(
+        mut self,
+        conversation_avatar_url: Option<String>,
+        sender_avatar_url: Option<String>,
+    ) -> Result<Self, DomainError> {
+        if conversation_avatar_url
+            .as_deref()
+            .is_some_and(|value| !valid_avatar_url(value))
+            || sender_avatar_url
+                .as_deref()
+                .is_some_and(|value| !valid_avatar_url(value))
+        {
+            return Err(invalid_record());
+        }
+        self.conversation_avatar_url = conversation_avatar_url;
+        self.sender_avatar_url = sender_avatar_url;
+        Ok(self)
     }
 
     #[must_use]
@@ -151,6 +179,16 @@ impl NormalizedCommunicationRecord {
     #[must_use]
     pub fn conversation_display_name(&self) -> &str {
         &self.conversation_display_name
+    }
+
+    #[must_use]
+    pub fn conversation_avatar_url(&self) -> Option<&str> {
+        self.conversation_avatar_url.as_deref()
+    }
+
+    #[must_use]
+    pub fn sender_avatar_url(&self) -> Option<&str> {
+        self.sender_avatar_url.as_deref()
     }
 
     #[must_use]
@@ -181,6 +219,10 @@ impl NormalizedCommunicationRecord {
             self.completed_media,
         )
     }
+}
+
+fn valid_avatar_url(value: &str) -> bool {
+    value.starts_with("https://") && value.len() <= 4096 && !value.chars().any(char::is_control)
 }
 
 /// Creates fresh Provider instances for retries and control revision transitions.

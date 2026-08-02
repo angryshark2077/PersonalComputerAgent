@@ -1240,6 +1240,8 @@ async fn prepare_record(
     let identity = control
         .identity
         .ok_or(LocalPersistenceError::InvalidRecord)?;
+    let conversation_avatar_url = record.conversation_avatar_url().map(str::to_owned);
+    let sender_avatar_url = record.sender_avatar_url().map(str::to_owned);
     let (account_id, source_sequence, conversation_display_name, message, completed_media) =
         record.into_parts();
     let prepared_media = copy_completed_media(
@@ -1250,12 +1252,19 @@ async fn prepare_record(
     )
     .await?;
     let created_at = message.occurred_at().to_owned();
-    let display_name_fingerprint = Sha256::digest(conversation_display_name.as_bytes());
+    let display_name_fingerprint = Sha256::digest(
+        format!(
+            "{}\0{}",
+            conversation_display_name,
+            conversation_avatar_url.as_deref().unwrap_or_default()
+        )
+        .as_bytes(),
+    );
     let conversation_source_key = format!(
         "conversation-observed:{}:{display_name_fingerprint:x}",
         message.source_key()
     );
-    let conversation_payload = serde_json::json!({
+    let mut conversation_payload = serde_json::json!({
         "conversation_id": message.conversation_id(),
         "display_name": conversation_display_name,
         "observed_at": message.occurred_at(),
@@ -1264,6 +1273,9 @@ async fn prepare_record(
     .as_object()
     .cloned()
     .ok_or(LocalPersistenceError::InvalidRecord)?;
+    if let Some(avatar_url) = conversation_avatar_url {
+        conversation_payload.insert("avatar_url".to_owned(), avatar_url.into());
+    }
     let conversation_event_id =
         stable_communication_event_id(identity, &account_id, &conversation_source_key);
     let conversation_event = EventEnvelope {
@@ -1281,14 +1293,20 @@ async fn prepare_record(
         idempotency_key: Some(format!("conversation-observed:{conversation_event_id}")),
     };
     let sender_fingerprint = Sha256::digest(
-        format!("{}\0{}", message.sender_id(), message.sender_display_name()).as_bytes(),
+        format!(
+            "{}\0{}\0{}",
+            message.sender_id(),
+            message.sender_display_name(),
+            sender_avatar_url.as_deref().unwrap_or_default()
+        )
+        .as_bytes(),
     );
     let sender_source_key = format!(
         "message-sender-observed:{}:{sender_fingerprint:x}",
         message.source_key()
     );
     let sender_event_id = stable_communication_event_id(identity, &account_id, &sender_source_key);
-    let sender_payload = serde_json::json!({
+    let mut sender_payload = serde_json::json!({
         "message_id": message.message_id(),
         "source_key": message.source_key(),
         "sender_id": message.sender_id(),
@@ -1298,6 +1316,9 @@ async fn prepare_record(
     .as_object()
     .cloned()
     .ok_or(LocalPersistenceError::InvalidRecord)?;
+    if let Some(avatar_url) = sender_avatar_url {
+        sender_payload.insert("avatar_url".to_owned(), avatar_url.into());
+    }
     let sender_event = EventEnvelope {
         event_id: sender_event_id.clone(),
         workspace_id: identity.workspace_id.hyphenated().to_string(),

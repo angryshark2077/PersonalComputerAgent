@@ -42,6 +42,7 @@ export interface DashboardSystemMetric {
 export interface DashboardConversation {
   conversation_id: string;
   display_name: string;
+  avatar_url: string | null;
   scope: "direct" | "group";
   member_count: number | null;
   message_count: number;
@@ -63,6 +64,7 @@ export interface DashboardMessage {
   message_id: string;
   sender_id: string;
   sender_display_name: string;
+  sender_avatar_url: string | null;
   occurred_at: string;
   direction: "incoming" | "outgoing";
   kind: "text" | "audio" | "image" | "video";
