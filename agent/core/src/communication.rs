@@ -123,6 +123,7 @@ pub enum CommunicationRuntimeError {
     Database(DbError),
     InvalidControl,
     StaleControl,
+    AuthorizationReadOnly,
     QueueClosed,
     WorkerStopped,
     ProviderStopFailed,
@@ -135,6 +136,9 @@ impl fmt::Display for CommunicationRuntimeError {
             Self::Database(error) => write!(formatter, "communication database: {error}"),
             Self::InvalidControl => formatter.write_str("communication control is invalid"),
             Self::StaleControl => formatter.write_str("communication control revision is stale"),
+            Self::AuthorizationReadOnly => {
+                formatter.write_str("communication authorization is read-only")
+            }
             Self::QueueClosed => formatter.write_str("communication command queue is closed"),
             Self::WorkerStopped => formatter.write_str("communication worker stopped"),
             Self::ProviderStopFailed => formatter.write_str("communication provider stop failed"),
@@ -172,7 +176,7 @@ enum PollWait {
 
 /// Joined owner of the single communication Provider task.
 pub struct CommunicationRuntime {
-    authorization: CommunicationAuthorization,
+    control_writer: Option<CommunicationAuthorization>,
     commands: Option<mpsc::Sender<Command>>,
     worker: Option<JoinHandle<Result<(), CommunicationRuntimeError>>>,
 }
@@ -338,7 +342,14 @@ impl CommunicationRuntime {
         if initial_control.identity.is_some() {
             authorization.apply_persisted(initial_control).await?;
         }
-        Self::start_authorized(database, database_path, factory, authorization).await
+        Self::start_inner(
+            database,
+            database_path,
+            factory,
+            authorization.clone(),
+            Some(authorization),
+        )
+        .await
     }
 
     /// Starts a runtime that observes a shared Cloud/pairing authorization generation directly.
@@ -351,6 +362,16 @@ impl CommunicationRuntime {
         database_path: PathBuf,
         factory: Arc<dyn CommunicationProviderFactory>,
         authorization: CommunicationAuthorization,
+    ) -> Result<Self, CommunicationRuntimeError> {
+        Self::start_inner(database, database_path, factory, authorization, None).await
+    }
+
+    async fn start_inner(
+        database: Arc<DbActorHandle>,
+        database_path: PathBuf,
+        factory: Arc<dyn CommunicationProviderFactory>,
+        authorization: CommunicationAuthorization,
+        control_writer: Option<CommunicationAuthorization>,
     ) -> Result<Self, CommunicationRuntimeError> {
         let authorization_receiver = authorization.subscribe();
         let initial_control = authorization_receiver.borrow().control;
@@ -366,7 +387,7 @@ impl CommunicationRuntime {
             authorization_receiver,
         ));
         Ok(Self {
-            authorization,
+            control_writer,
             commands: Some(commands),
             worker: Some(worker),
         })
@@ -381,10 +402,14 @@ impl CommunicationRuntime {
         &self,
         control: CommunicationControl,
     ) -> Result<(), CommunicationRuntimeError> {
+        let authorization = self
+            .control_writer
+            .as_ref()
+            .ok_or(CommunicationRuntimeError::AuthorizationReadOnly)?;
         if control.identity.is_none() {
-            self.authorization.disable().await;
+            authorization.disable().await;
         } else {
-            self.authorization.apply_persisted(control).await?;
+            authorization.apply_persisted(control).await?;
         }
         let (response_sender, response_receiver) = oneshot::channel();
         self.commands
@@ -492,7 +517,13 @@ async fn run_supervisor(
             return Ok(());
         }
 
-        let mut provider = match factory.create() {
+        let provider_result = {
+            let Some(_permit) = authorization_gate.commit_permit(control).await else {
+                continue;
+            };
+            factory.create()
+        };
+        let mut provider = match provider_result {
             Ok(provider) => provider,
             Err(error) => {
                 persist_collector_state(&database, control, Some(&error)).await?;

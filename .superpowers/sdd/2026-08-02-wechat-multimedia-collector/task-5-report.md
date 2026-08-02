@@ -10,7 +10,7 @@ No Cloud sync, R2, Dashboard, retention worker, Railway, deployment, or producti
 
 - `Cargo.lock` — records the Agent package's existing-workspace provider-contract dependency and the exact direct `rustix` dependency.
 - `agent/core/Cargo.toml` — adds `pca-provider-contracts`, exact `rustix = 0.38.44` with `fs`, and Tokio filesystem support.
-- `agent/core/src/app.rs` — owns the communication runtime, applies paired control notifications, installs the unavailable production factory, and joins the runtime during cleanup.
+- `agent/core/src/app.rs` — owns the read-only communication runtime, installs the unavailable production factory, and joins the runtime during cleanup; Cloud control is the sole production authorization writer.
 - `agent/core/src/cloud_control.rs` — consumes the strict `CommunicationScopeV2`, publishes monotonic validated revisions, and publishes fail-closed disable notifications for invalid/revoked control.
 - `agent/core/src/collector_registry.rs` — reuses the communication module's existing 10,000/8,000 outbox hysteresis constants for system collection.
 - `agent/core/src/communication.rs` — implements the serial lifecycle, cancellation/join, retry, backpressure, safe local spool, and atomic communication commit boundary.
@@ -209,4 +209,25 @@ As in prior verification, the workspace crash-marker test deliberately launches 
 - Single-owner mutation check: starting a replacement before joining the old worker, retaining a Pairing-owned worker handle, or accepting an old epoch would fail the four `cloud_owner_*` regressions.
 - Wait mutation check: removing authorization from retry, hysteresis, or terminal selects would fail the three disable-interruption regressions and permit additional factory calls.
 - Stop mutation check: ignoring a later stop failure, creating a replacement, or returning success from joined shutdown would fail the quarantine regressions.
-- No round-2 finding remains open. The previously documented unavailable production source factory and deferred duplicate-hash quota Minor remain unchanged and outside these three findings.
+- The three original round-2 findings were closed. The subsequent re-review identified the two authorization races handled in round 3 below. The unavailable production source factory and deferred duplicate-hash quota Minor remain unchanged.
+
+## Scoped authorization-race fix round 3
+
+Reviewed base: `049ce69`.
+
+1. **Stale App authorization writer — closed.** App no longer subscribes to and reconstructs `AppliedControl`, no longer writes unpaired/disabled state into the shared authorization, and no longer passes that authorization capability into Pairing IPC. The communication runtime started with shared Cloud authorization is explicitly read-only: `apply_control` returns `AuthorizationReadOnly`. The process-lifetime `CloudControlOwner` remains the production writer and its epoch-gated authorization is observed directly by the runtime.
+2. **Pre-factory authorization TOCTOU — closed.** After every `active_outbox_depth` query and immediately around synchronous factory creation, the supervisor obtains a matching active authorization read permit. A disable/revoke/identity replacement that completed during the database await makes the permit fail and skips factory creation; a concurrent change after permit acquisition waits until creation has completed, giving the operation one defined linearization point.
+
+Final verification for this round:
+
+| Command | Result |
+| --- | --- |
+| focused stale-epoch Cloud-owner regression | 1 passed, 0 failed |
+| focused authoritative-disable regressions | 3 passed, 0 failed |
+| `cargo test -p pca-agentd` | 80 passed, 0 failed; doc tests passed |
+| `cargo clippy -p pca-agentd --all-targets -- -D warnings` | exit 0 |
+| `cargo check -p pca-agentd --all-targets --features process-test-hooks` | exit 0 |
+| `cargo fmt --check` | exit 0 |
+| `git diff --check` | exit 0 |
+
+Scoped local review found no remaining Critical or Important authorization-race issue. The production source factory and duplicate/existing-hash quota Minor remain deferred as previously documented.

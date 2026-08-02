@@ -23,11 +23,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::cloud_control::{
-    synchronize_pairing_state_with_authorization, AgentPairingService, CloudControlCommands,
-    ControlClient, HttpControlClient, LoadedDeviceCredentials, PairingCallbackHandoff,
-    PairingClient, PairingStartHandoff, PRODUCTION_CLOUD_API_ORIGIN,
+    synchronize_pairing_state, AgentPairingService, CloudControlCommands, ControlClient,
+    HttpControlClient, LoadedDeviceCredentials, PairingCallbackHandoff, PairingClient,
+    PairingStartHandoff, PRODUCTION_CLOUD_API_ORIGIN,
 };
-use crate::communication::CommunicationAuthorization;
 
 const PAIRING_IPC_PROTOCOL_VERSION: u32 = 1;
 
@@ -51,7 +50,6 @@ pub struct PairingIpcServer {
     store: Arc<dyn CredentialStore>,
     pending: Mutex<Option<PendingPairing>>,
     control_commands: CloudControlCommands,
-    communication_authorization: CommunicationAuthorization,
 }
 
 struct PendingPairing {
@@ -263,7 +261,6 @@ impl PairingIpcServer {
         database: Arc<DbActorHandle>,
         store: Arc<dyn CredentialStore>,
         control_commands: CloudControlCommands,
-        communication_authorization: CommunicationAuthorization,
     ) -> Self {
         Self {
             socket,
@@ -271,7 +268,6 @@ impl PairingIpcServer {
             store,
             pending: Mutex::new(None),
             control_commands,
-            communication_authorization,
         }
     }
 
@@ -318,13 +314,9 @@ impl PairingIpcServer {
 
         let response = match request.operation {
             PairingIpcOperation::Status => {
-                let paired = synchronize_pairing_state_with_authorization(
-                    self.database.as_ref(),
-                    self.store.as_ref(),
-                    &self.communication_authorization,
-                )
-                .await
-                .unwrap_or(false);
+                let paired = synchronize_pairing_state(self.database.as_ref(), self.store.as_ref())
+                    .await
+                    .unwrap_or(false);
                 json!({ "paired": paired })
             }
             PairingIpcOperation::Begin => {

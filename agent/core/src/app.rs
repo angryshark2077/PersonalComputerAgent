@@ -9,12 +9,11 @@ use pca_agent_runtime::{
 };
 use pca_agentd::{
     cloud_control::{
-        AppliedControl, CloudControlCommands, CloudControlOwner, ControlClient, HttpControlClient,
+        CloudControlCommands, CloudControlOwner, ControlClient, HttpControlClient,
         PRODUCTION_CLOUD_API_ORIGIN,
     },
     communication::{
-        CommunicationAuthorization, CommunicationControl, CommunicationIdentity,
-        CommunicationRuntime, UnavailableCommunicationProviderFactory,
+        CommunicationAuthorization, CommunicationRuntime, UnavailableCommunicationProviderFactory,
     },
     pairing_ipc::{PairingIpcServer, PairingIpcServerError, PairingSocket},
 };
@@ -254,8 +253,6 @@ impl RuntimeResources {
             pairing_state_sender.clone(),
             communication_authorization.clone(),
         );
-        let mut communication_control_receiver = control.communication_controls();
-
         // A build with process hooks has no production Keychain identity; keeping those harnesses
         // explicitly unpaired prevents test-only identities from becoming a release input.
         let pairing_valid = if cfg!(feature = "process-test-hooks") {
@@ -291,7 +288,6 @@ impl RuntimeResources {
                 ),
                 credential_store,
                 control_commands,
-                communication_authorization.clone(),
                 pairing_shutdown_receiver,
             )
             .await?,
@@ -392,64 +388,11 @@ impl RuntimeResources {
                         )
                         .map_err(|_| FailureStage::State)?;
                         self.restart_system_collector(config, paired).await?;
-                        if !paired {
-                            communication_authorization.disable().await;
-                            self.apply_communication_control(None).await?;
-                        }
                         self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
-                    }
-                }
-                changed = communication_control_receiver.changed() => {
-                    if changed.is_ok() {
-                        let applied = *communication_control_receiver.borrow_and_update();
-                        self.apply_communication_control(applied).await?;
                     }
                 }
             }
         }
-    }
-
-    async fn apply_communication_control(
-        &self,
-        applied: Option<AppliedControl>,
-    ) -> Result<(), FailureStage> {
-        let control = match applied {
-            Some(applied) => {
-                let pairing = self
-                    .database()
-                    .load_pairing_state()
-                    .await
-                    .map_err(|_| FailureStage::CommunicationCollector)?;
-                let Some(pairing) = pairing else {
-                    return self.apply_unpaired_communication_control().await;
-                };
-                let identity =
-                    CommunicationIdentity::try_new(&pairing.workspace_id, &pairing.device_id)
-                        .map_err(|_| FailureStage::CommunicationCollector)?;
-                CommunicationControl::paired(
-                    identity,
-                    applied.configuration_revision,
-                    applied.communication_wechat_enabled,
-                )
-                .map_err(|_| FailureStage::CommunicationCollector)?
-            }
-            None => CommunicationControl::unpaired(),
-        };
-        self.communication_runtime
-            .as_ref()
-            .ok_or(FailureStage::CommunicationCollector)?
-            .apply_control(control)
-            .await
-            .map_err(|_| FailureStage::CommunicationCollector)
-    }
-
-    async fn apply_unpaired_communication_control(&self) -> Result<(), FailureStage> {
-        self.communication_runtime
-            .as_ref()
-            .ok_or(FailureStage::CommunicationCollector)?
-            .apply_control(CommunicationControl::unpaired())
-            .await
-            .map_err(|_| FailureStage::CommunicationCollector)
     }
 
     async fn start_system_collector(
@@ -744,19 +687,12 @@ async fn start_pairing_server(
     database: Arc<DbActorHandle>,
     credential_store: Arc<dyn CredentialStore>,
     control_commands: CloudControlCommands,
-    communication_authorization: CommunicationAuthorization,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), PairingIpcServerError>>, FailureStage> {
     let socket = PairingSocket::bind(&config.paths.pairing_socket_file)
         .await
         .map_err(|_| FailureStage::PairingConfiguration)?;
-    let server = PairingIpcServer::new(
-        socket,
-        database,
-        credential_store,
-        control_commands,
-        communication_authorization,
-    );
+    let server = PairingIpcServer::new(socket, database, credential_store, control_commands);
     Ok(tokio::spawn(server.serve(shutdown)))
 }
 

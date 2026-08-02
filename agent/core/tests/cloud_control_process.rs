@@ -12,7 +12,8 @@ use pca_agentd::cloud_control::{
     CloudControlRuntimeError, ControlClient, ControlError, ControlFuture,
 };
 use pca_agentd::communication::{
-    CommunicationAuthorization, CommunicationRuntime, UnavailableCommunicationProviderFactory,
+    CommunicationAuthorization, CommunicationControl, CommunicationIdentity, CommunicationRuntime,
+    CommunicationRuntimeError, UnavailableCommunicationProviderFactory,
 };
 use pca_db_local::{DbActorHandle, PairingState};
 use pca_domain::{CollectorState, CollectorStatus, EventEnvelope, Sensitivity};
@@ -837,6 +838,16 @@ async fn cloud_owner_stale_worker_cannot_publish_or_reauthorize_after_epoch_hand
         .unwrap();
     wait_for_calls(&old.calls, 1).await;
     controls.borrow_and_update();
+    let copied_old_control = CommunicationControl::paired(
+        CommunicationIdentity::try_new(
+            loaded.credential().workspace_id(),
+            loaded.credential().device_id(),
+        )
+        .unwrap(),
+        1,
+        true,
+    )
+    .unwrap();
 
     let replace = tokio::spawn({
         let commands = commands.clone();
@@ -849,6 +860,10 @@ async fn cloud_owner_stale_worker_cannot_publish_or_reauthorize_after_epoch_hand
     });
     controls.changed().await.unwrap();
     assert!(controls.borrow_and_update().is_none());
+    assert!(matches!(
+        communication.apply_control(copied_old_control).await,
+        Err(CommunicationRuntimeError::AuthorizationReadOnly)
+    ));
     old.release.notify_waiters();
     replace.await.unwrap().unwrap();
     wait_for_calls(&replacement.calls, 1).await;

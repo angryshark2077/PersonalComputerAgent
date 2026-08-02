@@ -166,18 +166,9 @@ async fn authenticated_status_reports_an_unpaired_agent() {
     let socket = PairingSocket::bind(&socket_path).await.expect("socket");
     let (pairing_state_sender, _) = watch::channel(false);
     let authorization = CommunicationAuthorization::new();
-    let (control_owner, control_commands) = CloudControlOwner::start(
-        Arc::clone(&database),
-        pairing_state_sender,
-        authorization.clone(),
-    );
-    let server = PairingIpcServer::new(
-        socket,
-        Arc::clone(&database),
-        store,
-        control_commands,
-        authorization,
-    );
+    let (control_owner, control_commands) =
+        CloudControlOwner::start(Arc::clone(&database), pairing_state_sender, authorization);
+    let server = PairingIpcServer::new(socket, Arc::clone(&database), store, control_commands);
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let server_task = tokio::spawn(server.serve(shutdown_receiver));
 
