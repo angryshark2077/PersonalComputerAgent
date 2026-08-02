@@ -147,15 +147,9 @@ fn probe_source(paths: &SourcePaths) -> Result<SourceCapabilities, DomainError> 
     with_database(&paths.contact_database, &material, |connection| {
         require_columns(connection, "name2id", &["username"])?;
         require_columns(connection, "chatroom_member", &["room_id", "member_id"])?;
-        require_columns(connection, "chat_room", &["username", "ext_buffer"])?;
         require_columns(
             connection,
             "contact",
-            &["username", "remark", "nick_name", "alias"],
-        )?;
-        require_columns(
-            connection,
-            "stranger",
             &["username", "remark", "nick_name", "alias"],
         )
     })?;
@@ -341,7 +335,8 @@ fn read_database_text(
                             sender_row.get::<_, String>(0)
                         })
                         .optional()
-                        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+                        .ok()
+                        .flatten()
                         .filter(|value| valid_identity(value));
                     resolve_group_sender(sender_id, row.real_sender_id, &metadata.participant_names)
                 }
@@ -448,13 +443,11 @@ fn read_conversation_metadata(
 ) -> Result<BTreeMap<String, ConversationMetadata>, SqlcipherProbeFailure> {
     let mut metadata = BTreeMap::new();
     let mut contact_statement = connection
-        .prepare(
-            "SELECT remark, nick_name, alias FROM contact WHERE username = ?1 \
-             UNION ALL \
-             SELECT remark, nick_name, alias FROM stranger WHERE username = ?1 \
-             LIMIT 1",
-        )
+        .prepare("SELECT remark, nick_name, alias FROM contact WHERE username = ?1 LIMIT 1")
         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut stranger_statement = connection
+        .prepare("SELECT remark, nick_name, alias FROM stranger WHERE username = ?1 LIMIT 1")
+        .ok();
     let mut count_statement = connection
         .prepare(
             "SELECT COUNT(*) FROM chatroom_member \
@@ -467,29 +460,46 @@ fn read_conversation_metadata(
              JOIN name2id n ON m.member_id = n.rowid \
              WHERE m.room_id = (SELECT rowid FROM name2id WHERE username = ?1)",
         )
-        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        .ok();
     let mut room_buffer_statement = connection
         .prepare("SELECT ext_buffer FROM chat_room WHERE username = ?1 LIMIT 1")
-        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        .ok();
     for session in sessions {
         let display_name = read_display_name(&mut contact_statement, &session.username)?
+            .or_else(|| {
+                stranger_statement.as_mut().and_then(|statement| {
+                    read_display_name(statement, &session.username)
+                        .ok()
+                        .flatten()
+                })
+            })
             .unwrap_or_else(|| session.username.clone());
         let (member_count, participant_names) = if session.username.ends_with("@chatroom") {
             let count: i64 = count_statement
                 .query_row([&session.username], |row| row.get(0))
                 .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
             let members = member_statement
-                .query_map([&session.username], |row| row.get::<_, String>(0))
-                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
-                .into_iter()
-                .filter(|member| valid_identity(member))
-                .collect::<Vec<_>>();
+                .as_mut()
+                .and_then(|statement| {
+                    statement
+                        .query_map([&session.username], |row| row.get::<_, String>(0))
+                        .ok()
+                        .map(|rows| {
+                            rows.filter_map(Result::ok)
+                                .filter(|member| valid_identity(member))
+                                .collect::<Vec<_>>()
+                        })
+                })
+                .unwrap_or_default();
             let room_buffer = room_buffer_statement
-                .query_row([&session.username], |row| row.get::<_, Value>(0))
-                .optional()
-                .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?
+                .as_mut()
+                .and_then(|statement| {
+                    statement
+                        .query_row([&session.username], |row| row.get::<_, Value>(0))
+                        .optional()
+                        .ok()
+                        .flatten()
+                })
                 .and_then(value_bytes);
             let group_nicknames = room_buffer
                 .as_deref()
@@ -500,7 +510,16 @@ fn read_conversation_metadata(
                 let name = group_nicknames
                     .get(&member)
                     .cloned()
-                    .or(read_display_name(&mut contact_statement, &member)?)
+                    .or_else(|| {
+                        read_display_name(&mut contact_statement, &member)
+                            .ok()
+                            .flatten()
+                    })
+                    .or_else(|| {
+                        stranger_statement.as_mut().and_then(|statement| {
+                            read_display_name(statement, &member).ok().flatten()
+                        })
+                    })
                     .unwrap_or_else(|| member.clone());
                 participant_names.insert(member, name);
             }
@@ -984,6 +1003,35 @@ mod tests {
         buffer.extend_from_slice(b"Alice");
         let names = parse_group_nicknames(&buffer, &["wxid_other".to_owned()]);
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn production_metadata_keeps_base_collection_when_optional_name_tables_are_absent() {
+        let connection = Connection::open_in_memory().expect("open contact fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE contact (username TEXT, remark TEXT, nick_name TEXT, alias TEXT);\
+                 CREATE TABLE name2id (username TEXT);\
+                 CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);\
+                 INSERT INTO contact VALUES ('room@chatroom', '', 'Group Name', '');\
+                 INSERT INTO contact VALUES ('wxid_member1', '', 'Member Name', '');\
+                 INSERT INTO name2id(rowid, username) VALUES (1, 'wxid_member1');\
+                 INSERT INTO name2id(rowid, username) VALUES (2, 'room@chatroom');\
+                 INSERT INTO chatroom_member(room_id, member_id) VALUES (2, 1);",
+            )
+            .expect("create base contact fixture");
+        let metadata = read_conversation_metadata(
+            &connection,
+            &[Session {
+                username: "room@chatroom".to_owned(),
+            }],
+        )
+        .expect("optional nickname tables do not gate base collection");
+        assert_eq!(metadata["room@chatroom"].member_count, Some(1));
+        assert_eq!(
+            metadata["room@chatroom"].participant_names["wxid_member1"],
+            "Member Name"
+        );
     }
 
     #[test]
