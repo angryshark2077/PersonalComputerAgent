@@ -20,6 +20,8 @@ EXPECTED_MIGRATIONS = {
         "0002_s2_collector_state.sql",
         "0003_s1b_pairing_state.sql",
         "0004_s1b_cloud_api_origin.sql",
+        "0005_wechat_messages.sql",
+        "0006_harden_attachment_spool.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",
@@ -28,6 +30,9 @@ EXPECTED_MIGRATIONS = {
         "0003_s1b_pairing_state_and_better_auth_session.sql",
         "0004_s1b_hash_better_auth_sessions.sql",
         "0005_s2_system_events.sql",
+        "0006_communication_event_inbox.sql",
+        "0007_communication_projections.sql",
+        "0008_communication_objects.sql",
     ],
 }
 
@@ -167,6 +172,11 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "device_revocation_audit",
         "device_heartbeats",
         "system_events",
+        "communication_events",
+        "communication_conversations",
+        "communication_messages",
+        "communication_message_attachments",
+        "communication_objects",
     }
     actual_tables = set(
         re.findall(r"CREATE TABLE IF NOT EXISTS\s+([a-z_]+)", sql, flags=re.IGNORECASE)
