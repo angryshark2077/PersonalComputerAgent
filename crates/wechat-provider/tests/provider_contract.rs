@@ -28,18 +28,25 @@ async fn emits_only_confirmed_direct_or_small_group_records() {
         .expect("fixture source must read");
 
     assert_eq!(emitted.len(), 2);
-    assert_eq!(emitted[0].direction(), Direction::Outgoing);
-    assert_eq!(emitted[0].kind(), MessageKind::Text);
-    assert_eq!(emitted[0].conversation(), &ConversationScope::Direct);
-    assert_eq!(emitted[1].direction(), Direction::Incoming);
-    assert_eq!(emitted[1].kind(), MessageKind::Video);
+    assert_eq!(emitted[0].account_id(), "wechat-account-1");
+    assert_eq!(emitted[0].source_sequence(), 1);
+    assert_eq!(emitted[0].message().direction(), Direction::Outgoing);
+    assert_eq!(emitted[0].message().kind(), MessageKind::Text);
     assert_eq!(
-        emitted[1].conversation(),
+        emitted[0].message().conversation(),
+        &ConversationScope::Direct
+    );
+    assert!(emitted[0].completed_media().is_empty());
+    assert_eq!(emitted[1].message().direction(), Direction::Incoming);
+    assert_eq!(emitted[1].message().kind(), MessageKind::Video);
+    assert_eq!(
+        emitted[1].message().conversation(),
         &ConversationScope::Group { member_count: 8 }
     );
+    assert_eq!(emitted[1].completed_media().len(), 1);
     assert!(emitted
         .iter()
-        .all(|message| message.conversation().is_allowed()));
+        .all(|record| record.message().conversation().is_allowed()));
 }
 
 #[tokio::test]

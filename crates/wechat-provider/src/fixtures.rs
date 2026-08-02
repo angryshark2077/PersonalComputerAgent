@@ -1,10 +1,13 @@
+use std::path::PathBuf;
+
 use pca_domain::{CommunicationAttachment, MessageKind};
 
 use crate::{
     source::{
-        GroupMembershipEvidence, LocalAccountProof, SourceCapabilities, SourceConversation,
-        SourceCursor, SourceDirection, SourceFinality, SourceMessageKind, SourceMessageRecord,
-        SourcePayload, SourceProbeFuture, SourceReadFuture, SourceRecord, WechatSource,
+        GroupMembershipEvidence, LocalAccountProof, SourceCapabilities, SourceCompletedMedia,
+        SourceConversation, SourceCursor, SourceDirection, SourceFinality, SourceMessageKind,
+        SourceMessageRecord, SourcePayload, SourceProbeFuture, SourceReadFuture, SourceRecord,
+        WechatSource,
     },
     WechatProvider,
 };
@@ -60,6 +63,10 @@ pub fn incoming_small_group_video(member_count: u8) -> SourceRecord {
         SourceFinality::IncomingPersisted,
         SourcePayload::Media {
             attachment: Some(attachment(MessageKind::Video)),
+            completed_source: Some(SourceCompletedMedia {
+                attachment_id: "attachment-1".to_owned(),
+                source_path: PathBuf::from("/fixture/completed-video.mp4"),
+            }),
         },
     )
 }
@@ -157,7 +164,10 @@ pub fn incomplete_video() -> SourceRecord {
         SourceMessageKind::Video,
         SourceConversation::Direct,
         SourceFinality::IncomingPersisted,
-        SourcePayload::Media { attachment: None },
+        SourcePayload::Media {
+            attachment: None,
+            completed_source: None,
+        },
     )
 }
 
@@ -173,7 +183,9 @@ fn message(
     finality: SourceFinality,
     payload: SourcePayload,
 ) -> SourceRecord {
-    SourceRecord::Message(SourceMessageRecord {
+    SourceRecord::Message(Box::new(SourceMessageRecord {
+        account_id: "wechat-account-1".to_owned(),
+        source_sequence: 1,
         message_id: "message-1".to_owned(),
         conversation_id: "conversation-1".to_owned(),
         source_key: "account-1:conversation-1:1".to_owned(),
@@ -184,7 +196,7 @@ fn message(
         conversation,
         finality,
         payload,
-    })
+    }))
 }
 
 fn attachment(kind: MessageKind) -> CommunicationAttachment {

@@ -2,13 +2,14 @@ use pca_domain::{
     CommunicationMessageRecorded, CommunicationMessageRecordedInput, ConversationScope, Direction,
     MessageKind,
 };
+use pca_provider_contracts::{CompletedMediaSource, NormalizedCommunicationRecord};
 
 use crate::source::{
     GroupMembershipEvidence, LocalAccountProof, SourceConversation, SourceDirection,
     SourceFinality, SourceMessageKind, SourcePayload, SourceRecord,
 };
 
-pub(crate) fn eligible_message(record: SourceRecord) -> Option<CommunicationMessageRecorded> {
+pub(crate) fn eligible_message(record: SourceRecord) -> Option<NormalizedCommunicationRecord> {
     let SourceRecord::Message(record) = record else {
         return None;
     };
@@ -43,18 +44,28 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<CommunicationMess
         SourceMessageKind::Unsupported | SourceMessageKind::Unknown => return None,
     };
 
-    let (text, attachments) = match (kind, record.payload) {
-        (MessageKind::Text, SourcePayload::Text { body }) => (Some(body), Vec::new()),
+    let (text, attachments, completed_media) = match (kind, record.payload) {
+        (MessageKind::Text, SourcePayload::Text { body }) => (Some(body), Vec::new(), Vec::new()),
         (
             media_kind,
             SourcePayload::Media {
                 attachment: Some(attachment),
+                completed_source: Some(completed_source),
             },
-        ) if attachment.kind() == media_kind => (None, vec![attachment]),
+        ) if attachment.kind() == media_kind
+            && completed_source.attachment_id == attachment.attachment_id() =>
+        {
+            let source = CompletedMediaSource::try_new(
+                completed_source.attachment_id,
+                completed_source.source_path,
+            )
+            .ok()?;
+            (None, vec![attachment], vec![source])
+        }
         _ => return None,
     };
 
-    CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
+    let message = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
         message_id: record.message_id,
         conversation_id: record.conversation_id,
         source_key: record.source_key,
@@ -65,5 +76,12 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<CommunicationMess
         text,
         attachments,
     })
+    .ok()?;
+    NormalizedCommunicationRecord::try_new(
+        record.account_id,
+        record.source_sequence,
+        message,
+        completed_media,
+    )
     .ok()
 }

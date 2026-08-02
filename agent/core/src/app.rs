@@ -9,8 +9,12 @@ use pca_agent_runtime::{
 };
 use pca_agentd::{
     cloud_control::{
-        CloudControlHandle, CloudControlRuntime, ControlClient, HttpControlClient,
+        AppliedControl, CloudControlHandle, CloudControlRuntime, ControlClient, HttpControlClient,
         PRODUCTION_CLOUD_API_ORIGIN,
+    },
+    communication::{
+        CommunicationControl, CommunicationIdentity, CommunicationRuntime,
+        UnavailableCommunicationProviderFactory,
     },
     pairing_ipc::{PairingIpcServer, PairingIpcServerError, PairingSocket},
 };
@@ -84,6 +88,7 @@ enum FailureStage {
     State,
     Lifecycle,
     SystemCollector,
+    CommunicationCollector,
     Heartbeat,
     Signal,
     PairingConfiguration,
@@ -94,6 +99,7 @@ enum FailureStage {
     InjectedHeartbeat,
     LifecycleCleanup,
     SystemCollectorCleanup,
+    CommunicationCollectorCleanup,
     BridgeCleanup,
     PairingCleanup,
     ControlCleanup,
@@ -115,6 +121,7 @@ impl FailureStage {
             Self::State => "state",
             Self::Lifecycle => "lifecycle",
             Self::SystemCollector => "system_collector",
+            Self::CommunicationCollector => "communication_collector",
             Self::Heartbeat => "heartbeat",
             Self::Signal => "signal",
             Self::PairingConfiguration => "pairing_configuration",
@@ -125,6 +132,7 @@ impl FailureStage {
             Self::InjectedHeartbeat => "injected_heartbeat",
             Self::LifecycleCleanup => "lifecycle_cleanup",
             Self::SystemCollectorCleanup => "system_collector_cleanup",
+            Self::CommunicationCollectorCleanup => "communication_collector_cleanup",
             Self::BridgeCleanup => "bridge_cleanup",
             Self::PairingCleanup => "pairing_cleanup",
             Self::ControlCleanup => "control_cleanup",
@@ -181,6 +189,7 @@ struct RuntimeResources {
     database: Option<Arc<DbActorHandle>>,
     lifecycle: Option<LifecycleRuntime>,
     system_runtime: Option<SystemRuntimeHandle>,
+    communication_runtime: Option<CommunicationRuntime>,
     bridge_shutdown: Option<watch::Sender<bool>>,
     bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
     pairing_shutdown: Option<watch::Sender<bool>>,
@@ -197,6 +206,7 @@ impl RuntimeResources {
             database: Some(Arc::new(database)),
             lifecycle: None,
             system_runtime: None,
+            communication_runtime: None,
             bridge_shutdown: None,
             bridge_task: None,
             pairing_shutdown: None,
@@ -253,6 +263,12 @@ impl RuntimeResources {
             .ok()
             .flatten()
         };
+        let (inactive_control_sender, inactive_control_receiver) = watch::channel(None);
+        let mut communication_control_receiver = self.control.as_ref().map_or(
+            inactive_control_receiver,
+            CloudControlHandle::communication_controls,
+        );
+        let _inactive_control_sender = inactive_control_sender;
         let pairing_valid = self.control.is_some();
         let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
         let bridge_task = start_bridge(
@@ -318,6 +334,20 @@ impl RuntimeResources {
             .map_err(|_| FailureStage::Lifecycle)?;
 
         self.start_system_collector(config, pairing_valid).await?;
+        self.communication_runtime = Some(
+            CommunicationRuntime::start(
+                Arc::clone(
+                    self.database
+                        .as_ref()
+                        .expect("database exists until cleanup"),
+                ),
+                config.paths.database_file.clone(),
+                Arc::new(UnavailableCommunicationProviderFactory),
+                CommunicationControl::unpaired(),
+            )
+            .await
+            .map_err(|_| FailureStage::CommunicationCollector)?,
+        );
 
         #[cfg(feature = "process-test-hooks")]
         if let Some(hook) = &config.process_test_fatal_cleanup {
@@ -364,11 +394,63 @@ impl RuntimeResources {
                         )
                         .map_err(|_| FailureStage::State)?;
                         self.restart_system_collector(config, paired).await?;
+                        if !paired {
+                            self.apply_communication_control(None).await?;
+                        }
                         self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
+                    }
+                }
+                changed = communication_control_receiver.changed() => {
+                    if changed.is_ok() {
+                        let applied = *communication_control_receiver.borrow_and_update();
+                        self.apply_communication_control(applied).await?;
                     }
                 }
             }
         }
+    }
+
+    async fn apply_communication_control(
+        &self,
+        applied: Option<AppliedControl>,
+    ) -> Result<(), FailureStage> {
+        let control = match applied {
+            Some(applied) => {
+                let pairing = self
+                    .database()
+                    .load_pairing_state()
+                    .await
+                    .map_err(|_| FailureStage::CommunicationCollector)?;
+                let Some(pairing) = pairing else {
+                    return self.apply_unpaired_communication_control().await;
+                };
+                let identity =
+                    CommunicationIdentity::try_new(&pairing.workspace_id, &pairing.device_id)
+                        .map_err(|_| FailureStage::CommunicationCollector)?;
+                CommunicationControl::paired(
+                    identity,
+                    applied.configuration_revision,
+                    applied.communication_wechat_enabled,
+                )
+                .map_err(|_| FailureStage::CommunicationCollector)?
+            }
+            None => CommunicationControl::unpaired(),
+        };
+        self.communication_runtime
+            .as_ref()
+            .ok_or(FailureStage::CommunicationCollector)?
+            .apply_control(control)
+            .await
+            .map_err(|_| FailureStage::CommunicationCollector)
+    }
+
+    async fn apply_unpaired_communication_control(&self) -> Result<(), FailureStage> {
+        self.communication_runtime
+            .as_ref()
+            .ok_or(FailureStage::CommunicationCollector)?
+            .apply_control(CommunicationControl::unpaired())
+            .await
+            .map_err(|_| FailureStage::CommunicationCollector)
     }
 
     async fn start_system_collector(
@@ -427,6 +509,12 @@ impl RuntimeResources {
 
     async fn cleanup(mut self, clean_shutdown: bool) -> Vec<FailureStage> {
         let mut failures = Vec::new();
+
+        if let Some(communication_runtime) = self.communication_runtime.take() {
+            if communication_runtime.shutdown().await.is_err() {
+                failures.push(FailureStage::CommunicationCollectorCleanup);
+            }
+        }
 
         if let Some(system_runtime) = self.system_runtime.take() {
             if system_runtime.shutdown().await.is_err() {

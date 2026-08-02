@@ -1,3 +1,4 @@
+use pca_agentd::communication::{OUTBOX_HIGH_WATER, OUTBOX_LOW_WATER};
 use pca_domain::{CollectorState, CollectorStatus, SystemMetricSample};
 use pca_system_collector::{MetricGroup, SystemSampleError, SystemSampleErrorKind};
 use uuid::Uuid;
@@ -188,9 +189,9 @@ impl CollectorRegistry {
     pub(crate) fn apply_outbox_depth(&mut self, depth: u64, now_ms: i64) -> RegistryUpdate {
         let previous_status = self.state.status;
         let previous_backpressure = self.backpressure;
-        if depth > 10_000 {
+        if depth > OUTBOX_HIGH_WATER {
             self.backpressure = true;
-        } else if depth < 8_000 {
+        } else if depth < OUTBOX_LOW_WATER {
             self.backpressure = false;
         }
         self.state.updated_at_ms = now_ms;

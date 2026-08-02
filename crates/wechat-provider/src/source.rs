@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, path::PathBuf, pin::Pin};
 
 use pca_domain::{CommunicationAttachment, DomainError};
 
@@ -21,13 +21,15 @@ pub struct SourceCursor;
 /// An untrusted record returned by a source adapter.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SourceRecord {
-    Message(SourceMessageRecord),
+    Message(Box<SourceMessageRecord>),
     Unknown,
 }
 
 /// Evidence required to normalize one source message without interpreting source-specific values.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceMessageRecord {
+    pub account_id: String,
+    pub source_sequence: u64,
     pub message_id: String,
     pub conversation_id: String,
     pub source_key: String,
@@ -96,8 +98,16 @@ pub enum SourcePayload {
     },
     Media {
         attachment: Option<CommunicationAttachment>,
+        completed_source: Option<SourceCompletedMedia>,
     },
     Unknown,
+}
+
+/// Provider-private proof that a source media file is complete.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SourceCompletedMedia {
+    pub attachment_id: String,
+    pub source_path: PathBuf,
 }
 
 /// Read-only source port. Implementations must not mutate or launch `WeChat`.

@@ -3,7 +3,7 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use pca_db_local::{DbActorHandle, DbError, PairingState};
-use pca_domain::EventEnvelope;
+use pca_domain::{CommunicationScopeV2, EventEnvelope};
 use pca_keychain::{
     delete_device_credential, load_device_credential, store_device_credential, CredentialError,
     CredentialStore, DeviceCredential,
@@ -298,7 +298,7 @@ pub struct AgentControlSnapshot {
 pub struct CollectorControls {
     pub network: EnabledControl,
     #[serde(rename = "communication.wechat")]
-    pub communication_wechat: WeChatControl,
+    pub communication_wechat: CommunicationScopeV2,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -307,22 +307,9 @@ pub struct EnabledControl {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WeChatControl {
-    pub enabled: bool,
-    pub direction: String,
-    pub message_type: String,
-    pub sync_mode: String,
-}
-
 impl AgentControlSnapshot {
     fn validate_exact_scopes(&self) -> Result<(), ControlError> {
-        if Uuid::parse_str(&self.device_id).is_err()
-            || Uuid::parse_str(&self.workspace_id).is_err()
-            || self.collectors.communication_wechat.direction != "outgoing"
-            || self.collectors.communication_wechat.message_type != "text"
-            || self.collectors.communication_wechat.sync_mode != "full"
+        if Uuid::parse_str(&self.device_id).is_err() || Uuid::parse_str(&self.workspace_id).is_err()
         {
             return Err(ControlError::Contract);
         }
@@ -331,7 +318,7 @@ impl AgentControlSnapshot {
 }
 
 /// Complete, durable desired configuration. S1B intentionally does not start either source.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppliedControl {
     pub configuration_revision: u64,
     pub network_enabled: bool,
@@ -355,7 +342,7 @@ pub fn apply_snapshot(
     Ok(Some(AppliedControl {
         configuration_revision: snapshot.configuration_revision,
         network_enabled: snapshot.collectors.network.enabled,
-        communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled,
+        communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
     }))
 }
 
@@ -371,6 +358,7 @@ pub struct CloudControlRuntime;
 /// Handle for observing and stopping the bounded Cloud-control worker.
 pub struct CloudControlHandle {
     state: Arc<Mutex<ControlState>>,
+    communication_controls: watch::Sender<Option<AppliedControl>>,
     shutdown: Option<watch::Sender<bool>>,
     worker: Option<JoinHandle<Result<(), CloudControlRuntimeError>>>,
 }
@@ -452,6 +440,7 @@ impl CloudControlRuntime {
             unpaired: false,
             applied_revision: Some(applied_revision),
         }));
+        let (communication_controls, _) = watch::channel(None);
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let worker = tokio::spawn(run_control_loop(
             database,
@@ -460,9 +449,11 @@ impl CloudControlRuntime {
             Arc::clone(&state),
             shutdown_receiver,
             pairing_state_sender,
+            communication_controls.clone(),
         ));
         Ok(CloudControlHandle {
             state,
+            communication_controls,
             shutdown: Some(shutdown_sender),
             worker: Some(worker),
         })
@@ -508,12 +499,19 @@ impl CloudControlHandle {
         self.state.lock().await.applied_revision
     }
 
+    /// Subscribes to validated, monotonic communication control revisions.
+    #[must_use]
+    pub fn communication_controls(&self) -> watch::Receiver<Option<AppliedControl>> {
+        self.communication_controls.subscribe()
+    }
+
     /// Stops the worker without aborting an in-flight HTTPS request.
     ///
     /// # Errors
     ///
     /// Returns an error if the worker ends unexpectedly or reports a runtime failure.
     pub async fn shutdown(mut self) -> Result<(), CloudControlRuntimeError> {
+        self.communication_controls.send_replace(None);
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send_replace(true);
         }
@@ -590,6 +588,7 @@ async fn run_control_loop(
     state: Arc<Mutex<ControlState>>,
     mut shutdown: watch::Receiver<bool>,
     pairing_state_sender: watch::Sender<bool>,
+    communication_controls: watch::Sender<Option<AppliedControl>>,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut retry_attempt = 0_u8;
     let mut wait = Duration::ZERO;
@@ -601,12 +600,25 @@ async fn run_control_loop(
             return Ok(());
         }
 
-        match control_once(&database, &mut credentials, client.as_ref(), &state).await {
+        match control_once(
+            &database,
+            &mut credentials,
+            client.as_ref(),
+            &state,
+            &communication_controls,
+        )
+        .await
+        {
             Ok(()) => {
                 retry_attempt = 0;
                 wait = CONTROL_INTERVAL;
             }
-            Err(ControlError::Transient | ControlError::Contract) => {
+            Err(ControlError::Transient) => {
+                retry_attempt = retry_attempt.saturating_add(1);
+                wait = retry_delay(retry_attempt);
+            }
+            Err(ControlError::Contract) => {
+                communication_controls.send_replace(None);
                 retry_attempt = retry_attempt.saturating_add(1);
                 wait = retry_delay(retry_attempt);
             }
@@ -616,8 +628,14 @@ async fn run_control_loop(
                         if next.device_id() != credentials.credential.device_id()
                             || next.workspace_id() != credentials.credential.workspace_id()
                         {
-                            return revoke(&database, &credentials, &state, &pairing_state_sender)
-                                .await;
+                            return revoke(
+                                &database,
+                                &credentials,
+                                &state,
+                                &pairing_state_sender,
+                                &communication_controls,
+                            )
+                            .await;
                         }
                         store_device_credential(credentials.store.as_ref(), &next)?;
                         credentials.credential = next;
@@ -626,17 +644,35 @@ async fn run_control_loop(
                         wait = Duration::ZERO;
                     }
                     Err(ControlError::Revoked | ControlError::InvalidCredential) => {
-                        return revoke(&database, &credentials, &state, &pairing_state_sender)
-                            .await;
+                        return revoke(
+                            &database,
+                            &credentials,
+                            &state,
+                            &pairing_state_sender,
+                            &communication_controls,
+                        )
+                        .await;
                     }
-                    Err(ControlError::Transient | ControlError::Contract) => {
+                    Err(ControlError::Transient) => {
+                        retry_attempt = retry_attempt.saturating_add(1);
+                        wait = retry_delay(retry_attempt);
+                    }
+                    Err(ControlError::Contract) => {
+                        communication_controls.send_replace(None);
                         retry_attempt = retry_attempt.saturating_add(1);
                         wait = retry_delay(retry_attempt);
                     }
                 }
             }
             Err(ControlError::Revoked) => {
-                return revoke(&database, &credentials, &state, &pairing_state_sender).await;
+                return revoke(
+                    &database,
+                    &credentials,
+                    &state,
+                    &pairing_state_sender,
+                    &communication_controls,
+                )
+                .await;
             }
         }
     }
@@ -647,6 +683,7 @@ async fn control_once(
     credentials: &mut LoadedDeviceCredentials,
     client: &dyn ControlClient,
     state: &Arc<Mutex<ControlState>>,
+    communication_controls: &watch::Sender<Option<AppliedControl>>,
 ) -> Result<(), ControlError> {
     let outbox_depth = database
         .active_outbox_depth()
@@ -673,6 +710,7 @@ async fn control_once(
         .await
         .map_err(|_| ControlError::Transient)?;
     state.lock().await.applied_revision = Some(applied.configuration_revision);
+    communication_controls.send_replace(Some(applied));
     Ok(())
 }
 
@@ -718,6 +756,7 @@ async fn revoke(
     credentials: &LoadedDeviceCredentials,
     state: &Arc<Mutex<ControlState>>,
     pairing_state_sender: &watch::Sender<bool>,
+    communication_controls: &watch::Sender<Option<AppliedControl>>,
 ) -> Result<(), CloudControlRuntimeError> {
     {
         let mut state = state.lock().await;
@@ -728,6 +767,7 @@ async fn revoke(
     database
         .clear_pairing_state_and_disable_sensitive_collectors()
         .await?;
+    communication_controls.send_replace(None);
     pairing_state_sender.send_replace(false);
     keychain_result?;
     Ok(())

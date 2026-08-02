@@ -5,9 +5,10 @@ pub mod fixtures;
 pub mod source;
 pub mod sqlcipher_source;
 
-use pca_domain::{CommunicationMessageRecorded, DomainError};
+use pca_domain::DomainError;
 use pca_provider_contracts::{
-    CommunicationPollFuture, CommunicationProvider, CommunicationProviderFuture, ProviderStatus,
+    CommunicationPollFuture, CommunicationProvider, CommunicationProviderFuture,
+    NormalizedCommunicationRecord, ProviderStatus,
 };
 
 use crate::{
@@ -44,7 +45,7 @@ where
     ///
     /// Returns a domain error when the source cannot be read. Ineligible source records are
     /// omitted without retaining their body, path, or media data.
-    pub async fn poll_once(&mut self) -> Result<Vec<CommunicationMessageRecorded>, DomainError> {
+    pub async fn poll_once(&mut self) -> Result<Vec<NormalizedCommunicationRecord>, DomainError> {
         let records = self.source.read_after(&self.cursor).await?;
         self.status = ProviderStatus::Active;
         Ok(records.into_iter().filter_map(eligible_message).collect())
