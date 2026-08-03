@@ -848,6 +848,34 @@ export class MemoryControlRepository implements ControlRepository {
           throw new ControlRepositoryError("CONFLICT");
         }
         if (event.eventType === "communication.message_recorded") {
+          let shouldProject = true;
+          for (const [storedEventId, stored] of this.#communicationEvents) {
+            if (
+              stored.eventType === "communication.message_recorded"
+              && stored.workspaceId === workspaceId
+              && stored.deviceId === deviceId
+              && stored.message.messageId === event.message.messageId
+              && stored.message.sourceKey !== event.message.sourceKey
+            ) {
+              if (
+                stored.message.conversationId !== event.message.conversationId
+                || stored.message.occurredAt.getTime() !== event.message.occurredAt.getTime()
+              ) {
+                throw new ControlRepositoryError("CONFLICT");
+              }
+              if (stored.createdAt.getTime() <= event.createdAt.getTime()) {
+                this.#communicationEvents.delete(storedEventId);
+              } else {
+                shouldProject = false;
+              }
+              break;
+            }
+          }
+          if (!shouldProject) {
+            if (idempotencyKey !== null) this.#communicationIdempotency.add(idempotencyKey);
+            acceptedEventIds.push(event.eventId);
+            continue;
+          }
           this.#communicationEvents.set(event.eventId, {
             ...event,
             payload: { ...event.payload },
@@ -1828,6 +1856,37 @@ export class DrizzleControlRepository implements ControlRepository {
               },
             });
           if (event.eventType === "communication.conversation_observed") return true;
+
+          const [existingMessage] = await transaction
+            .select({
+              eventId: communicationMessages.eventId,
+              sourceKey: communicationMessages.sourceKey,
+              conversationId: communicationMessages.conversationId,
+              occurredAt: communicationMessages.occurredAt,
+              createdAt: communicationEvents.createdAt,
+            })
+            .from(communicationMessages)
+            .innerJoin(communicationEvents, eq(communicationEvents.eventId, communicationMessages.eventId))
+            .where(
+              and(
+                eq(communicationMessages.workspaceId, workspaceId),
+                eq(communicationMessages.deviceId, deviceId),
+                eq(communicationMessages.messageId, event.message.messageId),
+              ),
+            )
+            .limit(1);
+          if (existingMessage !== undefined && existingMessage.sourceKey !== event.message.sourceKey) {
+            if (
+              existingMessage.conversationId !== event.message.conversationId
+              || existingMessage.occurredAt.getTime() !== event.message.occurredAt.getTime()
+            ) {
+              throw new ControlRepositoryError("CONFLICT");
+            }
+            if (existingMessage.createdAt.getTime() > event.createdAt.getTime()) return true;
+            await transaction
+              .delete(communicationMessages)
+              .where(eq(communicationMessages.eventId, existingMessage.eventId));
+          }
 
           await transaction.insert(communicationMessages).values({
             eventId: event.eventId,

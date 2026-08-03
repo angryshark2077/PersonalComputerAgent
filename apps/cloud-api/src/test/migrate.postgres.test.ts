@@ -7,6 +7,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { DrizzleControlRepository, type CommunicationMessageEventRecord } from "@pca/db-cloud/src/repository.js";
+import { cloudSchema } from "@pca/db-cloud/src/schema.js";
+import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 
 import { runCloudMigrations } from "../migrate.js";
@@ -27,6 +30,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationObjectSchema(pool);
     await assertCommunicationFileProjectionSchema(pool);
     await assertCommunicationProjectionBackfill(pool);
+    await assertCommunicationMediaUpgrade(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
     await assertHashedSessionSchema(pool);
@@ -199,6 +203,84 @@ async function assertCommunicationProjectionBackfill(pool: Pool) {
     [fileEventId],
   );
   assert.deepEqual(fileResult.rows, [{ kind: "file", file_name: "example.bin" }]);
+}
+
+async function assertCommunicationMediaUpgrade(pool: Pool) {
+  const workspaceId = "01982222-7222-8222-8222-222222222224";
+  const deviceId = "01981111-7111-8111-8111-111111111112";
+  const repository = new DrizzleControlRepository(drizzle(pool, { schema: cloudSchema }));
+  const event = (
+    eventId: string,
+    sourceKey: string,
+    attachmentId: string,
+    sizeBytes: number,
+    createdAt: Date,
+  ): CommunicationMessageEventRecord => ({
+    eventId,
+    workspaceId,
+    deviceId,
+    eventType: "communication.message_recorded",
+    source: "communication.wechat",
+    schemaVersion: 1,
+    occurredAt: new Date("2026-08-02T00:02:00Z"),
+    createdAt,
+    sensitivity: "high",
+    payload: {},
+    attachmentRefs: [attachmentId],
+    idempotencyKey: sourceKey,
+    message: {
+      messageId: "message-media-upgrade",
+      conversationId: "conversation-migration",
+      senderId: "wxid-self",
+      senderDisplayName: "You",
+      senderAvatarUrl: null,
+      sourceKey,
+      occurredAt: new Date("2026-08-02T00:02:00Z"),
+      direction: "outgoing",
+      kind: "image",
+      conversation: { scope: "direct", memberCount: null },
+      text: null,
+      attachments: [{
+        attachmentId,
+        kind: "image",
+        sha256: "c".repeat(64),
+        sizeBytes,
+        mimeType: "image/jpeg",
+        fileName: null,
+      }],
+    },
+  });
+
+  await repository.appendCommunicationEvents(workspaceId, deviceId, [
+    event(
+      "01986666-7666-8666-8666-666666666671",
+      "source-key-media-thumbnail",
+      "attachment-media-thumbnail",
+      1024,
+      new Date("2026-08-02T00:02:01Z"),
+    ),
+  ]);
+  await repository.appendCommunicationEvents(workspaceId, deviceId, [
+    event(
+      "01986666-7666-8666-8666-666666666672",
+      "source-key-media-full",
+      "attachment-media-full",
+      4096,
+      new Date("2026-08-02T00:02:02Z"),
+    ),
+  ]);
+
+  const result = await pool.query<{ event_id: string; attachment_id: string; size_bytes: string }>(
+    `SELECT message.event_id, attachment.attachment_id, attachment.size_bytes
+     FROM communication_messages AS message
+     INNER JOIN communication_message_attachments AS attachment USING (event_id)
+     WHERE message.message_id = 'message-media-upgrade'`,
+  );
+  assert.deepEqual(result.rows, [{
+    event_id: "01986666-7666-8666-8666-666666666672",
+    attachment_id: "attachment-media-full",
+    size_bytes: "4096",
+  }]);
 }
 
 async function migrationIds(pool: Pool): Promise<string[]> {

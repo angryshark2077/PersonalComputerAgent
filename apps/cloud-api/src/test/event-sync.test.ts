@@ -191,6 +191,23 @@ function communicationImage(deviceId: string) {
   };
 }
 
+function communicationFullImage(deviceId: string) {
+  const event = communicationImage(deviceId);
+  event.event_id = "01986666-7666-8666-8666-666666666672";
+  event.created_at = "2026-08-02T00:02:00Z";
+  event.payload.source_key = "opaque-source-key-2:full";
+  event.payload.attachments = [{
+    attachment_id: "attachment-1:full",
+    kind: "image",
+    sha256: "b".repeat(64),
+    size_bytes: 4096,
+    mime_type: "image/jpeg",
+  }];
+  event.attachment_refs = ["attachment-1:full"];
+  event.idempotency_key = "opaque-source-key-2:full";
+  return event;
+}
+
 class FakeR2ObjectStore implements R2ObjectStore {
   latest: R2ObjectDescriptor | null = null;
   uploaded = false;
@@ -277,6 +294,48 @@ test("paired device syncs a private communication event only through its dedicat
 
   const wrongEndpoint = await api.request("/v1/agent/sync/events", request);
   assert.equal(wrongEndpoint.status, 400);
+});
+
+test("a later media projection replaces the earlier projection for the same message", async () => {
+  const { api, credentials } = await pairedApi();
+  for (const event of [communicationImage(credentials.device_id), communicationFullImage(credentials.device_id)]) {
+    const response = await api.request("/v1/agent/sync/communication/events", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${credentials.device_access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        batch_id: crypto.randomUUID(),
+        device_id: credentials.device_id,
+        protocol_version: 1,
+        events: [event],
+      }),
+    });
+    assert.equal(response.status, 200);
+  }
+
+  const response = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages`,
+  );
+  assert.equal(response.status, 200);
+  const body = await response.json() as { messages: Array<{
+    event_id: string;
+    message_id: string;
+    attachments: Array<{ attachment_id: string; size_bytes: number }>;
+  }> };
+  assert.equal(body.messages.length, 1);
+  assert.equal(body.messages[0]?.event_id, "01986666-7666-8666-8666-666666666672");
+  assert.equal(body.messages[0]?.message_id, "message-2");
+  assert.deepEqual(body.messages[0]?.attachments, [{
+    attachment_id: "attachment-1:full",
+    kind: "image",
+    sha256: "b".repeat(64),
+    size_bytes: 4096,
+    mime_type: "image/jpeg",
+    object_id: null,
+    object_state: null,
+  }]);
 });
 
 test("only the device owner can read projected communication conversations and messages", async () => {

@@ -985,6 +985,7 @@ fn read_database_images(
                         context.database_name,
                         &table_name,
                         row.local_id,
+                        true,
                     )
                 })
                 .or_else(|| {
@@ -995,6 +996,7 @@ fn read_database_images(
                             context.database_name,
                             &table_name,
                             row.local_id,
+                            true,
                         )
                     })
                 });
@@ -1008,6 +1010,7 @@ fn read_database_images(
                             context.database_name,
                             &table_name,
                             row.local_id,
+                            false,
                         )
                     })
                 })
@@ -1022,6 +1025,7 @@ fn read_database_images(
                                 context.database_name,
                                 &table_name,
                                 row.local_id,
+                                false,
                             )
                         })
                 })
@@ -2541,6 +2545,7 @@ fn decrypted_image_attachment(
     database_name: &str,
     table_name: &str,
     local_id: i64,
+    full: bool,
 ) -> Option<(CommunicationAttachment, PathBuf)> {
     let encrypted = fs::read(encrypted_path).ok()?;
     let decrypted = keys
@@ -2550,7 +2555,7 @@ fn decrypted_image_attachment(
     let sha256 = format!("{:x}", Sha256::digest(&decrypted));
     let source_path = stage_decrypted_image(&decrypted, &sha256, &mime_type)?;
     let table_hash = table_name.strip_prefix("Msg_")?;
-    let attachment_id = format!("wechat-image:{database_name}:{table_hash}:{local_id}");
+    let attachment_id = image_attachment_id(database_name, table_hash, local_id, full);
     let attachment = CommunicationAttachment::try_new(
         attachment_id,
         MessageKind::Image,
@@ -2560,6 +2565,19 @@ fn decrypted_image_attachment(
     )
     .ok()?;
     Some((attachment, source_path))
+}
+
+fn image_attachment_id(
+    database_name: &str,
+    table_hash: &str,
+    local_id: i64,
+    full: bool,
+) -> String {
+    if full {
+        format!("wechat-image:{database_name}:{table_hash}:{local_id}:full")
+    } else {
+        format!("wechat-image:{database_name}:{table_hash}:{local_id}")
+    }
 }
 
 fn decrypt_v4_image(encrypted: &[u8], keys: &ImageKeys) -> Option<Vec<u8>> {
@@ -3008,7 +3026,7 @@ fn decoded_image_attachment(
     }
     let mime_type = image_mime_type(&bytes)?.to_owned();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    let attachment_id = format!("wechat-image:{database_name}:{table_hash}:{local_id}");
+    let attachment_id = image_attachment_id(database_name, table_hash, local_id, false);
     let attachment = CommunicationAttachment::try_new(
         attachment_id,
         MessageKind::Image,
@@ -4358,8 +4376,9 @@ mod tests {
     use super::{
         bootstrap_source_cursors, clean_account_directory_name, decode_value,
         decode_voice_attachment, decoded_image_attachment, decrypt_v4_image, derive_image_keys,
-        display_text_message, extend_message_database_routes, file_attachment, image_mime_type,
-        index_decoded_images, index_message_files, index_video_files, is_direct_conversation,
+        display_text_message, extend_message_database_routes, file_attachment, image_attachment_id,
+        image_mime_type, index_decoded_images, index_message_files, index_video_files,
+        is_direct_conversation,
         is_message_database, kvcomm_codes_from_filename, message_table_name, parse_group_nicknames,
         parse_image_dat_name, parse_video_file_key, parse_video_length, parse_video_md5_candidates,
         read_contact_cards, read_conversation_metadata, read_database_images, read_database_text,
@@ -5305,6 +5324,18 @@ mod tests {
         assert_eq!(
             attachment.attachment_id(),
             "wechat-image:message_0.db:abc:7"
+        );
+    }
+
+    #[test]
+    fn production_full_image_upgrade_uses_a_distinct_attachment_identifier() {
+        assert_eq!(
+            image_attachment_id("message_0.db", "abc", 7, false),
+            "wechat-image:message_0.db:abc:7"
+        );
+        assert_eq!(
+            image_attachment_id("message_0.db", "abc", 7, true),
+            "wechat-image:message_0.db:abc:7:full"
         );
     }
 
