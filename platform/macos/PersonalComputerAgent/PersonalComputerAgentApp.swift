@@ -2,6 +2,12 @@ import AppKit
 import Darwin
 import SwiftUI
 
+final class InstallerApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+}
+
 @main
 enum PersonalComputerAgentMain {
     static func main() {
@@ -41,6 +47,7 @@ enum PersonalComputerAgentMain {
 }
 
 private struct PCAInstallerApplication: App {
+    @NSApplicationDelegateAdaptor(InstallerApplicationDelegate.self) private var applicationDelegate
     @StateObject private var model: InstallerViewModel
 
     init() {

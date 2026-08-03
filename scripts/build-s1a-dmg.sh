@@ -58,7 +58,7 @@ if ! command -v cargo >/dev/null 2>&1 && [[ -d "/opt/homebrew/opt/rustup/bin" ]]
   PATH="/opt/homebrew/opt/rustup/bin:$PATH"
   export PATH
 fi
-for tool in cargo swift xcodebuild codesign lipo hdiutil plutil python3; do
+for tool in cargo swift xcodebuild codesign lipo hdiutil plutil python3 node; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing required build tool: $tool" >&2; exit 1; }
 done
 
@@ -84,6 +84,13 @@ install -m 0755 \
 install -m 0755 \
   "$repository_root/target/aarch64-apple-darwin/release/pca-wechat-repair" \
   "$build_inputs/pca-wechat-repair"
+ffmpeg_source=$(node -e 'const value = require("ffmpeg-static"); if (!value) process.exit(1); process.stdout.write(value)') \
+  || { echo "ffmpeg-static is unavailable; run pnpm install before packaging" >&2; exit 1; }
+[[ -f "$ffmpeg_source" && ! -L "$ffmpeg_source" ]] \
+  || { echo "ffmpeg-static did not provide a regular executable" >&2; exit 1; }
+[[ "$(lipo -archs "$ffmpeg_source")" == "arm64" ]] \
+  || { echo "ffmpeg-static must contain exactly arm64" >&2; exit 1; }
+install -m 0755 "$ffmpeg_source" "$build_inputs/ffmpeg"
 
 swift build \
   --package-path "$project_dir" \
@@ -126,14 +133,16 @@ cp -R "$archived_app" "$app"
 agent="$app/Contents/Resources/bin/pca-agentd"
 bridge="$app/Contents/Resources/bin/PCAPlatformBridge"
 wechat_repair="$app/Contents/Resources/bin/pca-wechat-repair"
+ffmpeg="$app/Contents/Resources/bin/ffmpeg"
 main="$app/Contents/MacOS/PersonalComputerAgent"
-for binary in "$agent" "$bridge" "$wechat_repair" "$main"; do
+for binary in "$agent" "$bridge" "$wechat_repair" "$ffmpeg" "$main"; do
   [[ "$(lipo -archs "$binary")" == "arm64" ]] || { echo "non-arm64 executable produced" >&2; exit 1; }
 done
 
 codesign --force --options runtime --timestamp=none --sign "$identity" "$agent"
 codesign --force --options runtime --timestamp=none --sign "$identity" "$bridge"
 codesign --force --options runtime --timestamp=none --sign "$identity" "$wechat_repair"
+codesign --force --options runtime --timestamp=none --sign "$identity" "$ffmpeg"
 codesign \
   --force \
   --options runtime \

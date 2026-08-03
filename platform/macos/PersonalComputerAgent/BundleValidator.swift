@@ -98,8 +98,9 @@ struct BundleValidator: BundleValidating {
         let agent = candidate.appendingPathComponent("Contents/Resources/bin/pca-agentd")
         let bridge = candidate.appendingPathComponent("Contents/Resources/bin/PCAPlatformBridge")
         let wechatRepair = candidate.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair")
+        let ffmpeg = candidate.appendingPathComponent("Contents/Resources/bin/ffmpeg")
         let launchAgent = candidate.appendingPathComponent("Contents/Library/LaunchAgents/\(Self.launchAgentName)")
-        for binary in [executable, agent, bridge, wechatRepair] {
+        for binary in [executable, agent, bridge, wechatRepair, ffmpeg] {
             try requireRegularFile(binary, executable: true)
             guard try architectureChecker.architectures(of: binary) == ["arm64"] else {
                 throw InstallError.invalidBundle
@@ -116,7 +117,7 @@ struct BundleValidator: BundleValidating {
         guard let expectedTeamIdentifier, !expectedTeamIdentifier.isEmpty else {
             throw InstallError.invalidBundle
         }
-        for signedTarget in [candidate, agent, bridge, wechatRepair] {
+        for signedTarget in [candidate, agent, bridge, wechatRepair, ffmpeg] {
             guard try signatureChecker.verifyAndReadTeamIdentifier(of: signedTarget) == expectedTeamIdentifier else {
                 throw InstallError.invalidBundle
             }

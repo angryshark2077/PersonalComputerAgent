@@ -73,12 +73,13 @@ main="$app/Contents/MacOS/PersonalComputerAgent"
 agent="$app/Contents/Resources/bin/pca-agentd"
 bridge="$app/Contents/Resources/bin/PCAPlatformBridge"
 wechat_repair="$app/Contents/Resources/bin/pca-wechat-repair"
+ffmpeg="$app/Contents/Resources/bin/ffmpeg"
 launch_agent="$app/Contents/Library/LaunchAgents/com.pca.agentd.plist"
 
 [[ -f "$info" ]] || fail "missing Contents/Info.plist"
 [[ -f "$launch_agent" ]] || fail "missing com.pca.agentd.plist"
 
-for binary in "$main" "$agent" "$bridge" "$wechat_repair"; do
+for binary in "$main" "$agent" "$bridge" "$wechat_repair" "$ffmpeg"; do
   [[ -f "$binary" ]] || fail "missing $(basename "$binary")"
   [[ -x "$binary" ]] || fail "$(basename "$binary") is not executable"
   mode=$(stat -f '%Lp' "$binary")
@@ -111,7 +112,7 @@ runtime_directories=$(find "$app" -type d \( -name Data -o -name Run \) -print -
 [[ -z "$runtime_directories" ]] || fail "writable Data or Run directories must not exist inside the bundle"
 
 metadata=()
-for signed_target in "$app" "$main" "$agent" "$bridge" "$wechat_repair"; do
+for signed_target in "$app" "$main" "$agent" "$bridge" "$wechat_repair" "$ffmpeg"; do
   codesign --verify --strict --verbose=2 "$signed_target" >/dev/null 2>&1 \
     || fail "signature verification failed for $(basename "$signed_target")"
   signature_details=$(codesign -d --verbose=4 "$signed_target" 2>&1) \
@@ -130,4 +131,4 @@ if [[ "$mounted" -eq 1 ]]; then
 fi
 
 echo "S1A BUNDLE VERIFIED: $version arm64"
-echo "S1A_BUNDLE_METADATA version=$version team_id=$team_id app_cdhash=${metadata[0]} main_cdhash=${metadata[1]} agent_cdhash=${metadata[2]} bridge_cdhash=${metadata[3]} wechat_repair_cdhash=${metadata[4]}"
+echo "S1A_BUNDLE_METADATA version=$version team_id=$team_id app_cdhash=${metadata[0]} main_cdhash=${metadata[1]} agent_cdhash=${metadata[2]} bridge_cdhash=${metadata[3]} wechat_repair_cdhash=${metadata[4]} ffmpeg_cdhash=${metadata[5]}"

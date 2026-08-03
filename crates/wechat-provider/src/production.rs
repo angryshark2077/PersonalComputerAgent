@@ -6,7 +6,9 @@ use std::{
     os::unix::ffi::OsStrExt,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -935,46 +937,76 @@ fn read_database_images(
             let is_retry = row.local_id <= after && retry_ids.contains(&row.local_id);
             let decoded_content =
                 decode_message_content(&row.compress_content, &row.message_content);
-            let image_md5 = decoded_content.as_deref().and_then(parse_image_md5);
+            let image_md5s = decoded_content
+                .as_deref()
+                .map(parse_image_md5_candidates)
+                .unwrap_or_default();
             let dat_name = parse_image_dat_name(&row.packed_info_data);
-            if image_md5.is_some() || dat_name.is_some() {
+            if !image_md5s.is_empty() || dat_name.is_some() {
                 metadata_matches += 1;
             }
-            let full_direct_dat_path = resolve_full_image_dat_path(
-                account_root,
-                &table_name,
-                row.create_time,
-                image_md5.as_deref(),
-                dat_name.as_deref(),
-            );
+            let full_direct_dat_path = image_md5s
+                .iter()
+                .find_map(|image_md5| {
+                    resolve_full_image_dat_path(
+                        account_root,
+                        &table_name,
+                        row.create_time,
+                        Some(image_md5),
+                        None,
+                    )
+                })
+                .or_else(|| {
+                    resolve_full_image_dat_path(
+                        account_root,
+                        &table_name,
+                        row.create_time,
+                        None,
+                        dat_name.as_deref(),
+                    )
+                });
             let direct_dat_path = full_direct_dat_path.clone().or_else(|| {
-                resolve_image_dat_path(
-                    account_root,
-                    &table_name,
-                    row.create_time,
-                    image_md5.as_deref(),
-                    dat_name.as_deref(),
-                )
+                image_md5s
+                    .iter()
+                    .find_map(|image_md5| {
+                        resolve_image_dat_path(
+                            account_root,
+                            &table_name,
+                            row.create_time,
+                            Some(image_md5),
+                            None,
+                        )
+                    })
+                    .or_else(|| {
+                        resolve_image_dat_path(
+                            account_root,
+                            &table_name,
+                            row.create_time,
+                            None,
+                            dat_name.as_deref(),
+                        )
+                    })
             });
             if direct_dat_path.is_some() {
                 dat_matches += 1;
             }
-            if [image_md5.as_deref(), dat_name.as_deref()]
-                .into_iter()
-                .flatten()
+            if image_md5s
+                .iter()
+                .map(String::as_str)
+                .chain(dat_name.as_deref())
                 .any(|identity| encrypted_images.contains(identity))
             {
                 index_matches += 1;
             }
-            if image_md5
-                .as_ref()
-                .is_some_and(|md5| image_hardlinks.contains_key(md5))
+            if image_md5s
+                .iter()
+                .any(|md5| image_hardlinks.contains_key(md5))
             {
                 hardlink_matches += 1;
             }
-            let full_hardlink_path = image_md5
-                .as_ref()
-                .and_then(|md5| image_hardlinks.get(md5))
+            let full_hardlink_path = image_md5s
+                .iter()
+                .find_map(|md5| image_hardlinks.get(md5))
                 .and_then(|source| resolve_full_image_variant(source));
             let completed_full_image = full_direct_dat_path
                 .as_ref()
@@ -1015,9 +1047,9 @@ fn read_database_images(
                     })
                 })
                 .or_else(|| {
-                    image_md5
-                        .as_ref()
-                        .and_then(|md5| image_hardlinks.get(md5))
+                    image_md5s
+                        .iter()
+                        .find_map(|md5| image_hardlinks.get(md5))
                         .and_then(|source| {
                             decrypted_image_attachment(
                                 source,
@@ -2551,6 +2583,7 @@ fn decrypted_image_attachment(
     let decrypted = keys
         .iter()
         .find_map(|candidate| decrypt_v4_image(&encrypted, candidate))?;
+    let decrypted = normalize_decrypted_image(decrypted)?;
     let mime_type = image_mime_type(&decrypted)?.to_owned();
     let sha256 = format!("{:x}", Sha256::digest(&decrypted));
     let source_path = stage_decrypted_image(&decrypted, &sha256, &mime_type)?;
@@ -2567,12 +2600,158 @@ fn decrypted_image_attachment(
     Some((attachment, source_path))
 }
 
-fn image_attachment_id(
-    database_name: &str,
-    table_hash: &str,
-    local_id: i64,
-    full: bool,
-) -> String {
+fn normalize_decrypted_image(decrypted: Vec<u8>) -> Option<Vec<u8>> {
+    if image_mime_type(&decrypted).is_some() {
+        return Some(decrypted);
+    }
+    if !decrypted.starts_with(b"wxgf") {
+        return None;
+    }
+    if let Some(offset) = embedded_image_offset(&decrypted) {
+        return Some(decrypted[offset..].to_vec());
+    }
+    wxgf_hevc_candidates(&decrypted)
+        .into_iter()
+        .find_map(|candidate| convert_hevc_to_jpeg(&candidate))
+}
+
+fn embedded_image_offset(bytes: &[u8]) -> Option<usize> {
+    let limit = bytes.len().min(4096);
+    (4..limit).find(|offset| image_mime_type(&bytes[*offset..]).is_some())
+}
+
+fn wxgf_hevc_candidates(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let units = extract_hevc_nalu_units(bytes);
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let mut groups = Vec::new();
+    let mut starts = units
+        .iter()
+        .enumerate()
+        .filter_map(|(index, unit)| (hevc_nalu_type(unit) == Some(32)).then_some(index))
+        .collect::<Vec<_>>();
+    starts.push(units.len());
+    for pair in starts.windows(2) {
+        let group = &units[pair[0]..pair[1]];
+        if group
+            .iter()
+            .any(|unit| matches!(hevc_nalu_type(unit), Some(1 | 19 | 20)))
+        {
+            groups.push(merge_hevc_nalu_units(group));
+        }
+    }
+    groups.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
+    let all_units = merge_hevc_nalu_units(&units);
+    if !all_units.is_empty() && !groups.contains(&all_units) {
+        groups.push(all_units);
+    }
+    groups
+}
+
+fn extract_hevc_nalu_units(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut starts = Vec::new();
+    let mut index = 4_usize;
+    while index + 3 < bytes.len() {
+        let prefix = if bytes[index..].starts_with(&[0, 0, 0, 1]) {
+            Some(4_usize)
+        } else if bytes[index..].starts_with(&[0, 0, 1]) {
+            Some(3_usize)
+        } else {
+            None
+        };
+        if let Some(prefix) = prefix {
+            starts.push((index, prefix));
+            index += prefix;
+        } else {
+            index += 1;
+        }
+    }
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(position, (start, prefix))| {
+            let payload_start = start + prefix;
+            let payload_end = starts
+                .get(position + 1)
+                .map_or(bytes.len(), |(next, _)| *next);
+            (payload_end.saturating_sub(payload_start) >= 2 && bytes[payload_start] & 0x80 == 0)
+                .then(|| bytes[payload_start..payload_end].to_vec())
+        })
+        .collect()
+}
+
+fn hevc_nalu_type(unit: &[u8]) -> Option<u8> {
+    unit.first().map(|byte| (byte >> 1) & 0x3f)
+}
+
+fn merge_hevc_nalu_units(units: &[Vec<u8>]) -> Vec<u8> {
+    let capacity = units.iter().map(|unit| unit.len() + 4).sum();
+    let mut merged = Vec::with_capacity(capacity);
+    for unit in units {
+        merged.extend_from_slice(&[0, 0, 0, 1]);
+        merged.extend_from_slice(unit);
+    }
+    merged
+}
+
+fn convert_hevc_to_jpeg(hevc: &[u8]) -> Option<Vec<u8>> {
+    if hevc.len() < 100 {
+        return None;
+    }
+    let bundled_ffmpeg = env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join("ffmpeg")));
+    let ffmpeg = bundled_ffmpeg
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })?;
+    let mut input = tempfile::Builder::new().suffix(".hevc").tempfile().ok()?;
+    input.write_all(hevc).ok()?;
+    input.flush().ok()?;
+    let output = tempfile::Builder::new().suffix(".jpg").tempfile().ok()?;
+    let mut child = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "hevc",
+            "-i",
+        ])
+        .arg(input.path())
+        .args(["-frames:v", "1", "-q:v", "3"])
+        .arg(output.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = SystemTime::now().checked_add(Duration::from_secs(15))?;
+    let success = loop {
+        if let Some(status) = child.try_wait().ok()? {
+            break status.success();
+        }
+        if SystemTime::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if !success {
+        return None;
+    }
+    let jpeg = fs::read(output.path()).ok()?;
+    (image_mime_type(&jpeg) == Some("image/jpeg")).then_some(jpeg)
+}
+
+fn image_attachment_id(database_name: &str, table_hash: &str, local_id: i64, full: bool) -> String {
     if full {
         format!("wechat-image:{database_name}:{table_hash}:{local_id}:full")
     } else {
@@ -3712,14 +3891,45 @@ fn decode_message_content(compressed: &Value, plain: &Value) -> Option<String> {
     decode_value(compressed).or_else(|| decode_value(plain))
 }
 
-fn parse_image_md5(content: &str) -> Option<String> {
-    const ATTRIBUTES: [&str; 5] = ["md5", "cdnthumbmd5", "thumbfullmd5", "fullmd5", "newmd5"];
+fn parse_image_md5_candidates(content: &str) -> Vec<String> {
+    const FIELDS: [&str; 5] = ["fullmd5", "thumbfullmd5", "md5", "newmd5", "cdnthumbmd5"];
+    let mut candidates = Vec::new();
+    for field in FIELDS {
+        if let Some(candidate) = parse_named_image_md5(content, field) {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+fn parse_named_image_md5(content: &str, field: &str) -> Option<String> {
     let lowercase = content.to_ascii_lowercase();
-    for attribute in ATTRIBUTES {
-        let mut search_from = 0;
-        while let Some(relative) = lowercase[search_from..].find(attribute) {
-            let start = search_from + relative + attribute.len();
-            let tail = &content[start..];
+    let open = format!("<{field}>");
+    let close = format!("</{field}>");
+    if let Some(start) = lowercase.find(&open) {
+        let value_start = start + open.len();
+        if let Some(relative_end) = lowercase[value_start..].find(&close) {
+            if let Some(candidate) = valid_md5(&content[value_start..value_start + relative_end]) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let mut search_from = 0;
+    while let Some(relative) = lowercase[search_from..].find(field) {
+        let field_start = search_from + relative;
+        let field_end = field_start + field.len();
+        let boundary_before = field_start == 0
+            || !lowercase.as_bytes()[field_start - 1].is_ascii_alphanumeric()
+                && lowercase.as_bytes()[field_start - 1] != b'_';
+        let boundary_after = lowercase
+            .as_bytes()
+            .get(field_end)
+            .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
+        if boundary_before && boundary_after {
+            let tail = &content[field_end..];
             let trimmed = tail.trim_start();
             if let Some(value) = trimmed.strip_prefix('=') {
                 let value = value.trim_start();
@@ -3734,22 +3944,8 @@ fn parse_image_md5(content: &str) -> Option<String> {
                     return Some(candidate);
                 }
             }
-            search_from = start;
         }
-    }
-    for tag in ["md5", "cdnthumbmd5", "thumbfullmd5", "fullmd5", "newmd5"] {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        if let Some(start) = lowercase.find(&open) {
-            let value_start = start + open.len();
-            if let Some(relative_end) = lowercase[value_start..].find(&close) {
-                if let Some(candidate) =
-                    valid_md5(&content[value_start..value_start + relative_end])
-                {
-                    return Some(candidate);
-                }
-            }
-        }
+        search_from = field_end;
     }
     None
 }
@@ -4376,16 +4572,17 @@ mod tests {
     use super::{
         bootstrap_source_cursors, clean_account_directory_name, decode_value,
         decode_voice_attachment, decoded_image_attachment, decrypt_v4_image, derive_image_keys,
-        display_text_message, extend_message_database_routes, file_attachment, image_attachment_id,
-        image_mime_type, index_decoded_images, index_message_files, index_video_files,
-        is_direct_conversation,
-        is_message_database, kvcomm_codes_from_filename, message_table_name, parse_group_nicknames,
-        parse_image_dat_name, parse_video_file_key, parse_video_length, parse_video_md5_candidates,
-        read_contact_cards, read_conversation_metadata, read_database_images, read_database_text,
-        read_database_videos, read_voice_blob, resolve_full_image_dat_path, resolve_group_sender,
-        resolve_image_dat_path, resolve_video_path, retention_cutoff_from, stage_decrypted_image,
-        video_attachment, voice_same_time_index, ContactCardProfile, ConversationMetadata,
-        ImageKeys, Session, SourcePaths, SourcePayload, TextReadContext,
+        display_text_message, extend_message_database_routes, extract_hevc_nalu_units,
+        file_attachment, image_attachment_id, image_mime_type, index_decoded_images,
+        index_message_files, index_video_files, is_direct_conversation, is_message_database,
+        kvcomm_codes_from_filename, message_table_name, normalize_decrypted_image,
+        parse_group_nicknames, parse_image_dat_name, parse_image_md5_candidates,
+        parse_video_file_key, parse_video_length, parse_video_md5_candidates, read_contact_cards,
+        read_conversation_metadata, read_database_images, read_database_text, read_database_videos,
+        read_voice_blob, resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
+        resolve_video_path, retention_cutoff_from, stage_decrypted_image, video_attachment,
+        voice_same_time_index, ContactCardProfile, ConversationMetadata, ImageKeys, Session,
+        SourcePaths, SourcePayload, TextReadContext,
     };
     use pca_keychain::{WechatDatabaseKeyMaterial, WechatKeyMaterial};
 
@@ -5241,6 +5438,46 @@ mod tests {
             Some("image/png")
         );
         assert_eq!(image_mime_type(b"not an image"), None);
+    }
+
+    #[test]
+    fn production_prefers_full_image_metadata_without_confusing_md5_field_names() {
+        let full = "1".repeat(32);
+        let thumb_full = "2".repeat(32);
+        let regular = "3".repeat(32);
+        let thumbnail = "4".repeat(32);
+        let content = format!(
+            "<img cdnthumbmd5=\"{thumbnail}\" md5=\"{regular}\" \
+             thumbfullmd5=\"{thumb_full}\"><fullmd5>{full}</fullmd5></img>"
+        );
+        assert_eq!(
+            parse_image_md5_candidates(&content),
+            vec![full, thumb_full, regular, thumbnail]
+        );
+    }
+
+    #[test]
+    fn production_unwraps_a_standard_image_embedded_in_wxgf() {
+        let mut wxgf = b"wxgf fixture metadata".to_vec();
+        wxgf.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9]);
+        assert_eq!(
+            normalize_decrypted_image(wxgf),
+            Some(vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9])
+        );
+    }
+
+    #[test]
+    fn production_extracts_three_and_four_byte_hevc_nalus_from_wxgf() {
+        let wxgf = [
+            b"wxgf".as_slice(),
+            &[0, 0, 0, 1, 0x40, 1, 2],
+            &[0, 0, 1, 0x42, 3, 4],
+        ]
+        .concat();
+        assert_eq!(
+            extract_hevc_nalu_units(&wxgf),
+            vec![vec![0x40, 1, 2], vec![0x42, 3, 4]]
+        );
     }
 
     #[test]

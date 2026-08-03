@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 import XCTest
@@ -977,6 +978,12 @@ private final class FakeServiceBackend: ServiceBackend {
 
 @MainActor
 final class InstallerViewModelTests: XCTestCase {
+    func testClosingLastInstallerWindowTerminatesInstallerApplication() {
+        let delegate = InstallerApplicationDelegate()
+
+        XCTAssertTrue(delegate.applicationShouldTerminateAfterLastWindowClosed(.shared))
+    }
+
     func testInstalledSetupAutomaticallyStartsExactlyOnce() async throws {
         let coordinator = CountingInstallCoordinator()
         let model = InstallerViewModel(
@@ -1228,6 +1235,7 @@ final class BundleValidatorSigningTests: XCTestCase {
                     "pca-agentd": "ENVTEAM123",
                     "PCAPlatformBridge": "ENVTEAM123",
                     "pca-wechat-repair": "ENVTEAM123",
+                    "ffmpeg": "ENVTEAM123",
                 ]
             ),
             architectureChecker: FakeArchitectureChecker()
@@ -1243,11 +1251,12 @@ final class BundleValidatorSigningTests: XCTestCase {
         let agent = bundle.appendingPathComponent("Contents/Resources/bin/pca-agentd")
         let bridge = bundle.appendingPathComponent("Contents/Resources/bin/PCAPlatformBridge")
         let wechatRepair = bundle.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair")
+        let ffmpeg = bundle.appendingPathComponent("Contents/Resources/bin/ffmpeg")
         let launchAgent = bundle.appendingPathComponent("Contents/Library/LaunchAgents/com.pca.agentd.plist")
         try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: agent.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: launchAgent.deletingLastPathComponent(), withIntermediateDirectories: true)
-        for binary in [executable, agent, bridge, wechatRepair] {
+        for binary in [executable, agent, bridge, wechatRepair, ffmpeg] {
             try Data("binary".utf8).write(to: binary)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
         }
