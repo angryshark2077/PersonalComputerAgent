@@ -43,6 +43,8 @@ const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const VOICE_SAMPLE_RATE: u32 = 24_000;
+const IMAGE_CODE_CACHE: &str =
+    "Library/Application Support/PersonalComputerAgent/Data/wechat-image-codes-v1";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MacOSWechatProviderFactory;
@@ -65,7 +67,7 @@ struct SourcePaths {
     account_id: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct ImageKeys {
     xor: u8,
     aes: [u8; 16],
@@ -278,7 +280,7 @@ fn read_message_batch(
                 &decoded_images,
                 &encrypted_images,
                 &image_hardlinks,
-                image_keys.as_ref(),
+                &image_keys,
                 &paths.account_root,
                 remaining,
             )
@@ -374,7 +376,7 @@ fn read_message_batch(
                 .count(),
             encrypted_images.len(),
             image_hardlinks.len(),
-            usize::from(image_keys.is_some()),
+            image_keys.len(),
             image_rows_scanned,
             image_cache_matches,
             image_metadata_matches,
@@ -582,7 +584,7 @@ fn read_database_images(
     decoded_images: &BTreeMap<(i64, i64), Option<PathBuf>>,
     encrypted_images: &BTreeSet<String>,
     image_hardlinks: &BTreeMap<String, PathBuf>,
-    image_keys: Option<&ImageKeys>,
+    image_keys: &[ImageKeys],
     account_root: &Path,
     limit: usize,
 ) -> Result<ImageReadBatch, SqlcipherProbeFailure> {
@@ -686,15 +688,14 @@ fn read_database_images(
             if image_md5.is_some() || dat_name.is_some() {
                 metadata_matches += 1;
             }
-            if resolve_image_dat_path(
+            let direct_dat_path = resolve_image_dat_path(
                 account_root,
                 &table_name,
                 row.create_time,
                 image_md5.as_deref(),
                 dat_name.as_deref(),
-            )
-            .is_some()
-            {
+            );
+            if direct_dat_path.is_some() {
                 dat_matches += 1;
             }
             if [image_md5.as_deref(), dat_name.as_deref()]
@@ -718,12 +719,23 @@ fn read_database_images(
                 row.create_time,
             )
             .or_else(|| {
-                let source = image_md5
+                image_md5
                     .as_ref()
-                    .and_then(|md5| image_hardlinks.get(md5))?;
+                    .and_then(|md5| image_hardlinks.get(md5))
+                    .and_then(|source| {
+                        decrypted_image_attachment(
+                            source,
+                            image_keys,
+                            context.database_name,
+                            &table_name,
+                            row.local_id,
+                        )
+                    })
+            })
+            .or_else(|| {
                 decrypted_image_attachment(
-                    source,
-                    image_keys?,
+                    direct_dat_path.as_ref()?,
+                    image_keys,
                     context.database_name,
                     &table_name,
                     row.local_id,
@@ -1638,35 +1650,56 @@ fn valid_sql_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn derive_image_keys(account_root: &Path) -> Option<ImageKeys> {
-    let raw_account = account_root.file_name()?.to_str()?.to_owned();
+fn derive_image_keys(account_root: &Path) -> Vec<ImageKeys> {
+    let Some(raw_account) = account_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+    else {
+        return Vec::new();
+    };
     let mut account_candidates = BTreeSet::from([raw_account.clone()]);
     if let Some(cleaned) = clean_account_directory_name(&raw_account) {
         account_candidates.insert(cleaned);
     }
     let codes = collect_kvcomm_codes(account_root);
-    let templates = collect_v4_templates(&account_root.join("msg").join("attach"), 32);
-    for template in templates {
-        let bytes = fs::read(template).ok()?;
-        let ciphertext: [u8; 16] = bytes.get(15..31)?.try_into().ok()?;
-        for account in &account_candidates {
-            for code in &codes {
-                let digest = Md5::digest(format!("{code}{account}").as_bytes());
-                let hex = format!("{digest:x}");
-                let aes: [u8; 16] = hex.as_bytes().get(..16)?.try_into().ok()?;
-                let keys = ImageKeys {
-                    xor: (*code & 0xff) as u8,
-                    aes,
-                };
-                if decrypt_aes_block(&ciphertext, &keys.aes)
+    let templates = collect_v4_templates(&account_root.join("msg").join("attach"), 32)
+        .into_iter()
+        .filter_map(|template| {
+            fs::read(template)
+                .ok()
+                .and_then(|bytes| bytes.get(15..31).and_then(|block| block.try_into().ok()))
+        })
+        .collect::<Vec<[u8; 16]>>();
+    let mut verified = BTreeSet::new();
+    let mut fallback = BTreeSet::new();
+    for account in &account_candidates {
+        for code in &codes {
+            let digest = Md5::digest(format!("{code}{account}").as_bytes());
+            let hex = format!("{digest:x}");
+            let Some(aes) = hex
+                .as_bytes()
+                .get(..16)
+                .and_then(|value| value.try_into().ok())
+            else {
+                continue;
+            };
+            let keys = ImageKeys {
+                xor: (*code & 0xff) as u8,
+                aes,
+            };
+            if templates.iter().any(|ciphertext| {
+                decrypt_aes_block(ciphertext, &keys.aes)
                     .is_some_and(|plain| image_or_wxgf_magic(&plain))
-                {
-                    return Some(keys);
-                }
+            }) {
+                verified.insert(keys);
+            } else {
+                fallback.insert(keys);
             }
         }
     }
-    None
+    verified.extend(fallback);
+    verified.into_iter().collect()
 }
 
 fn collect_kvcomm_codes(account_root: &Path) -> BTreeSet<u32> {
@@ -1674,6 +1707,7 @@ fn collect_kvcomm_codes(account_root: &Path) -> BTreeSet<u32> {
     if let Ok(home) = env::var("HOME") {
         let container = PathBuf::from(home).join("Library/Containers/com.tencent.xinWeChat/Data");
         directories.insert(container.join("Documents/app_data/net/kvcomm"));
+        directories.insert(container.join("Documents/app_data/ilink/kvcomm"));
         directories.insert(
             container.join("Library/Application Support/com.tencent.xinWeChat/xwechat/net/kvcomm"),
         );
@@ -1689,7 +1723,7 @@ fn collect_kvcomm_codes(account_root: &Path) -> BTreeSet<u32> {
         directories.insert(path.join("net/kvcomm"));
         cursor = path.parent();
     }
-    let mut codes = BTreeSet::new();
+    let mut codes = load_persisted_image_codes();
     for directory in directories {
         let Ok(entries) = fs::read_dir(directory) else {
             continue;
@@ -1698,21 +1732,86 @@ fn collect_kvcomm_codes(account_root: &Path) -> BTreeSet<u32> {
             let Some(filename) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
-            let Some(rest) = filename.strip_prefix("key_") else {
-                continue;
-            };
-            let Some((code, suffix)) = rest.split_once('_') else {
-                continue;
-            };
-            if !suffix.ends_with(".statistic") {
-                continue;
-            }
-            if let Ok(code) = code.parse::<u32>() {
-                codes.insert(code);
-            }
+            codes.extend(kvcomm_codes_from_filename(&filename));
         }
     }
+    persist_image_codes(&codes);
     codes
+}
+
+fn load_persisted_image_codes() -> BTreeSet<u32> {
+    let Some(path) = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(IMAGE_CODE_CACHE))
+    else {
+        return BTreeSet::new();
+    };
+    let Ok(metadata) = path.symlink_metadata() else {
+        return BTreeSet::new();
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > 4096
+    {
+        return BTreeSet::new();
+    }
+    fs::read_to_string(path)
+        .ok()
+        .map(|content| {
+            content
+                .lines()
+                .filter_map(|line| line.parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn persist_image_codes(codes: &BTreeSet<u32>) {
+    if codes.is_empty() {
+        return;
+    }
+    let Some(path) = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(IMAGE_CODE_CACHE))
+    else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let temporary = parent.join(format!(".wechat-image-codes-v1.{}.tmp", std::process::id()));
+    let content = codes
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut output| {
+            output.write_all(content.as_bytes())?;
+            output.sync_all()
+        })
+        .and_then(|()| fs::rename(&temporary, &path));
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+}
+
+fn kvcomm_codes_from_filename(filename: &str) -> Vec<u32> {
+    let Some(rest) = filename
+        .strip_prefix("key_")
+        .and_then(|rest| rest.strip_suffix(".statistic"))
+    else {
+        return Vec::new();
+    };
+    rest.split('_')
+        .filter_map(|component| component.parse::<u32>().ok())
+        .collect()
 }
 
 fn collect_v4_templates(root: &Path, limit: usize) -> Vec<PathBuf> {
@@ -1767,13 +1866,15 @@ fn image_or_wxgf_magic(bytes: &[u8]) -> bool {
 
 fn decrypted_image_attachment(
     encrypted_path: &Path,
-    keys: &ImageKeys,
+    keys: &[ImageKeys],
     database_name: &str,
     table_name: &str,
     local_id: i64,
 ) -> Option<(CommunicationAttachment, PathBuf)> {
     let encrypted = fs::read(encrypted_path).ok()?;
-    let decrypted = decrypt_v4_image(&encrypted, keys)?;
+    let decrypted = keys
+        .iter()
+        .find_map(|candidate| decrypt_v4_image(&encrypted, candidate))?;
     let mime_type = image_mime_type(&decrypted)?.to_owned();
     let sha256 = format!("{:x}", Sha256::digest(&decrypted));
     let source_path = stage_decrypted_image(&decrypted, &sha256, &mime_type)?;
@@ -2875,20 +2976,28 @@ fn parse_image_dat_name(value: &Value) -> Option<String> {
             }
         })
         .collect::<String>();
-    printable.split_ascii_whitespace().find_map(|token| {
-        let filename = token.rsplit(['/', '\\']).next()?;
-        let lowercase = filename.to_ascii_lowercase();
-        let dat_end = lowercase.find(".dat")?;
-        let base = &filename[..dat_end];
-        let base = base.strip_suffix(".t").unwrap_or(base);
-        let base = base.strip_suffix("_t").unwrap_or(base);
-        (!base.is_empty()
-            && base.len() <= 255
-            && base
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() || byte == b'_'))
-        .then(|| base.to_ascii_lowercase())
-    })
+    let lowercase = printable.to_ascii_lowercase();
+    let bytes = lowercase.as_bytes();
+    let mut search_from = 0_usize;
+    while let Some(relative) = lowercase[search_from..].find(".dat") {
+        let dat_start = search_from + relative;
+        let mut end = dat_start;
+        if matches!(bytes.get(end.saturating_sub(2)..end), Some(b".t" | b"_t")) {
+            end = end.saturating_sub(2);
+        }
+        let mut start = end;
+        while start > 0 && bytes[start - 1].is_ascii_hexdigit() {
+            start -= 1;
+        }
+        if (8..=64).contains(&(end - start)) {
+            return Some(lowercase[start..end].to_owned());
+        }
+        search_from = dat_start + 4;
+    }
+    lowercase
+        .split(|character: char| !character.is_ascii_hexdigit())
+        .find(|candidate| (16..=64).contains(&candidate.len()))
+        .map(ToOwned::to_owned)
 }
 
 fn resolve_image_dat_path(
@@ -3090,10 +3199,11 @@ mod tests {
         clean_account_directory_name, decode_value, decode_voice_attachment,
         decoded_image_attachment, decrypt_v4_image, derive_image_keys,
         extend_message_database_routes, image_mime_type, index_decoded_images, index_video_files,
-        is_direct_conversation, is_message_database, message_table_name, parse_group_nicknames,
-        parse_video_file_key, parse_video_length, parse_video_md5_candidates,
-        read_conversation_metadata, read_database_images, read_database_videos, read_voice_blob,
-        resolve_group_sender, resolve_video_path, retention_cutoff_from, stage_decrypted_image,
+        is_direct_conversation, is_message_database, kvcomm_codes_from_filename,
+        message_table_name, parse_group_nicknames, parse_image_dat_name, parse_video_file_key,
+        parse_video_length, parse_video_md5_candidates, read_conversation_metadata,
+        read_database_images, read_database_videos, read_voice_blob, resolve_group_sender,
+        resolve_image_dat_path, resolve_video_path, retention_cutoff_from, stage_decrypted_image,
         video_attachment, voice_same_time_index, ConversationMetadata, ImageKeys, Session,
         SourcePaths, TextReadContext,
     };
@@ -3354,9 +3464,10 @@ mod tests {
         std::fs::write(template_dir.join("sample_t.dat"), template)
             .expect("write encrypted template");
 
-        let keys = derive_image_keys(&account).expect("derive verified keys");
-        assert_eq!(keys.xor, 3);
-        assert_eq!(&keys.aes, &hex.as_bytes()[..16]);
+        let keys = derive_image_keys(&account);
+        assert!(keys
+            .iter()
+            .any(|keys| keys.xor == 3 && keys.aes == hex.as_bytes()[..16]));
     }
 
     #[test]
@@ -3565,6 +3676,45 @@ mod tests {
     }
 
     #[test]
+    fn production_resolves_a_direct_image_dat_name_embedded_in_packed_info() {
+        let account = tempfile::tempdir().expect("create direct image fixture");
+        let identity = "ed300ffbabff6feee7217d4df7d05fe5";
+        let source = account
+            .path()
+            .join(format!("msg/attach/abc/1970-01/Img/{identity}_t.dat"));
+        std::fs::create_dir_all(source.parent().expect("direct image parent"))
+            .expect("create direct image directory");
+        std::fs::write(&source, [1_u8, 2, 3]).expect("write encrypted image fixture");
+        let packed =
+            Value::Blob(format!("metadata(path=cache/{identity}_t.dat);other=value").into_bytes());
+
+        assert_eq!(parse_image_dat_name(&packed).as_deref(), Some(identity));
+        assert_eq!(
+            resolve_image_dat_path(
+                account.path(),
+                "Msg_abc",
+                1,
+                None,
+                parse_image_dat_name(&packed).as_deref(),
+            ),
+            Some(source)
+        );
+    }
+
+    #[test]
+    fn production_accepts_legacy_and_reportnow_kvcomm_filenames() {
+        assert_eq!(
+            kvcomm_codes_from_filename("key_123_456.statistic"),
+            vec![123, 456]
+        );
+        assert_eq!(
+            kvcomm_codes_from_filename("key_reportnow_164965891_4066647068_-1_60_ready.statistic"),
+            vec![164_965_891, 4_066_647_068, 60]
+        );
+        assert!(kvcomm_codes_from_filename("not-a-key.statistic").is_empty());
+    }
+
+    #[test]
     fn production_image_manifest_uses_the_real_thumbnail_location_and_bytes() {
         let account = tempfile::tempdir().expect("create account fixture");
         let thumb = account
@@ -3676,7 +3826,7 @@ mod tests {
             &images,
             &encrypted_images,
             &image_hardlinks,
-            None,
+            &[],
             account.path(),
             20,
         )

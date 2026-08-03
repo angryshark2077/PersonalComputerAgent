@@ -14,6 +14,7 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
+    io::AsyncReadExt,
     sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
     time,
@@ -1376,16 +1377,26 @@ async fn sync_pending_communication_attachments(
         .await
         .map_err(|_| ControlError::Transient)?;
     let attachment_count = attachments.len();
+    let mut completed = 0_usize;
     for attachment in attachments {
-        client
+        if client
             .sync_communication_attachment(credentials, &attachment)
-            .await?;
+            .await
+            .is_err()
+        {
+            database
+                .defer_communication_attachment(&attachment.attachment_id)
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            continue;
+        }
         database
             .complete_communication_attachment(&attachment.attachment_id)
             .await
             .map_err(|_| ControlError::Transient)?;
+        completed = completed.saturating_add(1);
     }
-    Ok(attachment_count)
+    Ok(if completed > 0 { attachment_count } else { 0 })
 }
 
 async fn apply_communication_authorization(
@@ -1500,8 +1511,60 @@ impl HttpControlClient {
             .map_err(|_| ControlError::Transient)
     }
 
+    fn direct_client() -> Result<Client, ControlError> {
+        Client::builder()
+            .https_only(true)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
+            .pool_max_idle_per_host(0)
+            .no_proxy()
+            .build()
+            .map_err(|_| ControlError::Transient)
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, ControlError> {
         self.base_url.join(path).map_err(|_| ControlError::Contract)
+    }
+}
+
+async fn upload_communication_attachment(
+    client: &Client,
+    upload_url: Url,
+    headers: &BTreeMap<String, String>,
+    attachment: &PendingCommunicationAttachment,
+) -> Result<(), ControlError> {
+    let file = attachment
+        .try_clone_file()
+        .map_err(|_| ControlError::Transient)?;
+    let body = if attachment.mime_type.starts_with("image/") {
+        let expected_size =
+            usize::try_from(attachment.size_bytes).map_err(|_| ControlError::Contract)?;
+        let mut bytes = Vec::with_capacity(expected_size);
+        tokio::fs::File::from_std(file)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        if bytes.len() != expected_size {
+            return Err(ControlError::Contract);
+        }
+        reqwest::Body::from(bytes)
+    } else {
+        reqwest::Body::wrap_stream(ReaderStream::new(tokio::fs::File::from_std(file)))
+    };
+    let mut request = client
+        .put(upload_url)
+        .timeout(MEDIA_UPLOAD_TIMEOUT)
+        .header(reqwest::header::CONTENT_LENGTH, attachment.size_bytes)
+        .body(body);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.send().await.map_err(|_| ControlError::Transient)?;
+    if response.status().is_success() {
+        Ok(())
+    } else if response.status().is_server_error() {
+        Err(ControlError::Transient)
+    } else {
+        Err(ControlError::Contract)
     }
 }
 
@@ -1653,26 +1716,22 @@ impl ControlClient for HttpControlClient {
             if upload_url.scheme() != "https" {
                 return Err(ControlError::Contract);
             }
-            let file = attachment
-                .try_clone_file()
-                .map_err(|_| ControlError::Transient)?;
-            let body =
-                reqwest::Body::wrap_stream(ReaderStream::new(tokio::fs::File::from_std(file)));
-            let mut request = client
-                .put(upload_url)
-                .timeout(MEDIA_UPLOAD_TIMEOUT)
-                .header(reqwest::header::CONTENT_LENGTH, attachment.size_bytes)
-                .body(body);
-            for (name, value) in upload.headers {
-                request = request.header(name, value);
-            }
-            let upload_response = request.send().await.map_err(|_| ControlError::Transient)?;
-            if !upload_response.status().is_success() {
-                return if upload_response.status().is_server_error() {
-                    Err(ControlError::Transient)
-                } else {
-                    Err(ControlError::Contract)
-                };
+            if upload_communication_attachment(
+                &client,
+                upload_url.clone(),
+                &upload.headers,
+                attachment,
+            )
+            .await
+            .is_err()
+            {
+                upload_communication_attachment(
+                    &Self::direct_client()?,
+                    upload_url,
+                    &upload.headers,
+                    attachment,
+                )
+                .await?;
             }
             let completed = parse_response::<CompletedCommunicationObject>(
                 Self::client()?

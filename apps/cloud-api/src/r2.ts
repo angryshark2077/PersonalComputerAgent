@@ -53,6 +53,7 @@ export function createR2ObjectStore(environment: R2Environment): R2ObjectStore |
   const client = new S3Client({
     endpoint: endpoint.toString(),
     region: "auto",
+    requestChecksumCalculation: "WHEN_REQUIRED",
     credentials: {
       accessKeyId: required(environment, "R2_ACCESS_KEY_ID"),
       secretAccessKey: required(environment, "R2_SECRET_ACCESS_KEY"),

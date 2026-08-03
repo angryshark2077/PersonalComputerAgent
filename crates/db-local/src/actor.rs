@@ -182,6 +182,10 @@ enum Request {
         attachment_id: String,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    DeferCommunicationAttachment {
+        attachment_id: String,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     CleanupCompletedCommunicationAttachments {
         cutoff_ms: i64,
         response: oneshot::Sender<Result<u64, DbError>>,
@@ -203,7 +207,8 @@ impl Request {
             | Self::AcknowledgeSystemEvents { response, .. }
             | Self::CommitCommunicationMessage { response, .. }
             | Self::AcknowledgeCommunicationEvents { response, .. }
-            | Self::CompleteCommunicationAttachment { response, .. } => response.is_closed(),
+            | Self::CompleteCommunicationAttachment { response, .. }
+            | Self::DeferCommunicationAttachment { response, .. } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
             Self::LoadPairingState { response } => response.is_closed(),
             Self::Health { response } => response.is_closed(),
@@ -715,6 +720,21 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Moves one failed upload behind attachments that have not yet been attempted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or database error, including when the attachment is already completed.
+    pub async fn defer_communication_attachment(&self, attachment_id: &str) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::DeferCommunicationAttachment {
+            attachment_id: attachment_id.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Deletes Cloud-confirmed media bodies at or before the caller-provided retention cutoff.
     ///
     /// # Errors
@@ -958,6 +978,15 @@ fn run(
                 response,
             } => {
                 let _ = response.send(repository::complete_communication_attachment(
+                    &connection,
+                    &attachment_id,
+                ));
+            }
+            Request::DeferCommunicationAttachment {
+                attachment_id,
+                response,
+            } => {
+                let _ = response.send(repository::defer_communication_attachment(
                     &connection,
                     &attachment_id,
                 ));

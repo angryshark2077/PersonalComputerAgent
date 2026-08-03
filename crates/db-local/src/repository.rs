@@ -1332,7 +1332,8 @@ pub(crate) fn load_pending_communication_attachments(
                 ON m.local_message_id = s.local_message_id
              INNER JOIN sync_outbox AS o ON o.event_id = m.event_id
              WHERE o.state = 'acked' AND s.transfer_state <> 'completed'
-             ORDER BY s.created_at_ms, s.attachment_id
+             ORDER BY CASE s.transfer_state WHEN 'failed' THEN 1 ELSE 0 END,
+                      s.created_at_ms, s.attachment_id
              LIMIT ?1",
         )
         .map_err(|error| DbError::sqlite("prepare pending attachment query", error))?;
@@ -1413,6 +1414,28 @@ pub(crate) fn complete_communication_attachment(
     } else {
         Err(DbError::sqlite(
             "complete communication attachment",
+            "attachment was not pending",
+        ))
+    }
+}
+
+pub(crate) fn defer_communication_attachment(
+    connection: &Connection,
+    attachment_id: &str,
+) -> Result<(), DbError> {
+    let updated = connection
+        .execute(
+            "UPDATE attachment_spool
+             SET transfer_state = 'failed'
+             WHERE attachment_id = ?1 AND transfer_state <> 'completed'",
+            [attachment_id],
+        )
+        .map_err(|error| DbError::sqlite("defer communication attachment", error))?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "defer communication attachment",
             "attachment was not pending",
         ))
     }

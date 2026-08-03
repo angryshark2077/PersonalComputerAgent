@@ -53,6 +53,8 @@ test("R2 upload signatures keep the integrity metadata in the signed request hea
   const url = new URL(upload.url);
 
   assert.equal(url.searchParams.has("x-amz-meta-sha256"), false);
+  assert.equal(url.searchParams.has("x-amz-checksum-crc32"), false);
+  assert.equal(url.searchParams.has("x-amz-sdk-checksum-algorithm"), false);
   assert.match(url.searchParams.get("X-Amz-SignedHeaders") ?? "", /(?:^|;)x-amz-meta-sha256(?:;|$)/);
   assert.equal(upload.headers["x-amz-meta-sha256"], "a".repeat(64));
 });

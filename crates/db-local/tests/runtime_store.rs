@@ -1142,3 +1142,73 @@ async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body
         .expect("stream fixture prefix");
     assert_eq!(prefix, [0x5a; 16]);
 }
+
+#[tokio::test]
+async fn failed_attachment_is_deferred_behind_unattempted_media() {
+    let (directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let spool = directory.0.join("communication-spool");
+    let bodies = [
+        ("first", b"first".as_slice()),
+        ("second", b"second".as_slice()),
+    ];
+    let manifests = bodies
+        .iter()
+        .map(|(name, body)| {
+            let sha256 = format!("{:x}", Sha256::digest(body));
+            std::fs::write(spool.join(&sha256), body).expect("write attachment body");
+            (*name, sha256, body.len())
+        })
+        .collect::<Vec<_>>();
+    let connection = Connection::open(&path).expect("open fixture database");
+    connection
+        .execute_batch(
+            "INSERT INTO events_local VALUES
+                ('defer-event', 'workspace-1', 'device-1', 'communication.message_recorded',
+                 'wechat', 1, 1, 1, 'high', '{}', '[]', NULL);
+             INSERT INTO sync_outbox VALUES ('event:defer-event', 'defer-event', 'acked', 1);
+             INSERT INTO communication_conversations VALUES
+                ('account-1', 'conversation-1', 'direct', NULL, 1, 1);
+             INSERT INTO communication_messages VALUES
+                (1, 'defer-event', 'account-1', 'conversation-1', 1, 'source-1',
+                 'incoming', 'image', 1, NULL, 1);",
+        )
+        .expect("insert attachment owner fixture");
+    for (index, (name, sha256, size)) in manifests.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO attachment_spool (
+                    attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                    spool_relative_path, transfer_state, created_at_ms, completed_at_ms
+                 ) VALUES (?1, 1, 'image', ?2, ?3, 'image/png', ?2, 'pending', ?4, NULL)",
+                rusqlite::params![
+                    name,
+                    sha256,
+                    i64::try_from(*size).unwrap(),
+                    i64::try_from(index).unwrap()
+                ],
+            )
+            .expect("insert pending attachment");
+    }
+    drop(connection);
+
+    assert_eq!(
+        db.load_pending_communication_attachments(1)
+            .await
+            .expect("load first attachment")[0]
+            .attachment_id,
+        "first"
+    );
+    db.defer_communication_attachment("first")
+        .await
+        .expect("defer failed attachment");
+    assert_eq!(
+        db.load_pending_communication_attachments(1)
+            .await
+            .expect("load unattempted attachment")[0]
+            .attachment_id,
+        "second"
+    );
+}

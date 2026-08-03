@@ -90,6 +90,17 @@ fn probe_messages() -> Result<(), RepairError> {
             MessageKind::Audio => audio += 1,
             MessageKind::Video => video += 1,
         }
+        if env::var_os("PCA_WECHAT_MEDIA_DIAGNOSTIC").is_some()
+            && record.message().kind() != MessageKind::Text
+        {
+            println!(
+                "MEDIA conversation={} sequence={} kind={:?} attachments={}",
+                record.message().conversation_id(),
+                record.source_sequence(),
+                record.message().kind(),
+                record.completed_media().len()
+            );
+        }
     }
     println!(
         "Eligible records: total={} text={} image={} audio={} video={}",
