@@ -15,6 +15,7 @@ pub use actor::DbActorHandle;
 pub use actor::ProcessTestHooks;
 pub use error::DbError;
 use pca_domain::{CommunicationMessageRecorded, EventEnvelope};
+use std::io::{Seek, SeekFrom};
 
 /// The initial local database migration.
 pub const BASELINE_MIGRATION: &str = include_str!("../migrations/0000_baseline.sql");
@@ -76,7 +77,9 @@ impl PendingCommunicationAttachment {
     ///
     /// Returns the operating-system error when the file descriptor cannot be duplicated.
     pub fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
-        self.file.try_clone()
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
     }
 }
 

@@ -1141,6 +1141,11 @@ async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body
         .read_exact(&mut prefix)
         .expect("stream fixture prefix");
     assert_eq!(prefix, [0x5a; 16]);
+    let mut retry = pending[0].try_clone_file().expect("clone retry handle");
+    retry
+        .read_exact(&mut prefix)
+        .expect("retry starts at attachment beginning");
+    assert_eq!(prefix, [0x5a; 16]);
 }
 
 #[tokio::test]
