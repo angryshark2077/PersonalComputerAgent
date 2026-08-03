@@ -25,6 +25,7 @@ EXPECTED_MIGRATIONS = {
         "0007_expand_group_limit.sql",
         "0008_attachment_completion_retention.sql",
         "0009_allow_message_kind_sequence_overlap.sql",
+        "0010_add_file_messages.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",
@@ -39,6 +40,7 @@ EXPECTED_MIGRATIONS = {
         "0009_communication_conversation_names.sql",
         "0010_communication_message_senders.sql",
         "0011_communication_avatars.sql",
+        "0012_communication_files.sql",
     ],
 }
 
