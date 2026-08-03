@@ -342,6 +342,13 @@ export function createApp(options: CreateAppOptions): Hono {
       || actual.mimeType !== object.expectedMimeType
       || actual.sha256 !== object.expectedSha256
     ) {
+      if (actual !== null) {
+        try {
+          await options.objectStore.deleteObject(object.objectKey);
+        } catch {
+          return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private media storage is unavailable.");
+        }
+      }
       return errorResponse(context, 409, "OBJECT_INVALID", "The uploaded media does not match its manifest.");
     }
     try {
@@ -524,6 +531,7 @@ export function createApp(options: CreateAppOptions): Hono {
             sha256: attachment.sha256,
             size_bytes: attachment.sizeBytes,
             mime_type: attachment.mimeType,
+            file_name: attachment.fileName ?? undefined,
             object_id: attachment.objectId,
             object_state: attachment.objectState,
           })),

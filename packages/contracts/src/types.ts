@@ -172,7 +172,7 @@ export interface AgentControlSnapshot {
 }
 
 export type CommunicationDirection = "incoming" | "outgoing";
-export type CommunicationMessageKind = "text" | "audio" | "image" | "video";
+export type CommunicationMessageKind = "text" | "audio" | "image" | "video" | "file";
 
 export type CommunicationConversation =
   | { scope: "direct" }
@@ -184,6 +184,7 @@ export interface CommunicationAttachment {
   sha256: string;
   size_bytes: number;
   mime_type: string;
+  file_name?: string;
 }
 
 export type CommunicationMessageRecorded =

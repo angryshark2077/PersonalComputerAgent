@@ -37,11 +37,13 @@ const HARDLINK_DATABASE: &str = "db_storage/hardlink/hardlink.db";
 const MESSAGE_DIRECTORY: &str = "db_storage/message";
 const MAX_BATCH: usize = 200;
 const MAX_PER_CONVERSATION: usize = 20;
+const KIND_BATCH_QUOTA: usize = MAX_BATCH / 5;
 const INITIAL_HISTORY_SECONDS: u64 = 60 * 24 * 60 * 60;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const VOICE_SAMPLE_RATE: u32 = 24_000;
 const IMAGE_CODE_CACHE: &str =
     "Library/Application Support/PersonalComputerAgent/Data/wechat-image-codes-v1";
@@ -224,6 +226,8 @@ fn read_message_batch(
         read_conversation_metadata(connection, &sessions)
     })
     .map_err(|_| read_stage_error("WECHAT_CONTACT_READ_FAILED"))?;
+    let contact_cards = with_database(&paths.contact_database, &material, read_contact_cards)
+        .map_err(|_| read_stage_error("WECHAT_CONTACT_READ_FAILED"))?;
     let cutoff = retention_cutoff();
     let decoded_images = index_decoded_images(&paths.account_root, cutoff);
     let encrypted_images = index_encrypted_image_identities(&paths.account_root);
@@ -242,6 +246,7 @@ fn read_message_batch(
         BTreeMap::new()
     };
     let video_files = index_video_files(&paths.account_root);
+    let message_files = index_message_files(&paths.account_root, cutoff);
     let image_keys = derive_image_keys(&paths.account_root);
     let mut records = Vec::new();
     let mut image_rows_scanned = 0_usize;
@@ -269,9 +274,45 @@ fn read_message_batch(
             local_username: &paths.local_username,
             account_id: material.account_id(),
             conversation_metadata: &conversation_metadata,
+            contact_cards: &contact_cards,
             cursors: &cursor_snapshot,
             cutoff,
         };
+        let text_limit = remaining.min(KIND_BATCH_QUOTA);
+        let text_batch = with_database(database, &material, |connection| {
+            read_database_text(connection, &context, &sessions, text_limit)
+        })
+        .map_err(|_| read_stage_error("WECHAT_MESSAGE_READ_FAILED"))?;
+        for (cursor_key, sequence, record) in text_batch {
+            cursor_guard
+                .entry(cursor_key)
+                .and_modify(|current| *current = (*current).max(sequence))
+                .or_insert(sequence);
+            if let Some(record) = record {
+                records.push(SourceRecord::Message(Box::new(record)));
+            }
+        }
+        if records.len() >= MAX_BATCH {
+            break;
+        }
+        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
+        let file_batch = with_database(database, &material, |connection| {
+            read_database_files(connection, &context, &sessions, &message_files, remaining)
+        })
+        .map_err(|_| read_stage_error("WECHAT_FILE_READ_FAILED"))?;
+        for (cursor_key, sequence) in file_batch.cursor_updates {
+            cursor_guard
+                .entry(cursor_key)
+                .and_modify(|current| *current = (*current).max(sequence))
+                .or_insert(sequence);
+        }
+        for record in file_batch.records {
+            records.push(SourceRecord::Message(Box::new(record)));
+        }
+        if records.len() >= MAX_BATCH {
+            break;
+        }
+        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
         let image_batch = with_database(database, &material, |connection| {
             read_database_images(
                 connection,
@@ -305,7 +346,7 @@ fn read_message_batch(
         if records.len() >= MAX_BATCH {
             break;
         }
-        let remaining = MAX_BATCH - records.len();
+        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
         let audio_batch = with_database(database, &material, |connection| {
             read_database_audio(
                 connection,
@@ -329,7 +370,7 @@ fn read_message_batch(
         if records.len() >= MAX_BATCH {
             break;
         }
-        let remaining = MAX_BATCH - records.len();
+        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
         let video_batch = with_database(database, &material, |connection| {
             read_database_videos(
                 connection,
@@ -348,21 +389,6 @@ fn read_message_batch(
                 .or_insert(sequence);
         }
         for record in video_batch.records {
-            records.push(SourceRecord::Message(Box::new(record)));
-        }
-        if records.len() >= MAX_BATCH {
-            break;
-        }
-        let remaining = MAX_BATCH - records.len();
-        let batch = with_database(database, &material, |connection| {
-            read_database_text(connection, &context, &sessions, remaining)
-        })
-        .map_err(|_| read_stage_error("WECHAT_MESSAGE_READ_FAILED"))?;
-        for (cursor_key, sequence, record) in batch {
-            cursor_guard
-                .entry(cursor_key)
-                .and_modify(|current| *current = (*current).max(sequence))
-                .or_insert(sequence);
             records.push(SourceRecord::Message(Box::new(record)));
         }
     }
@@ -394,6 +420,7 @@ struct TextReadContext<'a> {
     local_username: &'a str,
     account_id: &'a str,
     conversation_metadata: &'a BTreeMap<String, ConversationMetadata>,
+    contact_cards: &'a BTreeMap<String, ContactCardProfile>,
     cursors: &'a BTreeMap<String, i64>,
     cutoff: i64,
 }
@@ -407,7 +434,7 @@ fn read_database_text(
     context: &TextReadContext<'_>,
     sessions: &[Session],
     limit: usize,
-) -> Result<Vec<(String, i64, SourceMessageRecord)>, SqlcipherProbeFailure> {
+) -> Result<Vec<(String, i64, Option<SourceMessageRecord>)>, SqlcipherProbeFailure> {
     let my_rowid = local_sender_rowid(connection, context.local_username)?
         .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
     let mut sender_statement = connection
@@ -448,13 +475,17 @@ fn read_database_text(
         if !table_exists(connection, &table_name)? {
             continue;
         }
-        let cursor_key = format!("{}:{}:text", context.database_name, session.username);
+        let cursor_key = format!(
+            "{}:{}:display-text-v2",
+            context.database_name, session.username
+        );
         let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
         let per_conversation = MAX_PER_CONVERSATION.min(limit - records.len());
         let sql = format!(
-            "SELECT local_id, server_id, create_time, real_sender_id, status, message_content, compress_content \
+            "SELECT local_id, server_id, create_time, real_sender_id, status, local_type, message_content, compress_content \
              FROM \"{table_name}\" \
-             WHERE local_type = 1 AND local_id > ?1 AND create_time >= ?2 \
+             WHERE local_type IN (1, 42, 48, 49, 50, 8589934592049, 8594229559345) \
+               AND local_id > ?1 AND create_time >= ?2 \
              ORDER BY local_id ASC LIMIT ?3"
         );
         let mut statement = connection
@@ -474,19 +505,25 @@ fn read_database_text(
                         create_time: row.get(2)?,
                         real_sender_id: row.get(3)?,
                         status: row.get(4)?,
-                        message_content: row.get(5)?,
-                        compress_content: row.get(6)?,
+                        local_type: row.get(5)?,
+                        message_content: row.get(6)?,
+                        compress_content: row.get(7)?,
                     })
                 },
             )
             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
         for row in rows {
             let row = row.map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
-            if row.local_id <= 0 || row.create_time <= 0 {
+            if row.local_id <= 0 {
+                continue;
+            }
+            if row.create_time <= 0 {
+                records.push((cursor_key.clone(), row.local_id, None));
                 continue;
             }
             let direction = if row.real_sender_id == my_rowid {
                 if row.server_id <= 0 || row.status < 0 {
+                    records.push((cursor_key.clone(), row.local_id, None));
                     continue;
                 }
                 SourceDirection::Outgoing
@@ -524,6 +561,13 @@ fn read_database_text(
             };
             let Some(body) = decode_message_content(&row.compress_content, &row.message_content)
             else {
+                records.push((cursor_key.clone(), row.local_id, None));
+                continue;
+            };
+            let Some(body) =
+                display_text_message_with_contacts(row.local_type, &body, context.contact_cards)
+            else {
+                records.push((cursor_key.clone(), row.local_id, None));
                 continue;
             };
             let occurred_at = OffsetDateTime::from_unix_timestamp(row.create_time)
@@ -542,7 +586,7 @@ fn read_database_text(
             records.push((
                 cursor_key.clone(),
                 row.local_id,
-                SourceMessageRecord {
+                Some(SourceMessageRecord {
                     account_id: context.account_id.to_owned(),
                     source_sequence: u64::try_from(row.local_id)
                         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
@@ -565,7 +609,7 @@ fn read_database_text(
                         SourceDirection::Unknown => SourceFinality::Unknown,
                     },
                     payload: SourcePayload::Text { body },
-                },
+                }),
             ));
         }
     }
@@ -867,6 +911,220 @@ struct AudioReadBatch {
 struct VideoReadBatch {
     records: Vec<SourceMessageRecord>,
     cursor_updates: Vec<(String, i64)>,
+}
+
+struct FileReadBatch {
+    records: Vec<SourceMessageRecord>,
+    cursor_updates: Vec<(String, i64)>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "file rows share the reviewed message identity and scope mapping"
+)]
+fn read_database_files(
+    connection: &Connection,
+    read_context: &TextReadContext<'_>,
+    sessions: &[Session],
+    message_files: &BTreeMap<String, Vec<PathBuf>>,
+    limit: usize,
+) -> Result<FileReadBatch, SqlcipherProbeFailure> {
+    let my_rowid = local_sender_rowid(connection, read_context.local_username)?
+        .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
+    let mut sender_statement = connection
+        .prepare("SELECT user_name FROM Name2Id WHERE rowid = ?1 LIMIT 1")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut records = Vec::new();
+    let mut cursor_updates = Vec::new();
+    for session in sessions {
+        if records.len() >= limit {
+            break;
+        }
+        let metadata = read_context
+            .conversation_metadata
+            .get(&session.username)
+            .cloned()
+            .unwrap_or_else(|| ConversationMetadata {
+                display_name: session.username.clone(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: BTreeMap::new(),
+                participant_avatar_urls: BTreeMap::new(),
+            });
+        let conversation = if session.username.ends_with("@chatroom") {
+            let Some(member_count) = metadata.member_count else {
+                continue;
+            };
+            if !(1..=15).contains(&member_count) {
+                continue;
+            }
+            SourceConversation::Group {
+                membership: GroupMembershipEvidence::Verified(member_count),
+            }
+        } else if is_direct_conversation(&session.username) {
+            SourceConversation::Direct
+        } else {
+            continue;
+        };
+        let table_name = message_table_name(&session.username);
+        if !table_exists(connection, &table_name)? {
+            continue;
+        }
+        let cursor_key = format!("{}:{}:file", read_context.database_name, session.username);
+        let after = read_context.cursors.get(&cursor_key).copied().unwrap_or(0);
+        let per_conversation = MAX_PER_CONVERSATION.min(limit - records.len());
+        let sql = format!(
+            "SELECT local_id, server_id, create_time, real_sender_id, status, message_content, compress_content \
+             FROM \"{table_name}\" \
+             WHERE local_type = 49 AND local_id > ?1 AND create_time >= ?2 \
+             ORDER BY local_id ASC"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let rows = statement
+            .query_map((after, read_context.cutoff), |row| {
+                Ok(MessageRow {
+                    local_id: row.get(0)?,
+                    server_id: row.get(1)?,
+                    create_time: row.get(2)?,
+                    real_sender_id: row.get(3)?,
+                    status: row.get(4)?,
+                    local_type: 49,
+                    message_content: row.get(5)?,
+                    compress_content: row.get(6)?,
+                })
+            })
+            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let mut scanned_through = after;
+        let records_before_session = records.len();
+        for row in rows {
+            if records.len() - records_before_session >= per_conversation {
+                break;
+            }
+            let row = row.map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+            if row.local_id <= 0 || row.create_time <= 0 {
+                continue;
+            }
+            let Some(content) = decode_message_content(&row.compress_content, &row.message_content)
+            else {
+                scanned_through = row.local_id;
+                continue;
+            };
+            if app_message_type(&content) != Some(6) {
+                scanned_through = row.local_id;
+                continue;
+            }
+            let Some(file_name) = xml_text(&content, "title") else {
+                scanned_through = row.local_id;
+                continue;
+            };
+            let expected_size = xml_text(&content, "totallen")
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0);
+            let completed_file = resolve_message_file(message_files, &file_name, expected_size)
+                .and_then(|source| {
+                    file_attachment(
+                        source,
+                        read_context.database_name,
+                        &table_name,
+                        row.local_id,
+                    )
+                });
+            let Some((attachment, source_path)) = completed_file else {
+                scanned_through = row.local_id;
+                continue;
+            };
+            scanned_through = row.local_id;
+            let direction = if row.real_sender_id == my_rowid {
+                if row.server_id <= 0 || row.status < 0 {
+                    continue;
+                }
+                SourceDirection::Outgoing
+            } else {
+                SourceDirection::Incoming
+            };
+            let (sender_id, sender_display_name, sender_avatar_url) = match direction {
+                SourceDirection::Outgoing => (
+                    read_context.local_username.to_owned(),
+                    "You".to_owned(),
+                    None,
+                ),
+                SourceDirection::Incoming if session.username.ends_with("@chatroom") => {
+                    let sender_id = sender_statement
+                        .query_row([row.real_sender_id], |sender_row| {
+                            sender_row.get::<_, String>(0)
+                        })
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .filter(|value| valid_identity(value));
+                    let (sender_id, sender_display_name) = resolve_group_sender(
+                        sender_id,
+                        row.real_sender_id,
+                        &metadata.participant_names,
+                    );
+                    let avatar = metadata.participant_avatar_urls.get(&sender_id).cloned();
+                    (sender_id, sender_display_name, avatar)
+                }
+                SourceDirection::Incoming => (
+                    session.username.clone(),
+                    metadata.display_name.clone(),
+                    metadata.avatar_url.clone(),
+                ),
+                SourceDirection::Unknown => continue,
+            };
+            let occurred_at = OffsetDateTime::from_unix_timestamp(row.create_time)
+                .ok()
+                .and_then(|time| time.format(&Rfc3339).ok())
+                .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
+            let attachment_id = attachment.attachment_id().to_owned();
+            records.push(SourceMessageRecord {
+                account_id: read_context.account_id.to_owned(),
+                source_sequence: u64::try_from(row.local_id)
+                    .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                message_id: if row.server_id > 0 {
+                    row.server_id.to_string()
+                } else {
+                    format!("local-{}", row.local_id)
+                },
+                conversation_id: session.username.clone(),
+                conversation_display_name: metadata.display_name.clone(),
+                conversation_avatar_url: metadata.avatar_url.clone(),
+                sender_id,
+                sender_display_name,
+                sender_avatar_url,
+                source_key: format!(
+                    "wechat:{}:{table_name}:{}:file",
+                    read_context.database_name, row.local_id
+                ),
+                occurred_at,
+                local_account: LocalAccountProof::Verified,
+                direction,
+                kind: SourceMessageKind::File,
+                conversation: conversation.clone(),
+                finality: match direction {
+                    SourceDirection::Incoming => SourceFinality::IncomingPersisted,
+                    SourceDirection::Outgoing => SourceFinality::OutgoingSent,
+                    SourceDirection::Unknown => SourceFinality::Unknown,
+                },
+                payload: SourcePayload::Media {
+                    attachment: Some(attachment),
+                    completed_source: Some(crate::source::SourceCompletedMedia {
+                        attachment_id,
+                        source_path,
+                    }),
+                },
+            });
+        }
+        if scanned_through > after {
+            cursor_updates.push((cursor_key, scanned_through));
+        }
+    }
+    Ok(FileReadBatch {
+        records,
+        cursor_updates,
+    })
 }
 
 #[allow(
@@ -1591,6 +1849,78 @@ fn video_attachment(
     Some((attachment, source))
 }
 
+fn file_attachment(
+    source: &Path,
+    database_name: &str,
+    table_name: &str,
+    local_id: i64,
+) -> Option<(CommunicationAttachment, PathBuf)> {
+    let source = fs::canonicalize(source).ok()?;
+    let metadata = source.symlink_metadata().ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_FILE_BYTES
+    {
+        return None;
+    }
+    let file_name = source.file_name()?.to_str()?.to_owned();
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&source)
+        .ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut bytes_read = 0_u64;
+    loop {
+        let count = input.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        bytes_read = bytes_read.checked_add(u64::try_from(count).ok()?)?;
+    }
+    if bytes_read != metadata.len() {
+        return None;
+    }
+    let table_hash = table_name.strip_prefix("Msg_")?;
+    let attachment_id = format!("wechat-file:{database_name}:{table_hash}:{local_id}");
+    let attachment = CommunicationAttachment::try_new(
+        attachment_id,
+        MessageKind::File,
+        format!("{:x}", hasher.finalize()),
+        metadata.len(),
+        file_mime_type(&source).to_owned(),
+    )
+    .and_then(|attachment| attachment.with_file_name(&file_name))
+    .ok()?;
+    Some((attachment, source))
+}
+
+fn file_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("txt") => "text/plain",
+        Some("csv") => "text/csv",
+        Some("zip") => "application/zip",
+        Some("wav") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
+}
+
 fn query_voice_value(
     connection: &Connection,
     sql: &str,
@@ -2249,6 +2579,61 @@ fn index_video_files(account_root: &Path) -> BTreeMap<String, PathBuf> {
     paths
 }
 
+fn index_message_files(account_root: &Path, _cutoff: i64) -> BTreeMap<String, Vec<PathBuf>> {
+    let root = account_root.join("msg/file");
+    let Ok(months) = fs::read_dir(root) else {
+        return BTreeMap::new();
+    };
+    let mut files = BTreeMap::<String, Vec<PathBuf>>::new();
+    for month in months.flatten().take(120) {
+        let month_path = month.path();
+        let Ok(metadata) = month_path.symlink_metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(month_path) else {
+            continue;
+        };
+        for entry in entries.flatten().take(10_000) {
+            let path = entry.path();
+            let Ok(metadata) = path.symlink_metadata() else {
+                continue;
+            };
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() == 0
+                || metadata.len() > MAX_FILE_BYTES
+            {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            files.entry(file_name.to_owned()).or_default().push(path);
+        }
+    }
+    files
+}
+
+fn resolve_message_file<'a>(
+    files: &'a BTreeMap<String, Vec<PathBuf>>,
+    file_name: &str,
+    expected_size: Option<u64>,
+) -> Option<&'a Path> {
+    let candidates = files.get(file_name)?;
+    candidates
+        .iter()
+        .find(|path| {
+            expected_size.is_none_or(|expected| {
+                path.symlink_metadata()
+                    .is_ok_and(|metadata| metadata.len() == expected)
+            })
+        })
+        .map(PathBuf::as_path)
+}
+
 fn valid_path_component(value: &str) -> bool {
     if value.is_empty() || value.len() > 255 {
         return false;
@@ -2432,12 +2817,20 @@ struct ConversationMetadata {
     participant_avatar_urls: BTreeMap<String, String>,
 }
 
+#[derive(Clone)]
+struct ContactCardProfile {
+    display_name: String,
+    wechat_id: String,
+    avatar_url: Option<String>,
+}
+
 struct MessageRow {
     local_id: i64,
     server_id: i64,
     create_time: i64,
     real_sender_id: i64,
     status: i64,
+    local_type: i64,
     message_content: Value,
     compress_content: Value,
 }
@@ -2584,6 +2977,54 @@ fn read_avatar_urls(
         }
     }
     Ok(avatars)
+}
+
+fn read_contact_cards(
+    connection: &Connection,
+) -> Result<BTreeMap<String, ContactCardProfile>, SqlcipherProbeFailure> {
+    let avatars = read_avatar_urls(connection, "contact").unwrap_or_default();
+    let mut statement = connection
+        .prepare("SELECT username, remark, nick_name, alias FROM contact")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let mut profiles = BTreeMap::new();
+    for (username, remark, nickname, alias) in rows.flatten() {
+        if !valid_identity(&username) {
+            continue;
+        }
+        let display_name = [nickname, remark]
+            .into_iter()
+            .flatten()
+            .find_map(|value| valid_display_name(&value))
+            .unwrap_or_else(|| username.clone());
+        let wechat_id = alias
+            .and_then(|value| valid_wechat_id(&value))
+            .unwrap_or_else(|| username.clone());
+        profiles.insert(
+            username.clone(),
+            ContactCardProfile {
+                display_name,
+                wechat_id,
+                avatar_url: avatars.get(&username).cloned(),
+            },
+        );
+    }
+    Ok(profiles)
+}
+
+fn valid_wechat_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control))
+        .then(|| value.to_owned())
 }
 
 fn normalize_avatar_url(value: &str) -> Option<String> {
@@ -3057,6 +3498,246 @@ fn nonempty_text(text: impl AsRef<str>) -> Option<String> {
     (!text.is_empty() && text.len() <= 4 * 1024 * 1024).then_some(text)
 }
 
+fn display_text_message_with_contacts(
+    local_type: i64,
+    content: &str,
+    contact_cards: &BTreeMap<String, ContactCardProfile>,
+) -> Option<String> {
+    match local_type {
+        1 => nonempty_text(content),
+        42 => format_contact_card_message(content, contact_cards),
+        48 => format_location_message(content),
+        50 => format_call_message(content),
+        49 if app_message_type(content) == Some(2000) => format_transfer_message(content),
+        49 if app_message_type(content) == Some(2001) || content.contains("hongbao") => {
+            format_red_packet_message(content)
+        }
+        49 if is_location_app_message(content) => format_location_message(content),
+        49 if app_message_type(content) == Some(6) => None,
+        49 => format_app_message(content),
+        8_589_934_592_049 => format_transfer_message(content),
+        8_594_229_559_345 => format_red_packet_message(content),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn display_text_message(local_type: i64, content: &str) -> Option<String> {
+    display_text_message_with_contacts(local_type, content, &BTreeMap::new())
+}
+
+fn format_contact_card_message(
+    content: &str,
+    contact_cards: &BTreeMap<String, ContactCardProfile>,
+) -> Option<String> {
+    let username =
+        xml_attribute(content, "username").or_else(|| xml_attribute(content, "encryptusername"));
+    let profile = username
+        .as_ref()
+        .and_then(|username| contact_cards.get(username));
+    let display_name = profile
+        .map(|profile| profile.display_name.clone())
+        .or_else(|| xml_attribute(content, "nickname"));
+    let wechat_id = profile
+        .map(|profile| profile.wechat_id.clone())
+        .or_else(|| xml_attribute(content, "alias"))
+        .or(username);
+    let avatar_url = profile
+        .and_then(|profile| profile.avatar_url.clone())
+        .or_else(|| xml_attribute(content, "bigheadimgurl"))
+        .or_else(|| xml_attribute(content, "smallheadimgurl"))
+        .and_then(|value| normalize_avatar_url(&value));
+    let details = unique_nonempty([
+        display_name,
+        wechat_id.map(|wechat_id| format!("微信号：{wechat_id}")),
+        avatar_url.map(|avatar_url| format!("头像：{avatar_url}")),
+    ]);
+    nonempty_text(if details.is_empty() {
+        "[联系人名片]".to_owned()
+    } else {
+        format!("[联系人名片] {}", details.join(" · "))
+    })
+}
+
+fn format_location_message(content: &str) -> Option<String> {
+    let point_name = xml_attribute(content, "poiname")
+        .or_else(|| xml_text(content, "poiname"))
+        .or_else(|| xml_text(content, "poiName"))
+        .or_else(|| xml_text(content, "title"));
+    let address = xml_attribute(content, "label")
+        .or_else(|| xml_text(content, "label"))
+        .or_else(|| xml_text(content, "des"));
+    let source = xml_text(content, "sourcedisplayname")
+        .or_else(|| xml_text(content, "sourcename"))
+        .or_else(|| xml_text(content, "appname"));
+    let latitude = xml_attribute(content, "x")
+        .or_else(|| xml_attribute(content, "latitude"))
+        .or_else(|| xml_text(content, "latitude"));
+    let longitude = xml_attribute(content, "y")
+        .or_else(|| xml_attribute(content, "longitude"))
+        .or_else(|| xml_text(content, "longitude"));
+    let coordinate = latitude
+        .zip(longitude)
+        .map(|(latitude, longitude)| format!("坐标：{latitude},{longitude}"));
+    let url = xml_text(content, "url");
+    let details = unique_nonempty([point_name, address, source, coordinate, url]);
+    nonempty_text(if details.is_empty() {
+        "[位置]".to_owned()
+    } else {
+        format!("[位置] {}", details.join(" · "))
+    })
+}
+
+fn is_location_app_message(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("<location")
+        || lower.contains("poiname=")
+        || lower.contains("<poiname>")
+        || [
+            "高德地图",
+            "百度地图",
+            "腾讯地图",
+            "大众点评",
+            "amap.com",
+            "map.baidu.com",
+            "map.qq.com",
+            "dianping.com",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn format_call_message(content: &str) -> Option<String> {
+    let kind = match xml_text(content, "room_type").as_deref() {
+        Some("0") => "视频通话",
+        _ => "语音通话",
+    };
+    let detail = xml_text(content, "msg")
+        .or_else(|| xml_text(content, "display_content"))
+        .filter(|value| value != kind);
+    nonempty_text(match detail {
+        Some(detail) => format!("[{kind}] {detail}"),
+        None => format!("[{kind}]"),
+    })
+}
+
+fn format_transfer_message(content: &str) -> Option<String> {
+    let amount = xml_text(content, "feedesc")
+        .or_else(|| xml_text(content, "pay_memo"))
+        .or_else(|| xml_text(content, "title"));
+    let memo =
+        xml_text(content, "pay_memo").filter(|memo| amount.as_deref() != Some(memo.as_str()));
+    let detail = [amount, memo]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    nonempty_text(if detail.is_empty() {
+        "[转账]".to_owned()
+    } else {
+        format!("[转账] {detail}")
+    })
+}
+
+fn format_red_packet_message(content: &str) -> Option<String> {
+    let details = unique_nonempty([
+        xml_text(content, "receivertitle"),
+        xml_text(content, "sendertitle"),
+        xml_text(content, "wishing"),
+        xml_text(content, "pay_memo"),
+        xml_text(content, "title"),
+    ]);
+    nonempty_text(if details.is_empty() {
+        "[红包]".to_owned()
+    } else {
+        format!("[红包] {}", details.join(" · "))
+    })
+}
+
+fn format_app_message(content: &str) -> Option<String> {
+    let message_type = app_message_type(content);
+    let source_username = xml_text(content, "sourceusername").unwrap_or_default();
+    let source_name = xml_text(content, "sourcedisplayname")
+        .or_else(|| xml_text(content, "sourcename"))
+        .or_else(|| xml_text(content, "appname"));
+    let label = match message_type {
+        Some(3) => "音乐分享",
+        Some(5) if source_username.starts_with("gh_") || source_name.is_some() => "公众号卡片",
+        Some(5) => "链接分享",
+        Some(6) => "文件分享",
+        Some(19) => "聊天记录",
+        Some(33 | 36) => "小程序",
+        Some(51) => "视频号",
+        Some(87) => "群公告",
+        Some(115) => "微信礼物",
+        _ => "卡片分享",
+    };
+    let title = if message_type == Some(51) {
+        xml_text(content, "desc").or_else(|| xml_text(content, "title"))
+    } else {
+        xml_text(content, "title")
+            .or_else(|| xml_text(content, "textannouncement"))
+            .or_else(|| xml_text(content, "wishmessage"))
+    };
+    let description = xml_text(content, "des");
+    let finder_name = xml_text(content, "nickname")
+        .or_else(|| xml_text(content, "findernickname"))
+        .or_else(|| xml_text(content, "finder_nickname"));
+    let url = xml_text(content, "url");
+    let details = unique_nonempty([title, description, finder_name, source_name, url]);
+    nonempty_text(if details.is_empty() {
+        format!("[{label}]")
+    } else {
+        format!("[{label}] {}", details.join(" · "))
+    })
+}
+
+fn app_message_type(content: &str) -> Option<i64> {
+    let appmsg = content
+        .find("<appmsg")
+        .and_then(|start| content[start..].find('>').map(|end| start + end + 1))?;
+    xml_text(&content[appmsg..], "type")?.parse().ok()
+}
+
+fn xml_text(content: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = content.find(&start_tag)? + start_tag.len();
+    let end = content[start..].find(&end_tag)? + start;
+    let value = content[start..end].trim();
+    let value = value
+        .strip_prefix("<![CDATA[")
+        .and_then(|value| value.strip_suffix("]]>"))
+        .unwrap_or(value);
+    nonempty_text(value)
+}
+
+fn xml_attribute(content: &str, attribute: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("{attribute}={quote}");
+        let Some(start) = content.find(&needle).map(|start| start + needle.len()) else {
+            continue;
+        };
+        let Some(end) = content[start..].find(quote).map(|end| end + start) else {
+            continue;
+        };
+        if let Some(value) = nonempty_text(&content[start..end]) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn unique_nonempty<const N: usize>(values: [Option<String>; N]) -> Vec<String> {
+    let mut unique = Vec::new();
+    for value in values.into_iter().flatten() {
+        if !unique.iter().any(|existing| existing == &value) {
+            unique.push(value);
+        }
+    }
+    unique
+}
+
 fn message_table_name(username: &str) -> String {
     let digest = Md5::digest(username.as_bytes());
     format!("Msg_{digest:x}")
@@ -3197,17 +3878,241 @@ fn capability_unavailable() -> DomainError {
 mod tests {
     use super::{
         clean_account_directory_name, decode_value, decode_voice_attachment,
-        decoded_image_attachment, decrypt_v4_image, derive_image_keys,
-        extend_message_database_routes, image_mime_type, index_decoded_images, index_video_files,
-        is_direct_conversation, is_message_database, kvcomm_codes_from_filename,
-        message_table_name, parse_group_nicknames, parse_image_dat_name, parse_video_file_key,
-        parse_video_length, parse_video_md5_candidates, read_conversation_metadata,
-        read_database_images, read_database_videos, read_voice_blob, resolve_group_sender,
-        resolve_image_dat_path, resolve_video_path, retention_cutoff_from, stage_decrypted_image,
-        video_attachment, voice_same_time_index, ConversationMetadata, ImageKeys, Session,
-        SourcePaths, TextReadContext,
+        decoded_image_attachment, decrypt_v4_image, derive_image_keys, display_text_message,
+        extend_message_database_routes, file_attachment, image_mime_type, index_decoded_images,
+        index_message_files, index_video_files, is_direct_conversation, is_message_database,
+        kvcomm_codes_from_filename, message_table_name, parse_group_nicknames,
+        parse_image_dat_name, parse_video_file_key, parse_video_length, parse_video_md5_candidates,
+        read_contact_cards, read_conversation_metadata, read_database_images, read_database_text,
+        read_database_videos, read_voice_blob, resolve_group_sender, resolve_image_dat_path,
+        resolve_video_path, retention_cutoff_from, stage_decrypted_image, video_attachment,
+        voice_same_time_index, ContactCardProfile, ConversationMetadata, ImageKeys, Session,
+        SourcePaths, SourcePayload, TextReadContext,
     };
     use pca_keychain::{WechatDatabaseKeyMaterial, WechatKeyMaterial};
+
+    #[test]
+    fn production_formats_calls_payments_and_shared_cards_as_text() {
+        assert_eq!(
+            display_text_message(
+                50,
+                "<voip><room_type>1</room_type><msg><![CDATA[通话时长 00:32]]></msg></voip>"
+            )
+            .as_deref(),
+            Some("[语音通话] 通话时长 00:32")
+        );
+        assert_eq!(
+            display_text_message(
+                50,
+                "<voip><room_type>0</room_type><msg>对方无应答</msg></voip>"
+            )
+            .as_deref(),
+            Some("[视频通话] 对方无应答")
+        );
+        assert_eq!(
+            display_text_message(
+                49,
+                "<msg><appmsg><title>微信转账</title><type>2000</type><wcpayinfo><feedesc>￥20.00</feedesc><pay_memo>晚饭</pay_memo></wcpayinfo></appmsg></msg>"
+            )
+            .as_deref(),
+            Some("[转账] ￥20.00 · 晚饭")
+        );
+        assert_eq!(
+            display_text_message(
+                49,
+                "<msg><appmsg><type>2001</type><wcpayinfo><receivertitle>恭喜发财</receivertitle><pay_memo>生日快乐</pay_memo></wcpayinfo></appmsg></msg>"
+            )
+            .as_deref(),
+            Some("[红包] 恭喜发财 · 生日快乐")
+        );
+        assert_eq!(
+            display_text_message(
+                42,
+                "<msg username=\"wxid_contact123\" nickname=\"联系人\" alias=\"alias123\" />"
+            )
+            .as_deref(),
+            Some("[联系人名片] 联系人 · 微信号：alias123")
+        );
+        let contacts = std::collections::BTreeMap::from([(
+            "wxid_contact123".to_owned(),
+            ContactCardProfile {
+                display_name: "真实昵称".to_owned(),
+                wechat_id: "A5202544".to_owned(),
+                avatar_url: Some("https://avatar.example/contact.jpg".to_owned()),
+            },
+        )]);
+        assert_eq!(
+            super::display_text_message_with_contacts(
+                42,
+                "<msg username=\"wxid_contact123\" nickname=\"旧昵称\" />",
+                &contacts,
+            )
+            .as_deref(),
+            Some(
+                "[联系人名片] 真实昵称 · 微信号：A5202544 · 头像：https://avatar.example/contact.jpg"
+            )
+        );
+        assert_eq!(
+            display_text_message(
+                48,
+                "<msg><location x=\"31.2304\" y=\"121.4737\" poiname=\"人民广场\" label=\"上海市黄浦区\" /></msg>"
+            )
+            .as_deref(),
+            Some("[位置] 人民广场 · 上海市黄浦区 · 坐标：31.2304,121.4737")
+        );
+        assert_eq!(
+            display_text_message(
+                49,
+                "<msg><appmsg><title>示例餐厅</title><des>上海市黄浦区示例路 1 号</des><type>5</type><url>https://www.dianping.com/shop/example</url><appname>大众点评</appname></appmsg></msg>"
+            )
+            .as_deref(),
+            Some("[位置] 示例餐厅 · 上海市黄浦区示例路 1 号 · 大众点评 · https://www.dianping.com/shop/example")
+        );
+        assert_eq!(
+            display_text_message(
+                49,
+                "<msg><appmsg><title>产品更新</title><des>更新说明</des><type>5</type><url>https://example.test/post</url><sourceusername>gh_source</sourceusername><sourcedisplayname>示例公众号</sourcedisplayname></appmsg></msg>"
+            )
+            .as_deref(),
+            Some("[公众号卡片] 产品更新 · 更新说明 · 示例公众号 · https://example.test/post")
+        );
+        assert_eq!(
+            display_text_message(
+                49,
+                "<msg><appmsg><title>当前版本不支持该内容</title><type>51</type><finderFeed><desc>视频标题</desc><nickname>视频作者</nickname></finderFeed></appmsg></msg>"
+            )
+            .as_deref(),
+            Some("[视频号] 视频标题 · 视频作者")
+        );
+        assert_eq!(
+            display_text_message(
+                49,
+                "<msg><appmsg><title>订单详情</title><des>来自示例 App</des><type>33</type><appname>示例 App</appname></appmsg></msg>"
+            )
+            .as_deref(),
+            Some("[小程序] 订单详情 · 来自示例 App · 示例 App")
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture covers every newly supported database message shape"
+    )]
+    fn production_reads_special_messages_and_advances_the_new_cursor() {
+        let connection = Connection::open_in_memory().expect("open special message fixture");
+        let conversation_id = "wxid_friend";
+        let table_name = message_table_name(conversation_id);
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE Name2Id (user_name TEXT);\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'wxid_local');\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (2, '{conversation_id}');\
+                 CREATE TABLE \"{table_name}\" (\
+                    local_id INTEGER, server_id INTEGER, create_time INTEGER,\
+                    real_sender_id INTEGER, status INTEGER, local_type INTEGER,\
+                    message_content TEXT, compress_content BLOB\
+                 );"
+            ))
+            .expect("create special message fixture schema");
+        let rows = [
+            (1_i64, 1_i64, "普通文本"),
+            (
+                2,
+                42,
+                "<msg username=\"wxid_card\" nickname=\"名片联系人\" />",
+            ),
+            (
+                3,
+                50,
+                "<voip><room_type>1</room_type><msg>通话时长 00:05</msg></voip>",
+            ),
+            (
+                4,
+                49,
+                "<msg><appmsg><type>2000</type><wcpayinfo><feedesc>￥8.88</feedesc><pay_memo>咖啡</pay_memo></wcpayinfo></appmsg></msg>",
+            ),
+            (
+                5,
+                8_594_229_559_345,
+                "<msg><wcpayinfo><sendertitle>节日快乐</sendertitle></wcpayinfo></msg>",
+            ),
+            (
+                6,
+                49,
+                "<msg><appmsg><title>视频标题</title><type>51</type><finderFeed><nickname>视频作者</nickname></finderFeed></appmsg></msg>",
+            ),
+            (
+                7,
+                48,
+                "<msg><location x=\"31.2304\" y=\"121.4737\" poiname=\"人民广场\" label=\"上海市黄浦区\" /></msg>",
+            ),
+        ];
+        for (local_id, local_type, content) in rows {
+            connection
+                .execute(
+                    &format!(
+                        "INSERT INTO \"{table_name}\" VALUES (?1, ?2, 1000, 2, 0, ?3, ?4, NULL)"
+                    ),
+                    rusqlite::params![local_id, 100 + local_id, local_type, content],
+                )
+                .expect("insert special message fixture");
+        }
+        let metadata = std::collections::BTreeMap::from([(
+            conversation_id.to_owned(),
+            ConversationMetadata {
+                display_name: "Friend".to_owned(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: std::collections::BTreeMap::new(),
+                participant_avatar_urls: std::collections::BTreeMap::new(),
+            },
+        )]);
+        let contact_cards = std::collections::BTreeMap::new();
+        let cursors = std::collections::BTreeMap::new();
+        let context = TextReadContext {
+            database_name: "message_0.db",
+            local_username: "wxid_local",
+            account_id: "account",
+            conversation_metadata: &metadata,
+            contact_cards: &contact_cards,
+            cursors: &cursors,
+            cutoff: 0,
+        };
+        let records = read_database_text(
+            &connection,
+            &context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            20,
+        )
+        .expect("read special messages");
+        assert_eq!(records.len(), 7);
+        assert!(records.iter().all(|(cursor, _, record)| {
+            cursor == "message_0.db:wxid_friend:display-text-v2" && record.is_some()
+        }));
+        let bodies = records
+            .into_iter()
+            .filter_map(|(_, _, record)| record)
+            .filter_map(|record| match record.payload {
+                SourcePayload::Text { body } => Some(body),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies,
+            vec![
+                "普通文本",
+                "[联系人名片] 名片联系人 · 微信号：wxid_card",
+                "[语音通话] 通话时长 00:05",
+                "[转账] ￥8.88 · 咖啡",
+                "[红包] 节日快乐",
+                "[视频号] 视频标题 · 视频作者",
+                "[位置] 人民广场 · 上海市黄浦区 · 坐标：31.2304,121.4737",
+            ]
+        );
+    }
 
     #[test]
     fn production_decodes_silk_voice_to_browser_wav() {
@@ -3314,6 +4219,26 @@ mod tests {
     }
 
     #[test]
+    fn production_indexes_and_manifests_downloaded_file_messages() {
+        let account = tempfile::tempdir().expect("create account fixture");
+        let month = account.path().join("msg/file/2026-08");
+        std::fs::create_dir_all(&month).expect("create file directory");
+        let source = month.join("report.pdf");
+        std::fs::write(&source, b"%PDF-1.7 fixture").expect("write file fixture");
+        let files = index_message_files(account.path(), 0);
+        assert_eq!(files["report.pdf"], vec![source.clone()]);
+        let (attachment, resolved) =
+            file_attachment(&source, "message_0.db", "Msg_abc", 9).expect("manifest file");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(source).expect("canonical file")
+        );
+        assert_eq!(attachment.kind(), pca_domain::MessageKind::File);
+        assert_eq!(attachment.file_name(), Some("report.pdf"));
+        assert_eq!(attachment.mime_type(), "application/pdf");
+    }
+
+    #[test]
     fn production_emits_video_only_for_an_eligible_conversation() {
         let connection = Connection::open_in_memory().expect("open video message fixture");
         let conversation_id = "wxid_friend";
@@ -3352,12 +4277,14 @@ mod tests {
                 participant_avatar_urls: std::collections::BTreeMap::new(),
             },
         )]);
+        let contact_cards = std::collections::BTreeMap::new();
         let cursors = std::collections::BTreeMap::new();
         let context = TextReadContext {
             database_name: "message_0.db",
             local_username: "wxid_local",
             account_id: "account",
             conversation_metadata: &metadata,
+            contact_cards: &contact_cards,
             cursors: &cursors,
             cutoff: 0,
         };
@@ -3556,8 +4483,15 @@ mod tests {
             },
         ];
         let metadata = read_conversation_metadata(&connection, &sessions).expect("read metadata");
+        let cards = read_contact_cards(&connection).expect("read contact cards");
 
         assert_eq!(metadata["wxid_friend"].display_name, "Friend Remark");
+        assert_eq!(cards["wxid_friend"].display_name, "Friend Nick");
+        assert_eq!(cards["wxid_friend"].wechat_id, "friend_alias");
+        assert_eq!(
+            cards["wxid_friend"].avatar_url.as_deref(),
+            Some("https://avatar.example/friend-big.jpg")
+        );
         assert_eq!(
             metadata["wxid_friend"].avatar_url.as_deref(),
             Some("https://avatar.example/friend-big.jpg")
@@ -3808,12 +4742,14 @@ mod tests {
                 participant_avatar_urls: std::collections::BTreeMap::new(),
             },
         )]);
+        let contact_cards = std::collections::BTreeMap::new();
         let cursors = std::collections::BTreeMap::new();
         let context = TextReadContext {
             database_name: "message_0.db",
             local_username: "wxid_local",
             account_id: "account",
             conversation_metadata: &metadata,
+            contact_cards: &contact_cards,
             cursors: &cursors,
             cutoff: 0,
         };

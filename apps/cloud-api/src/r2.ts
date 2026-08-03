@@ -2,6 +2,7 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
+  DeleteObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -24,6 +25,7 @@ export interface R2ObjectHead {
 export interface R2ObjectStore {
   signUpload(descriptor: R2ObjectDescriptor): Promise<{ url: string; headers: Record<string, string> }>;
   headObject(objectKey: string): Promise<R2ObjectHead | null>;
+  deleteObject(objectKey: string): Promise<void>;
   signRead(objectKey: string): Promise<{ url: string; expiresAt: Date }>;
 }
 
@@ -115,6 +117,10 @@ class S3R2ObjectStore implements R2ObjectStore {
       }
       throw error;
     }
+  }
+
+  async deleteObject(objectKey: string): Promise<void> {
+    await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: objectKey }));
   }
 
   async signRead(objectKey: string): Promise<{ url: string; expiresAt: Date }> {

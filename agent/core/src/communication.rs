@@ -1478,6 +1478,7 @@ fn mime_matches_kind(kind: MessageKind, mime_type: &str) -> bool {
         MessageKind::Audio => "audio/",
         MessageKind::Image => "image/",
         MessageKind::Video => "video/",
+        MessageKind::File => return !mime_type.trim().is_empty(),
         MessageKind::Text => return false,
     };
     mime_type

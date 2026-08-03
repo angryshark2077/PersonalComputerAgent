@@ -195,15 +195,16 @@ function parseCommunicationMessage(
     source_key: string;
     occurred_at: string;
     direction: "incoming" | "outgoing";
-    kind: "text" | "audio" | "image" | "video";
+    kind: "text" | "audio" | "image" | "video" | "file";
     conversation: { scope: "direct" | "group"; member_count?: number };
     text?: string;
     attachments?: Array<{
       attachment_id: string;
-      kind: "audio" | "image" | "video";
+      kind: "audio" | "image" | "video" | "file";
       sha256: string;
       size_bytes: number;
       mime_type: string;
+      file_name?: string;
     }>;
   };
   const occurredAt = new Date(message.occurred_at);
@@ -214,6 +215,7 @@ function parseCommunicationMessage(
     sha256: attachment.sha256,
     sizeBytes: attachment.size_bytes,
     mimeType: attachment.mime_type,
+    fileName: attachment.file_name ?? null,
   }));
   if (
     attachments.length !== attachmentRefs.length

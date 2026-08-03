@@ -67,6 +67,7 @@ pub enum SourceMessageKind {
     Audio,
     Image,
     Video,
+    File,
     Unsupported,
     Unknown,
 }

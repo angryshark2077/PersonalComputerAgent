@@ -3,7 +3,7 @@ export interface CollectorConfig {
   "communication.wechat": {
     enabled: boolean;
     directions: ["incoming", "outgoing"];
-    message_types: ["text", "audio", "image", "video"];
+    message_types: ["text", "audio", "image", "video"] | ["text", "audio", "image", "video", "file"];
     conversation_scope: "direct_and_group_at_most_fifteen_members";
     max_group_members: 15;
     sync_mode: "full";
@@ -51,10 +51,11 @@ export interface DashboardConversation {
 
 export interface DashboardMessageAttachment {
   attachment_id: string;
-  kind: "audio" | "image" | "video";
+  kind: "audio" | "image" | "video" | "file";
   sha256: string;
   size_bytes: number;
   mime_type: string;
+  file_name?: string;
   object_id: string | null;
   object_state: "prepared" | "completed" | null;
 }
@@ -67,7 +68,7 @@ export interface DashboardMessage {
   sender_avatar_url: string | null;
   occurred_at: string;
   direction: "incoming" | "outgoing";
-  kind: "text" | "audio" | "image" | "video";
+  kind: "text" | "audio" | "image" | "video" | "file";
   text: string | null;
   attachments: DashboardMessageAttachment[];
 }

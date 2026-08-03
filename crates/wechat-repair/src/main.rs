@@ -83,12 +83,14 @@ fn probe_messages() -> Result<(), RepairError> {
     let mut image = 0;
     let mut audio = 0;
     let mut video = 0;
+    let mut file = 0;
     for record in &records {
         match record.message().kind() {
             MessageKind::Text => text += 1,
             MessageKind::Image => image += 1,
             MessageKind::Audio => audio += 1,
             MessageKind::Video => video += 1,
+            MessageKind::File => file += 1,
         }
         if env::var_os("PCA_WECHAT_MEDIA_DIAGNOSTIC").is_some()
             && record.message().kind() != MessageKind::Text
@@ -103,12 +105,13 @@ fn probe_messages() -> Result<(), RepairError> {
         }
     }
     println!(
-        "Eligible records: total={} text={} image={} audio={} video={}",
+        "Eligible records: total={} text={} image={} audio={} video={} file={}",
         records.len(),
         text,
         image,
         audio,
-        video
+        video,
+        file
     );
     Ok(())
 }

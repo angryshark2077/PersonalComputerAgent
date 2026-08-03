@@ -44,6 +44,9 @@ pub const ATTACHMENT_COMPLETION_RETENTION_MIGRATION: &str =
 /// Allows different `WeChat` message kinds to use the same conversation-local source sequence.
 pub const ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION: &str =
     include_str!("../migrations/0009_allow_message_kind_sequence_overlap.sql");
+/// Adds file messages and file attachment spool rows without rewriting existing data.
+pub const ADD_FILE_MESSAGES_MIGRATION: &str =
+    include_str!("../migrations/0010_add_file_messages.sql");
 
 /// A private spool-file reference corresponding to one validated media manifest.
 ///

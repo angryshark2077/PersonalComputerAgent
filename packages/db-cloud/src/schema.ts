@@ -488,7 +488,7 @@ export const communicationMessages = pgTable(
     ),
     check(
       "communication_messages_kind",
-      sql`${table.kind} IN ('text', 'audio', 'image', 'video')`,
+      sql`${table.kind} IN ('text', 'audio', 'image', 'video', 'file')`,
     ),
     check(
       "communication_messages_text_body",
@@ -506,10 +506,11 @@ export const communicationMessageAttachments = pgTable(
     sha256: char("sha256", { length: 64 }).notNull(),
     sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
     mimeType: text("mime_type").notNull(),
+    fileName: text("file_name"),
   },
   (table) => [
     primaryKey({ columns: [table.eventId, table.attachmentId] }),
-    check("communication_message_attachments_kind", sql`${table.kind} IN ('audio', 'image', 'video')`),
+    check("communication_message_attachments_kind", sql`${table.kind} IN ('audio', 'image', 'video', 'file')`),
     check("communication_message_attachments_hash", sql`${table.sha256} ~ '^[a-f0-9]{64}$'`),
     check("communication_message_attachments_size", sql`${table.sizeBytes} > 0`),
   ],

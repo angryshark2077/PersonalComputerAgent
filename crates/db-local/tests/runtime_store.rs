@@ -242,7 +242,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 9);
+    assert_eq!(health.schema_version, 10);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -330,7 +330,7 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        9
+        10
     );
     db.shutdown().await.expect("close upgraded database");
 
@@ -901,7 +901,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0010', 'future', '10.0.0', 1, 1, 'completed')",
+             VALUES ('0011', 'future', '11.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -912,8 +912,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 10,
-            max_supported: 9
+            found: 11,
+            max_supported: 10
         })
     ));
 }
@@ -936,7 +936,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 9);
+    assert_eq!(health.schema_version, 10);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(

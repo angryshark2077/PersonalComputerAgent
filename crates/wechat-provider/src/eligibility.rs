@@ -43,6 +43,7 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<NormalizedCommuni
         SourceMessageKind::Audio => MessageKind::Audio,
         SourceMessageKind::Image => MessageKind::Image,
         SourceMessageKind::Video => MessageKind::Video,
+        SourceMessageKind::File => MessageKind::File,
         SourceMessageKind::Unsupported | SourceMessageKind::Unknown => return None,
     };
 

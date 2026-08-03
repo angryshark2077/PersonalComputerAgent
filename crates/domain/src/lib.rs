@@ -535,6 +535,7 @@ pub enum MessageKind {
     Audio,
     Image,
     Video,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,14 +608,22 @@ impl CommunicationScopeV2 {
     }
 
     fn try_new(raw: RawCommunicationScopeV2) -> Result<Self, DomainError> {
+        let legacy_message_types = [
+            MessageKind::Text,
+            MessageKind::Audio,
+            MessageKind::Image,
+            MessageKind::Video,
+        ];
+        let current_message_types = [
+            MessageKind::Text,
+            MessageKind::Audio,
+            MessageKind::Image,
+            MessageKind::Video,
+            MessageKind::File,
+        ];
         if raw.directions.as_slice() != [Direction::Incoming, Direction::Outgoing]
-            || raw.message_types.as_slice()
-                != [
-                    MessageKind::Text,
-                    MessageKind::Audio,
-                    MessageKind::Image,
-                    MessageKind::Video,
-                ]
+            || (raw.message_types.as_slice() != legacy_message_types
+                && raw.message_types.as_slice() != current_message_types)
             || raw.max_group_members != 15
             || raw.retention_days != 180
         {
@@ -662,6 +671,8 @@ pub struct CommunicationAttachment {
     sha256: String,
     size_bytes: u64,
     mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_name: Option<String>,
 }
 
 impl CommunicationAttachment {
@@ -693,7 +704,23 @@ impl CommunicationAttachment {
             sha256,
             size_bytes,
             mime_type,
+            file_name: None,
         })
+    }
+
+    /// Adds a user-visible file name without changing the immutable content manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a domain error for an empty, excessively long, or control-character name.
+    pub fn with_file_name(mut self, file_name: &str) -> Result<Self, DomainError> {
+        let file_name = file_name.trim();
+        if file_name.is_empty() || file_name.len() > 1024 || file_name.chars().any(char::is_control)
+        {
+            return Err(invalid_communication_record());
+        }
+        self.file_name = Some(file_name.to_owned());
+        Ok(self)
     }
 
     #[must_use]
@@ -721,15 +748,23 @@ impl CommunicationAttachment {
         &self.mime_type
     }
 
+    #[must_use]
+    pub fn file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
+    }
+
     fn validate(&self) -> Result<(), DomainError> {
-        Self::try_new(
+        let attachment = Self::try_new(
             self.attachment_id.clone(),
             self.kind,
             self.sha256.clone(),
             self.size_bytes,
             self.mime_type.clone(),
-        )
-        .map(|_| ())
+        )?;
+        match &self.file_name {
+            Some(file_name) => attachment.with_file_name(file_name).map(|_| ()),
+            None => Ok(()),
+        }
     }
 }
 
@@ -741,19 +776,25 @@ struct RawCommunicationAttachment {
     sha256: String,
     size_bytes: u64,
     mime_type: String,
+    #[serde(default)]
+    file_name: Option<String>,
 }
 
 impl TryFrom<RawCommunicationAttachment> for CommunicationAttachment {
     type Error = DomainError;
 
     fn try_from(raw: RawCommunicationAttachment) -> Result<Self, Self::Error> {
-        Self::try_new(
+        let attachment = Self::try_new(
             raw.attachment_id,
             raw.kind,
             raw.sha256,
             raw.size_bytes,
             raw.mime_type,
-        )
+        )?;
+        match raw.file_name {
+            Some(file_name) => attachment.with_file_name(&file_name),
+            None => Ok(attachment),
+        }
     }
 }
 

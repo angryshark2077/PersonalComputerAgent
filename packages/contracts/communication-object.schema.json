@@ -7,9 +7,10 @@
   "required": ["attachment_id", "kind", "sha256", "size_bytes", "mime_type"],
   "properties": {
     "attachment_id": { "type": "string", "minLength": 1 },
-    "kind": { "enum": ["audio", "image", "video"] },
+    "kind": { "enum": ["audio", "image", "video", "file"] },
     "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "size_bytes": { "type": "integer", "minimum": 1 },
-    "mime_type": { "type": "string", "minLength": 1 }
+    "mime_type": { "type": "string", "minLength": 1 },
+    "file_name": { "type": "string", "minLength": 1, "maxLength": 1024 }
   }
 }

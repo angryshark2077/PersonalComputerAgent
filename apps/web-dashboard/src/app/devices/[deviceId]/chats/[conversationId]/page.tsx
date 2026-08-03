@@ -142,7 +142,7 @@ export default function ChatMessagesPage() {
                       : null}
                     <article className="message-bubble">
                       {message.kind === "text"
-                        ? <p className="message-text">{message.text}</p>
+                        ? <TextMessage text={message.text} />
                         : <MediaSummary deviceId={deviceId} message={message} />}
                       <p className="message-meta">
                         {message.direction === "incoming" ? "Received" : "Sent"} · {formatTime(message.occurred_at)}
@@ -169,6 +169,34 @@ function Avatar({ name, url }: { name: string; url: string | null }) {
 
 function initial(name: string): string {
   return Array.from(name.trim())[0]?.toUpperCase() ?? "?";
+}
+
+function TextMessage({ text }: { text: string | null }) {
+  const contact = parseContactCard(text);
+  if (contact === null) return <p className="message-text">{text}</p>;
+  return (
+    <section className="shared-contact-card" aria-label="Shared WeChat contact">
+      <Avatar name={contact.displayName} url={contact.avatarUrl} />
+      <div>
+        <p className="shared-contact-name">{contact.displayName}</p>
+        <p className="message-text">微信号：{contact.wechatId}</p>
+      </div>
+    </section>
+  );
+}
+
+function parseContactCard(text: string | null): {
+  displayName: string;
+  wechatId: string;
+  avatarUrl: string | null;
+} | null {
+  if (text === null || !text.startsWith("[联系人名片] ")) return null;
+  const parts = text.slice("[联系人名片] ".length).split(" · ");
+  const displayName = parts.find((part) => !part.startsWith("微信号：") && !part.startsWith("头像："));
+  const wechatId = parts.find((part) => part.startsWith("微信号："))?.slice("微信号：".length);
+  const avatarUrl = parts.find((part) => part.startsWith("头像："))?.slice("头像：".length) ?? null;
+  if (displayName === undefined || wechatId === undefined) return null;
+  return { displayName, wechatId, avatarUrl };
 }
 
 function MediaSummary({ deviceId, message }: { deviceId: string; message: DashboardMessage }) {
@@ -203,11 +231,19 @@ function MediaSummary({ deviceId, message }: { deviceId: string; message: Dashbo
   if (message.kind === "video" && mediaUrl !== null) {
     return <video className="message-video" src={mediaUrl} controls preload="metadata" />;
   }
+  if (message.kind === "file" && mediaUrl !== null) {
+    return <a className="message-file" href={mediaUrl} download>{attachment.file_name ?? "Download file"}</a>;
+  }
   return (
     <p className="message-attachment">
-      {message.kind} · {(attachment.size_bytes / (1024 ** 2)).toFixed(1)} MiB · {attachment.object_state ?? "pending upload"}
+      {attachment.file_name ?? message.kind} · {formatBytes(attachment.size_bytes)} · {attachment.object_state ?? "pending upload"}
     </p>
   );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 ** 2) return `${Math.max(0.1, bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 ** 2)).toFixed(1)} MiB`;
 }
 
 function formatTime(value: string): string {

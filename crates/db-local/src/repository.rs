@@ -544,6 +544,7 @@ const fn message_kind_name(kind: MessageKind) -> &'static str {
         MessageKind::Audio => "audio",
         MessageKind::Image => "image",
         MessageKind::Video => "video",
+        MessageKind::File => "file",
     }
 }
 

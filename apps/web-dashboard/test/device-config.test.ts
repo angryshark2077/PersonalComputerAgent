@@ -28,7 +28,7 @@ const snapshotWithWechatEnabled = () => ({
 test("device configuration exposes the approved WeChat scope", () => {
   const page = renderDeviceConfiguration(snapshotWithWechatEnabled());
 
-  assert.match(page, /Incoming and outgoing text, audio, images and video/);
+  assert.match(page, /Incoming and outgoing text, audio, images, video and files/);
   assert.match(page, /groups up to 15 members/);
   assert.match(page, /180-day retention/);
 });

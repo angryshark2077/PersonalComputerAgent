@@ -241,7 +241,7 @@ export interface CommunicationMessageProjection {
   sourceKey: string;
   occurredAt: Date;
   direction: "incoming" | "outgoing";
-  kind: "text" | "audio" | "image" | "video";
+  kind: "text" | "audio" | "image" | "video" | "file";
   conversation: {
     scope: "direct" | "group";
     memberCount: number | null;
@@ -261,10 +261,11 @@ export interface CommunicationMessageSenderProjection {
 
 export interface CommunicationAttachmentProjection {
   attachmentId: string;
-  kind: "audio" | "image" | "video";
+  kind: "audio" | "image" | "video" | "file";
   sha256: string;
   sizeBytes: number;
   mimeType: string;
+  fileName: string | null;
 }
 
 export interface CommunicationMessageAttachmentRecord extends CommunicationAttachmentProjection {
@@ -313,7 +314,7 @@ export interface CommunicationMessageRecord {
   senderId: string;
   senderDisplayName: string;
   senderAvatarUrl: string | null;
-  kind: "text" | "audio" | "image" | "video";
+  kind: "text" | "audio" | "image" | "video" | "file";
   text: string | null;
   attachments: CommunicationMessageAttachmentRecord[];
 }
@@ -1852,6 +1853,7 @@ export class DrizzleControlRepository implements ControlRepository {
                 sha256: attachment.sha256,
                 sizeBytes: attachment.sizeBytes,
                 mimeType: attachment.mimeType,
+                fileName: attachment.fileName,
               })),
             );
           }
@@ -1975,6 +1977,7 @@ export class DrizzleControlRepository implements ControlRepository {
             sha256: communicationMessageAttachments.sha256,
             sizeBytes: communicationMessageAttachments.sizeBytes,
             mimeType: communicationMessageAttachments.mimeType,
+            fileName: communicationMessageAttachments.fileName,
             objectId: communicationObjects.objectId,
             objectState: communicationObjects.state,
           })
@@ -2036,6 +2039,7 @@ export class DrizzleControlRepository implements ControlRepository {
             sha256: communicationMessageAttachments.sha256,
             sizeBytes: communicationMessageAttachments.sizeBytes,
             mimeType: communicationMessageAttachments.mimeType,
+            fileName: communicationMessageAttachments.fileName,
           })
           .from(communicationMessageAttachments)
           .innerJoin(

@@ -214,6 +214,11 @@ class FakeR2ObjectStore implements R2ObjectStore {
     };
   }
 
+  async deleteObject() {
+    this.uploaded = false;
+    this.headOverride = undefined;
+  }
+
   async signRead() {
     return { url: "https://private-media.example/read", expiresAt: new Date("2026-08-02T00:06:00Z") };
   }
@@ -503,6 +508,8 @@ test("only a completed attachment receives a short Owner read URL", async () => 
     headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
     body: JSON.stringify({ object_id: preparedBody.object_id }),
   })).status, 409);
+  assert.equal(store.uploaded, false);
+  store.uploaded = true;
   store.headOverride = undefined;
   const completed = await api.request("/v1/agent/communication/objects/complete", {
     method: "POST",

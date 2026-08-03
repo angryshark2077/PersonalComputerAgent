@@ -161,6 +161,10 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 .message-attachment { color: #475467; font-size: 13px; margin: 0; }
 .message-image { display: block; max-height: 520px; max-width: min(520px, 65vw); object-fit: contain; border-radius: 8px; }
 .message-audio { display: block; max-width: min(420px, 65vw); width: 100%; }
+.message-file { color: #155eef; font-weight: 650; overflow-wrap: anywhere; }
+.shared-contact-card { align-items: center; display: flex; gap: 12px; min-width: 220px; }
+.shared-contact-card .message-avatar { flex: 0 0 auto; }
+.shared-contact-name { font-weight: 700; margin: 0 0 3px; }
 .message-video { display: block; max-height: 520px; max-width: min(520px, 65vw); border-radius: 8px; }
 
 .device-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 28px 0 36px; }
