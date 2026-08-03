@@ -159,7 +159,15 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 .message-meta { color: #667085; font-size: 11px; margin: 7px 0 0; }
 
 .message-attachment { color: #475467; font-size: 13px; margin: 0; }
+.message-image-button { background: transparent; border: 0; cursor: zoom-in; display: block; padding: 0; }
 .message-image { display: block; max-height: 520px; max-width: min(520px, 65vw); object-fit: contain; border-radius: 8px; }
+.message-media-quality { color: #667085; font-size: 11px; margin: 6px 0 0; }
+.image-preview-overlay { align-items: center; background: rgb(10 15 25 / 92%); display: flex; inset: 0; justify-content: center; padding: 28px; position: fixed; z-index: 1000; }
+.image-preview-content { display: flex; flex-direction: column; gap: 12px; max-height: 100%; max-width: 100%; }
+.image-preview-content > img { display: block; max-height: calc(100vh - 100px); max-width: calc(100vw - 56px); object-fit: contain; }
+.image-preview-actions { align-items: center; display: flex; gap: 16px; justify-content: flex-end; }
+.image-preview-actions a, .image-preview-actions button { color: #ffffff; font: inherit; }
+.image-preview-actions button { background: transparent; border: 1px solid #98a2b3; border-radius: 7px; cursor: pointer; padding: 6px 10px; }
 .message-audio { display: block; max-width: min(420px, 65vw); width: 100%; }
 .message-file { color: #155eef; font-weight: 650; overflow-wrap: anywhere; }
 .shared-contact-card { align-items: center; display: flex; gap: 12px; min-width: 220px; }

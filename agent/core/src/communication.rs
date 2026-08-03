@@ -734,7 +734,8 @@ async fn run_supervisor(
                 };
 
             match records {
-                Ok(records) => {
+                Ok(mut records) => {
+                    records.sort_by_key(|record| !record.completed_media().is_empty());
                     let mut persistence_failed = false;
                     let mut batch_paused = false;
                     for record in records {
@@ -815,7 +816,7 @@ async fn run_supervisor(
                         };
                         let Ok(mut prepared) = commit else {
                             persistence_failed = true;
-                            break;
+                            continue;
                         };
                         match commands.try_recv() {
                             Ok(command) => {

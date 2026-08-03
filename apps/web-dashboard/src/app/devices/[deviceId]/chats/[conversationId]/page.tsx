@@ -31,6 +31,7 @@ export default function ChatMessagesPage() {
   const messagePanel = useRef<HTMLElement | null>(null);
   const didInitialScroll = useRef(false);
   const loadingOlderMessagesRef = useRef(false);
+  const visibleMessages = messages === null ? null : deduplicateMediaUpgrades(messages);
 
   useEffect(() => {
     const origin = cloudApiOrigin();
@@ -113,7 +114,7 @@ export default function ChatMessagesPage() {
         <p className="conversation-id">{conversationId}</p>
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
-      {messages === null ? <p className="status-note">Loading messages…</p> : (
+      {visibleMessages === null ? <p className="status-note">Loading messages…</p> : (
         <section
           ref={messagePanel}
           className="dashboard-panel message-scroll"
@@ -123,12 +124,12 @@ export default function ChatMessagesPage() {
           }}
         >
           {loadingOlderMessages ? <p className="message-page-status">Loading older messages…</p> : null}
-          {!hasOlderMessages && messages.length > 0
+          {!hasOlderMessages && visibleMessages.length > 0
             ? <p className="message-page-status">Beginning of synchronized history</p>
             : null}
-          {messages.length === 0 ? <p className="empty-state">No synchronized messages.</p> : (
+          {visibleMessages.length === 0 ? <p className="empty-state">No synchronized messages.</p> : (
             <ol className="message-list">
-              {messages.map((message) => (
+              {visibleMessages.map((message) => (
                 <li className={`message-row is-${message.direction}`} key={message.event_id}>
                   <Avatar
                     name={message.direction === "outgoing" ? "我" : message.sender_display_name}
@@ -157,6 +158,24 @@ export default function ChatMessagesPage() {
       )}
     </DashboardShell>
   );
+}
+
+function deduplicateMediaUpgrades(messages: DashboardMessage[]): DashboardMessage[] {
+  const bestByMessageId = new Map<string, DashboardMessage>();
+  for (const message of messages) {
+    const current = bestByMessageId.get(message.message_id);
+    if (current === undefined || mediaQualityScore(message) > mediaQualityScore(current)) {
+      bestByMessageId.set(message.message_id, message);
+    }
+  }
+  return messages.filter((message) => bestByMessageId.get(message.message_id)?.event_id === message.event_id);
+}
+
+function mediaQualityScore(message: DashboardMessage): number {
+  if (message.kind === "text") {
+    return message.text === "[视频] 等待微信保存原始文件" ? 0 : 1;
+  }
+  return 10 + (message.attachments[0]?.size_bytes ?? 0);
 }
 
 function Avatar({ name, url }: { name: string; url: string | null }) {
@@ -202,6 +221,7 @@ function parseContactCard(text: string | null): {
 function MediaSummary({ deviceId, message }: { deviceId: string; message: DashboardMessage }) {
   const attachment = message.attachments[0];
   const [mediaUrl, setMediaUrl] = useState<string | null>(null);
+  const [imagePreviewOpen, setImagePreviewOpen] = useState(false);
   useEffect(() => {
     if (message.kind === "text" || attachment?.object_state !== "completed" || attachment.object_id === null) {
       return;
@@ -221,9 +241,41 @@ function MediaSummary({ deviceId, message }: { deviceId: string; message: Dashbo
       active = false;
     };
   }, [attachment?.object_id, attachment?.object_state, deviceId, message.kind]);
+  useEffect(() => {
+    if (!imagePreviewOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setImagePreviewOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [imagePreviewOpen]);
   if (attachment === undefined) return <p className="message-attachment">{message.kind} · file unavailable</p>;
   if (message.kind === "image" && mediaUrl !== null) {
-    return <img className="message-image" src={mediaUrl} alt="Synchronized WeChat image" loading="lazy" />;
+    const likelyThumbnail = attachment.size_bytes < 50 * 1024;
+    return (
+      <>
+        <button
+          className="message-image-button"
+          type="button"
+          title="Double-click to view the uploaded image"
+          onDoubleClick={() => setImagePreviewOpen(true)}
+        >
+          <img className="message-image" src={mediaUrl} alt="Synchronized WeChat image" loading="lazy" />
+        </button>
+        {likelyThumbnail ? <p className="message-media-quality">Thumbnail cached by WeChat</p> : null}
+        {imagePreviewOpen ? (
+          <div className="image-preview-overlay" role="dialog" aria-modal="true" aria-label="Image preview" onClick={() => setImagePreviewOpen(false)}>
+            <div className="image-preview-content" onClick={(event) => event.stopPropagation()}>
+              <div className="image-preview-actions">
+                <a href={mediaUrl} target="_blank" rel="noreferrer">Open current image in new tab</a>
+                <button type="button" onClick={() => setImagePreviewOpen(false)} aria-label="Close image preview">Close</button>
+              </div>
+              <img src={mediaUrl} alt="Synchronized WeChat image preview" />
+            </div>
+          </div>
+        ) : null}
+      </>
+    );
   }
   if (message.kind === "audio" && mediaUrl !== null) {
     return <audio className="message-audio" src={mediaUrl} controls preload="none" />;

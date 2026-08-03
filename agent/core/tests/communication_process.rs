@@ -1394,6 +1394,39 @@ async fn symlink_hash_size_open_and_copy_failures_leave_no_partial_spool_or_data
 }
 
 #[tokio::test]
+async fn one_broken_media_source_does_not_block_attachment_free_records_in_the_batch() {
+    let harness = Harness::new().await;
+    let missing = harness.directory.path().join("missing-video.mp4");
+    harness
+        .state
+        .poll_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![
+            media_record(&missing, b"missing-video", 1),
+            text_record(2),
+        ]));
+
+    let runtime = harness.start(enabled(1)).await;
+    wait_for_collector_error(&harness.database, 1).await;
+    runtime.shutdown().await.unwrap();
+
+    let connection = Connection::open(&harness.database_path).unwrap();
+    assert_eq!(row_count(&connection, "communication_messages"), 1);
+    assert_eq!(row_count(&connection, "attachment_spool"), 0);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT last_source_sequence FROM communication_cursors",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn spool_hard_limit_pauses_copy_until_usage_is_strictly_below_resume_water() {
     assert_eq!(SPOOL_HARD_LIMIT_BYTES, 6 * 1024 * 1024 * 1024);
     assert_eq!(SPOOL_RESUME_BELOW_BYTES, 5 * 1024 * 1024 * 1024);

@@ -1,4 +1,4 @@
-use std::{fs, sync::Arc, time::Duration};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 
 #[cfg(feature = "process-test-hooks")]
 use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
@@ -58,13 +58,17 @@ const HEALTH_FRESHNESS: TimeDuration = TimeDuration::seconds(5);
 const LIFECYCLE_CAPACITY: usize = 32;
 
 fn production_communication_factory(
+    local_database: PathBuf,
 ) -> Arc<dyn pca_provider_contracts::CommunicationProviderFactory> {
     #[cfg(all(target_os = "macos", not(feature = "process-test-hooks")))]
     {
-        Arc::new(MacOSWechatProviderFactory)
+        Arc::new(MacOSWechatProviderFactory::with_local_database(
+            local_database,
+        ))
     }
     #[cfg(any(not(target_os = "macos"), feature = "process-test-hooks"))]
     {
+        let _ = local_database;
         Arc::new(UnavailableCommunicationProviderFactory)
     }
 }
@@ -350,7 +354,7 @@ impl RuntimeResources {
                         .expect("database exists until cleanup"),
                 ),
                 config.paths.database_file.clone(),
-                production_communication_factory(),
+                production_communication_factory(config.paths.database_file.clone()),
                 communication_authorization.clone(),
             )
             .await
