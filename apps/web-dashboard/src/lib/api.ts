@@ -127,8 +127,17 @@ export function chatReadStorageKey(deviceId: string, conversationId: string): st
   return `pca.chat-read:${deviceId}:${conversationId}`;
 }
 
-export function initializeChatReadAt(lastMessageAt: string, storedReadAt: string | null): string {
-  return storedReadAt ?? lastMessageAt;
+export function chatReadBaselineStorageKey(deviceId: string): string {
+  return `pca.chat-read-baseline:${deviceId}`;
+}
+
+export function initializeChatReadAt(
+  lastMessageAt: string,
+  storedReadAt: string | null,
+  baselineInitialized = false,
+): string | null {
+  if (storedReadAt !== null) return storedReadAt;
+  return baselineInitialized ? null : lastMessageAt;
 }
 
 export function isConversationUnread(lastMessageAt: string, readAt: string | null): boolean {

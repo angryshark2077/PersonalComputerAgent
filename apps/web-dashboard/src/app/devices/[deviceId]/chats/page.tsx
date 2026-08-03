@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { DashboardShell } from "../../../../components/dashboard-shell";
 import {
   DashboardApiError,
+  chatReadBaselineStorageKey,
   chatReadStorageKey,
   cloudApiOrigin,
   getCommunicationConversations,
@@ -23,42 +24,58 @@ export default function DeviceChatsPage() {
   const [readTimes, setReadTimes] = useState<Record<string, string | null>>({});
 
   useEffect(() => {
-    if (conversations === null) return;
-    const refreshReadTimes = () => setReadTimes(Object.fromEntries(conversations.map((conversation) => [
-      conversation.conversation_id,
-      window.localStorage.getItem(chatReadStorageKey(params.deviceId, conversation.conversation_id)),
-    ])));
-    window.addEventListener("focus", refreshReadTimes);
-    window.addEventListener("pageshow", refreshReadTimes);
-    return () => {
-      window.removeEventListener("focus", refreshReadTimes);
-      window.removeEventListener("pageshow", refreshReadTimes);
-    };
-  }, [conversations, params.deviceId]);
-
-  useEffect(() => {
     const origin = cloudApiOrigin();
+    let active = true;
+    let loading = false;
+    const refresh = async () => {
+      if (loading) return;
+      loading = true;
+      try {
+        const latest = await getCommunicationConversations(window.fetch, origin, params.deviceId);
+        if (!active) return;
+        const baselineKey = chatReadBaselineStorageKey(params.deviceId);
+        const baselineInitialized = window.localStorage.getItem(baselineKey) !== null
+          || latest.some((conversation) => window.localStorage.getItem(
+            chatReadStorageKey(params.deviceId, conversation.conversation_id),
+          ) !== null);
+        const nextReadTimes = Object.fromEntries(latest.map((conversation) => {
+          const key = chatReadStorageKey(params.deviceId, conversation.conversation_id);
+          const storedReadAt = window.localStorage.getItem(key);
+          const readAt = initializeChatReadAt(
+            conversation.last_message_at,
+            storedReadAt,
+            baselineInitialized,
+          );
+          if (storedReadAt === null && readAt !== null) window.localStorage.setItem(key, readAt);
+          return [conversation.conversation_id, readAt];
+        }));
+        window.localStorage.setItem(baselineKey, "1");
+        setConversations(latest);
+        setReadTimes(nextReadTimes);
+        setError(null);
+      } catch (cause) {
+        if (active) setError(messageFor(cause));
+      } finally {
+        loading = false;
+      }
+    };
     void (async () => {
       if ((await getBrowserSession(window.fetch, origin)) === null) {
         redirectToSignIn();
         return;
       }
-      try {
-        const latest = await getCommunicationConversations(window.fetch, origin, params.deviceId);
-        setConversations(latest);
-        setReadTimes(Object.fromEntries(latest.map((conversation) => {
-          const key = chatReadStorageKey(params.deviceId, conversation.conversation_id);
-          const readAt = initializeChatReadAt(
-            conversation.last_message_at,
-            window.localStorage.getItem(key),
-          );
-          window.localStorage.setItem(key, readAt);
-          return [conversation.conversation_id, readAt];
-        })));
-      } catch (cause) {
-        setError(messageFor(cause));
-      }
+      await refresh();
     })();
+    const refreshOnVisible = () => void refresh();
+    const interval = window.setInterval(refreshOnVisible, 15_000);
+    window.addEventListener("focus", refreshOnVisible);
+    window.addEventListener("pageshow", refreshOnVisible);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refreshOnVisible);
+      window.removeEventListener("pageshow", refreshOnVisible);
+    };
   }, [params.deviceId]);
 
   return (

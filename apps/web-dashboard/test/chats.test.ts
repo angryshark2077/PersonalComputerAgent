@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   decodeDashboardRouteParam,
+  chatReadBaselineStorageKey,
   chatReadStorageKey,
   getCommunicationConversations,
   getCommunicationMessages,
@@ -17,12 +18,14 @@ test("decodes an encoded WeChat group identity exactly once", () => {
 });
 
 test("chat unread state is isolated by device and conversation", () => {
+  assert.equal(chatReadBaselineStorageKey("device-a"), "pca.chat-read-baseline:device-a");
   assert.equal(chatReadStorageKey("device-a", "room@chatroom"), "pca.chat-read:device-a:room@chatroom");
   assert.equal(initializeChatReadAt("2026-08-02T10:00:00Z", null), "2026-08-02T10:00:00Z");
   assert.equal(
     initializeChatReadAt("2026-08-02T10:00:00Z", "2026-08-02T09:00:00Z"),
     "2026-08-02T09:00:00Z",
   );
+  assert.equal(initializeChatReadAt("2026-08-02T10:00:00Z", null, true), null);
   assert.equal(isConversationUnread("2026-08-02T10:00:00Z", null), true);
   assert.equal(isConversationUnread("2026-08-02T10:00:00Z", "2026-08-02T09:00:00Z"), true);
   assert.equal(isConversationUnread("2026-08-02T10:00:00Z", "2026-08-02T10:00:00Z"), false);
