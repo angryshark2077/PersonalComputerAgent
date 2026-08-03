@@ -278,6 +278,12 @@ fn read_message_batch(
             cursors: &cursor_snapshot,
             cutoff,
         };
+        if std::env::var_os("PCA_WECHAT_ROW_DIAGNOSTIC").is_some() {
+            with_database(database, &material, |connection| {
+                diagnostic_recent_rows(connection, &sessions, &video_hardlinks, &video_files)
+            })
+            .map_err(|_| read_stage_error("WECHAT_MESSAGE_READ_FAILED"))?;
+        }
         let text_limit = remaining.min(KIND_BATCH_QUOTA);
         let text_batch = with_database(database, &material, |connection| {
             read_database_text(connection, &context, &sessions, text_limit)
@@ -415,6 +421,119 @@ fn read_message_batch(
     Ok(records)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the opt-in redacted row diagnostic keeps one bounded schema snapshot together"
+)]
+fn diagnostic_recent_rows(
+    connection: &Connection,
+    sessions: &[Session],
+    video_hardlinks: &BTreeMap<String, String>,
+    video_files: &BTreeMap<String, PathBuf>,
+) -> Result<(), SqlcipherProbeFailure> {
+    let Some(target) = std::env::var_os("PCA_WECHAT_DIAGNOSTIC_CONVERSATION") else {
+        return Ok(());
+    };
+    let Some(target) = target.to_str().filter(|value| valid_identity(value)) else {
+        return Ok(());
+    };
+    if !sessions.iter().any(|session| session.username == target) {
+        return Ok(());
+    }
+    let table_name = message_table_name(target);
+    if !table_exists(connection, &table_name)? {
+        return Ok(());
+    }
+    let cutoff = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(2 * 60 * 60),
+    )
+    .unwrap_or(0);
+    let sql = format!(
+        "SELECT local_id, create_time, local_type, status, server_id, message_content, compress_content, packed_info_data \
+         FROM \"{table_name}\" WHERE create_time >= ?1 ORDER BY local_id ASC LIMIT 200"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Value>(5)?,
+                row.get::<_, Value>(6)?,
+                row.get::<_, Value>(7)?,
+            ))
+        })
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    for row in rows.flatten() {
+        let content = decode_message_content(&row.6, &row.5);
+        let app_type = content.as_deref().and_then(app_message_type);
+        let has_file_name = content
+            .as_deref()
+            .and_then(|value| xml_text(value, "title"))
+            .is_some();
+        let is_location = content.as_deref().is_some_and(|value| {
+            let base_type = row.2 & 0xffff_ffff;
+            base_type == 48 || (base_type == 49 && is_location_app_message(value))
+        });
+        let video_key = parse_video_file_key(&row.7);
+        let video_md5s = content
+            .as_deref()
+            .map(parse_video_md5_candidates)
+            .unwrap_or_default();
+        let video_length = content.as_deref().and_then(parse_video_length);
+        let video_cdn = content
+            .as_deref()
+            .is_some_and(|value| value.contains("cdnvideourl="));
+        let video_aes_key = content
+            .as_deref()
+            .is_some_and(|value| value.contains("aeskey="));
+        let hardlink_keys = video_md5s
+            .iter()
+            .filter_map(|md5| video_hardlinks.get(md5))
+            .cloned()
+            .collect::<Vec<_>>();
+        let video_resolved =
+            resolve_video_path(content.as_deref(), &row.7, video_hardlinks, video_files).is_some();
+        eprintln!(
+            "ROW conversation={target} sequence={} time={} local_type={} status={} server_id={} decoded={} app_type={} file_name={} location={} video_key={} video_md5s={} video_length={} video_cdn={} video_aes_key={} hardlink_keys={} video_resolved={}",
+            row.0,
+            row.1,
+            row.2,
+            row.3,
+            row.4,
+            content.is_some(),
+            app_type.map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            has_file_name,
+            is_location,
+            video_key.as_deref().unwrap_or("none"),
+            if video_md5s.is_empty() {
+                "none".to_owned()
+            } else {
+                video_md5s.join(",")
+            },
+            video_length.map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            video_cdn,
+            video_aes_key,
+            if hardlink_keys.is_empty() {
+                "none".to_owned()
+            } else {
+                hardlink_keys.join(",")
+            },
+            video_resolved,
+        );
+    }
+    Ok(())
+}
+
 struct TextReadContext<'a> {
     database_name: &'a str,
     local_username: &'a str,
@@ -484,7 +603,7 @@ fn read_database_text(
         let sql = format!(
             "SELECT local_id, server_id, create_time, real_sender_id, status, local_type, message_content, compress_content \
              FROM \"{table_name}\" \
-             WHERE local_type IN (1, 42, 48, 49, 50, 8589934592049, 8594229559345) \
+             WHERE (local_type & 4294967295) IN (1, 42, 48, 49, 50) \
                AND local_id > ?1 AND create_time >= ?2 \
              ORDER BY local_id ASC LIMIT ?3"
         );
@@ -976,7 +1095,7 @@ fn read_database_files(
         let sql = format!(
             "SELECT local_id, server_id, create_time, real_sender_id, status, message_content, compress_content \
              FROM \"{table_name}\" \
-             WHERE local_type = 49 AND local_id > ?1 AND create_time >= ?2 \
+             WHERE (local_type & 4294967295) = 49 AND local_id > ?1 AND create_time >= ?2 \
              ORDER BY local_id ASC"
         );
         let mut statement = connection
@@ -3503,20 +3622,21 @@ fn display_text_message_with_contacts(
     content: &str,
     contact_cards: &BTreeMap<String, ContactCardProfile>,
 ) -> Option<String> {
-    match local_type {
+    let base_type = local_type & 0xffff_ffff;
+    let encoded_app_type = local_type >> 32;
+    let app_type = app_message_type(content).or((encoded_app_type > 0).then_some(encoded_app_type));
+    match base_type {
         1 => nonempty_text(content),
         42 => format_contact_card_message(content, contact_cards),
         48 => format_location_message(content),
         50 => format_call_message(content),
-        49 if app_message_type(content) == Some(2000) => format_transfer_message(content),
-        49 if app_message_type(content) == Some(2001) || content.contains("hongbao") => {
+        49 if app_type == Some(2000) => format_transfer_message(content),
+        49 if app_type == Some(2001) || content.contains("hongbao") => {
             format_red_packet_message(content)
         }
         49 if is_location_app_message(content) => format_location_message(content),
-        49 if app_message_type(content) == Some(6) => None,
+        49 if app_type == Some(6) => None,
         49 => format_app_message(content),
-        8_589_934_592_049 => format_transfer_message(content),
-        8_594_229_559_345 => format_red_packet_message(content),
         _ => None,
     }
 }
@@ -4039,7 +4159,7 @@ mod tests {
             ),
             (
                 6,
-                49,
+                (51_i64 << 32) | 0x31,
                 "<msg><appmsg><title>视频标题</title><type>51</type><finderFeed><nickname>视频作者</nickname></finderFeed></appmsg></msg>",
             ),
             (

@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "dev": "tsx src/index.ts",
-    "start": "tsx src/server.ts",
+    "start": "tsx src/migrate.ts && tsx src/server.ts",
     "migrate": "tsx src/migrate.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test 'src/test/*.test.ts'"

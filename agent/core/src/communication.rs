@@ -738,6 +738,18 @@ async fn run_supervisor(
                     let mut persistence_failed = false;
                     let mut batch_paused = false;
                     for record in records {
+                        if let Some(identity) = control.identity {
+                            let event_id = stable_communication_event_id(
+                                identity,
+                                record.account_id(),
+                                record.message().source_key(),
+                            );
+                            let (event_count, _) =
+                                database.count_event_and_outbox(&event_id).await?;
+                            if event_count == 1 {
+                                continue;
+                            }
+                        }
                         let depth = database.active_outbox_depth().await?;
                         update_hysteresis(
                             &mut outbox_paused,

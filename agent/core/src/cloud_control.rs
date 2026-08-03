@@ -1550,14 +1550,11 @@ async fn upload_communication_attachment(
     } else {
         reqwest::Body::wrap_stream(ReaderStream::new(tokio::fs::File::from_std(file)))
     };
-    let mut request = client
+    let request = client
         .put(upload_url)
         .timeout(MEDIA_UPLOAD_TIMEOUT)
-        .header(reqwest::header::CONTENT_LENGTH, attachment.size_bytes)
         .body(body);
-    for (name, value) in headers {
-        request = request.header(name, value);
-    }
+    let request = apply_communication_upload_headers(request, headers, attachment.size_bytes)?;
     let response = request.send().await.map_err(|_| ControlError::Transient)?;
     if response.status().is_success() {
         Ok(())
@@ -1566,6 +1563,25 @@ async fn upload_communication_attachment(
     } else {
         Err(ControlError::Contract)
     }
+}
+
+fn apply_communication_upload_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &BTreeMap<String, String>,
+    size_bytes: u64,
+) -> Result<reqwest::RequestBuilder, ControlError> {
+    let expected_content_length = size_bytes.to_string();
+    request = request.header(reqwest::header::CONTENT_LENGTH, &expected_content_length);
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case(reqwest::header::CONTENT_LENGTH.as_str()) {
+            if value != &expected_content_length {
+                return Err(ControlError::Contract);
+            }
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    Ok(request)
 }
 
 impl ControlClient for HttpControlClient {
@@ -1883,11 +1899,11 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_control_wait, retry_delay, sync_pending_communication_events,
-        sync_pending_system_events, AgentControlSnapshot, ControlClient, ControlError,
-        ControlFuture, DeviceCredential, HttpControlClient, SyncEventsResponse, CONTROL_INTERVAL,
-        CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT,
-        PRODUCTION_CLOUD_API_ORIGIN,
+        apply_communication_upload_headers, next_control_wait, retry_delay,
+        sync_pending_communication_events, sync_pending_system_events, AgentControlSnapshot,
+        ControlClient, ControlError, ControlFuture, DeviceCredential, HttpControlClient,
+        SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF,
+        MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
     use pca_domain::{
@@ -2004,6 +2020,32 @@ mod tests {
             next_control_wait(usize::from(MEDIA_BATCH_SIZE - 1)),
             CONTROL_INTERVAL
         );
+    }
+
+    #[test]
+    fn communication_upload_sends_one_validated_content_length_header() {
+        let headers = std::collections::BTreeMap::from([
+            ("content-length".to_owned(), "7".to_owned()),
+            ("content-type".to_owned(), "image/jpeg".to_owned()),
+        ]);
+        let request = apply_communication_upload_headers(
+            reqwest::Client::new().put("https://example.test/upload"),
+            &headers,
+            7,
+        )
+        .expect("valid signed upload headers")
+        .build()
+        .expect("build upload request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get_all(reqwest::header::CONTENT_LENGTH)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(request.headers()[reqwest::header::CONTENT_LENGTH], "7");
     }
 
     #[test]

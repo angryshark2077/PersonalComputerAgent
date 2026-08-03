@@ -946,6 +946,62 @@ async fn completed_media_is_streamed_to_its_hash_name_before_atomic_commit() {
 }
 
 #[tokio::test]
+async fn replayed_media_with_a_changed_manifest_does_not_block_a_new_message() {
+    let harness = Harness::new().await;
+    let source = harness.directory.path().join("replayed.mp4");
+    let original = b"original-media";
+    fs::write(&source, original).expect("write original media");
+    let source = source.canonicalize().expect("canonical media source");
+    harness
+        .state
+        .poll_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![media_record(&source, original, 1)]));
+
+    let runtime = harness.start(enabled(1)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let connection = Connection::open(&harness.database_path).unwrap();
+            if row_count(&connection, "communication_messages") == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("original media commits");
+    runtime.shutdown().await.unwrap();
+
+    let changed = b"changed-media";
+    fs::write(&source, changed).expect("replace replayed media");
+    harness
+        .state
+        .poll_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![media_record(&source, changed, 1), text_record(2)]));
+
+    let runtime = harness.start(enabled(1)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let connection = Connection::open(&harness.database_path).unwrap();
+            if row_count(&connection, "communication_messages") == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("new message is not blocked by changed replay");
+    runtime.shutdown().await.unwrap();
+
+    let connection = Connection::open(&harness.database_path).unwrap();
+    assert_eq!(row_count(&connection, "communication_messages"), 2);
+    assert_eq!(row_count(&connection, "attachment_spool"), 1);
+}
+
+#[tokio::test]
 async fn b1_cancellation_after_first_finalized_attachment_removes_attempt_files() {
     let harness = Harness::new().await;
     let first = b"first-finalized";
