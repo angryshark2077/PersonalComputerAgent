@@ -25,6 +25,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationEventSchema(pool);
     await assertCommunicationProjectionSchema(pool);
     await assertCommunicationObjectSchema(pool);
+    await assertCommunicationFileProjectionSchema(pool);
     await assertCommunicationProjectionBackfill(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
@@ -33,7 +34,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationEventSchema(pool);
     await assertCommunicationProjectionSchema(pool);
     await assertCommunicationObjectSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"]);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -96,6 +97,22 @@ async function assertCommunicationObjectSchema(pool: Pool) {
   assert.equal(result.rows[0]?.exists, true);
 }
 
+async function assertCommunicationFileProjectionSchema(pool: Pool) {
+  const result = await pool.query<{ constraint_name: string }>(
+    `SELECT constraint_name
+     FROM information_schema.table_constraints
+     WHERE table_schema = 'public'
+       AND table_name IN ('communication_messages', 'communication_message_attachments')
+       AND constraint_type = 'CHECK'
+     ORDER BY constraint_name`,
+  );
+  const names = result.rows.map((row) => row.constraint_name);
+  assert.ok(names.includes("communication_messages_kind"));
+  assert.ok(names.includes("communication_message_attachments_kind"));
+  assert.ok(!names.includes("communication_messages_kind_check"));
+  assert.ok(!names.includes("communication_message_attachments_kind_check"));
+}
+
 async function assertCommunicationProjectionBackfill(pool: Pool) {
   const workspaceId = "01982222-7222-8222-8222-222222222224";
   const userId = "01983333-7333-8333-8333-333333333335";
@@ -146,6 +163,42 @@ async function assertCommunicationProjectionBackfill(pool: Pool) {
     "SELECT message_id, text_body FROM communication_messages WHERE event_id = '01986666-7666-8666-8666-666666666669'",
   );
   assert.deepEqual(result.rows, [{ message_id: "message-migration", text_body: "private body" }]);
+
+  const fileEventId = "01986666-7666-8666-8666-666666666670";
+  await pool.query(
+    `INSERT INTO communication_events (
+       event_id, workspace_id, device_id, event_type, source, schema_version,
+       occurred_at, created_at, sensitivity, payload, attachment_refs, idempotency_key
+     ) VALUES (
+       $1, $2, $3, 'communication.message_recorded', 'communication.wechat', 1,
+       '2026-08-02T00:01:00Z', '2026-08-02T00:01:00Z', 'high', '{}'::jsonb, '[]'::jsonb,
+       'source-key-file-migration'
+     )`,
+    [fileEventId, workspaceId, deviceId],
+  );
+  await pool.query(
+    `INSERT INTO communication_messages (
+       event_id, workspace_id, device_id, conversation_id, message_id, source_key,
+       occurred_at, direction, kind, text_body
+     ) VALUES ($1, $2, $3, 'conversation-migration', 'message-file-migration',
+       'source-key-file-migration', '2026-08-02T00:01:00Z', 'incoming', 'file', NULL)`,
+    [fileEventId, workspaceId, deviceId],
+  );
+  await pool.query(
+    `INSERT INTO communication_message_attachments (
+       event_id, attachment_id, kind, sha256, size_bytes, mime_type, file_name
+     ) VALUES ($1, 'attachment-file-migration', 'file', $2, 12,
+       'application/octet-stream', 'example.bin')`,
+    [fileEventId, "b".repeat(64)],
+  );
+  const fileResult = await pool.query<{ kind: string; file_name: string }>(
+    `SELECT message.kind, attachment.file_name
+     FROM communication_messages AS message
+     INNER JOIN communication_message_attachments AS attachment USING (event_id)
+     WHERE message.event_id = $1`,
+    [fileEventId],
+  );
+  assert.deepEqual(fileResult.rows, [{ kind: "file", file_name: "example.bin" }]);
 }
 
 async function migrationIds(pool: Pool): Promise<string[]> {

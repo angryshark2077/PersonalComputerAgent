@@ -41,6 +41,7 @@ EXPECTED_MIGRATIONS = {
         "0010_communication_message_senders.sql",
         "0011_communication_avatars.sql",
         "0012_communication_files.sql",
+        "0013_drop_legacy_communication_kind_checks.sql",
     ],
 }
 
