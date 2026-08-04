@@ -173,12 +173,36 @@ export class DashboardApiError extends Error {
 
 export type DashboardFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+const defaultScreenCaptureConfig: CollectorConfig["screen.capture"] = {
+  enabled: false,
+  scheduled_enabled: true,
+  interval_seconds: 300,
+  activity_enabled: true,
+  activity_min_interval_seconds: 30,
+  excluded_bundle_ids: [],
+};
+
+export function normalizeDashboardDevice(device: DashboardDevice): DashboardDevice {
+  const collectors = device.collectors as Partial<CollectorConfig>;
+  return {
+    ...device,
+    collectors: {
+      ...device.collectors,
+      "screen.capture": collectors["screen.capture"] ?? defaultScreenCaptureConfig,
+    },
+  };
+}
+
 export async function getDevice(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,
   deviceId: string,
 ): Promise<DashboardDevice> {
-  return jsonRequest(fetcher, apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}`));
+  const device = await jsonRequest<DashboardDevice>(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}`),
+  );
+  return normalizeDashboardDevice(device);
 }
 
 export async function getDevices(

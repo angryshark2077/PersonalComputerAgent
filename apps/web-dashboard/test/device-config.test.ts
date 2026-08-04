@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { normalizeDashboardDevice, type DashboardDevice } from "../src/lib/api.ts";
 import { renderDeviceConfiguration } from "../src/lib/device-configuration.ts";
 
 const snapshotWithWechatEnabled = () => ({
@@ -54,4 +55,21 @@ test("device configuration exposes active-display screenshot boundaries", () => 
 
   assert.match(page, /Active display only/);
   assert.match(page, /lock screen and excluded applications are skipped/);
+});
+
+test("device page normalizes an old Cloud response without screenshot settings", () => {
+  const current = snapshotWithWechatEnabled();
+  const { "screen.capture": _screenCapture, ...legacyCollectors } = current.collectors;
+  const legacy = { ...current, collectors: legacyCollectors } as unknown as DashboardDevice;
+
+  const normalized = normalizeDashboardDevice(legacy);
+
+  assert.deepEqual(normalized.collectors["screen.capture"], {
+    enabled: false,
+    scheduled_enabled: true,
+    interval_seconds: 300,
+    activity_enabled: true,
+    activity_min_interval_seconds: 30,
+    excluded_bundle_ids: [],
+  });
 });
