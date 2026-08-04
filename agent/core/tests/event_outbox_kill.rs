@@ -12,6 +12,8 @@ use pca_agent_runtime::RuntimePaths;
 use rusqlite::Connection;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKSPACE_ID: &str = "11111111-1111-4111-8111-111111111111";
+const DEVICE_ID: &str = "22222222-2222-4222-8222-222222222222";
 
 struct ChildGuard(Child);
 
@@ -62,6 +64,8 @@ fn process_kill_between_event_and_outbox_statements_never_commits_a_partial_pair
         Command::new(env!("CARGO_BIN_EXE_pca-agentd"))
             .args(["run", "--runtime-root"])
             .arg(root.path())
+            .args(["--process-test-workspace-id", WORKSPACE_ID])
+            .args(["--process-test-device-id", DEVICE_ID])
             .arg("--process-test-event-barrier-ready")
             .arg(&ready)
             .arg("--process-test-event-barrier-release")

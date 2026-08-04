@@ -16,6 +16,8 @@ use pca_domain::{AgentStatus, BridgeStatus, RuntimeStatusEnvelope};
 use rusqlite::Connection;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_WORKSPACE_ID: &str = "11111111-1111-4111-8111-111111111111";
+const PROCESS_DEVICE_ID: &str = "22222222-2222-4222-8222-222222222222";
 
 struct ChildGuard {
     child: Child,
@@ -145,6 +147,8 @@ fn spawn_run(root: &Path) -> ChildGuard {
             .arg("run")
             .arg("--runtime-root")
             .arg(root)
+            .args(["--process-test-workspace-id", PROCESS_WORKSPACE_ID])
+            .args(["--process-test-device-id", PROCESS_DEVICE_ID])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -349,7 +353,8 @@ fn run_writes_fresh_local_health_when_bridge_is_missing_and_stops_cleanly() {
         lifecycle,
         vec![
             ("agent.started".to_owned(), 1),
-            ("agent.stopped".to_owned(), 1)
+            ("agent.stopped".to_owned(), 1),
+            ("collector.status_changed".to_owned(), 1),
         ]
     );
     let mismatched_pairs: u64 = connection

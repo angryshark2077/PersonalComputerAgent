@@ -213,11 +213,9 @@ impl LifecycleRuntime {
         Ok(event_id)
     }
 
-    /// Rejects new producers, drains queued work, records clean stop, and joins the worker.
-    pub(crate) async fn stop_and_drain(self) -> Result<String, LifecycleError> {
-        self.finish(Some("agent.stopped"))
-            .await?
-            .ok_or(LifecycleError::WorkerStopped)
+    /// Rejects new producers, drains queued work, and records clean stop when paired.
+    pub(crate) async fn stop_and_drain(self) -> Result<Option<String>, LifecycleError> {
+        self.finish(Some("agent.stopped")).await
     }
 
     pub(crate) async fn abort_and_drain(self) -> Result<(), LifecycleError> {
@@ -563,6 +561,43 @@ mod tests {
         assert_eq!(stored.1, "01982222-7222-8222-8222-222222222222");
         assert_eq!(stored.2, "network.online");
         assert_eq!(stored.3, "1785855600000");
+    }
+
+    #[tokio::test]
+    async fn unpaired_runtime_drains_cleanly_without_emitting_a_stop_event() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("agent.sqlite3");
+        let database = Arc::new(
+            DbActorHandle::open(&path, "0.0.0")
+                .await
+                .expect("open database"),
+        );
+        let runtime = LifecycleRuntime::start(
+            database,
+            None,
+            2,
+            Arc::new(RecordingRefresher {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                database_path: None,
+                fail: false,
+            }),
+        );
+
+        assert_eq!(
+            runtime
+                .stop_and_drain()
+                .await
+                .expect("unpaired lifecycle drains"),
+            None
+        );
+        let connection = rusqlite::Connection::open(path).expect("inspect database");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM events_local", [], |row| row
+                    .get::<_, u64>(0))
+                .expect("count lifecycle events"),
+            0
+        );
     }
 
     #[tokio::test]
