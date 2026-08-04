@@ -47,6 +47,17 @@ struct DeviceLocationObservation: Equatable, Sendable {
     }
 }
 
+func validDeviceLocation(
+    latitude: Double,
+    longitude: Double,
+    horizontalAccuracyMeters: Double
+) -> Bool {
+    latitude.isFinite && (-90 ... 90).contains(latitude)
+        && longitude.isFinite && (-180 ... 180).contains(longitude)
+        && horizontalAccuracyMeters.isFinite
+        && (0 ... 100_000).contains(horizontalAccuracyMeters)
+}
+
 final class DeviceLocationSource: NSObject, CLLocationManagerDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var manager: CLLocationManager?
@@ -104,7 +115,13 @@ final class DeviceLocationSource: NSObject, CLLocationManagerDelegate, @unchecke
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         let location = locations
-            .filter { $0.horizontalAccuracy >= 0 }
+            .filter {
+                validDeviceLocation(
+                    latitude: $0.coordinate.latitude,
+                    longitude: $0.coordinate.longitude,
+                    horizontalAccuracyMeters: $0.horizontalAccuracy
+                )
+            }
             .max(by: { $0.timestamp < $1.timestamp })
         let observation = location.map {
             DeviceLocationObservation(

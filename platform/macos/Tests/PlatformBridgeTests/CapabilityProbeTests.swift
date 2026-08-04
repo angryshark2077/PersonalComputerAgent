@@ -22,6 +22,29 @@ final class CapabilityProbeTests: XCTestCase {
         ]))
     }
 
+    func testDeviceLocationValidationRejectsValuesThatCannotCrossTheBridgeContract() {
+        XCTAssertTrue(validDeviceLocation(
+            latitude: 31.2931614,
+            longitude: 121.3167298,
+            horizontalAccuracyMeters: 24.5
+        ))
+        XCTAssertFalse(validDeviceLocation(
+            latitude: .infinity,
+            longitude: 121.3167298,
+            horizontalAccuracyMeters: 24.5
+        ))
+        XCTAssertFalse(validDeviceLocation(
+            latitude: 31.2931614,
+            longitude: 181,
+            horizontalAccuracyMeters: 24.5
+        ))
+        XCTAssertFalse(validDeviceLocation(
+            latitude: 31.2931614,
+            longitude: 121.3167298,
+            horizontalAccuracyMeters: 100_001
+        ))
+    }
+
     func testWiFiLocationGateAcceptsOnlyTheGrantedMacOSCoreLocationStatus() {
         XCTAssertTrue(locationAccessGranted(.authorizedAlways))
         XCTAssertFalse(locationAccessGranted(.notDetermined))

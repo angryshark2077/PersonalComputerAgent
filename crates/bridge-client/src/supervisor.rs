@@ -250,6 +250,9 @@ impl BridgeSupervisor {
                                 self.network_observations.replace(observation);
                                 last_network_observation = Some(Instant::now());
                             }
+                            Err(error) if !network_observation_error_requires_reconnect(&error) => {
+                                last_network_observation = Some(Instant::now());
+                            }
                             Err(_) => break false,
                         }
                     }
@@ -272,6 +275,10 @@ impl BridgeSupervisor {
             }
         }
     }
+}
+
+fn network_observation_error_requires_reconnect(error: &BridgeClientError) -> bool {
+    !matches!(error, BridgeClientError::InvalidEnvelope)
 }
 
 enum ConnectOutcome {
@@ -469,9 +476,11 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::{
-        reap_child, remove_confirmed_socket, Backoff, BridgeSupervisorConfig, ReapProcess,
-        StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT, MAX_STABLE_READY,
+        network_observation_error_requires_reconnect, reap_child, remove_confirmed_socket, Backoff,
+        BridgeSupervisorConfig, ReapProcess, StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT,
+        MAX_STABLE_READY,
     };
+    use crate::BridgeClientError;
     use pca_domain::BridgeStatus;
     use std::{
         collections::VecDeque,
@@ -520,6 +529,16 @@ mod tests {
         emitter.emit(BridgeStatus::Degraded);
         assert_eq!(*emitter.sender.borrow(), BridgeStatus::Degraded);
         assert_eq!(emitter.sender.receiver_count(), 0);
+    }
+
+    #[test]
+    fn invalid_network_sample_does_not_restart_an_otherwise_healthy_bridge() {
+        assert!(!network_observation_error_requires_reconnect(
+            &BridgeClientError::InvalidEnvelope
+        ));
+        assert!(network_observation_error_requires_reconnect(
+            &BridgeClientError::Timeout
+        ));
     }
 
     #[test]
