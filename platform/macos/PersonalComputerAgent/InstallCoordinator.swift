@@ -559,8 +559,19 @@ final class LocationAccessController: LocationAccessControlling {
             throw InstallError.locationAccessRequired
         }
         onWaitingForAuthorization()
-        manager.requestWhenInUseAuthorization()
+        NSApplication.shared.activate(ignoringOtherApps: true)
         let clock = ContinuousClock()
+        let activationDeadline = clock.now.advanced(by: .seconds(2))
+        while !NSApplication.shared.isActive, clock.now < activationDeadline {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        guard NSApplication.shared.isActive else {
+            throw InstallError.locationAccessRequired
+        }
+        manager.requestWhenInUseAuthorization()
+        manager.startUpdatingLocation()
+        defer { manager.stopUpdatingLocation() }
         let deadline = clock.now.advanced(by: approvalTimeout)
         while clock.now < deadline {
             try Task.checkCancellation()

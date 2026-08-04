@@ -194,6 +194,20 @@ class S1APackagingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("TeamIdentifier", result.stdout)
 
+    def test_missing_bridge_location_entitlement_is_rejected(self) -> None:
+        env_name = "PCA_SYNTHETIC_MISSING_LOCATION_ENTITLEMENT"
+        previous = os.environ.get(env_name)
+        os.environ[env_name] = "PCAPlatformBridge"
+        try:
+            result = self.run_verify()
+        finally:
+            if previous is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = previous
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("location entitlement", result.stdout)
+
     def test_build_fails_before_creating_output_when_identity_is_missing(self) -> None:
         output = self.temp / "must-not-exist.dmg"
         env = os.environ.copy()
@@ -333,7 +347,13 @@ if [[ "$(basename "$target")" == "${PCA_SYNTHETIC_SIGNATURE_FAILURE:-}" ]]; then
   echo "synthetic signature failure" >&2
   exit 1
 fi
-if [[ "$1" == "--verify" ]]; then
+if [[ " $* " == *" --entitlements :- "* ]]; then
+  if [[ "$(basename "$target")" == "${PCA_SYNTHETIC_MISSING_LOCATION_ENTITLEMENT:-}" ]]; then
+    echo '<?xml version="1.0"?><plist version="1.0"><dict/></plist>'
+  else
+    echo '<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.personal-information.location</key><true/></dict></plist>'
+  fi
+elif [[ "$1" == "--verify" ]]; then
   [[ " $* " == *" --strict "* && " $* " == *" --verbose=2 "* ]]
 elif [[ "$1" == "-d" ]]; then
   team="${PCA_SYNTHETIC_TEAM_ID:-ABCDEFGHIJ}"

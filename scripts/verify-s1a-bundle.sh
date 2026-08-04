@@ -99,6 +99,21 @@ plist_mode=$(stat -f '%Lp' "$launch_agent")
 version=$(plutil -extract CFBundleShortVersionString raw -o - "$info")
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "bundle version must be three numeric components"
 
+for location_target in "$app" "$bridge"; do
+  location_entitlements=$(codesign -d --entitlements :- "$location_target" 2>/dev/null) \
+    || fail "could not inspect signature location entitlement for $(basename "$location_target")"
+  location_allowed=$(python3 -c '
+import plistlib, sys
+value = plistlib.load(sys.stdin.buffer).get("com.apple.security.personal-information.location")
+if value is not True:
+    raise SystemExit(1)
+print("true")
+' <<<"$location_entitlements" 2>/dev/null) \
+    || fail "missing location entitlement for $(basename "$location_target")"
+  [[ "$location_allowed" == "true" ]] \
+    || fail "location entitlement must be enabled for $(basename "$location_target")"
+done
+
 [[ "$(plutil -extract Label raw -o - "$launch_agent")" == "com.pca.agentd" ]] || fail "wrong LaunchAgent label"
 [[ "$(plutil -extract BundleProgram raw -o - "$launch_agent")" == "Contents/Resources/bin/pca-agentd" ]] || fail "wrong BundleProgram"
 arguments=$(plutil -extract ProgramArguments json -o - "$launch_agent" | tr -d '[:space:]')
