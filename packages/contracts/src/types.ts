@@ -157,6 +157,7 @@ export interface AgentControlSnapshot {
   workspace_id: string;
   revoked: boolean;
   configuration_revision: number;
+  local_media_cleanup?: { request_id: string } | null;
   collectors: {
     network: { enabled: boolean };
     "communication.wechat": {

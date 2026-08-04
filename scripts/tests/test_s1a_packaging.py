@@ -305,6 +305,7 @@ class S1APackagingTests(unittest.TestCase):
                     "CFBundleVersion": "1",
                     "CFBundleExecutable": "PersonalComputerAgent",
                     "LSUIElement": True,
+                    "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
                 },
                 output,
             )

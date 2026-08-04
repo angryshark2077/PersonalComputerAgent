@@ -302,6 +302,21 @@ export const deviceHeartbeats = pgTable(
     agentVersion: text("agent_version").notNull(),
     presence: text("presence").notNull(),
     outboxDepth: bigint("outbox_depth", { mode: "number" }).notNull(),
+    completedMediaFileCount: bigint("completed_media_file_count", { mode: "number" }).notNull().default(0),
+    completedMediaBytes: bigint("completed_media_bytes", { mode: "number" }).notNull().default(0),
+    protectedMediaFileCount: bigint("protected_media_file_count", { mode: "number" }).notNull().default(0),
+    protectedMediaBytes: bigint("protected_media_bytes", { mode: "number" }).notNull().default(0),
+    networkInterfaceType: text("network_interface_type"),
+    networkWifiIdentityAvailable: boolean("network_wifi_identity_available"),
+    networkSsid: text("network_ssid"),
+    networkBssid: text("network_bssid"),
+    networkLocalIpv4: inet("network_local_ipv4"),
+    networkLocalIpv6: inet("network_local_ipv6"),
+    networkPublicIp: inet("network_public_ip"),
+    networkIpCountry: text("network_ip_country"),
+    networkIpRegion: text("network_ip_region"),
+    networkIpCity: text("network_ip_city"),
+    networkIpAccuracy: text("network_ip_accuracy"),
   },
   (table) => [
     foreignKey({
@@ -318,6 +333,73 @@ export const deviceHeartbeats = pgTable(
       sql`${table.presence} IN ('online', 'stale', 'offline', 'sleeping')`,
     ),
     check("device_heartbeats_outbox_nonnegative", sql`${table.outboxDepth} >= 0`),
+    check(
+      "device_heartbeats_media_counts_nonnegative",
+      sql`${table.completedMediaFileCount} >= 0 AND ${table.completedMediaBytes} >= 0 AND ${table.protectedMediaFileCount} >= 0 AND ${table.protectedMediaBytes} >= 0`,
+    ),
+  ],
+);
+
+export const networkLocationLibrary = pgTable(
+  "network_location_library",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+    actorUserId: uuid("actor_user_id").notNull(),
+    name: text("name").notNull(),
+    matchSsid: text("match_ssid"),
+    matchBssid: text("match_bssid"),
+    country: text("country"),
+    region: text("region"),
+    city: text("city"),
+    createdAt: timestampColumn("created_at").notNull(),
+    updatedAt: timestampColumn("updated_at").notNull(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.actorUserId],
+      foreignColumns: [workspaceMembers.workspaceId, workspaceMembers.userId],
+    }).onDelete("cascade"),
+    uniqueIndex("network_location_library_workspace_bssid_unique")
+      .on(table.workspaceId, table.matchBssid)
+      .where(sql`${table.matchBssid} IS NOT NULL`),
+    index("idx_network_location_library_workspace_ssid")
+      .on(table.workspaceId, table.matchSsid)
+      .where(sql`${table.matchSsid} IS NOT NULL`),
+  ],
+);
+
+export const deviceMediaCleanupRequests = pgTable(
+  "device_media_cleanup_requests",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    actorUserId: uuid("actor_user_id").notNull().references(() => authUsers.id, { onDelete: "restrict" }),
+    status: text("status").notNull().default("queued"),
+    requestedAt: timestampColumn("requested_at").notNull(),
+    completedAt: timestampColumn("completed_at"),
+    deletedFileCount: bigint("deleted_file_count", { mode: "number" }),
+    freedBytes: bigint("freed_bytes", { mode: "number" }),
+    errorCode: text("error_code"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    uniqueIndex("device_media_cleanup_one_queued")
+      .on(table.workspaceId, table.deviceId)
+      .where(sql`${table.status} = 'queued'`),
+    index("device_media_cleanup_latest").on(
+      table.workspaceId,
+      table.deviceId,
+      table.requestedAt.desc(),
+    ),
+    check(
+      "device_media_cleanup_status",
+      sql`${table.status} IN ('queued', 'succeeded', 'failed')`,
+    ),
   ],
 );
 
@@ -580,6 +662,8 @@ export const cloudSchema = {
   collectorConfigs,
   collectorConfigAudit,
   deviceHeartbeats,
+  deviceMediaCleanupRequests,
+  networkLocationLibrary,
   deviceRevocationAudit,
   communicationEvents,
   communicationConversations,

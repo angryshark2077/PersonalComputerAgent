@@ -27,6 +27,7 @@ import {
   type OwnerAuthenticator,
 } from "./auth.js";
 import { parseCollectorConfig, parseHeartbeat } from "./control.js";
+import { CountryIsGeoEnricher, type GeoEnrichmentPort } from "./geo.js";
 import { createR2ObjectStore, type R2ObjectHead, type R2ObjectStore } from "./r2.js";
 import { parseCommunicationSyncBatch, parseSyncBatch } from "./sync.js";
 import {
@@ -52,6 +53,7 @@ export interface CreateAppOptions {
   ownerAuthenticator?: OwnerAuthenticator;
   pairingRateLimiter?: PairingRateLimiter;
   clientAddress?: (request: Request) => string | undefined;
+  geoEnricher?: GeoEnrichmentPort;
   objectStore?: R2ObjectStore;
 }
 
@@ -197,8 +199,19 @@ export function createApp(options: CreateAppOptions): Hono {
     }
     const now = new Date();
     try {
+      const publicIp = heartbeat.network === null
+        ? null
+        : options.clientAddress?.(context.req.raw) ?? null;
+      const ipLocation = publicIp === null || options.geoEnricher === undefined
+        ? null
+        : await options.geoEnricher.locate(publicIp).catch(() => null);
       await options.repository.recordHeartbeat({
         ...heartbeat,
+        network: heartbeat.network === null ? null : {
+          ...heartbeat.network,
+          publicIp,
+          ipLocation,
+        },
         workspaceId: device.workspaceId,
         deviceId: device.deviceId,
         receivedAt: now,
@@ -394,6 +407,60 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.get("/v1/network-locations", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    try {
+      const locations = await options.repository.listOwnerNetworkLocations(
+        principal.workspaceId,
+        principal.userId,
+      );
+      return context.json({ locations: locations.map(networkLocationResponse) });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.post("/v1/network-locations", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const input = parseNetworkLocation(await context.req.json().catch(() => null));
+    if (input === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid network location.");
+    }
+    try {
+      const location = await options.repository.createOwnerNetworkLocation({
+        locationId: randomUUID(),
+        workspaceId: principal.workspaceId,
+        actorUserId: principal.userId,
+        ...input,
+        now: new Date(),
+      });
+      return context.json({ location: networkLocationResponse(location) }, 201);
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.delete("/v1/network-locations/:locationId", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const locationId = context.req.param("locationId");
+    if (!isUuid(locationId)) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid network location.");
+    }
+    try {
+      await options.repository.deleteOwnerNetworkLocation(
+        locationId,
+        principal.workspaceId,
+        principal.userId,
+      );
+      return context.body(null, 204);
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.get("/v1/devices/:deviceId", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
@@ -406,6 +473,7 @@ export function createApp(options: CreateAppOptions): Hono {
       return context.json({
         ...ownerDeviceSummaryResponse(device),
         collectors: device.snapshot.collectors,
+        local_media_cleanup: localMediaCleanupResponse(device.localMediaCleanup),
       });
     } catch (error) {
       return repositoryErrorResponse(context, error);
@@ -604,6 +672,23 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.post("/v1/devices/:deviceId/communication/local-media/cleanup", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    try {
+      const cleanup = await options.repository.requestLocalMediaCleanup({
+        requestId: randomUUID(),
+        actorUserId: principal.userId,
+        workspaceId: principal.workspaceId,
+        deviceId: context.req.param("deviceId"),
+        now: new Date(),
+      });
+      return context.json({ cleanup: localMediaCleanupResponse(cleanup) }, 202);
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   return app;
 }
 
@@ -656,6 +741,48 @@ function isUuid(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+function parseNetworkLocation(value: unknown): {
+  name: string;
+  matchSsid: string | null;
+  matchBssid: string | null;
+  country: string | null;
+  region: string | null;
+  city: string | null;
+} | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  if (Object.keys(body).some((key) => !["name", "match_ssid", "match_bssid", "country", "region", "city"].includes(key))) return null;
+  const name = normalizedText(body.name, 100);
+  const matchSsid = nullableText(body.match_ssid, 128);
+  const rawBssid = nullableText(body.match_bssid, 17);
+  const matchBssid = rawBssid?.toUpperCase() ?? null;
+  const country = nullableText(body.country, 100);
+  const region = nullableText(body.region, 100);
+  const city = nullableText(body.city, 100);
+  if (
+    name === null
+    || matchSsid === undefined
+    || rawBssid === undefined
+    || country === undefined
+    || region === undefined
+    || city === undefined
+    || (matchSsid === null && matchBssid === null)
+    || (matchBssid !== null && !/^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/.test(matchBssid))
+  ) return null;
+  return { name, matchSsid, matchBssid, country, region, city };
+}
+
+function normalizedText(value: unknown, maximum: number): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  return text.length > 0 && text.length <= maximum ? text : null;
+}
+
+function nullableText(value: unknown, maximum: number): string | null | undefined {
+  if (value === null || value === undefined || value === "") return null;
+  return typeof value === "string" ? normalizedText(value, maximum) ?? undefined : undefined;
+}
+
 export interface ProductionEnvironment {
   DATABASE_URL?: string;
   BETTER_AUTH_SECRET?: string;
@@ -665,6 +792,7 @@ export interface ProductionEnvironment {
   R2_SECRET_ACCESS_KEY?: string;
   R2_BUCKET?: string;
   R2_BUCKET_PUBLIC?: string;
+  RAILWAY_ENVIRONMENT?: string;
 }
 
 export function createProductionApp(environment: ProductionEnvironment = process.env): Hono {
@@ -689,10 +817,24 @@ export function createProductionApp(environment: ProductionEnvironment = process
   const app = createApp({
     repository,
     ownerAuthenticator: createBetterAuthOwnerAuthenticator(auth, repository),
+    clientAddress: createRailwayClientAddress(environment),
+    geoEnricher: new CountryIsGeoEnricher(),
     ...(objectStore === undefined ? {} : { objectStore }),
   });
   app.all("/api/auth/*", (context) => auth.handler(context.req.raw));
   return app;
+}
+
+export function createRailwayClientAddress(
+  environment: { RAILWAY_ENVIRONMENT?: string },
+): (request: Request) => string | undefined {
+  const onRailway = typeof environment.RAILWAY_ENVIRONMENT === "string"
+    && environment.RAILWAY_ENVIRONMENT.length > 0;
+  return (request) => {
+    if (!onRailway) return undefined;
+    const value = request.headers.get("x-real-ip");
+    return value !== null && isIP(value) !== 0 ? value : undefined;
+  };
 }
 
 /** The Better Auth hook runs after a new user exists and creates its sole Owner Workspace. */
@@ -873,6 +1015,33 @@ function ownerDeviceSummaryResponse(device: {
     presence: string;
     agentVersion: string;
     outboxDepth: number;
+    localMedia: {
+      completedFileCount: number;
+      completedBytes: number;
+      protectedFileCount: number;
+      protectedBytes: number;
+    };
+    network: {
+      interfaceType: string;
+      wifiIdentityAvailable: boolean;
+      ssid: string | null;
+      bssid: string | null;
+      localIpv4: string | null;
+      localIpv6: string | null;
+      publicIp: string | null;
+      ipLocation: { country: string | null; region: string | null; city: string | null; accuracy: string } | null;
+    } | null;
+    matchedLocation: {
+      locationId: string;
+      name: string;
+      matchSsid: string | null;
+      matchBssid: string | null;
+      country: string | null;
+      region: string | null;
+      city: string | null;
+      createdAt: Date;
+      updatedAt: Date;
+    } | null;
     observedAt: Date;
   } | null;
 }) {
@@ -890,8 +1059,71 @@ function ownerDeviceSummaryResponse(device: {
             presence: device.status.presence,
             agent_version: device.status.agentVersion,
             outbox_depth: device.status.outboxDepth,
+            local_media: {
+              completed_file_count: device.status.localMedia.completedFileCount,
+              completed_bytes: device.status.localMedia.completedBytes,
+              protected_file_count: device.status.localMedia.protectedFileCount,
+              protected_bytes: device.status.localMedia.protectedBytes,
+            },
+            network: device.status.network === null ? null : {
+              interface_type: device.status.network.interfaceType,
+              wifi_identity_available: device.status.network.wifiIdentityAvailable,
+              ssid: device.status.network.ssid,
+              bssid: device.status.network.bssid,
+              local_ipv4: device.status.network.localIpv4,
+              local_ipv6: device.status.network.localIpv6,
+              public_ip: device.status.network.publicIp,
+              ip_location: device.status.network.ipLocation,
+              matched_location: device.status.matchedLocation === null
+                ? null
+                : networkLocationResponse(device.status.matchedLocation),
+            },
             observed_at: device.status.observedAt.toISOString(),
           },
+  };
+}
+
+function networkLocationResponse(location: {
+  locationId: string;
+  name: string;
+  matchSsid: string | null;
+  matchBssid: string | null;
+  country: string | null;
+  region: string | null;
+  city: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}) {
+  return {
+    location_id: location.locationId,
+    name: location.name,
+    match_ssid: location.matchSsid,
+    match_bssid: location.matchBssid,
+    country: location.country,
+    region: location.region,
+    city: location.city,
+    created_at: location.createdAt.toISOString(),
+    updated_at: location.updatedAt.toISOString(),
+  };
+}
+
+function localMediaCleanupResponse(cleanup: {
+  requestId: string;
+  status: string;
+  requestedAt: Date;
+  completedAt: Date | null;
+  deletedFileCount: number | null;
+  freedBytes: number | null;
+  errorCode: string | null;
+} | null) {
+  return cleanup === null ? null : {
+    request_id: cleanup.requestId,
+    status: cleanup.status,
+    requested_at: cleanup.requestedAt.toISOString(),
+    completed_at: cleanup.completedAt?.toISOString() ?? null,
+    deleted_file_count: cleanup.deletedFileCount,
+    freed_bytes: cleanup.freedBytes,
+    error_code: cleanup.errorCode,
   };
 }
 

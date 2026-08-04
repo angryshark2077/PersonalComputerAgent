@@ -264,6 +264,17 @@ async fn cloud_completed_media_is_deleted_only_after_the_local_retention_cutoff(
         .await
         .expect("complete attachment");
 
+    let before_cleanup = store
+        .communication_media_storage_stats()
+        .await
+        .expect("measure completed media");
+    assert_eq!(before_cleanup.completed_file_count, 1);
+    assert_eq!(
+        before_cleanup.completed_bytes,
+        std::fs::metadata(&spool_file).unwrap().len()
+    );
+    assert_eq!(before_cleanup.protected_file_count, 0);
+
     assert_eq!(
         store
             .cleanup_completed_communication_attachments(i64::MIN)
@@ -280,6 +291,92 @@ async fn cloud_completed_media_is_deleted_only_after_the_local_retention_cutoff(
         1
     );
     assert!(!spool_file.exists());
+    assert_eq!(
+        store
+            .communication_media_storage_stats()
+            .await
+            .expect("measure removed media")
+            .completed_bytes,
+        0
+    );
+}
+
+#[tokio::test]
+async fn cleanup_never_deletes_pending_failed_or_shared_media() {
+    let (_directory, path) = database_path();
+    let store = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let commit = valid_commit(&path);
+    let spool_root = DbActorHandle::communication_spool_root(&path);
+    let shared_file = spool_root.join(&commit.attachment_spool[0].file_name);
+    let pending_sha256 = "b".repeat(64);
+    let failed_sha256 = "c".repeat(64);
+    let pending_file = spool_root.join(&pending_sha256);
+    let failed_file = spool_root.join(&failed_sha256);
+    std::fs::write(&pending_file, b"pending media").expect("pending spool file");
+    std::fs::write(&failed_file, b"failed media").expect("failed spool file");
+
+    store
+        .commit_communication_message(&commit)
+        .await
+        .expect("commit communication message");
+    store
+        .acknowledge_communication_events(std::slice::from_ref(&commit.event.event_id))
+        .await
+        .expect("acknowledge communication event");
+    store
+        .complete_communication_attachment("attachment-1")
+        .await
+        .expect("complete attachment");
+
+    let connection = Connection::open(&path).expect("open fixture database");
+    connection
+        .execute(
+            "INSERT INTO attachment_spool (
+                attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                spool_relative_path, transfer_state, created_at_ms, completed_at_ms
+             ) VALUES (?1, 1, 'image', ?2, 1, 'image/png', ?2, ?3, 1, NULL)",
+            rusqlite::params!["shared-pending", "a".repeat(64), "pending"],
+        )
+        .expect("insert pending shared reference");
+    connection
+        .execute(
+            "INSERT INTO attachment_spool (
+                attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                spool_relative_path, transfer_state, created_at_ms, completed_at_ms
+             ) VALUES (?1, 1, 'image', ?2, 1, 'image/png', ?2, ?3, 1, NULL)",
+            rusqlite::params!["pending-only", pending_sha256, "pending"],
+        )
+        .expect("insert pending attachment");
+    connection
+        .execute(
+            "INSERT INTO attachment_spool (
+                attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                spool_relative_path, transfer_state, created_at_ms, completed_at_ms
+             ) VALUES (?1, 1, 'image', ?2, 1, 'image/png', ?2, ?3, 1, NULL)",
+            rusqlite::params!["failed-only", failed_sha256, "failed"],
+        )
+        .expect("insert failed attachment");
+    drop(connection);
+
+    let protected = store
+        .communication_media_storage_stats()
+        .await
+        .expect("measure protected media");
+    assert_eq!(protected.completed_file_count, 0);
+    assert_eq!(protected.protected_file_count, 3);
+
+    assert_eq!(
+        store
+            .cleanup_completed_communication_attachments(i64::MAX)
+            .await
+            .expect("protect non-completed media"),
+        0
+    );
+    assert!(shared_file.is_file());
+    assert!(pending_file.is_file());
+    assert!(failed_file.is_file());
 }
 
 #[tokio::test]

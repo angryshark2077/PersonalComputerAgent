@@ -219,6 +219,14 @@ test("heartbeats are append-only and Workspace-scoped", async () => {
     agentVersion: "0.3.0",
     presence: "online" as const,
     outboxDepth: 0,
+    localMedia: {
+      completedFileCount: 2,
+      completedBytes: 1024,
+      protectedFileCount: 1,
+      protectedBytes: 512,
+    },
+    cleanupResult: null,
+    network: null,
   };
   await repository.recordHeartbeat(heartbeat);
   await assert.rejects(

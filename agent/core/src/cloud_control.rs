@@ -4,7 +4,11 @@ use std::{
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use pca_db_local::{DbActorHandle, DbError, PairingState, PendingCommunicationAttachment};
+use pca_bridge_client::{NetworkObservation, NetworkObservationState};
+use pca_db_local::{
+    CommunicationMediaStorageStats, DbActorHandle, DbError, PairingState,
+    PendingCommunicationAttachment,
+};
 use pca_domain::{CommunicationScopeV2, EventEnvelope};
 use pca_keychain::{
     delete_device_credential, load_device_credential, store_device_credential, CredentialError,
@@ -33,7 +37,6 @@ const MEDIA_BATCH_SIZE: u16 = 4;
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
 const CONTROL_OWNER_COMMAND_CAPACITY: usize = 8;
-const LOCAL_MEDIA_RETENTION: Duration = Duration::from_hours(168);
 pub const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.up.railway.app";
 
 /// Future returned by the small Cloud-control port.
@@ -50,6 +53,8 @@ pub enum ControlError {
 
 /// Authenticated, bounded Cloud-control operations owned by Agent Core.
 pub trait ControlClient: Send + Sync {
+    fn set_network_enabled(&self, _: bool) {}
+
     fn refresh<'a>(
         &'a self,
         credentials: &'a DeviceCredential,
@@ -60,6 +65,16 @@ pub trait ControlClient: Send + Sync {
         credentials: &'a DeviceCredential,
         outbox_depth: u64,
     ) -> ControlFuture<'a, AgentControlSnapshot>;
+
+    fn heartbeat_and_control_with_media<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        outbox_depth: u64,
+        _: CommunicationMediaStorageStats,
+        _: Option<LocalMediaCleanupResult>,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        self.heartbeat_and_control(credentials, outbox_depth)
+    }
 
     fn sync_system_events<'a>(
         &'a self,
@@ -338,7 +353,25 @@ pub struct AgentControlSnapshot {
     pub workspace_id: String,
     pub revoked: bool,
     pub configuration_revision: u64,
+    #[serde(default)]
+    pub local_media_cleanup: Option<LocalMediaCleanupRequest>,
     pub collectors: CollectorControls,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalMediaCleanupRequest {
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalMediaCleanupResult {
+    request_id: String,
+    status: &'static str,
+    deleted_file_count: u64,
+    freed_bytes: u64,
+    error_code: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -358,6 +391,13 @@ pub struct EnabledControl {
 impl AgentControlSnapshot {
     fn validate_exact_scopes(&self) -> Result<(), ControlError> {
         if Uuid::parse_str(&self.device_id).is_err() || Uuid::parse_str(&self.workspace_id).is_err()
+        {
+            return Err(ControlError::Contract);
+        }
+        if self
+            .local_media_cleanup
+            .as_ref()
+            .is_some_and(|request| Uuid::parse_str(&request.request_id).is_err())
         {
             return Err(ControlError::Contract);
         }
@@ -394,11 +434,12 @@ pub fn apply_snapshot(
     }))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ControlState {
     unpaired: bool,
     applied_revision: Option<u64>,
     communication_hydrated: bool,
+    pending_media_cleanup_result: Option<LocalMediaCleanupResult>,
 }
 
 /// Starts the authenticated Cloud-control worker.
@@ -639,6 +680,7 @@ async fn start_control_worker(
         unpaired: false,
         applied_revision: Some(applied_revision),
         communication_hydrated: false,
+        pending_media_cleanup_result: None,
     }));
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let worker = tokio::spawn(run_control_loop(
@@ -1107,6 +1149,7 @@ async fn run_control_loop(
                 wait = retry_delay(retry_attempt);
             }
             Err(ControlError::Contract) => {
+                client.set_network_enabled(false);
                 if authorization.disable_for_owner(owner_epoch).await {
                     publication.publish(owner_epoch, None).await;
                 }
@@ -1186,21 +1229,9 @@ async fn control_once(
     authorization: &CommunicationAuthorization,
     owner_epoch: u64,
 ) -> Result<usize, ControlError> {
-    let retention_ms =
-        i64::try_from(LOCAL_MEDIA_RETENTION.as_millis()).map_err(|_| ControlError::Contract)?;
-    let now_ms = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
-        .map_err(|_| ControlError::Contract)?;
-    let _ = database
-        .cleanup_completed_communication_attachments(now_ms.saturating_sub(retention_ms))
-        .await;
-    let outbox_depth = database
-        .active_outbox_depth()
-        .await
-        .map_err(|_| ControlError::Transient)?;
-    let snapshot = client
-        .heartbeat_and_control(&credentials.credential, outbox_depth)
-        .await?;
+    let snapshot = send_control_heartbeat(database, credentials, client, state).await?;
     if snapshot.revoked {
+        client.set_network_enabled(false);
         if !authorization.disable_for_owner(owner_epoch).await {
             return Err(ControlError::Transient);
         }
@@ -1210,12 +1241,76 @@ async fn control_once(
     if snapshot.device_id != credentials.credential.device_id()
         || snapshot.workspace_id != credentials.credential.workspace_id()
     {
+        client.set_network_enabled(false);
         if !authorization.disable_for_owner(owner_epoch).await {
             return Err(ControlError::Transient);
         }
         publication.publish(owner_epoch, None).await;
         return Err(ControlError::Contract);
     }
+    apply_control_snapshot(
+        database,
+        credentials,
+        client,
+        state,
+        publication,
+        authorization,
+        owner_epoch,
+        snapshot,
+    )
+    .await
+}
+
+async fn send_control_heartbeat(
+    database: &DbActorHandle,
+    credentials: &LoadedDeviceCredentials,
+    client: &dyn ControlClient,
+    state: &Arc<Mutex<ControlState>>,
+) -> Result<AgentControlSnapshot, ControlError> {
+    let outbox_depth = database
+        .active_outbox_depth()
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    let media_stats = database
+        .communication_media_storage_stats()
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    let pending_cleanup_result = state.lock().await.pending_media_cleanup_result.clone();
+    let snapshot = client
+        .heartbeat_and_control_with_media(
+            &credentials.credential,
+            outbox_depth,
+            media_stats,
+            pending_cleanup_result.clone(),
+        )
+        .await?;
+    if let Some(acknowledged) = pending_cleanup_result {
+        let mut state = state.lock().await;
+        if state
+            .pending_media_cleanup_result
+            .as_ref()
+            .is_some_and(|current| current.request_id == acknowledged.request_id)
+        {
+            state.pending_media_cleanup_result = None;
+        }
+    }
+    Ok(snapshot)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one validated control snapshot is applied against its existing runtime dependencies"
+)]
+async fn apply_control_snapshot(
+    database: &DbActorHandle,
+    credentials: &LoadedDeviceCredentials,
+    client: &dyn ControlClient,
+    state: &Arc<Mutex<ControlState>>,
+    publication: &ControlPublication,
+    authorization: &CommunicationAuthorization,
+    owner_epoch: u64,
+    snapshot: AgentControlSnapshot,
+) -> Result<usize, ControlError> {
     let (current, hydrated) = {
         let state = state.lock().await;
         (
@@ -1249,6 +1344,7 @@ async fn control_once(
     sync_pending_system_events(database, &credentials.credential, client).await?;
     sync_pending_communication_events(database, &credentials.credential, client).await?;
     if let Some(applied) = applied {
+        client.set_network_enabled(applied.network_enabled);
         if applied.configuration_revision > current {
             database
                 .save_control_revision(applied.configuration_revision)
@@ -1280,7 +1376,47 @@ async fn control_once(
         sync_pending_communication_attachments(database, &credentials.credential, client)
             .await
             .unwrap_or(0);
+    if let Some(request) = snapshot.local_media_cleanup {
+        handle_local_media_cleanup(database, state, request).await?;
+        return Ok(usize::from(MEDIA_BATCH_SIZE));
+    }
     Ok(completed_media)
+}
+
+async fn handle_local_media_cleanup(
+    database: &DbActorHandle,
+    state: &Arc<Mutex<ControlState>>,
+    request: LocalMediaCleanupRequest,
+) -> Result<(), ControlError> {
+    let before = database
+        .communication_media_storage_stats()
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    let cleanup = database
+        .cleanup_completed_communication_attachments(i64::MAX)
+        .await;
+    let after = database
+        .communication_media_storage_stats()
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    let (status, deleted_file_count, error_code) = match cleanup {
+        Ok(deleted) => ("succeeded", deleted, None),
+        Err(_) => (
+            "failed",
+            before
+                .completed_file_count
+                .saturating_sub(after.completed_file_count),
+            Some("LOCAL_MEDIA_CLEANUP_FAILED"),
+        ),
+    };
+    state.lock().await.pending_media_cleanup_result = Some(LocalMediaCleanupResult {
+        request_id: request.request_id,
+        status,
+        deleted_file_count,
+        freed_bytes: before.completed_bytes.saturating_sub(after.completed_bytes),
+        error_code,
+    });
+    Ok(())
 }
 
 fn next_control_wait(completed_media: usize) -> Duration {
@@ -1479,6 +1615,7 @@ fn pkce_challenge(verifier: &str) -> String {
 /// HTTPS adapter for the fixed S1B endpoints. It never serializes credentials to diagnostics.
 pub struct HttpControlClient {
     base_url: Url,
+    network_observations: Arc<NetworkObservationState>,
 }
 
 impl HttpControlClient {
@@ -1499,7 +1636,19 @@ impl HttpControlClient {
         {
             return Err(ControlError::Contract);
         }
-        Ok(Self { base_url })
+        Ok(Self {
+            base_url,
+            network_observations: Arc::new(NetworkObservationState::default()),
+        })
+    }
+
+    #[must_use]
+    pub fn with_network_observations(
+        mut self,
+        network_observations: Arc<NetworkObservationState>,
+    ) -> Self {
+        self.network_observations = network_observations;
+        self
     }
 
     fn client() -> Result<Client, ControlError> {
@@ -1585,6 +1734,10 @@ fn apply_communication_upload_headers(
 }
 
 impl ControlClient for HttpControlClient {
+    fn set_network_enabled(&self, enabled: bool) {
+        self.network_observations.set_enabled(enabled);
+    }
+
     fn refresh<'a>(
         &'a self,
         credentials: &'a DeviceCredential,
@@ -1622,6 +1775,21 @@ impl ControlClient for HttpControlClient {
         credentials: &'a DeviceCredential,
         outbox_depth: u64,
     ) -> ControlFuture<'a, AgentControlSnapshot> {
+        self.heartbeat_and_control_with_media(
+            credentials,
+            outbox_depth,
+            CommunicationMediaStorageStats::default(),
+            None,
+        )
+    }
+
+    fn heartbeat_and_control_with_media<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        outbox_depth: u64,
+        local_media: CommunicationMediaStorageStats,
+        cleanup_result: Option<LocalMediaCleanupResult>,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
         Box::pin(async move {
             let client = Self::client()?;
             let request = HeartbeatRequest {
@@ -1631,6 +1799,14 @@ impl ControlClient for HttpControlClient {
                     .to_owned(),
                 presence: "online",
                 outbox_depth,
+                local_media: LocalMediaHeartbeat {
+                    completed_file_count: local_media.completed_file_count,
+                    completed_bytes: local_media.completed_bytes,
+                    protected_file_count: local_media.protected_file_count,
+                    protected_bytes: local_media.protected_bytes,
+                },
+                network: self.network_observations.current_if_enabled(),
+                cleanup_result,
             };
             let response = client
                 .post(self.endpoint("v1/agent/control")?)
@@ -1820,6 +1996,18 @@ struct HeartbeatRequest {
     agent_version: String,
     presence: &'static str,
     outbox_depth: u64,
+    local_media: LocalMediaHeartbeat,
+    network: Option<NetworkObservation>,
+    cleanup_result: Option<LocalMediaCleanupResult>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalMediaHeartbeat {
+    completed_file_count: u64,
+    completed_bytes: u64,
+    protected_file_count: u64,
+    protected_bytes: u64,
 }
 
 #[derive(Serialize)]

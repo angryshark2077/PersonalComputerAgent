@@ -69,10 +69,17 @@ impl MacOSWechatProviderFactory {
 
 impl CommunicationProviderFactory for MacOSWechatProviderFactory {
     fn create(&self) -> Result<Box<dyn CommunicationProvider>, DomainError> {
+        require_full_disk_access()?;
         Ok(Box::new(WechatProvider::new(MacOSWechatSource::discover(
             self.local_database.as_deref(),
         )?)))
     }
+}
+
+fn require_full_disk_access() -> Result<(), DomainError> {
+    fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db")
+        .map(|_| ())
+        .map_err(|_| full_disk_access_required())
 }
 
 struct SourcePaths {
@@ -4555,6 +4562,14 @@ fn source_unavailable() -> DomainError {
     DomainError::new(
         "WECHAT_DATABASE_UNAVAILABLE",
         "WeChat source database is unavailable",
+        true,
+    )
+}
+
+fn full_disk_access_required() -> DomainError {
+    DomainError::new(
+        "WECHAT_PERMISSION_REQUIRED",
+        "Full Disk Access is required before reading WeChat data",
         true,
     )
 }

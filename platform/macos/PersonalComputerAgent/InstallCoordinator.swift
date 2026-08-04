@@ -1,4 +1,6 @@
 import BridgeProtocol
+import AppKit
+import CoreLocation
 import Darwin
 import Foundation
 import Security
@@ -30,6 +32,8 @@ enum InstallError: Error, Equatable {
     case relaunchFailed
     case serviceRegistrationFailed
     case credentialProvisioningFailed
+    case fullDiskAccessRequired
+    case locationAccessRequired
     case approvalTimedOut
     case healthCheckFailed
     case uninstallConfirmationRequired
@@ -52,6 +56,8 @@ extension InstallError: LocalizedError {
         case .relaunchFailed: "The installed app could not be opened."
         case .serviceRegistrationFailed: "The background service could not be registered."
         case .credentialProvisioningFailed: "The Bridge credential could not be created in Keychain."
+        case .fullDiskAccessRequired: "Full Disk Access was not granted, so the background Agent was not started."
+        case .locationAccessRequired: "Location access was not granted, so Wi-Fi SSID and BSSID cannot be collected."
         case .approvalTimedOut: "Background-item approval was not completed in time."
         case .healthCheckFailed: "The local runtime did not become healthy."
         case .uninstallConfirmationRequired: "Complete uninstall cancelled because the confirmation token did not match."
@@ -66,6 +72,10 @@ extension InstallError: LocalizedError {
 
     var recoveryAction: String {
         switch self {
+        case .fullDiskAccessRequired:
+            "Open System Settings > Privacy & Security > Full Disk Access, add and enable PersonalComputerAgent, then retry."
+        case .locationAccessRequired:
+            "Open System Settings > Privacy & Security > Location Services, enable PersonalComputerAgent, then retry."
         case .approvalTimedOut, .serviceRegistrationFailed:
             "Open System Settings > General > Login Items and allow Personal Computer Agent, then retry."
         case .keychainDeletionFailed:
@@ -514,6 +524,128 @@ protocol InstallCoordinating: AnyObject {
 }
 
 @MainActor
+protocol FullDiskAccessControlling: AnyObject {
+    func waitForAuthorization(
+        installedBundleURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws
+}
+
+@MainActor
+protocol LocationAccessControlling: AnyObject {
+    func waitForAuthorization(onWaitingForAuthorization: @escaping @MainActor () -> Void) async throws
+}
+
+@MainActor
+final class LocationAccessController: LocationAccessControlling {
+    private let manager = CLLocationManager()
+    private let approvalTimeout: Duration
+    private let pollInterval: Duration
+
+    init(
+        approvalTimeout: Duration = .seconds(300),
+        pollInterval: Duration = .milliseconds(500)
+    ) {
+        self.approvalTimeout = approvalTimeout
+        self.pollInterval = pollInterval
+    }
+
+    func waitForAuthorization(
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        if Self.authorized(manager.authorizationStatus) { return }
+        if manager.authorizationStatus == .denied || manager.authorizationStatus == .restricted {
+            openLocationSettings()
+            throw InstallError.locationAccessRequired
+        }
+        onWaitingForAuthorization()
+        manager.requestWhenInUseAuthorization()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: approvalTimeout)
+        while clock.now < deadline {
+            try Task.checkCancellation()
+            if Self.authorized(manager.authorizationStatus) { return }
+            if manager.authorizationStatus == .denied || manager.authorizationStatus == .restricted {
+                throw InstallError.locationAccessRequired
+            }
+            try await Task.sleep(for: pollInterval)
+        }
+        throw InstallError.locationAccessRequired
+    }
+
+    private static func authorized(_ status: CLAuthorizationStatus) -> Bool {
+        status == .authorizedAlways
+    }
+
+    private func openLocationSettings() {
+        guard let settings = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
+        ) else { return }
+        NSWorkspace.shared.open(settings)
+    }
+}
+
+@MainActor
+final class FullDiskAccessController: FullDiskAccessControlling {
+    private let protectedDatabaseURL: URL
+    private let approvalTimeout: Duration
+    private let pollInterval: Duration
+
+    convenience init(
+        approvalTimeout: Duration = .seconds(300),
+        pollInterval: Duration = .milliseconds(500)
+    ) {
+        self.init(
+            protectedDatabaseURL: URL(
+                fileURLWithPath: "/Library/Application Support/com.apple.TCC/TCC.db"
+            ),
+            approvalTimeout: approvalTimeout,
+            pollInterval: pollInterval
+        )
+    }
+
+    init(protectedDatabaseURL: URL, approvalTimeout: Duration, pollInterval: Duration) {
+        self.protectedDatabaseURL = protectedDatabaseURL
+        self.approvalTimeout = approvalTimeout
+        self.pollInterval = pollInterval
+    }
+
+    func waitForAuthorization(
+        installedBundleURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        guard FileManager.default.fileExists(atPath: installedBundleURL.path) else {
+            throw InstallError.invalidBundle
+        }
+        if canReadProtectedDatabase() { return }
+        onWaitingForAuthorization()
+        openFullDiskAccessSettings()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: approvalTimeout)
+        while clock.now < deadline {
+            try Task.checkCancellation()
+            if canReadProtectedDatabase() { return }
+            try await Task.sleep(for: pollInterval)
+        }
+        throw InstallError.fullDiskAccessRequired
+    }
+
+    private func canReadProtectedDatabase() -> Bool {
+        let descriptor = open(protectedDatabaseURL.path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { return false }
+        close(descriptor)
+        return true
+    }
+
+    private func openFullDiskAccessSettings() {
+        guard let settings = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+        ) else { return }
+        NSWorkspace.shared.open(settings)
+    }
+}
+
+@MainActor
 protocol BridgeCredentialProvisioning {
     func ensureCredential(trustedApplicationURLs: [URL]) throws
     func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws
@@ -570,6 +702,8 @@ final class InstallCoordinator: InstallCoordinating {
     private let service: any ServiceControlling
     private let health: any HealthChecking
     private let relauncher: any Relaunching
+    private let fullDiskAccess: any FullDiskAccessControlling
+    private let locationAccess: any LocationAccessControlling
     private let credentialProvisioner: any BridgeCredentialProvisioning
     private let fileSystem: any InstallFileOperating
 
@@ -579,6 +713,8 @@ final class InstallCoordinator: InstallCoordinating {
         service: any ServiceControlling,
         health: any HealthChecking,
         relauncher: any Relaunching,
+        fullDiskAccess: any FullDiskAccessControlling = FullDiskAccessController(),
+        locationAccess: any LocationAccessControlling = LocationAccessController(),
         credentialProvisioner: any BridgeCredentialProvisioning = KeychainBridgeCredentialProvisioner(),
         fileSystem: any InstallFileOperating = LocalInstallFileSystem()
     ) {
@@ -587,6 +723,8 @@ final class InstallCoordinator: InstallCoordinating {
         self.service = service
         self.health = health
         self.relauncher = relauncher
+        self.fullDiskAccess = fullDiskAccess
+        self.locationAccess = locationAccess
         self.credentialProvisioner = credentialProvisioner
         self.fileSystem = fileSystem
     }
@@ -733,6 +871,13 @@ final class InstallCoordinator: InstallCoordinating {
         }
 
         let installedVersion = try validator.version(at: paths.installedBundleURL)
+        try await fullDiskAccess.waitForAuthorization(
+            installedBundleURL: paths.installedBundleURL,
+            onWaitingForAuthorization: { onState(.waitingFullDiskAccess) }
+        )
+        try await locationAccess.waitForAuthorization {
+            onState(.waitingLocationAccess)
+        }
         do {
             let trustedApplicationURLs = [
                 paths.installedBundleURL,

@@ -20,6 +20,7 @@ use pca_agentd::{
 use pca_bridge_client::supervisor::{
     BridgeSupervisor, BridgeSupervisorConfig, BridgeSupervisorError,
 };
+use pca_bridge_client::NetworkObservationState;
 #[cfg(feature = "process-test-hooks")]
 use pca_db_local::ProcessTestHooks;
 use pca_db_local::{DbActorHandle, PairingState};
@@ -262,6 +263,7 @@ impl RuntimeResources {
             watch::channel(BridgeStatus::Disconnected);
         let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
         let communication_authorization = CommunicationAuthorization::new();
+        let network_observations = Arc::new(NetworkObservationState::default());
         let (control, control_commands) = CloudControlOwner::start(
             Arc::clone(
                 self.database
@@ -276,10 +278,14 @@ impl RuntimeResources {
         let pairing_valid = if cfg!(feature = "process-test-hooks") {
             false
         } else {
-            start_paired_control(Arc::clone(&credential_store), &control_commands)
-                .await
-                .ok()
-                .unwrap_or(false)
+            start_paired_control(
+                Arc::clone(&credential_store),
+                &control_commands,
+                Arc::clone(&network_observations),
+            )
+            .await
+            .ok()
+            .unwrap_or(false)
         };
         self.control = Some(control);
         let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
@@ -287,6 +293,7 @@ impl RuntimeResources {
             config,
             Arc::clone(&credential_store),
             bridge_status_sender.clone(),
+            Arc::clone(&network_observations),
             bridge_shutdown_receiver,
         );
         #[cfg(feature = "process-test-hooks")]
@@ -649,6 +656,7 @@ fn start_bridge(
     config: &RunConfig,
     credential_store: Arc<dyn CredentialStore>,
     statuses: watch::Sender<BridgeStatus>,
+    network_observations: Arc<NetworkObservationState>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), BridgeSupervisorError>>, ()> {
     let bridge_config = BridgeSupervisorConfig::new(
@@ -663,7 +671,12 @@ fn start_bridge(
     } else {
         bridge_config
     };
-    let supervisor = BridgeSupervisor::new(bridge_config, credential_store, statuses);
+    let supervisor = BridgeSupervisor::new_with_network(
+        bridge_config,
+        credential_store,
+        statuses,
+        network_observations,
+    );
     Ok(tokio::spawn(supervisor.run(shutdown)))
 }
 
@@ -717,10 +730,13 @@ async fn start_pairing_server(
 async fn start_paired_control(
     credential_store: Arc<dyn CredentialStore>,
     control_commands: &CloudControlCommands,
+    network_observations: Arc<NetworkObservationState>,
 ) -> Result<bool, FailureStage> {
     let origin =
         Url::parse(PRODUCTION_CLOUD_API_ORIGIN).map_err(|_| FailureStage::ControlConfiguration)?;
-    let client = HttpControlClient::new(origin).map_err(|_| FailureStage::ControlConfiguration)?;
+    let client = HttpControlClient::new(origin)
+        .map_err(|_| FailureStage::ControlConfiguration)?
+        .with_network_observations(network_observations);
     control_commands
         .replace_from_keychain(credential_store, Arc::new(client) as Arc<dyn ControlClient>)
         .await

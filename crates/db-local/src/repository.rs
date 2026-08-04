@@ -1487,6 +1487,76 @@ pub(crate) fn cleanup_completed_communication_attachments(
     Ok(removed)
 }
 
+pub(crate) fn communication_media_storage_stats(
+    connection: &Connection,
+    spool_root: &Path,
+) -> Result<crate::CommunicationMediaStorageStats, DbError> {
+    let directory = rustix::fs::open(
+        spool_root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| DbError::sqlite("open communication spool for statistics", error))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT spool_relative_path,
+                    MIN(CASE
+                        WHEN transfer_state = 'completed' AND completed_at_ms IS NOT NULL
+                        THEN 1 ELSE 0
+                    END) AS completed_only
+             FROM attachment_spool
+             GROUP BY spool_relative_path",
+        )
+        .map_err(|error| DbError::sqlite("prepare communication media statistics", error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
+        .map_err(|error| DbError::sqlite("query communication media statistics", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DbError::sqlite("read communication media statistics", error))?;
+    let mut stats = crate::CommunicationMediaStorageStats::default();
+    for (file_name, completed_only) in rows {
+        validate_spool_file_name(&file_name)?;
+        let file = match rustix::fs::openat(
+            &directory,
+            file_name.as_str(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(file) => File::from(file),
+            Err(error) if error == rustix::io::Errno::NOENT => continue,
+            Err(error) => {
+                return Err(DbError::sqlite(
+                    "open communication media for statistics",
+                    std::io::Error::from(error),
+                ));
+            }
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| DbError::sqlite("inspect communication media statistics", error))?;
+        if !metadata.is_file() {
+            return Err(DbError::sqlite(
+                "inspect communication media statistics",
+                "communication spool entry must be a regular file",
+            ));
+        }
+        if completed_only {
+            stats.completed_file_count = stats.completed_file_count.saturating_add(1);
+            stats.completed_bytes = stats.completed_bytes.saturating_add(metadata.len());
+        } else {
+            stats.protected_file_count = stats.protected_file_count.saturating_add(1);
+            stats.protected_bytes = stats.protected_bytes.saturating_add(metadata.len());
+        }
+    }
+    Ok(stats)
+}
+
 fn remove_communication_spool_file(
     spool_root: &Path,
     file_name: &str,

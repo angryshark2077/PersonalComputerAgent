@@ -53,8 +53,46 @@ final class InstallCoordinatorTests: XCTestCase {
             ]]
         )
         XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.locationAccess.checkCount, 1)
         XCTAssertEqual(fixture.health.checkCount, 1)
         XCTAssertTrue(fixture.relauncher.urls.isEmpty)
+    }
+
+    func testMissingFullDiskAccessStopsBeforeCredentialsServiceAndHealth() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
+        fixture.fullDiskAccess.error = .fullDiskAccessRequired
+        var states: [InstallerState] = []
+
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.coordinator.finishInstalledSetup { states.append($0) }
+        ) { error in
+            XCTAssertEqual(error as? InstallError, .fullDiskAccessRequired)
+        }
+
+        XCTAssertEqual(states, [.waitingFullDiskAccess])
+        XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
+        XCTAssertEqual(fixture.service.registerCount, 0)
+        XCTAssertEqual(fixture.health.checkCount, 0)
+    }
+
+    func testMissingLocationAccessStopsBeforeCredentialsServiceAndHealth() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
+        fixture.locationAccess.error = .locationAccessRequired
+        var states: [InstallerState] = []
+
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.coordinator.finishInstalledSetup { states.append($0) }
+        ) { error in
+            XCTAssertEqual(error as? InstallError, .locationAccessRequired)
+        }
+
+        XCTAssertEqual(states, [.waitingLocationAccess])
+        XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
+        XCTAssertEqual(fixture.locationAccess.checkCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
+        XCTAssertEqual(fixture.service.registerCount, 0)
+        XCTAssertEqual(fixture.health.checkCount, 0)
     }
 
     func testHealthyExistingRuntimeSkipsReregistrationWhenReopeningInstalledSetup() async throws {
@@ -453,6 +491,8 @@ private final class Fixture {
     let service = FakeServiceController()
     let health = FakeHealthChecker()
     let relauncher = FakeRelauncher()
+    let fullDiskAccess = FakeFullDiskAccessController()
+    let locationAccess = FakeLocationAccessController()
     let credentialProvisioner = FakeBridgeCredentialProvisioner()
     let fileSystem: FaultingInstallFileSystem
     let coordinator: InstallCoordinator
@@ -477,6 +517,8 @@ private final class Fixture {
             service: service,
             health: health,
             relauncher: relauncher,
+            fullDiskAccess: fullDiskAccess,
+            locationAccess: locationAccess,
             credentialProvisioner: credentialProvisioner,
             fileSystem: fileSystem
         )
@@ -529,6 +571,39 @@ private final class Fixture {
         )
         try Data(version.utf8).write(to: url.appendingPathComponent("version"))
         try Data("executable".utf8).write(to: url.appendingPathComponent("Contents/MacOS/PersonalComputerAgent"))
+    }
+}
+
+@MainActor
+private final class FakeFullDiskAccessController: FullDiskAccessControlling {
+    var checkCount = 0
+    var error: InstallError?
+
+    func waitForAuthorization(
+        installedBundleURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        checkCount += 1
+        if let error {
+            onWaitingForAuthorization()
+            throw error
+        }
+    }
+}
+
+@MainActor
+private final class FakeLocationAccessController: LocationAccessControlling {
+    var checkCount = 0
+    var error: InstallError?
+
+    func waitForAuthorization(
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        checkCount += 1
+        if let error {
+            onWaitingForAuthorization()
+            throw error
+        }
     }
 }
 

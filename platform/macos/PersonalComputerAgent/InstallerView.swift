@@ -42,6 +42,14 @@ struct InstallerView: View {
             progress("Copying the signed app…")
         case .validating:
             progress("Validating bundle, architecture, and signatures…")
+        case .waitingFullDiskAccess:
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Full Disk Access is required before the Agent can start.", systemImage: "externaldrive.badge.checkmark")
+                Text("In System Settings, add and enable PersonalComputerAgent. Installation continues automatically after access is verified.")
+                    .foregroundStyle(.secondary)
+            }
+        case .waitingLocationAccess:
+            progress("Allow Location access once so Wi-Fi SSID and BSSID remain available after restarts.")
         case .waitingApproval:
             progress("Approve Personal Computer Agent in System Settings > General > Login Items.")
         case .starting:

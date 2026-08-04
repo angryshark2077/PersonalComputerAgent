@@ -172,6 +172,7 @@ actor BridgeServer {
     private let pathValidator: SocketPathValidator
     private let handshakeHandler: HandshakeHandler
     private let credentialProvider: any BridgeCredentialProviding
+    private let networkSource: NetworkObservationSource
     private let handshakeTimeoutMilliseconds: UInt64
     private let credentialTimeoutMilliseconds: UInt64
     private let idleTimeoutMilliseconds: UInt64
@@ -186,6 +187,7 @@ actor BridgeServer {
         pathValidator: SocketPathValidator = SocketPathValidator(),
         handshakeHandler: HandshakeHandler,
         credentialProvider: any BridgeCredentialProviding,
+        networkSource: NetworkObservationSource = NetworkObservationSource(),
         handshakeTimeoutMilliseconds: UInt64 = 1_000,
         credentialTimeoutMilliseconds: UInt64 = 1_000,
         idleTimeoutMilliseconds: UInt64 = 30_000
@@ -194,6 +196,7 @@ actor BridgeServer {
         self.pathValidator = pathValidator
         self.handshakeHandler = handshakeHandler
         self.credentialProvider = credentialProvider
+        self.networkSource = networkSource
         self.handshakeTimeoutMilliseconds = max(handshakeTimeoutMilliseconds, 1)
         self.credentialTimeoutMilliseconds = max(credentialTimeoutMilliseconds, 1)
         self.idleTimeoutMilliseconds = max(idleTimeoutMilliseconds, 1)
@@ -349,7 +352,7 @@ actor BridgeServer {
                 reader: &reader,
                 timeoutMilliseconds: idleTimeoutMilliseconds
             )
-            let response = try CapabilityRequestHandler.respond(to: request)
+            let response = try CapabilityRequestHandler.respond(to: request, networkSource: networkSource)
             try await writeFrame(
                 descriptor,
                 payload: response.payload,
@@ -476,20 +479,33 @@ enum CapabilityRequestHandler {
     private static let envelopeKeys: Set<String> = [
         "protocol_version", "request_id", "message_kind", "capability", "deadline_ms", "payload", "error",
     ]
-    private static let payloadKeys: Set<String> = ["include_permissions"]
+    private static let capabilityPayloadKeys: Set<String> = ["include_permissions"]
+    private static let networkPayloadKeys: Set<String> = ["include_wifi_identity"]
 
     struct Response {
         let payload: Data
         let deadlineMilliseconds: UInt64
     }
 
-    static func respond(to requestJSON: Data) throws -> Response {
+    static func respond(
+        to requestJSON: Data,
+        networkSource: NetworkObservationSource = NetworkObservationSource()
+    ) throws -> Response {
         let object = try StrictJSON.object(requestJSON)
         try StrictJSON.requireOnlyKeys(object, allowed: envelopeKeys)
         guard let payloadObject = object["payload"] as? [String: Any] else {
             throw BridgeServerError.invalidRequest
         }
-        try StrictJSON.requireExactKeys(payloadObject, expected: payloadKeys)
+        guard let capability = object["capability"] as? String else {
+            throw BridgeServerError.invalidRequest
+        }
+        if capability == "system.capabilities" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: capabilityPayloadKeys)
+        } else if capability == "network.observe" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: networkPayloadKeys)
+        } else {
+            throw BridgeServerError.invalidRequest
+        }
 
         let request: StrictCapabilityEnvelope
         do {
@@ -499,12 +515,17 @@ enum CapabilityRequestHandler {
         }
         guard request.protocolVersion == HandshakeHandler.protocolVersion,
               request.messageKind == .request,
-              request.capability == "system.capabilities",
+              request.capability == capability,
               request.deadlineMilliseconds > 0,
               request.deadlineMilliseconds <= UInt64(Int.max),
               request.deadlineMilliseconds <= BridgeWireLimits.maximumDeadlineMilliseconds,
               request.error == nil else {
             throw BridgeServerError.invalidRequest
+        }
+        let responsePayload: [String: JSONValue] = if capability == "network.observe" {
+            networkSource.capture().payload
+        } else {
+            ["screen_capture": .string("available")]
         }
         let response = BridgeEnvelope(
             protocolVersion: Int(HandshakeHandler.protocolVersion),
@@ -512,7 +533,7 @@ enum CapabilityRequestHandler {
             messageKind: .response,
             capability: request.capability,
             deadlineMilliseconds: Int(request.deadlineMilliseconds),
-            payload: ["screen_capture": .string("available")]
+            payload: responsePayload
         )
         return Response(
             payload: try JSONEncoder().encode(response),
@@ -542,9 +563,11 @@ private struct StrictCapabilityEnvelope: Decodable {
 }
 
 private struct StrictCapabilityPayload: Decodable {
-    let includePermissions: Bool
+    let includePermissions: Bool?
+    let includeWifiIdentity: Bool?
 
     private enum CodingKeys: String, CodingKey {
         case includePermissions = "include_permissions"
+        case includeWifiIdentity = "include_wifi_identity"
     }
 }

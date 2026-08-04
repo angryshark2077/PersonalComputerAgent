@@ -15,8 +15,10 @@ import {
   collectorConfigs,
   deviceCredentialGenerations,
   deviceHeartbeats,
+  deviceMediaCleanupRequests,
   devices,
   deviceRevocationAudit,
+  networkLocationLibrary,
   pairingAuthorizationCodes,
   pairingSessions,
   systemEvents,
@@ -105,6 +107,85 @@ export interface HeartbeatInput {
   agentVersion: string;
   presence: "online" | "stale" | "offline" | "sleeping";
   outboxDepth: number;
+  localMedia: LocalMediaStorageStatus;
+  cleanupResult: LocalMediaCleanupResult | null;
+  network: NetworkHeartbeat | null;
+}
+
+export interface NetworkHeartbeat {
+  interfaceType: "wifi" | "wired" | "other" | "none";
+  wifiIdentityAvailable: boolean;
+  ssid: string | null;
+  bssid: string | null;
+  localIpv4: string | null;
+  localIpv6: string | null;
+  publicIp: string | null;
+  ipLocation: IpLocation | null;
+}
+
+export interface IpLocation {
+  country: string | null;
+  region: string | null;
+  city: string | null;
+  accuracy: "ip_city";
+}
+
+export interface NetworkLocationRecord {
+  locationId: string;
+  name: string;
+  matchSsid: string | null;
+  matchBssid: string | null;
+  country: string | null;
+  region: string | null;
+  city: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface NetworkLocationInput {
+  locationId: string;
+  workspaceId: string;
+  actorUserId: string;
+  name: string;
+  matchSsid: string | null;
+  matchBssid: string | null;
+  country: string | null;
+  region: string | null;
+  city: string | null;
+  now: Date;
+}
+
+export interface LocalMediaStorageStatus {
+  completedFileCount: number;
+  completedBytes: number;
+  protectedFileCount: number;
+  protectedBytes: number;
+}
+
+export interface LocalMediaCleanupResult {
+  requestId: string;
+  status: "succeeded" | "failed";
+  deletedFileCount: number;
+  freedBytes: number;
+  errorCode: string | null;
+}
+
+export interface LocalMediaCleanupRequestInput {
+  requestId: string;
+  actorUserId: string;
+  workspaceId: string;
+  deviceId: string;
+  now: Date;
+}
+
+export interface LocalMediaCleanupRecord {
+  requestId: string;
+  status: "queued" | "succeeded" | "failed";
+  requestedAt: Date;
+  completedAt: Date | null;
+  deletedFileCount: number | null;
+  freedBytes: number | null;
+  errorCode: string | null;
 }
 
 export interface ConfigAuditInput {
@@ -138,6 +219,9 @@ export interface DeviceStatus {
   presence: HeartbeatInput["presence"];
   agentVersion: string;
   outboxDepth: number;
+  localMedia: LocalMediaStorageStatus;
+  network: NetworkHeartbeat | null;
+  matchedLocation: NetworkLocationRecord | null;
   observedAt: Date;
 }
 
@@ -153,6 +237,7 @@ export interface OwnerDeviceSummary {
 
 export interface OwnerDeviceDetail extends OwnerDeviceSummary {
   snapshot: AgentControlSnapshot;
+  localMediaCleanup: LocalMediaCleanupRecord | null;
 }
 
 export interface CollectorConfigAuditRecord {
@@ -339,6 +424,15 @@ export interface ControlRepository {
   ): Promise<DeviceCredentialAuthentication>;
   loadControlSnapshot(deviceId: string, workspaceId: string): Promise<AgentControlSnapshot>;
   recordHeartbeat(input: HeartbeatInput): Promise<void>;
+  requestLocalMediaCleanup(input: LocalMediaCleanupRequestInput): Promise<LocalMediaCleanupRecord>;
+  loadLatestOwnerLocalMediaCleanup(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<LocalMediaCleanupRecord | null>;
+  listOwnerNetworkLocations(workspaceId: string, userId: string): Promise<NetworkLocationRecord[]>;
+  createOwnerNetworkLocation(input: NetworkLocationInput): Promise<NetworkLocationRecord>;
+  deleteOwnerNetworkLocation(locationId: string, workspaceId: string, userId: string): Promise<void>;
   appendConfigAudit(input: ConfigAuditInput): Promise<number>;
   revokeDevice(input: DeviceRevocationInput): Promise<void>;
   resolveOwnerWorkspace(userId: string): Promise<string | null>;
@@ -453,6 +547,8 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #revocationAuditIds = new Set<string>();
   readonly #workspaceNames = new Map<string, string>();
   readonly #latestHeartbeats = new Map<string, DeviceStatus>();
+  readonly #mediaCleanupRequests = new Map<string, LocalMediaCleanupRecord & { workspaceId: string; deviceId: string }>();
+  readonly #networkLocations = new Map<string, NetworkLocationRecord & { workspaceId: string }>();
   readonly #configAudit: Array<CollectorConfigAuditRecord & { workspaceId: string; deviceId: string }> = [];
   readonly #systemEvents = new Map<string, SystemEventRecord>();
   readonly #communicationEvents = new Map<string, CommunicationEventRecord>();
@@ -625,7 +721,9 @@ export class MemoryControlRepository implements ControlRepository {
       networkEnabled: false,
       wechatEnabled: false,
     };
-    return snapshot(device, config);
+    const cleanup = [...this.#mediaCleanupRequests.values()]
+      .find((request) => request.workspaceId === workspaceId && request.deviceId === deviceId && request.status === "queued");
+    return snapshot(device, config, cleanup?.requestId ?? null);
   }
 
   async recordHeartbeat(input: HeartbeatInput): Promise<void> {
@@ -634,12 +732,104 @@ export class MemoryControlRepository implements ControlRepository {
       throw new ControlRepositoryError("CONFLICT");
     }
     this.#heartbeatIds.add(input.heartbeatId);
+    if (input.cleanupResult !== null) {
+      const request = this.#mediaCleanupRequests.get(input.cleanupResult.requestId);
+      if (request === undefined || request.workspaceId !== input.workspaceId || request.deviceId !== input.deviceId) {
+        throw new ControlRepositoryError("CONFLICT");
+      }
+      if (request.status === "queued") {
+        request.status = input.cleanupResult.status;
+        request.completedAt = input.receivedAt;
+        request.deletedFileCount = input.cleanupResult.deletedFileCount;
+        request.freedBytes = input.cleanupResult.freedBytes;
+        request.errorCode = input.cleanupResult.errorCode;
+      }
+    }
     this.#latestHeartbeats.set(input.deviceId, {
       presence: input.presence,
       agentVersion: input.agentVersion,
       outboxDepth: input.outboxDepth,
+      localMedia: { ...input.localMedia },
+      network: input.network === null ? null : { ...input.network, ipLocation: input.network.ipLocation === null ? null : { ...input.network.ipLocation } },
+      matchedLocation: null,
       observedAt: input.receivedAt,
     });
+  }
+
+  async listOwnerNetworkLocations(workspaceId: string, userId: string): Promise<NetworkLocationRecord[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    return [...this.#networkLocations.values()]
+      .filter((location) => location.workspaceId === workspaceId)
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map(({ workspaceId: _workspaceId, ...location }) => ({ ...location }));
+  }
+
+  async createOwnerNetworkLocation(input: NetworkLocationInput): Promise<NetworkLocationRecord> {
+    this.#requireOwnerMembership(input.workspaceId, input.actorUserId);
+    if ([...this.#networkLocations.values()].some((location) =>
+      location.workspaceId === input.workspaceId
+      && input.matchBssid !== null
+      && location.matchBssid === input.matchBssid)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    const record = {
+      workspaceId: input.workspaceId,
+      locationId: input.locationId,
+      name: input.name,
+      matchSsid: input.matchSsid,
+      matchBssid: input.matchBssid,
+      country: input.country,
+      region: input.region,
+      city: input.city,
+      createdAt: input.now,
+      updatedAt: input.now,
+    };
+    this.#networkLocations.set(input.locationId, record);
+    const { workspaceId: _workspaceId, ...result } = record;
+    return result;
+  }
+
+  async deleteOwnerNetworkLocation(locationId: string, workspaceId: string, userId: string): Promise<void> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    const location = this.#networkLocations.get(locationId);
+    if (location === undefined || location.workspaceId !== workspaceId) {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    this.#networkLocations.delete(locationId);
+  }
+
+  async requestLocalMediaCleanup(input: LocalMediaCleanupRequestInput): Promise<LocalMediaCleanupRecord> {
+    this.#requireOwnerMembership(input.workspaceId, input.actorUserId);
+    this.#requireDevice(input.deviceId, input.workspaceId, false);
+    if ([...this.#mediaCleanupRequests.values()].some((request) => request.workspaceId === input.workspaceId && request.deviceId === input.deviceId && request.status === "queued")) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    const record: LocalMediaCleanupRecord & { workspaceId: string; deviceId: string } = {
+      requestId: input.requestId,
+      workspaceId: input.workspaceId,
+      deviceId: input.deviceId,
+      status: "queued",
+      requestedAt: input.now,
+      completedAt: null,
+      deletedFileCount: null,
+      freedBytes: null,
+      errorCode: null,
+    };
+    this.#mediaCleanupRequests.set(input.requestId, record);
+    return cleanupRecord(record);
+  }
+
+  async loadLatestOwnerLocalMediaCleanup(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<LocalMediaCleanupRecord | null> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    const latest = [...this.#mediaCleanupRequests.values()]
+      .filter((request) => request.workspaceId === workspaceId && request.deviceId === deviceId)
+      .sort((left, right) => right.requestedAt.getTime() - left.requestedAt.getTime())[0];
+    return latest === undefined ? null : cleanupRecord(latest);
   }
 
   async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
@@ -746,7 +936,11 @@ export class MemoryControlRepository implements ControlRepository {
     this.#requireOwnerMembership(workspaceId, userId);
     const device = this.#requireDevice(deviceId, workspaceId, true);
     const summary = this.#ownerDeviceSummary(device);
-    return { ...summary, snapshot: await this.loadControlSnapshot(deviceId, workspaceId) };
+    return {
+      ...summary,
+      snapshot: await this.loadControlSnapshot(deviceId, workspaceId),
+      localMediaCleanup: await this.loadLatestOwnerLocalMediaCleanup(deviceId, workspaceId, userId),
+    };
   }
 
   async listCollectorConfigAudit(
@@ -1084,6 +1278,14 @@ export class MemoryControlRepository implements ControlRepository {
       networkEnabled: false,
       wechatEnabled: false,
     };
+    const storedStatus = this.#latestHeartbeats.get(device.id) ?? null;
+    const status = storedStatus === null ? null : {
+      ...storedStatus,
+      matchedLocation: matchNetworkLocation(
+        storedStatus.network,
+        [...this.#networkLocations.values()].filter((location) => location.workspaceId === device.workspaceId),
+      ),
+    };
     return {
       deviceId: device.id,
       workspaceId: device.workspaceId,
@@ -1091,7 +1293,7 @@ export class MemoryControlRepository implements ControlRepository {
       pairedAt: device.createdAt,
       revoked: device.revokedAt !== null,
       configurationRevision: config.configurationRevision,
-      status: this.#latestHeartbeats.get(device.id) ?? null,
+      status,
     };
   }
 
@@ -1385,11 +1587,23 @@ export class DrizzleControlRepository implements ControlRepository {
           ),
         )
         .limit(1);
+      const [cleanup] = await this.database
+        .select({ requestId: deviceMediaCleanupRequests.id })
+        .from(deviceMediaCleanupRequests)
+        .where(
+          and(
+            eq(deviceMediaCleanupRequests.workspaceId, workspaceId),
+            eq(deviceMediaCleanupRequests.deviceId, deviceId),
+            eq(deviceMediaCleanupRequests.status, "queued"),
+          ),
+        )
+        .orderBy(desc(deviceMediaCleanupRequests.requestedAt))
+        .limit(1);
       return snapshot(device, {
         configurationRevision: config?.configurationRevision ?? 0,
         networkEnabled: config?.networkEnabled ?? false,
         wechatEnabled: config?.wechatEnabled ?? false,
-      });
+      }, cleanup?.requestId ?? null);
     } catch (error) {
       throw repositoryError(error);
     }
@@ -1398,15 +1612,169 @@ export class DrizzleControlRepository implements ControlRepository {
   async recordHeartbeat(input: HeartbeatInput): Promise<void> {
     try {
       await requireDatabaseDevice(this.database, input.deviceId, input.workspaceId, false);
-      await this.database.insert(deviceHeartbeats).values({
-        id: input.heartbeatId,
-        workspaceId: input.workspaceId,
-        deviceId: input.deviceId,
-        receivedAt: input.receivedAt,
-        agentVersion: input.agentVersion,
-        presence: input.presence,
-        outboxDepth: input.outboxDepth,
+      await this.database.transaction(async (transaction) => {
+        if (input.cleanupResult !== null) {
+          const updated = await transaction
+            .update(deviceMediaCleanupRequests)
+            .set({
+              status: input.cleanupResult.status,
+              completedAt: input.receivedAt,
+              deletedFileCount: input.cleanupResult.deletedFileCount,
+              freedBytes: input.cleanupResult.freedBytes,
+              errorCode: input.cleanupResult.errorCode,
+            })
+            .where(
+              and(
+                eq(deviceMediaCleanupRequests.id, input.cleanupResult.requestId),
+                eq(deviceMediaCleanupRequests.workspaceId, input.workspaceId),
+                eq(deviceMediaCleanupRequests.deviceId, input.deviceId),
+                eq(deviceMediaCleanupRequests.status, "queued"),
+              ),
+            )
+            .returning({ requestId: deviceMediaCleanupRequests.id });
+          if (updated.length !== 1) throw new ControlRepositoryError("CONFLICT");
+        }
+        await transaction.insert(deviceHeartbeats).values({
+          id: input.heartbeatId,
+          workspaceId: input.workspaceId,
+          deviceId: input.deviceId,
+          receivedAt: input.receivedAt,
+          agentVersion: input.agentVersion,
+          presence: input.presence,
+          outboxDepth: input.outboxDepth,
+          completedMediaFileCount: input.localMedia.completedFileCount,
+          completedMediaBytes: input.localMedia.completedBytes,
+          protectedMediaFileCount: input.localMedia.protectedFileCount,
+          protectedMediaBytes: input.localMedia.protectedBytes,
+          networkInterfaceType: input.network?.interfaceType ?? null,
+          networkWifiIdentityAvailable: input.network?.wifiIdentityAvailable ?? null,
+          networkSsid: input.network?.ssid ?? null,
+          networkBssid: input.network?.bssid ?? null,
+          networkLocalIpv4: input.network?.localIpv4 ?? null,
+          networkLocalIpv6: input.network?.localIpv6 ?? null,
+          networkPublicIp: input.network?.publicIp ?? null,
+          networkIpCountry: input.network?.ipLocation?.country ?? null,
+          networkIpRegion: input.network?.ipLocation?.region ?? null,
+          networkIpCity: input.network?.ipLocation?.city ?? null,
+          networkIpAccuracy: input.network?.ipLocation?.accuracy ?? null,
+        });
+        await transaction
+          .update(deviceHeartbeats)
+          .set({
+            networkSsid: null,
+            networkBssid: null,
+            networkLocalIpv4: null,
+            networkLocalIpv6: null,
+            networkPublicIp: null,
+          })
+          .where(lt(
+            deviceHeartbeats.receivedAt,
+            new Date(input.receivedAt.getTime() - 30 * 24 * 60 * 60 * 1000),
+          ));
       });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async requestLocalMediaCleanup(input: LocalMediaCleanupRequestInput): Promise<LocalMediaCleanupRecord> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, input.workspaceId, input.actorUserId);
+      await requireDatabaseDevice(this.database, input.deviceId, input.workspaceId, false);
+      const [created] = await this.database
+        .insert(deviceMediaCleanupRequests)
+        .values({
+          id: input.requestId,
+          workspaceId: input.workspaceId,
+          deviceId: input.deviceId,
+          actorUserId: input.actorUserId,
+          status: "queued",
+          requestedAt: input.now,
+        })
+        .returning();
+      if (created === undefined) throw new ControlRepositoryError("CONFLICT");
+      return cleanupRecordFromRow(created);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async loadLatestOwnerLocalMediaCleanup(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<LocalMediaCleanupRecord | null> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const [row] = await this.database
+        .select()
+        .from(deviceMediaCleanupRequests)
+        .where(
+          and(
+            eq(deviceMediaCleanupRequests.workspaceId, workspaceId),
+            eq(deviceMediaCleanupRequests.deviceId, deviceId),
+          ),
+        )
+        .orderBy(desc(deviceMediaCleanupRequests.requestedAt))
+        .limit(1);
+      return row === undefined ? null : cleanupRecordFromRow(row);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listOwnerNetworkLocations(workspaceId: string, userId: string): Promise<NetworkLocationRecord[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      const rows = await this.database
+        .select()
+        .from(networkLocationLibrary)
+        .where(eq(networkLocationLibrary.workspaceId, workspaceId))
+        .orderBy(networkLocationLibrary.name);
+      return rows.map(networkLocationFromRow);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async createOwnerNetworkLocation(input: NetworkLocationInput): Promise<NetworkLocationRecord> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, input.workspaceId, input.actorUserId);
+      const [row] = await this.database
+        .insert(networkLocationLibrary)
+        .values({
+          id: input.locationId,
+          workspaceId: input.workspaceId,
+          actorUserId: input.actorUserId,
+          name: input.name,
+          matchSsid: input.matchSsid,
+          matchBssid: input.matchBssid,
+          country: input.country,
+          region: input.region,
+          city: input.city,
+          createdAt: input.now,
+          updatedAt: input.now,
+        })
+        .returning();
+      if (row === undefined) throw new ControlRepositoryError("CONFLICT");
+      return networkLocationFromRow(row);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async deleteOwnerNetworkLocation(locationId: string, workspaceId: string, userId: string): Promise<void> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      const deleted = await this.database
+        .delete(networkLocationLibrary)
+        .where(and(
+          eq(networkLocationLibrary.id, locationId),
+          eq(networkLocationLibrary.workspaceId, workspaceId),
+        ))
+        .returning({ id: networkLocationLibrary.id });
+      if (deleted.length !== 1) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
     } catch (error) {
       throw repositoryError(error);
     }
@@ -1625,6 +1993,21 @@ export class DrizzleControlRepository implements ControlRepository {
           presence: deviceHeartbeats.presence,
           agentVersion: deviceHeartbeats.agentVersion,
           outboxDepth: deviceHeartbeats.outboxDepth,
+          completedMediaFileCount: deviceHeartbeats.completedMediaFileCount,
+          completedMediaBytes: deviceHeartbeats.completedMediaBytes,
+          protectedMediaFileCount: deviceHeartbeats.protectedMediaFileCount,
+          protectedMediaBytes: deviceHeartbeats.protectedMediaBytes,
+          networkInterfaceType: deviceHeartbeats.networkInterfaceType,
+          networkWifiIdentityAvailable: deviceHeartbeats.networkWifiIdentityAvailable,
+          networkSsid: deviceHeartbeats.networkSsid,
+          networkBssid: deviceHeartbeats.networkBssid,
+          networkLocalIpv4: deviceHeartbeats.networkLocalIpv4,
+          networkLocalIpv6: deviceHeartbeats.networkLocalIpv6,
+          networkPublicIp: deviceHeartbeats.networkPublicIp,
+          networkIpCountry: deviceHeartbeats.networkIpCountry,
+          networkIpRegion: deviceHeartbeats.networkIpRegion,
+          networkIpCity: deviceHeartbeats.networkIpCity,
+          networkIpAccuracy: deviceHeartbeats.networkIpAccuracy,
           observedAt: deviceHeartbeats.receivedAt,
         })
         .from(deviceHeartbeats)
@@ -1641,6 +2024,29 @@ export class DrizzleControlRepository implements ControlRepository {
         networkEnabled: config?.networkEnabled ?? false,
         wechatEnabled: config?.wechatEnabled ?? false,
       };
+      const network: NetworkHeartbeat | null = heartbeat?.networkInterfaceType === null || heartbeat?.networkInterfaceType === undefined
+        ? null
+        : {
+            interfaceType: heartbeat.networkInterfaceType as NetworkHeartbeat["interfaceType"],
+            wifiIdentityAvailable: heartbeat.networkWifiIdentityAvailable ?? false,
+            ssid: heartbeat.networkSsid,
+            bssid: heartbeat.networkBssid,
+            localIpv4: heartbeat.networkLocalIpv4,
+            localIpv6: heartbeat.networkLocalIpv6,
+            publicIp: heartbeat.networkPublicIp,
+            ipLocation: heartbeat.networkIpAccuracy === "ip_city"
+              ? {
+                  country: heartbeat.networkIpCountry,
+                  region: heartbeat.networkIpRegion,
+                  city: heartbeat.networkIpCity,
+                  accuracy: "ip_city",
+                }
+              : null,
+          };
+      const matchedLocation = matchNetworkLocation(
+        network,
+        await this.listOwnerNetworkLocations(workspaceId, userId),
+      );
       return {
         deviceId: device.id,
         workspaceId: device.workspaceId,
@@ -1655,9 +2061,18 @@ export class DrizzleControlRepository implements ControlRepository {
                 presence: heartbeat.presence as HeartbeatInput["presence"],
                 agentVersion: heartbeat.agentVersion,
                 outboxDepth: heartbeat.outboxDepth,
+                localMedia: {
+                  completedFileCount: heartbeat.completedMediaFileCount,
+                  completedBytes: heartbeat.completedMediaBytes,
+                  protectedFileCount: heartbeat.protectedMediaFileCount,
+                  protectedBytes: heartbeat.protectedMediaBytes,
+                },
+                network,
+                matchedLocation,
                 observedAt: heartbeat.observedAt,
               },
-        snapshot: snapshot(device, configRecord),
+        snapshot: await this.loadControlSnapshot(deviceId, workspaceId),
+        localMediaCleanup: await this.loadLatestOwnerLocalMediaCleanup(deviceId, workspaceId, userId),
       };
     } catch (error) {
       throw repositoryError(error);
@@ -2365,6 +2780,20 @@ function membershipKey(workspaceId: string, userId: string): string {
   return `${workspaceId}:${userId}`;
 }
 
+function matchNetworkLocation(
+  network: NetworkHeartbeat | null,
+  locations: Array<NetworkLocationRecord & { workspaceId?: string }>,
+): NetworkLocationRecord | null {
+  if (network === null) return null;
+  const matched = locations.find((location) =>
+    network.bssid !== null && location.matchBssid === network.bssid)
+    ?? locations.find((location) =>
+      network.ssid !== null && location.matchSsid === network.ssid);
+  if (matched === undefined) return null;
+  const { workspaceId: _workspaceId, ...location } = matched;
+  return location;
+}
+
 function cloneCommunicationMessageProjection(
   message: CommunicationMessageProjection,
 ): CommunicationMessageProjection {
@@ -2428,12 +2857,17 @@ function secureEqual(left: string, right: string): boolean {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
-function snapshot(device: DeviceRecord, config: ConfigRecord): AgentControlSnapshot {
+function snapshot(
+  device: DeviceRecord,
+  config: ConfigRecord,
+  cleanupRequestId: string | null = null,
+): AgentControlSnapshot {
   return {
     device_id: device.id,
     workspace_id: device.workspaceId,
     revoked: device.revokedAt !== null,
     configuration_revision: config.configurationRevision,
+    local_media_cleanup: cleanupRequestId === null ? null : { request_id: cleanupRequestId },
     collectors: {
       network: { enabled: config.networkEnabled },
       "communication.wechat": {
@@ -2446,6 +2880,44 @@ function snapshot(device: DeviceRecord, config: ConfigRecord): AgentControlSnaps
         retention_days: 180,
       },
     },
+  };
+}
+
+function cleanupRecord(record: LocalMediaCleanupRecord): LocalMediaCleanupRecord {
+  return {
+    requestId: record.requestId,
+    status: record.status,
+    requestedAt: new Date(record.requestedAt),
+    completedAt: record.completedAt === null ? null : new Date(record.completedAt),
+    deletedFileCount: record.deletedFileCount,
+    freedBytes: record.freedBytes,
+    errorCode: record.errorCode,
+  };
+}
+
+function cleanupRecordFromRow(row: typeof deviceMediaCleanupRequests.$inferSelect): LocalMediaCleanupRecord {
+  return cleanupRecord({
+    requestId: row.id,
+    status: row.status as LocalMediaCleanupRecord["status"],
+    requestedAt: row.requestedAt,
+    completedAt: row.completedAt,
+    deletedFileCount: row.deletedFileCount,
+    freedBytes: row.freedBytes,
+    errorCode: row.errorCode,
+  });
+}
+
+function networkLocationFromRow(row: typeof networkLocationLibrary.$inferSelect): NetworkLocationRecord {
+  return {
+    locationId: row.id,
+    name: row.name,
+    matchSsid: row.matchSsid,
+    matchBssid: row.matchBssid,
+    country: row.country,
+    region: row.region,
+    city: row.city,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
 

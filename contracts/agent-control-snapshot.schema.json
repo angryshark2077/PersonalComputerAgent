@@ -16,6 +16,17 @@
     "workspace_id": { "type": "string", "minLength": 1 },
     "revoked": { "type": "boolean" },
     "configuration_revision": { "type": "integer", "minimum": 0 },
+    "local_media_cleanup": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["request_id"],
+          "properties": { "request_id": { "type": "string", "format": "uuid" } }
+        },
+        { "type": "null" }
+      ]
+    },
     "collectors": {
       "type": "object",
       "additionalProperties": false,

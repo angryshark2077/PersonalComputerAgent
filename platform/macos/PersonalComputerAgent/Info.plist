@@ -24,5 +24,9 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Personal Computer Agent</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Personal Computer Agent uses the current Wi-Fi name and BSSID to match this Mac to your saved Dashboard locations.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>Personal Computer Agent uses the current Wi-Fi name and BSSID to match this Mac to your saved Dashboard locations.</string>
 </dict>
 </plist>

@@ -91,6 +91,13 @@ test("owner config is scoped, strict, and reaches device control", async () => {
       agent_version: "0.1.0",
       presence: "online",
       outbox_depth: 0,
+      local_media: {
+        completed_file_count: 2,
+        completed_bytes: 1024,
+        protected_file_count: 1,
+        protected_bytes: 512,
+      },
+      cleanup_result: null,
     }),
   });
   assert.equal(control.status, 200);
@@ -145,9 +152,166 @@ test("refresh rotates credentials and a revoked device is rejected", async () =>
       agent_version: "0.1.0",
       presence: "online",
       outbox_depth: 0,
+      local_media: {
+        completed_file_count: 0,
+        completed_bytes: 0,
+        protected_file_count: 0,
+        protected_bytes: 0,
+      },
+      cleanup_result: null,
+      network: null,
     }),
   });
   assert.equal(control.status, 401);
+});
+
+test("Owner queues one completed-media cleanup and the Agent acknowledges it", async () => {
+  const { api, credentials } = await pairedApi();
+  const queued = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/local-media/cleanup`,
+    { method: "POST" },
+  );
+  assert.equal(queued.status, 202);
+  const queuedBody = await queued.json() as { cleanup: { request_id: string; status: string } };
+  assert.equal(queuedBody.cleanup.status, "queued");
+
+  const duplicate = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/local-media/cleanup`,
+    { method: "POST" },
+  );
+  assert.equal(duplicate.status, 409);
+
+  const dispatch = await api.request("/v1/agent/control", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      heartbeat_id: "01985555-7555-8555-8555-555555555557",
+      agent_version: "0.1.70",
+      presence: "online",
+      outbox_depth: 0,
+      local_media: {
+        completed_file_count: 4,
+        completed_bytes: 4096,
+        protected_file_count: 1,
+        protected_bytes: 256,
+      },
+      cleanup_result: null,
+      network: null,
+    }),
+  });
+  assert.equal(dispatch.status, 200);
+  const dispatchBody = await dispatch.json() as { snapshot: { local_media_cleanup: { request_id: string } | null } };
+  assert.equal(dispatchBody.snapshot.local_media_cleanup?.request_id, queuedBody.cleanup.request_id);
+
+  const acknowledgement = await api.request("/v1/agent/control", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      heartbeat_id: "01985555-7555-8555-8555-555555555558",
+      agent_version: "0.1.70",
+      presence: "online",
+      outbox_depth: 0,
+      local_media: {
+        completed_file_count: 0,
+        completed_bytes: 0,
+        protected_file_count: 1,
+        protected_bytes: 256,
+      },
+      cleanup_result: {
+        request_id: queuedBody.cleanup.request_id,
+        status: "succeeded",
+        deleted_file_count: 4,
+        freed_bytes: 4096,
+        error_code: null,
+      },
+      network: null,
+    }),
+  });
+  assert.equal(acknowledgement.status, 200);
+  const acknowledgementBody = await acknowledgement.json() as { snapshot: { local_media_cleanup: null } };
+  assert.equal(acknowledgementBody.snapshot.local_media_cleanup, null);
+
+  const detail = await api.request(`/v1/devices/${credentials.device_id}`);
+  const detailBody = await detail.json() as {
+    status: { local_media: { completed_bytes: number; protected_bytes: number } };
+    local_media_cleanup: { status: string; freed_bytes: number };
+  };
+  assert.equal(detailBody.status.local_media.completed_bytes, 0);
+  assert.equal(detailBody.status.local_media.protected_bytes, 256);
+  assert.equal(detailBody.local_media_cleanup.status, "succeeded");
+  assert.equal(detailBody.local_media_cleanup.freed_bytes, 4096);
+});
+
+test("network heartbeat is IP-enriched and matched against the Owner location library", async () => {
+  const paired = await pairedApi();
+  const api = createApp({
+    repository: paired.repository,
+    ownerAuthenticator: async () => owner,
+    clientAddress: () => "203.0.113.25",
+    geoEnricher: {
+      locate: async (publicIp) => {
+        assert.equal(publicIp, "203.0.113.25");
+        return { country: "SG", region: "Singapore", city: "Singapore", accuracy: "ip_city" };
+      },
+    },
+  });
+  const created = await api.request("/v1/network-locations", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name: "Home",
+      match_ssid: "Jacob WiFi",
+      match_bssid: "aa:bb:cc:dd:ee:ff",
+      country: "SG",
+      region: "Singapore",
+      city: "Singapore",
+    }),
+  });
+  assert.equal(created.status, 201);
+
+  const heartbeat = await api.request("/v1/agent/control", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${paired.credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      heartbeat_id: "01985555-7555-8555-8555-555555555559",
+      agent_version: "0.1.70",
+      presence: "online",
+      outbox_depth: 0,
+      local_media: {
+        completed_file_count: 0,
+        completed_bytes: 0,
+        protected_file_count: 0,
+        protected_bytes: 0,
+      },
+      cleanup_result: null,
+      network: {
+        interface_type: "wifi",
+        wifi_identity_available: true,
+        ssid: "Jacob WiFi",
+        bssid: "AA:BB:CC:DD:EE:FF",
+        local_ipv4: "192.168.71.120",
+        local_ipv6: null,
+      },
+    }),
+  });
+  assert.equal(heartbeat.status, 200);
+
+  const detail = await api.request(`/v1/devices/${paired.credentials.device_id}`);
+  const body = await detail.json() as {
+    status: { network: { public_ip: string; matched_location: { name: string }; ip_location: { city: string } } };
+  };
+  assert.equal(body.status.network.public_ip, "203.0.113.25");
+  assert.equal(body.status.network.matched_location.name, "Home");
+  assert.equal(body.status.network.ip_location.city, "Singapore");
 });
 
 test("Owner reads only its device control state and configuration audit", async () => {
@@ -187,6 +351,14 @@ test("Owner reads only its device control state and configuration audit", async 
           agent_version: "0.1.0",
           presence: "online",
           outbox_depth: 2,
+          local_media: {
+            completed_file_count: 3,
+            completed_bytes: 2048,
+            protected_file_count: 0,
+            protected_bytes: 0,
+          },
+          cleanup_result: null,
+          network: null,
         }),
       })
     ).status,

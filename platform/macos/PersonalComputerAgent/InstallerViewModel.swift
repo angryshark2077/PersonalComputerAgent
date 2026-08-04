@@ -5,6 +5,8 @@ enum InstallerState: Equatable, Sendable {
     case ready
     case copying
     case validating
+    case waitingFullDiskAccess
+    case waitingLocationAccess
     case waitingApproval
     case starting
     case pairing

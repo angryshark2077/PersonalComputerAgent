@@ -9,8 +9,16 @@
     "presence": "online",
     "agent_version": "0.1.0",
     "outbox_depth": 2,
+    "local_media": {
+      "completed_file_count": 4,
+      "completed_bytes": 4096,
+      "protected_file_count": 1,
+      "protected_bytes": 256
+    },
+    "network": null,
     "observed_at": "2026-07-31T10:01:00.000Z"
   },
+  "local_media_cleanup": null,
   "collectors": {
     "network": { "enabled": true },
     "communication.wechat": {

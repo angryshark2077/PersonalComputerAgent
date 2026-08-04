@@ -12,8 +12,8 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    migrations, repository, CommunicationMessageCommit, DbError, DbHealth, PairingState,
-    PendingCommunicationAttachment,
+    migrations, repository, CommunicationMediaStorageStats, CommunicationMessageCommit, DbError,
+    DbHealth, PairingState, PendingCommunicationAttachment,
 };
 
 const REQUEST_CAPACITY: usize = 64;
@@ -190,6 +190,9 @@ enum Request {
         cutoff_ms: i64,
         response: oneshot::Sender<Result<u64, DbError>>,
     },
+    CommunicationMediaStorageStats {
+        response: oneshot::Sender<Result<CommunicationMediaStorageStats, DbError>>,
+    },
 }
 
 impl Request {
@@ -217,6 +220,7 @@ impl Request {
             | Self::CleanupCompletedCommunicationAttachments { response, .. } => {
                 response.is_closed()
             }
+            Self::CommunicationMediaStorageStats { response } => response.is_closed(),
             Self::LoadPendingSystemEvents { response, .. }
             | Self::LoadPendingCommunicationEvents { response, .. } => response.is_closed(),
             Self::LoadPendingCommunicationAttachments { response, .. } => response.is_closed(),
@@ -753,6 +757,22 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Measures physical communication-spool files without counting already-removed history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, query, path-validation, or filesystem inspection error.
+    pub async fn communication_media_storage_stats(
+        &self,
+    ) -> Result<CommunicationMediaStorageStats, DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::CommunicationMediaStorageStats {
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Closes the request queue, waits without blocking the async executor, and joins the owner.
     ///
     /// Requests whose response futures were canceled are skipped before they touch `SQLite`.
@@ -999,6 +1019,12 @@ fn run(
                     &connection,
                     communication_spool_root,
                     cutoff_ms,
+                ));
+            }
+            Request::CommunicationMediaStorageStats { response } => {
+                let _ = response.send(repository::communication_media_storage_stats(
+                    &connection,
+                    communication_spool_root,
                 ));
             }
         }

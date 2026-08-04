@@ -1240,7 +1240,10 @@ fn should_retry(error: &DomainError) -> bool {
     error.retryable
         && matches!(
             error.code.as_str(),
-            "WECHAT_WAITING_SOURCE" | "WECHAT_DATABASE_UNAVAILABLE" | "WECHAT_PROBE_TIMEOUT"
+            "WECHAT_WAITING_SOURCE"
+                | "WECHAT_DATABASE_UNAVAILABLE"
+                | "WECHAT_PROBE_TIMEOUT"
+                | "WECHAT_PERMISSION_REQUIRED"
         )
 }
 
@@ -1838,6 +1841,8 @@ async fn persist_collector_state(
 ) -> Result<(), CommunicationRuntimeError> {
     let status = if !control.active() {
         CollectorStatus::Disabled
+    } else if error.is_some_and(|error| error.code == "WECHAT_PERMISSION_REQUIRED") {
+        CollectorStatus::PermissionRequired
     } else if error.is_some_and(|error| error.code == "WECHAT_CAPABILITY_UNAVAILABLE") {
         CollectorStatus::Unsupported
     } else if error.is_some() {
@@ -1915,7 +1920,12 @@ impl CommunicationProviderFactory for UnavailableCommunicationProviderFactory {
 
 #[cfg(test)]
 mod tests {
-    use super::{stable_communication_event_id, CommunicationIdentity};
+    use super::{
+        persist_collector_state, stable_communication_event_id, CommunicationControl,
+        CommunicationIdentity,
+    };
+    use pca_db_local::DbActorHandle;
+    use pca_domain::{CollectorStatus, DomainError};
     use uuid::Uuid;
 
     #[test]
@@ -1932,5 +1942,44 @@ mod tests {
 
         assert_eq!(first, replay);
         assert_ne!(first, different);
+    }
+
+    #[tokio::test]
+    async fn full_disk_access_error_is_persisted_as_permission_required() {
+        let directory = tempfile::tempdir().expect("create database fixture");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.1.0")
+            .await
+            .expect("open database");
+        let control = CommunicationControl::paired(
+            CommunicationIdentity {
+                workspace_id: Uuid::new_v4(),
+                device_id: Uuid::new_v4(),
+            },
+            1,
+            true,
+        )
+        .expect("valid control");
+        let error = DomainError::new(
+            "WECHAT_PERMISSION_REQUIRED",
+            "Full Disk Access is required",
+            true,
+        );
+
+        persist_collector_state(&database, control, Some(&error))
+            .await
+            .expect("persist permission state");
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("read collector")
+            .into_iter()
+            .find(|state| state.collector_key == "communication.wechat")
+            .expect("collector exists");
+
+        assert_eq!(state.status, CollectorStatus::PermissionRequired);
+        assert_eq!(
+            state.last_error_code.as_deref(),
+            Some("WECHAT_PERMISSION_REQUIRED")
+        );
     }
 }

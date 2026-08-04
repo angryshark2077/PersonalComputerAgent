@@ -20,7 +20,7 @@ use tokio::{
     time::{sleep, Instant},
 };
 
-use crate::{BridgeClient, BridgeClientConfig, BridgeClientError};
+use crate::{BridgeClient, BridgeClientConfig, BridgeClientError, NetworkObservationState};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(250);
@@ -29,6 +29,8 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const CHILD_REAP_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STABLE_READY: Duration = Duration::from_secs(30);
+const NETWORK_OBSERVATION_INTERVAL: Duration = Duration::from_mins(1);
+const NETWORK_ENABLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct BridgeSupervisorConfig {
@@ -126,6 +128,7 @@ pub struct BridgeSupervisor {
     config: BridgeSupervisorConfig,
     credential_store: Arc<dyn CredentialStore>,
     statuses: watch::Sender<BridgeStatus>,
+    network_observations: Arc<NetworkObservationState>,
 }
 
 impl BridgeSupervisor {
@@ -135,10 +138,26 @@ impl BridgeSupervisor {
         credential_store: Arc<dyn CredentialStore>,
         statuses: watch::Sender<BridgeStatus>,
     ) -> Self {
+        Self::new_with_network(
+            config,
+            credential_store,
+            statuses,
+            Arc::new(NetworkObservationState::default()),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_network(
+        config: BridgeSupervisorConfig,
+        credential_store: Arc<dyn CredentialStore>,
+        statuses: watch::Sender<BridgeStatus>,
+        network_observations: Arc<NetworkObservationState>,
+    ) -> Self {
         Self {
             config,
             credential_store,
             statuses,
+            network_observations,
         }
     }
 
@@ -180,7 +199,7 @@ impl BridgeSupervisor {
                 &mut shutdown,
             )
             .await;
-            let client = match connection {
+            let mut client = match connection {
                 ConnectOutcome::Ready(client) => client,
                 ConnectOutcome::Cancelled => {
                     cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
@@ -203,35 +222,35 @@ impl BridgeSupervisor {
 
             status.emit(BridgeStatus::Ready);
             let ready_at = Instant::now();
-            let stable = sleep(self.config.stable_ready);
-            tokio::pin!(stable);
-            let child_exited = tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    let _ = changed;
-                    cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
-                    return Ok(());
-                }
-                result = child.wait() => {
-                    if result.is_err() {
-                        reap_child(&mut child).await;
+            let mut network_timer = tokio::time::interval(NETWORK_ENABLE_POLL_INTERVAL);
+            network_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_network_observation: Option<Instant> = None;
+            let child_exited = loop {
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                        cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
+                        return Ok(());
                     }
-                    true
-                }
-                () = &mut stable => {
-                    backoff.reset();
-                    tokio::select! {
-                        biased;
-                        changed = shutdown.changed() => {
-                            let _ = changed;
-                            cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
-                            return Ok(());
+                    result = child.wait() => {
+                        if result.is_err() {
+                            reap_child(&mut child).await;
                         }
-                        result = child.wait() => {
-                            if result.is_err() {
-                                reap_child(&mut child).await;
+                        break true;
+                    }
+                    _ = network_timer.tick() => {
+                        if !self.network_observations.is_enabled()
+                            || last_network_observation.is_some_and(|last| last.elapsed() < NETWORK_OBSERVATION_INTERVAL)
+                        {
+                            continue;
+                        }
+                        match client.observe_network().await {
+                            Ok(observation) => {
+                                self.network_observations.replace(observation);
+                                last_network_observation = Some(Instant::now());
                             }
-                            true
+                            Err(_) => break false,
                         }
                     }
                 }
@@ -239,9 +258,13 @@ impl BridgeSupervisor {
             drop(client);
             if child_exited {
                 remove_confirmed_socket(self.config.client_config.socket_path())?;
-                if ready_at.elapsed() >= self.config.stable_ready {
-                    backoff.reset();
-                }
+            } else {
+                cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
+            }
+            if ready_at.elapsed() >= self.config.stable_ready {
+                backoff.reset();
+            }
+            if child_exited || !*shutdown.borrow() {
                 status.emit(BridgeStatus::Degraded);
                 if wait_or_cancel(backoff.next_delay(), &mut shutdown).await {
                     return Ok(());

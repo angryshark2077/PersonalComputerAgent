@@ -64,12 +64,71 @@
     "DeviceStatus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["presence", "agent_version", "outbox_depth", "observed_at"],
+      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "observed_at"],
       "properties": {
         "presence": { "enum": ["online", "stale", "offline", "sleeping"] },
         "agent_version": { "type": "string", "minLength": 1 },
         "outbox_depth": { "type": "integer", "minimum": 0 },
+        "local_media": { "$ref": "#/$defs/LocalMedia" },
+        "network": { "anyOf": [{ "$ref": "#/$defs/NetworkStatus" }, { "type": "null" }] },
         "observed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "NetworkStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interface_type", "wifi_identity_available", "ssid", "bssid", "local_ipv4", "local_ipv6", "public_ip", "ip_location", "matched_location"],
+      "properties": {
+        "interface_type": { "enum": ["wifi", "wired", "other", "none"] },
+        "wifi_identity_available": { "type": "boolean" },
+        "ssid": { "type": ["string", "null"] },
+        "bssid": { "type": ["string", "null"] },
+        "local_ipv4": { "type": ["string", "null"] },
+        "local_ipv6": { "type": ["string", "null"] },
+        "public_ip": { "type": ["string", "null"] },
+        "ip_location": { "anyOf": [{ "type": "object", "additionalProperties": false, "required": ["country", "region", "city", "accuracy"], "properties": { "country": { "type": ["string", "null"] }, "region": { "type": ["string", "null"] }, "city": { "type": ["string", "null"] }, "accuracy": { "const": "ip_city" } } }, { "type": "null" }] },
+        "matched_location": { "anyOf": [{ "$ref": "#/$defs/NetworkLocation" }, { "type": "null" }] }
+      }
+    },
+    "NetworkLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["location_id", "name", "match_ssid", "match_bssid", "country", "region", "city", "created_at", "updated_at"],
+      "properties": {
+        "location_id": { "type": "string", "format": "uuid" },
+        "name": { "type": "string", "minLength": 1 },
+        "match_ssid": { "type": ["string", "null"] },
+        "match_bssid": { "type": ["string", "null"] },
+        "country": { "type": ["string", "null"] },
+        "region": { "type": ["string", "null"] },
+        "city": { "type": ["string", "null"] },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "LocalMedia": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["completed_file_count", "completed_bytes", "protected_file_count", "protected_bytes"],
+      "properties": {
+        "completed_file_count": { "type": "integer", "minimum": 0 },
+        "completed_bytes": { "type": "integer", "minimum": 0 },
+        "protected_file_count": { "type": "integer", "minimum": 0 },
+        "protected_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "LocalMediaCleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "status", "requested_at", "completed_at", "deleted_file_count", "freed_bytes", "error_code"],
+      "properties": {
+        "request_id": { "type": "string", "format": "uuid" },
+        "status": { "enum": ["queued", "succeeded", "failed"] },
+        "requested_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": ["string", "null"], "format": "date-time" },
+        "deleted_file_count": { "type": ["integer", "null"], "minimum": 0 },
+        "freed_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "error_code": { "type": ["string", "null"] }
       }
     },
     "DeviceSummary": {
@@ -91,7 +150,7 @@
     "DeviceDetail": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["device_id", "workspace_id", "platform", "paired_at", "revoked", "configuration_revision", "status", "collectors"],
+      "required": ["device_id", "workspace_id", "platform", "paired_at", "revoked", "configuration_revision", "status", "collectors", "local_media_cleanup"],
       "properties": {
         "device_id": { "type": "string", "format": "uuid" },
         "workspace_id": { "type": "string", "format": "uuid" },
@@ -102,7 +161,10 @@
         "status": {
           "anyOf": [{ "$ref": "#/$defs/DeviceStatus" }, { "type": "null" }]
         },
-        "collectors": { "$ref": "#/$defs/CollectorConfig" }
+        "collectors": { "$ref": "#/$defs/CollectorConfig" },
+        "local_media_cleanup": {
+          "anyOf": [{ "$ref": "#/$defs/LocalMediaCleanup" }, { "type": "null" }]
+        }
       }
     },
     "WorkspaceList": {

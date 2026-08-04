@@ -140,7 +140,7 @@ for binary in "$agent" "$bridge" "$wechat_repair" "$ffmpeg" "$main"; do
 done
 
 codesign --force --options runtime --timestamp=none --sign "$identity" "$agent"
-codesign --force --options runtime --timestamp=none --sign "$identity" "$bridge"
+codesign --force --options runtime --timestamp=none --identifier com.pca.PersonalComputerAgent --sign "$identity" "$bridge"
 codesign --force --options runtime --timestamp=none --sign "$identity" "$wechat_repair"
 codesign --force --options runtime --timestamp=none --sign "$identity" "$ffmpeg"
 codesign \

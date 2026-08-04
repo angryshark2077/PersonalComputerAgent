@@ -22,9 +22,47 @@ export interface DashboardDevice {
     presence: "online" | "stale" | "offline" | "sleeping";
     agent_version: string;
     outbox_depth: number;
+    local_media: {
+      completed_file_count: number;
+      completed_bytes: number;
+      protected_file_count: number;
+      protected_bytes: number;
+    };
+    network: {
+      interface_type: "wifi" | "wired" | "other" | "none";
+      wifi_identity_available: boolean;
+      ssid: string | null;
+      bssid: string | null;
+      local_ipv4: string | null;
+      local_ipv6: string | null;
+      public_ip: string | null;
+      ip_location: { country: string | null; region: string | null; city: string | null; accuracy: "ip_city" } | null;
+      matched_location: DashboardNetworkLocation | null;
+    } | null;
     observed_at: string;
   } | null;
+  local_media_cleanup: {
+    request_id: string;
+    status: "queued" | "succeeded" | "failed";
+    requested_at: string;
+    completed_at: string | null;
+    deleted_file_count: number | null;
+    freed_bytes: number | null;
+    error_code: string | null;
+  } | null;
   collectors: CollectorConfig;
+}
+
+export interface DashboardNetworkLocation {
+  location_id: string;
+  name: string;
+  match_ssid: string | null;
+  match_bssid: string | null;
+  country: string | null;
+  region: string | null;
+  city: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface DashboardWorkspace {
@@ -259,6 +297,62 @@ export async function revokeDevice(
 ): Promise<void> {
   const response = await fetcher(apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/revoke`), {
     method: "POST",
+    credentials: "include",
+  });
+  if (response.status !== 204) throw await apiError(response);
+}
+
+export async function requestLocalMediaCleanup(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+): Promise<void> {
+  await jsonRequest(
+    fetcher,
+    apiUrl(
+      cloudApiOrigin,
+      `/v1/devices/${encodeURIComponent(deviceId)}/communication/local-media/cleanup`,
+    ),
+    { method: "POST" },
+  );
+}
+
+export async function getNetworkLocations(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+): Promise<DashboardNetworkLocation[]> {
+  const result = await jsonRequest<{ locations: DashboardNetworkLocation[] }>(
+    fetcher,
+    apiUrl(cloudApiOrigin, "/v1/network-locations"),
+  );
+  return result.locations;
+}
+
+export async function createNetworkLocation(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  input: {
+    name: string;
+    match_ssid: string | null;
+    match_bssid: string | null;
+    country: string | null;
+    region: string | null;
+    city: string | null;
+  },
+): Promise<void> {
+  await jsonRequest(fetcher, apiUrl(cloudApiOrigin, "/v1/network-locations"), {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteNetworkLocation(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  locationId: string,
+): Promise<void> {
+  const response = await fetcher(apiUrl(cloudApiOrigin, `/v1/network-locations/${encodeURIComponent(locationId)}`), {
+    method: "DELETE",
     credentials: "include",
   });
   if (response.status !== 204) throw await apiError(response);

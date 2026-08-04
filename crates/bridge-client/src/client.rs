@@ -1,4 +1,5 @@
 use std::{
+    net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -24,6 +25,7 @@ use crate::{
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const HANDSHAKE_CAPABILITY: &str = "bridge.handshake";
+const NETWORK_OBSERVE_CAPABILITY: &str = "network.observe";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -131,6 +133,17 @@ impl Eq for BridgeClientError {}
 pub struct BridgeClient {
     stream: Option<UnixStream>,
     operation_timeout: Duration,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkObservation {
+    pub interface_type: String,
+    pub wifi_identity_available: bool,
+    pub ssid: Option<String>,
+    pub bssid: Option<String>,
+    pub local_ipv4: Option<String>,
+    pub local_ipv6: Option<String>,
 }
 
 impl std::fmt::Debug for BridgeClient {
@@ -263,6 +276,94 @@ impl BridgeClient {
         self.stream = Some(stream);
         Ok(response)
     }
+
+    /// Requests one current platform network observation without performing geo lookup.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed interface, Wi-Fi identity, or local address fields.
+    pub async fn observe_network(&mut self) -> Result<NetworkObservation, BridgeClientError> {
+        let request = BridgeEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            message_kind: BridgeMessageKind::Request,
+            capability: NETWORK_OBSERVE_CAPABILITY.to_owned(),
+            deadline_ms: duration_millis(self.operation_timeout)?,
+            payload: object_payload(&serde_json::json!({ "include_wifi_identity": true }))?,
+            error: None,
+        };
+        let response = self.request(request).await?;
+        if response.error.is_some() {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        let observation: NetworkObservation =
+            serde_json::from_value(Value::Object(response.payload))
+                .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+        validate_network_observation(&observation)?;
+        Ok(observation)
+    }
+}
+
+fn validate_network_observation(observation: &NetworkObservation) -> Result<(), BridgeClientError> {
+    if !matches!(
+        observation.interface_type.as_str(),
+        "wifi" | "wired" | "other" | "none"
+    ) {
+        return Err(BridgeClientError::InvalidEnvelope);
+    }
+    if observation.interface_type != "wifi"
+        && (observation.ssid.is_some() || observation.bssid.is_some())
+    {
+        return Err(BridgeClientError::InvalidEnvelope);
+    }
+    if observation.wifi_identity_available
+        != (observation.interface_type == "wifi"
+            && observation.ssid.is_some()
+            && observation.bssid.is_some())
+    {
+        return Err(BridgeClientError::InvalidEnvelope);
+    }
+    if observation
+        .ssid
+        .as_ref()
+        .is_some_and(|ssid| ssid.is_empty() || ssid.len() > 128)
+        || observation
+            .bssid
+            .as_ref()
+            .is_some_and(|bssid| !valid_bssid(bssid))
+        || observation.local_ipv4.as_ref().is_some_and(|value| {
+            value
+                .parse::<IpAddr>()
+                .map_or(true, |address| !address.is_ipv4() || !usable_ip(address))
+        })
+        || observation.local_ipv6.as_ref().is_some_and(|value| {
+            value
+                .parse::<IpAddr>()
+                .map_or(true, |address| !address.is_ipv6() || !usable_ip(address))
+        })
+    {
+        return Err(BridgeClientError::InvalidEnvelope);
+    }
+    Ok(())
+}
+
+fn valid_bssid(value: &str) -> bool {
+    value.len() == 17
+        && value.as_bytes().iter().enumerate().all(|(index, byte)| {
+            if index % 3 == 2 {
+                *byte == b':'
+            } else {
+                byte.is_ascii_digit() || (b'A'..=b'F').contains(byte)
+            }
+        })
+}
+
+fn usable_ip(address: IpAddr) -> bool {
+    !address.is_loopback()
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && !matches!(address, IpAddr::V4(value) if value.is_link_local())
+        && !matches!(address, IpAddr::V6(value) if value.is_unicast_link_local())
 }
 
 fn load_secret(store: &dyn CredentialStore) -> Result<[u8; 32], BridgeClientError> {
@@ -427,4 +528,30 @@ struct StrictHandshakeResponse {
     nonce: String,
     proof: String,
     bridge_version: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_network_observation, NetworkObservation};
+
+    #[test]
+    fn network_observation_rejects_spoofed_wifi_and_unusable_addresses() {
+        let valid = NetworkObservation {
+            interface_type: "wifi".to_owned(),
+            wifi_identity_available: true,
+            ssid: Some("Jacob WiFi".to_owned()),
+            bssid: Some("AA:BB:CC:DD:EE:FF".to_owned()),
+            local_ipv4: Some("192.168.71.120".to_owned()),
+            local_ipv6: None,
+        };
+        validate_network_observation(&valid).expect("valid observation");
+
+        let mut invalid = valid.clone();
+        invalid.bssid = Some("aa:bb:cc:dd:ee:ff".to_owned());
+        assert!(validate_network_observation(&invalid).is_err());
+
+        invalid = valid;
+        invalid.local_ipv4 = Some("169.254.1.2".to_owned());
+        assert!(validate_network_observation(&invalid).is_err());
+    }
 }

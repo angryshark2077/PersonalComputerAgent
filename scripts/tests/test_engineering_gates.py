@@ -77,6 +77,8 @@ class EngineeringGateTests(unittest.TestCase):
         self.assertIn("0004_s1b_hash_better_auth_sessions.sql sha256=", result.stdout)
         self.assertIn("0005_s2_system_events.sql sha256=", result.stdout)
         self.assertIn("0013_drop_legacy_communication_kind_checks.sql sha256=", result.stdout)
+        self.assertIn("0014_local_media_management.sql sha256=", result.stdout)
+        self.assertIn("0015_network_locations.sql sha256=", result.stdout)
 
     def test_domain_to_platform_import_is_rejected(self) -> None:
         root = self.make_repo()

@@ -38,7 +38,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationEventSchema(pool);
     await assertCommunicationProjectionSchema(pool);
     await assertCommunicationObjectSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"]);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015"]);
   } finally {
     await pool.end();
     await postgres.stop();

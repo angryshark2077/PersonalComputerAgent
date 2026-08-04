@@ -17,6 +17,15 @@ pub use error::DbError;
 use pca_domain::{CommunicationMessageRecorded, EventEnvelope};
 use std::io::{Seek, SeekFrom};
 
+/// Physical local-media usage grouped by whether every database reference is Cloud-completed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommunicationMediaStorageStats {
+    pub completed_file_count: u64,
+    pub completed_bytes: u64,
+    pub protected_file_count: u64,
+    pub protected_bytes: u64,
+}
+
 /// The initial local database migration.
 pub const BASELINE_MIGRATION: &str = include_str!("../migrations/0000_baseline.sql");
 /// The immutable S1A runtime database migration.
@@ -38,7 +47,7 @@ pub const HARDEN_ATTACHMENT_SPOOL_MIGRATION: &str =
 /// Expands the verified small-group limit while preserving existing communication rows.
 pub const EXPAND_GROUP_LIMIT_MIGRATION: &str =
     include_str!("../migrations/0007_expand_group_limit.sql");
-/// Records verified Cloud completion time for seven-day local media cleanup.
+/// Records verified Cloud completion time for safe manual local media cleanup.
 pub const ATTACHMENT_COMPLETION_RETENTION_MIGRATION: &str =
     include_str!("../migrations/0008_attachment_completion_retention.sql");
 /// Allows different `WeChat` message kinds to use the same conversation-local source sequence.
