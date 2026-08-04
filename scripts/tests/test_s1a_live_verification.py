@@ -26,7 +26,7 @@ class S1ALiveVerificationTests(unittest.TestCase):
         self.data = self.runtime_root / "Data"
         self.run = self.runtime_root / "Run"
         self.agent = self.app / "Contents/Resources/bin/pca-agentd"
-        self.bridge = self.app / "Contents/Resources/bin/PCAPlatformBridge"
+        self.bridge = self.app / "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
         self.wechat_repair = self.app / "Contents/Resources/bin/pca-wechat-repair"
         self.ffmpeg = self.app / "Contents/Resources/bin/ffmpeg"
         self.socket_path = self.run / "bridge.sock"

@@ -80,7 +80,7 @@ class S1APackagingTests(unittest.TestCase):
         )
 
     def test_missing_bridge_is_rejected(self) -> None:
-        (self.app / "Contents/Resources/bin/PCAPlatformBridge").unlink()
+        (self.app / "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge").unlink()
         result = self.run_verify()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("PCAPlatformBridge", result.stdout)
@@ -183,7 +183,7 @@ class S1APackagingTests(unittest.TestCase):
     def test_mismatched_nested_team_identifier_is_rejected(self) -> None:
         env_name = "PCA_SYNTHETIC_WRONG_TEAM_TARGET"
         previous = os.environ.get(env_name)
-        os.environ[env_name] = "PCAPlatformBridge"
+        os.environ[env_name] = "PCAPlatformBridge.app"
         try:
             result = self.run_verify()
         finally:
@@ -197,7 +197,7 @@ class S1APackagingTests(unittest.TestCase):
     def test_missing_bridge_location_entitlement_is_rejected(self) -> None:
         env_name = "PCA_SYNTHETIC_MISSING_LOCATION_ENTITLEMENT"
         previous = os.environ.get(env_name)
-        os.environ[env_name] = "PCAPlatformBridge"
+        os.environ[env_name] = "PCAPlatformBridge.app"
         try:
             result = self.run_verify()
         finally:
@@ -300,12 +300,13 @@ class S1APackagingTests(unittest.TestCase):
     def _make_app(self) -> None:
         executable = self.app / "Contents/MacOS/PersonalComputerAgent"
         agent = self.app / "Contents/Resources/bin/pca-agentd"
-        bridge = self.app / "Contents/Resources/bin/PCAPlatformBridge"
+        bridge = self.app / "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
         wechat_repair = self.app / "Contents/Resources/bin/pca-wechat-repair"
         ffmpeg = self.app / "Contents/Resources/bin/ffmpeg"
         launch_agent = self.app / "Contents/Library/LaunchAgents/com.pca.agentd.plist"
         launch_agent.parent.mkdir(parents=True)
         agent.parent.mkdir(parents=True)
+        bridge.parent.mkdir(parents=True)
         executable.parent.mkdir(parents=True)
         for binary in (executable, agent, bridge, wechat_repair, ffmpeg):
             binary.write_bytes(b"synthetic Mach-O fixture")
@@ -319,6 +320,18 @@ class S1APackagingTests(unittest.TestCase):
                     "CFBundleVersion": "1",
                     "CFBundleExecutable": "PersonalComputerAgent",
                     "LSUIElement": True,
+                    "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
+                },
+                output,
+            )
+        with (self.app / "Contents/Helpers/PCAPlatformBridge.app/Contents/Info.plist").open("wb") as output:
+            plistlib.dump(
+                {
+                    "CFBundleIdentifier": "com.pca.PersonalComputerAgent.PlatformBridge",
+                    "CFBundleShortVersionString": "1.0.0",
+                    "CFBundleExecutable": "PCAPlatformBridge",
+                    "LSUIElement": True,
+                    "NSLocationWhenInUseUsageDescription": "Read Wi-Fi identity for location matching.",
                     "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
                 },
                 output,

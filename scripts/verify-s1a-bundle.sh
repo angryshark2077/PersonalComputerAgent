@@ -71,12 +71,14 @@ esac
 info="$app/Contents/Info.plist"
 main="$app/Contents/MacOS/PersonalComputerAgent"
 agent="$app/Contents/Resources/bin/pca-agentd"
-bridge="$app/Contents/Resources/bin/PCAPlatformBridge"
+bridge_app="$app/Contents/Helpers/PCAPlatformBridge.app"
+bridge="$bridge_app/Contents/MacOS/PCAPlatformBridge"
 wechat_repair="$app/Contents/Resources/bin/pca-wechat-repair"
 ffmpeg="$app/Contents/Resources/bin/ffmpeg"
 launch_agent="$app/Contents/Library/LaunchAgents/com.pca.agentd.plist"
 
 [[ -f "$info" ]] || fail "missing Contents/Info.plist"
+[[ -f "$bridge_app/Contents/Info.plist" ]] || fail "missing Bridge helper Info.plist"
 [[ -f "$launch_agent" ]] || fail "missing com.pca.agentd.plist"
 
 for binary in "$main" "$agent" "$bridge" "$wechat_repair" "$ffmpeg"; do
@@ -93,13 +95,15 @@ plist_mode=$(stat -f '%Lp' "$launch_agent")
 (( (8#$plist_mode & 8#022) == 0 )) || fail "LaunchAgent plist is group/world writable"
 
 [[ "$(plutil -extract CFBundleIdentifier raw -o - "$info")" == "com.pca.PersonalComputerAgent" ]] || fail "wrong bundle identifier"
+[[ "$(plutil -extract CFBundleIdentifier raw -o - "$bridge_app/Contents/Info.plist")" == "com.pca.PersonalComputerAgent.PlatformBridge" ]] || fail "wrong Bridge helper bundle identifier"
+[[ -n "$(plutil -extract NSLocationWhenInUseUsageDescription raw -o - "$bridge_app/Contents/Info.plist")" ]] || fail "missing Bridge helper location usage description"
 [[ -n "$(plutil -extract NSLocationUsageDescription raw -o - "$info")" ]] || fail "missing macOS location usage description"
 [[ "$(plutil -extract CFBundleExecutable raw -o - "$info")" == "PersonalComputerAgent" ]] || fail "wrong bundle executable"
 [[ "$(plutil -extract LSUIElement raw -o - "$info")" == "true" ]] || fail "LSUIElement must be true"
 version=$(plutil -extract CFBundleShortVersionString raw -o - "$info")
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "bundle version must be three numeric components"
 
-for location_target in "$app" "$bridge"; do
+for location_target in "$app" "$bridge_app"; do
   location_entitlements=$(codesign -d --entitlements :- "$location_target" 2>/dev/null) \
     || fail "could not inspect signature location entitlement for $(basename "$location_target")"
   location_allowed=$(python3 -c '
@@ -128,6 +132,12 @@ runtime_directories=$(find "$app" -type d \( -name Data -o -name Run \) -print -
 [[ -z "$runtime_directories" ]] || fail "writable Data or Run directories must not exist inside the bundle"
 
 metadata=()
+codesign --verify --strict --verbose=2 "$bridge_app" >/dev/null 2>&1 \
+  || fail "signature verification failed for $(basename "$bridge_app")"
+bridge_app_signature=$(codesign -d --verbose=4 "$bridge_app" 2>&1) \
+  || fail "could not inspect TeamIdentifier for $(basename "$bridge_app")"
+grep -Fxq "TeamIdentifier=$team_id" <<<"$bridge_app_signature" \
+  || fail "TeamIdentifier mismatch for $(basename "$bridge_app")"
 for signed_target in "$app" "$main" "$agent" "$bridge" "$wechat_repair" "$ffmpeg"; do
   codesign --verify --strict --verbose=2 "$signed_target" >/dev/null 2>&1 \
     || fail "signature verification failed for $(basename "$signed_target")"

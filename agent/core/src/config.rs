@@ -306,7 +306,7 @@ fn bridge_executable(paths: &RuntimePaths, explicit_root: bool) -> Result<PathBu
     if explicit_root {
         Ok(paths
             .app_dir
-            .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge"))
+            .join("PersonalComputerAgent.app/Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"))
     } else {
         production_bridge_executable()
     }
@@ -350,7 +350,11 @@ fn production_bridge_executable() -> Result<PathBuf, String> {
     let parent = executable
         .parent()
         .ok_or_else(|| "cannot resolve agent bundle directory".to_owned())?;
-    Ok(parent.join("PCAPlatformBridge"))
+    let contents = parent
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "cannot resolve agent app Contents directory".to_owned())?;
+    Ok(contents.join("Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"))
 }
 
 #[cfg(feature = "process-test-hooks")]

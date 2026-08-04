@@ -131,7 +131,13 @@ app="$dmg_root/Install Personal Computer Agent.app"
 cp -R "$archived_app" "$app"
 
 agent="$app/Contents/Resources/bin/pca-agentd"
-bridge="$app/Contents/Resources/bin/PCAPlatformBridge"
+legacy_bridge="$app/Contents/Resources/bin/PCAPlatformBridge"
+bridge_app="$app/Contents/Helpers/PCAPlatformBridge.app"
+bridge="$bridge_app/Contents/MacOS/PCAPlatformBridge"
+install -d -m 0755 "$bridge_app/Contents/MacOS"
+mv "$legacy_bridge" "$bridge"
+install -m 0644 "$project_dir/PCAPlatformBridge-Info.plist" "$bridge_app/Contents/Info.plist"
+plutil -replace CFBundleShortVersionString -string "$version" "$bridge_app/Contents/Info.plist"
 wechat_repair="$app/Contents/Resources/bin/pca-wechat-repair"
 ffmpeg="$app/Contents/Resources/bin/ffmpeg"
 main="$app/Contents/MacOS/PersonalComputerAgent"
@@ -144,10 +150,9 @@ codesign \
   --force \
   --options runtime \
   --timestamp=none \
-  --identifier com.pca.PersonalComputerAgent \
   --entitlements "$project_dir/PersonalComputerAgent/PersonalComputerAgent.entitlements" \
   --sign "$identity" \
-  "$bridge"
+  "$bridge_app"
 codesign --force --options runtime --timestamp=none --sign "$identity" "$wechat_repair"
 codesign --force --options runtime --timestamp=none --sign "$identity" "$ffmpeg"
 codesign \

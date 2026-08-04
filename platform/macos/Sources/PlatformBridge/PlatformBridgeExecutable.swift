@@ -1,3 +1,5 @@
+import AppKit
+import CoreLocation
 import Darwin
 import Dispatch
 import Foundation
@@ -24,6 +26,8 @@ private func safeFailure(_ message: String) {
 }
 
 public enum PlatformBridgeExecutable {
+    private static let locationAuthorizationArgument = "--authorize-location"
+
     static func run(
         arguments commandLineArguments: [String],
         signalRuntime: TerminationSignalRuntime
@@ -105,6 +109,13 @@ public enum PlatformBridgeExecutable {
     }
 
     public static func main() -> Never {
+        if CommandLine.arguments == [CommandLine.arguments[0], locationAuthorizationArgument] {
+            Task { @MainActor in
+                exit(await requestLocationAuthorization())
+            }
+            dispatchMain()
+        }
+
         let signalRuntime: TerminationSignalRuntime
         do {
             signalRuntime = try TerminationSignalRuntime.install()
@@ -117,5 +128,32 @@ public enum PlatformBridgeExecutable {
             exit(await run(arguments: CommandLine.arguments, signalRuntime: signalRuntime))
         }
         dispatchMain()
+    }
+
+    @MainActor
+    private static func requestLocationAuthorization() async -> Int32 {
+        let manager = CLLocationManager()
+        if manager.authorizationStatus == .authorizedAlways { return 0 }
+        if manager.authorizationStatus == .denied || manager.authorizationStatus == .restricted { return 2 }
+
+        NSApplication.shared.setActivationPolicy(.accessory)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let clock = ContinuousClock()
+        let activationDeadline = clock.now.advanced(by: .seconds(2))
+        while !NSApplication.shared.isActive, clock.now < activationDeadline {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard NSApplication.shared.isActive else { return 4 }
+        manager.requestWhenInUseAuthorization()
+        manager.startUpdatingLocation()
+        defer { manager.stopUpdatingLocation() }
+
+        let deadline = clock.now.advanced(by: .seconds(300))
+        while clock.now < deadline {
+            if manager.authorizationStatus == .authorizedAlways { return 0 }
+            if manager.authorizationStatus == .denied || manager.authorizationStatus == .restricted { return 2 }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return 3
     }
 }

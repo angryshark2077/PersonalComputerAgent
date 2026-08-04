@@ -54,6 +54,7 @@ final class InstallCoordinatorTests: XCTestCase {
         )
         XCTAssertEqual(fixture.service.registerCount, 1)
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
+        XCTAssertEqual(fixture.locationAccess.helperExecutableURLs, [fixture.paths.installedBridgeExecutableURL])
         XCTAssertEqual(fixture.health.checkCount, 1)
         XCTAssertTrue(fixture.relauncher.urls.isEmpty)
     }
@@ -594,12 +595,15 @@ private final class FakeFullDiskAccessController: FullDiskAccessControlling {
 @MainActor
 private final class FakeLocationAccessController: LocationAccessControlling {
     var checkCount = 0
+    var helperExecutableURLs: [URL] = []
     var error: InstallError?
 
     func waitForAuthorization(
+        helperExecutableURL: URL,
         onWaitingForAuthorization: @escaping @MainActor () -> Void
     ) async throws {
         checkCount += 1
+        helperExecutableURLs.append(helperExecutableURL)
         if let error {
             onWaitingForAuthorization()
             throw error
@@ -1324,12 +1328,15 @@ final class BundleValidatorSigningTests: XCTestCase {
     private func makeValidBundle(at bundle: URL) throws {
         let executable = bundle.appendingPathComponent("Contents/MacOS/PersonalComputerAgent")
         let agent = bundle.appendingPathComponent("Contents/Resources/bin/pca-agentd")
-        let bridge = bundle.appendingPathComponent("Contents/Resources/bin/PCAPlatformBridge")
+        let bridge = bundle.appendingPathComponent(
+            "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
+        )
         let wechatRepair = bundle.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair")
         let ffmpeg = bundle.appendingPathComponent("Contents/Resources/bin/ffmpeg")
         let launchAgent = bundle.appendingPathComponent("Contents/Library/LaunchAgents/com.pca.agentd.plist")
         try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: agent.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: bridge.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: launchAgent.deletingLastPathComponent(), withIntermediateDirectories: true)
         for binary in [executable, agent, bridge, wechatRepair, ffmpeg] {
             try Data("binary".utf8).write(to: binary)
@@ -1342,6 +1349,17 @@ final class BundleValidatorSigningTests: XCTestCase {
             "LSUIElement": true,
         ]
         XCTAssertTrue((info as NSDictionary).write(to: bundle.appendingPathComponent("Contents/Info.plist"), atomically: true))
+        let bridgeInfo: [String: Any] = [
+            "CFBundleIdentifier": "com.pca.PersonalComputerAgent.PlatformBridge",
+            "CFBundleExecutable": "PCAPlatformBridge",
+            "CFBundleShortVersionString": "2.0.0",
+            "LSUIElement": true,
+            "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
+        ]
+        XCTAssertTrue((bridgeInfo as NSDictionary).write(
+            to: bridge.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist"),
+            atomically: true
+        ))
         let plist: [String: Any] = [
             "Label": "com.pca.agentd",
             "BundleProgram": "Contents/Resources/bin/pca-agentd",

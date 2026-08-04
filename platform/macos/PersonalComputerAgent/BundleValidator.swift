@@ -96,7 +96,9 @@ struct BundleValidator: BundleValidating {
 
         let executable = candidate.appendingPathComponent("Contents/MacOS/PersonalComputerAgent")
         let agent = candidate.appendingPathComponent("Contents/Resources/bin/pca-agentd")
-        let bridge = candidate.appendingPathComponent("Contents/Resources/bin/PCAPlatformBridge")
+        let bridge = candidate.appendingPathComponent(
+            "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
+        )
         let wechatRepair = candidate.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair")
         let ffmpeg = candidate.appendingPathComponent("Contents/Resources/bin/ffmpeg")
         let launchAgent = candidate.appendingPathComponent("Contents/Library/LaunchAgents/\(Self.launchAgentName)")

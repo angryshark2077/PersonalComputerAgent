@@ -1,6 +1,5 @@
 import BridgeProtocol
 import AppKit
-import CoreLocation
 import Darwin
 import Foundation
 import Security
@@ -142,7 +141,9 @@ struct InstallPaths: Equatable, Sendable {
     }
 
     var installedBridgeExecutableURL: URL {
-        installedBundleURL.appendingPathComponent("Contents/Resources/bin/PCAPlatformBridge")
+        installedBundleURL.appendingPathComponent(
+            "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
+        )
     }
 
     var installedWechatRepairExecutableURL: URL {
@@ -533,66 +534,43 @@ protocol FullDiskAccessControlling: AnyObject {
 
 @MainActor
 protocol LocationAccessControlling: AnyObject {
-    func waitForAuthorization(onWaitingForAuthorization: @escaping @MainActor () -> Void) async throws
+    func waitForAuthorization(
+        helperExecutableURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws
 }
 
 @MainActor
 final class LocationAccessController: LocationAccessControlling {
-    private let manager = CLLocationManager()
-    private let approvalTimeout: Duration
-    private let pollInterval: Duration
-
-    init(
-        approvalTimeout: Duration = .seconds(300),
-        pollInterval: Duration = .milliseconds(500)
-    ) {
-        self.approvalTimeout = approvalTimeout
-        self.pollInterval = pollInterval
-    }
-
     func waitForAuthorization(
+        helperExecutableURL: URL,
         onWaitingForAuthorization: @escaping @MainActor () -> Void
     ) async throws {
-        if Self.authorized(manager.authorizationStatus) { return }
-        if manager.authorizationStatus == .denied || manager.authorizationStatus == .restricted {
-            openLocationSettings()
-            throw InstallError.locationAccessRequired
+        guard FileManager.default.isExecutableFile(atPath: helperExecutableURL.path) else {
+            throw InstallError.invalidBundle
         }
         onWaitingForAuthorization()
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        let clock = ContinuousClock()
-        let activationDeadline = clock.now.advanced(by: .seconds(2))
-        while !NSApplication.shared.isActive, clock.now < activationDeadline {
-            try Task.checkCancellation()
-            try await Task.sleep(for: .milliseconds(100))
+        try Task.checkCancellation()
+        let process = Process()
+        process.executableURL = helperExecutableURL
+        process.arguments = ["--authorize-location"]
+        let status = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { process in
+                    continuation.resume(returning: process.terminationStatus)
+                }
+                do { try process.run() } catch { continuation.resume(throwing: error) }
+            }
+        } onCancel: {
+            if process.isRunning { process.terminate() }
         }
-        guard NSApplication.shared.isActive else {
+        try Task.checkCancellation()
+        guard status == 0 else {
+            if let settings = URL(
+                string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
+            ) { NSWorkspace.shared.open(settings) }
             throw InstallError.locationAccessRequired
         }
-        manager.requestWhenInUseAuthorization()
-        manager.startUpdatingLocation()
-        defer { manager.stopUpdatingLocation() }
-        let deadline = clock.now.advanced(by: approvalTimeout)
-        while clock.now < deadline {
-            try Task.checkCancellation()
-            if Self.authorized(manager.authorizationStatus) { return }
-            if manager.authorizationStatus == .denied || manager.authorizationStatus == .restricted {
-                throw InstallError.locationAccessRequired
-            }
-            try await Task.sleep(for: pollInterval)
-        }
-        throw InstallError.locationAccessRequired
-    }
-
-    private static func authorized(_ status: CLAuthorizationStatus) -> Bool {
-        status == .authorizedAlways
-    }
-
-    private func openLocationSettings() {
-        guard let settings = URL(
-            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
-        ) else { return }
-        NSWorkspace.shared.open(settings)
     }
 }
 
@@ -886,7 +864,7 @@ final class InstallCoordinator: InstallCoordinating {
             installedBundleURL: paths.installedBundleURL,
             onWaitingForAuthorization: { onState(.waitingFullDiskAccess) }
         )
-        try await locationAccess.waitForAuthorization {
+        try await locationAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
             onState(.waitingLocationAccess)
         }
         do {

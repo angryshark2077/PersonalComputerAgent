@@ -204,7 +204,7 @@ fn wait_for_file_while_running(child: &mut ChildGuard, path: &Path) {
 fn install_fake_bridge(paths: &RuntimePaths) -> String {
     let executable = paths
         .app_dir
-        .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge");
+        .join("PersonalComputerAgent.app/Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge");
     fs::create_dir_all(executable.parent().expect("Bridge executable parent"))
         .expect("create fake Bridge bundle path");
     fs::copy(env!("CARGO_BIN_EXE_pca-test-bridge"), &executable)
@@ -238,7 +238,7 @@ fn child_guard_cleans_recorded_fixture_even_when_agent_already_exited() {
     install_fake_bridge(&paths);
     let executable = paths
         .app_dir
-        .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge");
+        .join("PersonalComputerAgent.app/Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge");
     let mut fake = Command::new(&executable)
         .arg("--socket")
         .arg(&paths.socket_file)
@@ -438,7 +438,7 @@ fn fatal_failure_after_bridge_start_reaps_child_and_shuts_down_database_owner() 
     let canonical_paths = RuntimePaths::under(root.path().canonicalize().expect("canonical root"));
     let bridge_executable = canonical_paths
         .app_dir
-        .join("PersonalComputerAgent.app/Contents/Resources/bin/PCAPlatformBridge");
+        .join("PersonalComputerAgent.app/Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge");
     BridgeSupervisorConfig::new(
         &bridge_executable,
         &canonical_paths.socket_file,
