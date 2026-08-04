@@ -252,6 +252,12 @@ fn read_message_batch(
         read_conversation_metadata(connection, &sessions)
     })
     .map_err(|_| read_stage_error("WECHAT_CONTACT_READ_FAILED"))?;
+    if std::env::var_os("PCA_WECHAT_SPECIAL_SESSION_DIAGNOSTIC").is_some() {
+        with_database(&paths.session_database, &material, |connection| {
+            diagnostic_special_sessions(connection, &conversation_metadata)
+        })
+        .map_err(|_| read_stage_error("WECHAT_SESSION_READ_FAILED"))?;
+    }
     let contact_cards = with_database(&paths.contact_database, &material, read_contact_cards)
         .map_err(|_| read_stage_error("WECHAT_CONTACT_READ_FAILED"))?;
     let cutoff = retention_cutoff();
@@ -3827,6 +3833,49 @@ fn read_sessions(connection: &Connection) -> Result<Vec<Session>, SqlcipherProbe
     sessions
 }
 
+fn diagnostic_special_sessions(
+    connection: &Connection,
+    metadata: &BTreeMap<String, ConversationMetadata>,
+) -> Result<(), SqlcipherProbeFailure> {
+    let mut statement = connection
+        .prepare(
+            "SELECT username, last_msg_type, summary FROM SessionTable \
+             WHERE username <> '' ORDER BY last_timestamp DESC LIMIT 4096",
+        )
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Value>(2)?,
+            ))
+        })
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    for (username, last_msg_type, summary) in rows.flatten() {
+        if !valid_identity(&username) {
+            continue;
+        }
+        let display_name = metadata
+            .get(&username)
+            .map_or(username.as_str(), |value| value.display_name.as_str());
+        let summary = decode_value(&summary).unwrap_or_default();
+        let relevant = matches!(username.as_str(), "notifymessage" | "weixin")
+            || display_name.contains("微信支付")
+            || display_name.contains("服务通知")
+            || summary.contains("微信支付")
+            || summary.contains("服务通知");
+        if relevant {
+            eprintln!(
+                "SPECIAL_SESSION username={username} display_name={display_name} last_msg_type={last_msg_type} summary_payment={} summary_service={}",
+                summary.contains("微信支付"),
+                summary.contains("服务通知")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn read_conversation_metadata(
     connection: &Connection,
     sessions: &[Session],
@@ -4826,7 +4875,10 @@ fn clean_account_directory_name(name: &str) -> Option<String> {
 fn is_message_database(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix("message_"))
+        .and_then(|name| {
+            name.strip_prefix("biz_message_")
+                .or_else(|| name.strip_prefix("message_"))
+        })
         .and_then(|name| name.strip_suffix(".db"))
         .is_some_and(|index| {
             !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
@@ -4856,8 +4908,10 @@ fn is_direct_conversation(username: &str, display_name: &str) -> bool {
         "brandservicesessionholder",
         "notifymessage",
     ];
-    if username.eq_ignore_ascii_case("filehelper")
-        || matches!(display_name.trim(), "微信支付" | "服务通知")
+    if matches!(
+        username.to_ascii_lowercase().as_str(),
+        "filehelper" | "gh_3dfda90e39d6" | "notifymessage"
+    ) || matches!(display_name.trim(), "微信支付" | "服务通知")
     {
         return true;
     }
@@ -5628,6 +5682,7 @@ mod tests {
             Some("wxid_example")
         );
         assert!(is_message_database(Path::new("message_0.db")));
+        assert!(is_message_database(Path::new("biz_message_0.db")));
         assert!(!is_message_database(Path::new("message_fts.db")));
     }
 
@@ -5811,8 +5866,10 @@ mod tests {
     fn production_scope_excludes_system_and_official_sessions() {
         assert!(is_direct_conversation("wxid_friend", "Friend"));
         assert!(is_direct_conversation("filehelper", "文件传输助手"));
+        assert!(is_direct_conversation("gh_3dfda90e39d6", "gh_3dfda90e39d6"));
+        assert!(is_direct_conversation("notifymessage", "notifymessage"));
         assert!(is_direct_conversation("gh_payment", "微信支付"));
-        assert!(is_direct_conversation("notifymessage", "服务通知"));
+        assert!(!is_direct_conversation("weixin", "微信团队"));
         assert!(!is_direct_conversation("gh_official", "公众号"));
         assert!(!is_direct_conversation("service_account", "Service"));
     }

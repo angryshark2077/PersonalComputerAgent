@@ -9,6 +9,7 @@
 mod lldb_capture;
 
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsStr,
     fs::{self, File},
@@ -84,13 +85,39 @@ fn probe_messages() -> Result<(), RepairError> {
     let mut audio = 0;
     let mut video = 0;
     let mut file = 0;
+    let special_diagnostic = env::var_os("PCA_WECHAT_SPECIAL_SESSION_DIAGNOSTIC").is_some();
+    let mut special_counts = BTreeMap::from([
+        ("gh_3dfda90e39d6", [0_usize; 6]),
+        ("notifymessage", [0_usize; 6]),
+    ]);
     for record in &records {
-        match record.message().kind() {
-            MessageKind::Text => text += 1,
-            MessageKind::Image => image += 1,
-            MessageKind::Audio => audio += 1,
-            MessageKind::Video => video += 1,
-            MessageKind::File => file += 1,
+        let kind_index = match record.message().kind() {
+            MessageKind::Text => {
+                text += 1;
+                1
+            }
+            MessageKind::Image => {
+                image += 1;
+                2
+            }
+            MessageKind::Audio => {
+                audio += 1;
+                3
+            }
+            MessageKind::Video => {
+                video += 1;
+                4
+            }
+            MessageKind::File => {
+                file += 1;
+                5
+            }
+        };
+        if special_diagnostic {
+            if let Some(counts) = special_counts.get_mut(record.message().conversation_id()) {
+                counts[0] += 1;
+                counts[kind_index] += 1;
+            }
         }
         if env::var_os("PCA_WECHAT_MEDIA_DIAGNOSTIC").is_some()
             && record.message().kind() != MessageKind::Text
@@ -101,6 +128,14 @@ fn probe_messages() -> Result<(), RepairError> {
                 record.source_sequence(),
                 record.message().kind(),
                 record.completed_media().len()
+            );
+        }
+    }
+    if special_diagnostic {
+        for (conversation, counts) in special_counts {
+            println!(
+                "SPECIAL_RECORDS conversation={conversation} total={} text={} image={} audio={} video={} file={}",
+                counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
             );
         }
     }
