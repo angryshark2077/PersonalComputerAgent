@@ -1,9 +1,17 @@
 import AVFoundation
+import CoreLocation
 import Foundation
 @testable import PlatformBridge
 import XCTest
 
 final class CapabilityProbeTests: XCTestCase {
+    func testWiFiLocationGateAcceptsOnlyTheGrantedMacOSCoreLocationStatus() {
+        XCTAssertTrue(locationAccessGranted(.authorizedAlways))
+        XCTAssertFalse(locationAccessGranted(.notDetermined))
+        XCTAssertFalse(locationAccessGranted(.denied))
+        XCTAssertFalse(locationAccessGranted(.restricted))
+    }
+
     func testEveryRawTCCStatusMapsToCanonicalPermissionStatus() {
         let cases: [(RawPermissionStatus, PermissionStatus)] = [
             (.notDetermined, .notDetermined),

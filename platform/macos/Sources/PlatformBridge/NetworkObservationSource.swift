@@ -5,6 +5,10 @@ import Darwin
 import Foundation
 import Network
 
+func locationAccessGranted(_ status: CLAuthorizationStatus) -> Bool {
+    status == .authorizedAlways
+}
+
 struct NetworkObservation: Equatable, Sendable {
     let interfaceType: String
     let wifiIdentityAvailable: Bool
@@ -48,7 +52,7 @@ final class NetworkObservationSource: @unchecked Sendable {
         let interfaceType = Self.interfaceType(path)
         let interfaceName = Self.interfaceName(path, type: interfaceType)
         let addresses = interfaceName.map(Self.addresses) ?? (nil, nil)
-        let wifi = interfaceType == "wifi" && Self.locationAuthorized(locationManager.authorizationStatus)
+        let wifi = interfaceType == "wifi" && locationAccessGranted(locationManager.authorizationStatus)
             ? CWWiFiClient.shared().interface(withName: interfaceName)
             : nil
         let ssid = wifi?.ssid()?.precomposedStringWithCanonicalMapping
@@ -68,10 +72,6 @@ final class NetworkObservationSource: @unchecked Sendable {
         if path.usesInterfaceType(.wifi) { return "wifi" }
         if path.usesInterfaceType(.wiredEthernet) { return "wired" }
         return "other"
-    }
-
-    private static func locationAuthorized(_ status: CLAuthorizationStatus) -> Bool {
-        status == .authorizedAlways
     }
 
     private static func interfaceName(_ path: NWPath?, type: String) -> String? {
