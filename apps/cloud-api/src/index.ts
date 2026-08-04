@@ -1072,7 +1072,15 @@ export interface ProductionEnvironment {
   RAILWAY_ENVIRONMENT?: string;
 }
 
-export function createProductionApp(environment: ProductionEnvironment = process.env): Hono {
+export interface ProductionRuntime {
+  app: Hono;
+  repository: DrizzleControlRepository;
+  objectStore?: R2ObjectStore;
+}
+
+export function createProductionRuntime(
+  environment: ProductionEnvironment = process.env,
+): ProductionRuntime {
   const connectionString = requiredEnvironment(environment, "DATABASE_URL");
   const secret = requiredEnvironment(environment, "BETTER_AUTH_SECRET");
   const baseURL = requiredEnvironment(environment, "BETTER_AUTH_URL");
@@ -1099,7 +1107,15 @@ export function createProductionApp(environment: ProductionEnvironment = process
     ...(objectStore === undefined ? {} : { objectStore }),
   });
   app.all("/api/auth/*", (context) => auth.handler(context.req.raw));
-  return app;
+  return {
+    app,
+    repository,
+    ...(objectStore === undefined ? {} : { objectStore }),
+  };
+}
+
+export function createProductionApp(environment: ProductionEnvironment = process.env): Hono {
+  return createProductionRuntime(environment).app;
 }
 
 export function createRailwayClientAddress(

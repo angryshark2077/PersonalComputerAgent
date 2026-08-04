@@ -244,6 +244,46 @@ test("heartbeats are append-only and Workspace-scoped", async () => {
   );
 });
 
+test("screenshot retention selects and deletes only expired completed captures", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  const prepare = async (screenshotId: string, capturedAt: Date) => repository.prepareScreenshot(
+    workspaceId,
+    deviceId,
+    {
+      screenshotId,
+      objectKey: `screenshots/${screenshotId}`,
+      requestId: null,
+      trigger: "activity",
+      capturedAt,
+      appBundleId: "com.example.App",
+      pixelWidth: 1920,
+      pixelHeight: 1080,
+      expectedSha256: hash("a"),
+      expectedSizeBytes: 1024,
+      expectedMimeType: "image/jpeg",
+      now: capturedAt,
+    },
+  );
+  const expiredId = "01981111-7111-8111-8111-111111111112";
+  const recentId = "01981111-7111-8111-8111-111111111113";
+  const preparedId = "01981111-7111-8111-8111-111111111114";
+  await prepare(expiredId, new Date("2026-07-20T12:00:00.000Z"));
+  await repository.completeScreenshot(workspaceId, deviceId, expiredId, now);
+  await prepare(recentId, new Date("2026-07-30T12:00:00.000Z"));
+  await repository.completeScreenshot(workspaceId, deviceId, recentId, now);
+  await prepare(preparedId, new Date("2026-07-20T12:00:00.000Z"));
+
+  const cutoff = new Date("2026-07-24T12:00:00.000Z");
+  const expired = await repository.listExpiredCompletedScreenshots(cutoff, 100);
+
+  assert.deepEqual(expired.map((screenshot) => screenshot.screenshotId), [expiredId]);
+  assert.equal(await repository.deleteExpiredCompletedScreenshot(recentId, cutoff), false);
+  assert.equal(await repository.deleteExpiredCompletedScreenshot(expiredId, cutoff), true);
+  assert.equal((await repository.listExpiredCompletedScreenshots(cutoff, 100)).length, 0);
+});
+
 test("pairing authorization and config audit require Owner membership", async () => {
   const repository = new MemoryControlRepository([membership]);
   await repository.createPairingSession({

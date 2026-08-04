@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 
-import { createProductionApp } from "./index.js";
+import { createProductionRuntime } from "./index.js";
+import { startScreenshotRetentionWorker } from "./screenshot-retention.js";
 
 export function parseListenPort(value: string | undefined): number {
   const port = Number(value);
@@ -9,12 +10,17 @@ export function parseListenPort(value: string | undefined): number {
 }
 
 export function startProductionServer(environment = process.env) {
-  const app = createProductionApp(environment);
-  return serve({
-    fetch: app.fetch,
+  const runtime = createProductionRuntime(environment);
+  const server = serve({
+    fetch: runtime.app.fetch,
     hostname: "0.0.0.0",
     port: parseListenPort(environment.PORT),
   });
+  const retention = runtime.objectStore === undefined
+    ? null
+    : startScreenshotRetentionWorker(runtime.repository, runtime.objectStore);
+  server.once("close", () => retention?.stop());
+  return server;
 }
 
 if (process.env.NODE_TEST_CONTEXT === undefined) startProductionServer();

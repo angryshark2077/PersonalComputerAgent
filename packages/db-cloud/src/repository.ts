@@ -534,6 +534,8 @@ export interface ControlRepository {
     deviceId: string,
     screenshotId: string,
   ): Promise<ScreenshotRecord>;
+  listExpiredCompletedScreenshots(capturedBefore: Date, limit: number): Promise<ScreenshotRecord[]>;
+  deleteExpiredCompletedScreenshot(screenshotId: string, capturedBefore: Date): Promise<boolean>;
   listOwnerNetworkLocations(workspaceId: string, userId: string): Promise<NetworkLocationRecord[]>;
   createOwnerNetworkLocation(input: NetworkLocationInput): Promise<NetworkLocationRecord>;
   deleteOwnerNetworkLocation(locationId: string, workspaceId: string, userId: string): Promise<void>;
@@ -1078,6 +1080,28 @@ export class MemoryControlRepository implements ControlRepository {
       throw new ControlRepositoryError("DEVICE_NOT_FOUND");
     }
     return { ...screenshot };
+  }
+
+  async listExpiredCompletedScreenshots(
+    capturedBefore: Date,
+    limit: number,
+  ): Promise<ScreenshotRecord[]> {
+    return [...this.#screenshots.values()]
+      .filter((record) => record.state === "completed" && record.capturedAt < capturedBefore)
+      .sort((left, right) => left.capturedAt.getTime() - right.capturedAt.getTime())
+      .slice(0, limit)
+      .map((record) => ({ ...record }));
+  }
+
+  async deleteExpiredCompletedScreenshot(
+    screenshotId: string,
+    capturedBefore: Date,
+  ): Promise<boolean> {
+    const screenshot = this.#screenshots.get(screenshotId);
+    if (screenshot === undefined
+      || screenshot.state !== "completed"
+      || screenshot.capturedAt >= capturedBefore) return false;
+    return this.#screenshots.delete(screenshotId);
   }
 
   async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
@@ -1805,6 +1829,37 @@ export class DrizzleControlRepository implements ControlRepository {
       )).limit(1);
       if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
       return screenshotFromRow(row);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listExpiredCompletedScreenshots(
+    capturedBefore: Date,
+    limit: number,
+  ): Promise<ScreenshotRecord[]> {
+    try {
+      const rows = await this.database.select().from(deviceScreenshots).where(and(
+        eq(deviceScreenshots.state, "completed"),
+        lt(deviceScreenshots.capturedAt, capturedBefore),
+      )).orderBy(deviceScreenshots.capturedAt).limit(limit);
+      return rows.map(screenshotFromRow);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async deleteExpiredCompletedScreenshot(
+    screenshotId: string,
+    capturedBefore: Date,
+  ): Promise<boolean> {
+    try {
+      const [deleted] = await this.database.delete(deviceScreenshots).where(and(
+        eq(deviceScreenshots.id, screenshotId),
+        eq(deviceScreenshots.state, "completed"),
+        lt(deviceScreenshots.capturedAt, capturedBefore),
+      )).returning({ id: deviceScreenshots.id });
+      return deleted !== undefined;
     } catch (error) {
       throw repositoryError(error);
     }

@@ -57,7 +57,7 @@ export default function ScreenshotsPage() {
       <section className="page-heading">
         <p className="workspace-name">Private R2 media</p>
         <h1>Screenshots</h1>
-        <p>Active-display captures. Read links expire after five minutes.</p>
+        <p>Active-display captures are retained in private R2 for seven days. Read links expire after five minutes.</p>
       </section>
       <button className="primary-button" type="button" disabled={busy} onClick={() => void refresh()}>
         {busy ? "Refreshing…" : "Refresh screenshots"}
