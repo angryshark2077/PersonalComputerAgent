@@ -44,6 +44,7 @@ EXPECTED_MIGRATIONS = {
         "0013_drop_legacy_communication_kind_checks.sql",
         "0014_local_media_management.sql",
         "0015_network_locations.sql",
+        "0016_device_location.sql",
     ],
 }
 

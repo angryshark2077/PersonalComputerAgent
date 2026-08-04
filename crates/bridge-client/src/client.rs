@@ -555,9 +555,7 @@ struct StrictHandshakeResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        validate_network_observation, DeviceLocationObservation, NetworkObservation,
-    };
+    use super::{validate_network_observation, DeviceLocationObservation, NetworkObservation};
 
     #[test]
     fn network_observation_rejects_spoofed_wifi_and_unusable_addresses() {

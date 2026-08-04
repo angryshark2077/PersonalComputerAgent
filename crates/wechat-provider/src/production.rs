@@ -2709,14 +2709,12 @@ fn convert_hevc_to_jpeg(hevc: &[u8]) -> Option<Vec<u8>> {
     let bundled_ffmpeg = env::current_exe()
         .ok()
         .and_then(|executable| executable.parent().map(|parent| parent.join("ffmpeg")));
-    let ffmpeg = bundled_ffmpeg
-        .filter(|path| path.is_file())
-        .or_else(|| {
-            ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-                .into_iter()
-                .map(PathBuf::from)
-                .find(|path| path.is_file())
-        })?;
+    let ffmpeg = bundled_ffmpeg.filter(|path| path.is_file()).or_else(|| {
+        ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+    })?;
     let mut input = tempfile::Builder::new().suffix(".hevc").tempfile().ok()?;
     input.write_all(hevc).ok()?;
     input.flush().ok()?;
