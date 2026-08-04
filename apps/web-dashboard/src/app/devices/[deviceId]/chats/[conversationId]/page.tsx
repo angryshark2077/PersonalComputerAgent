@@ -268,7 +268,8 @@ function MediaSummary({ deviceId, message }: { deviceId: string; message: Dashbo
   }, [imagePreviewOpen]);
   if (attachment === undefined) return <p className="message-attachment">{message.kind} · file unavailable</p>;
   if (message.kind === "image" && mediaUrl !== null) {
-    const likelyThumbnail = attachment.size_bytes < 50 * 1024;
+    const likelyThumbnail = !attachment.attachment_id.endsWith(":full")
+      && attachment.size_bytes < 50 * 1024;
     return (
       <>
         <button
