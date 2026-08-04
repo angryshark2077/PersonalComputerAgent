@@ -25,6 +25,12 @@ export interface HeartbeatRequest {
     bssid: string | null;
     localIpv4: string | null;
     localIpv6: string | null;
+    location: {
+      latitude: number;
+      longitude: number;
+      horizontalAccuracyMeters: number;
+      observedAt: Date;
+    } | null;
   } | null;
 }
 
@@ -72,12 +78,14 @@ function parseNetwork(value: unknown): HeartbeatRequest["network"] | undefined {
     "bssid",
     "local_ipv4",
     "local_ipv6",
+    "location",
   ])) return undefined;
   const interfaceType = value.interface_type;
   const ssid = value.ssid;
   const bssid = value.bssid;
   const localIpv4 = value.local_ipv4;
   const localIpv6 = value.local_ipv6;
+  const location = value.location === undefined ? null : parseDeviceLocation(value.location);
   if (
     !isInterfaceType(interfaceType)
     || typeof value.wifi_identity_available !== "boolean"
@@ -85,6 +93,7 @@ function parseNetwork(value: unknown): HeartbeatRequest["network"] | undefined {
     || !(bssid === null || (typeof bssid === "string" && /^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/.test(bssid)))
     || !(localIpv4 === null || (typeof localIpv4 === "string" && isIP(localIpv4) === 4))
     || !(localIpv6 === null || (typeof localIpv6 === "string" && isIP(localIpv6) === 6))
+    || location === undefined
     || (interfaceType !== "wifi" && (ssid !== null || bssid !== null))
     || value.wifi_identity_available !== (interfaceType === "wifi" && ssid !== null && bssid !== null)
   ) return undefined;
@@ -95,7 +104,31 @@ function parseNetwork(value: unknown): HeartbeatRequest["network"] | undefined {
     bssid,
     localIpv4,
     localIpv6,
+    location,
   };
+}
+
+function parseDeviceLocation(value: unknown): NonNullable<HeartbeatRequest["network"]>["location"] | undefined {
+  if (value === null) return null;
+  if (!isRecord(value) || !hasOnly(value, [
+    "latitude",
+    "longitude",
+    "horizontal_accuracy_meters",
+    "observed_at",
+  ])) return undefined;
+  const latitude = value.latitude;
+  const longitude = value.longitude;
+  const horizontalAccuracyMeters = value.horizontal_accuracy_meters;
+  const observedAt = value.observed_at;
+  if (
+    typeof latitude !== "number" || !Number.isFinite(latitude) || latitude < -90 || latitude > 90
+    || typeof longitude !== "number" || !Number.isFinite(longitude) || longitude < -180 || longitude > 180
+    || typeof horizontalAccuracyMeters !== "number" || !Number.isFinite(horizontalAccuracyMeters)
+    || horizontalAccuracyMeters < 0 || horizontalAccuracyMeters > 100_000
+    || typeof observedAt !== "string" || observedAt.length === 0 || observedAt.length > 64
+    || Number.isNaN(Date.parse(observedAt))
+  ) return undefined;
+  return { latitude, longitude, horizontalAccuracyMeters, observedAt: new Date(observedAt) };
 }
 
 function parseLocalMedia(value: unknown): HeartbeatRequest["localMedia"] | null {

@@ -135,7 +135,7 @@ pub struct BridgeClient {
     operation_timeout: Duration,
 }
 
-#[derive(Clone, Debug, Deserialize, serde::Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkObservation {
     pub interface_type: String,
@@ -144,6 +144,16 @@ pub struct NetworkObservation {
     pub bssid: Option<String>,
     pub local_ipv4: Option<String>,
     pub local_ipv6: Option<String>,
+    pub location: Option<DeviceLocationObservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceLocationObservation {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub horizontal_accuracy_meters: f64,
+    pub observed_at: String,
 }
 
 impl std::fmt::Debug for BridgeClient {
@@ -341,6 +351,19 @@ fn validate_network_observation(observation: &NetworkObservation) -> Result<(), 
                 .parse::<IpAddr>()
                 .map_or(true, |address| !address.is_ipv6() || !usable_ip(address))
         })
+        || observation.location.as_ref().is_some_and(|location| {
+            !location.latitude.is_finite()
+                || !(-90.0..=90.0).contains(&location.latitude)
+                || !location.longitude.is_finite()
+                || !(-180.0..=180.0).contains(&location.longitude)
+                || !location.horizontal_accuracy_meters.is_finite()
+                || !(0.0..=100_000.0).contains(&location.horizontal_accuracy_meters)
+                || time::OffsetDateTime::parse(
+                    &location.observed_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .is_err()
+        })
     {
         return Err(BridgeClientError::InvalidEnvelope);
     }
@@ -532,7 +555,9 @@ struct StrictHandshakeResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_network_observation, NetworkObservation};
+    use super::{
+        validate_network_observation, DeviceLocationObservation, NetworkObservation,
+    };
 
     #[test]
     fn network_observation_rejects_spoofed_wifi_and_unusable_addresses() {
@@ -543,6 +568,12 @@ mod tests {
             bssid: Some("AA:BB:CC:DD:EE:FF".to_owned()),
             local_ipv4: Some("192.168.71.120".to_owned()),
             local_ipv6: None,
+            location: Some(DeviceLocationObservation {
+                latitude: 1.352_083,
+                longitude: 103.819_836,
+                horizontal_accuracy_meters: 24.5,
+                observed_at: "2026-08-04T09:00:00Z".to_owned(),
+            }),
         };
         validate_network_observation(&valid).expect("valid observation");
 
@@ -550,8 +581,20 @@ mod tests {
         invalid.bssid = Some("aa:bb:cc:dd:ee:ff".to_owned());
         assert!(validate_network_observation(&invalid).is_err());
 
-        invalid = valid;
+        invalid = valid.clone();
         invalid.local_ipv4 = Some("169.254.1.2".to_owned());
+        assert!(validate_network_observation(&invalid).is_err());
+
+        invalid = NetworkObservation {
+            local_ipv4: Some("192.168.71.120".to_owned()),
+            location: Some(DeviceLocationObservation {
+                latitude: 91.0,
+                longitude: 103.819_836,
+                horizontal_accuracy_meters: 24.5,
+                observed_at: "2026-08-04T09:00:00Z".to_owned(),
+            }),
+            ..valid
+        };
         assert!(validate_network_observation(&invalid).is_err());
     }
 }

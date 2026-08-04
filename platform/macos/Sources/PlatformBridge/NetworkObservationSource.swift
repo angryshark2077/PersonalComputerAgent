@@ -16,6 +16,7 @@ struct NetworkObservation: Equatable, Sendable {
     let bssid: String?
     let localIPv4: String?
     let localIPv6: String?
+    let location: DeviceLocationObservation?
 
     var payload: [String: JSONValue] {
         [
@@ -25,13 +26,122 @@ struct NetworkObservation: Equatable, Sendable {
             "bssid": bssid.map(JSONValue.string) ?? .null,
             "local_ipv4": localIPv4.map(JSONValue.string) ?? .null,
             "local_ipv6": localIPv6.map(JSONValue.string) ?? .null,
+            "location": location?.payload ?? .null,
         ]
+    }
+}
+
+struct DeviceLocationObservation: Equatable, Sendable {
+    let latitude: Double
+    let longitude: Double
+    let horizontalAccuracyMeters: Double
+    let observedAt: String
+
+    var payload: JSONValue {
+        .object([
+            "latitude": .number(latitude),
+            "longitude": .number(longitude),
+            "horizontal_accuracy_meters": .number(horizontalAccuracyMeters),
+            "observed_at": .string(observedAt),
+        ])
+    }
+}
+
+final class DeviceLocationSource: NSObject, CLLocationManagerDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var manager: CLLocationManager?
+    private var latest: DeviceLocationObservation?
+    private var latestObservedAt: Date?
+    private var requestInFlight = false
+    private var lastRequestAt: Date?
+
+    override init() {
+        super.init()
+        Task { @MainActor [weak self] in
+            self?.start()
+        }
+    }
+
+    func current() -> DeviceLocationObservation? {
+        refreshIfNeeded()
+        return lock.withLock {
+            guard let latestObservedAt,
+                  Date().timeIntervalSince(latestObservedAt) <= 600 else { return nil }
+            return latest
+        }
+    }
+
+    @MainActor
+    private func start() {
+        let manager = CLLocationManager()
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+        self.manager = manager
+        manager.delegate = self
+    }
+
+    private func refreshIfNeeded() {
+        let shouldRequest = lock.withLock {
+            !requestInFlight && (lastRequestAt.map { Date().timeIntervalSince($0) >= 300 } ?? true)
+        }
+        guard shouldRequest else { return }
+        Task { @MainActor [weak self] in
+            self?.requestLocationIfAuthorized()
+        }
+    }
+
+    @MainActor
+    private func requestLocationIfAuthorized() {
+        guard let manager,
+              locationAccessGranted(manager.authorizationStatus) else { return }
+        let shouldRequest = lock.withLock {
+            guard !requestInFlight else { return false }
+            requestInFlight = true
+            lastRequestAt = Date()
+            return true
+        }
+        if shouldRequest { manager.requestLocation() }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        let location = locations
+            .filter { $0.horizontalAccuracy >= 0 }
+            .max(by: { $0.timestamp < $1.timestamp })
+        let observation = location.map {
+            DeviceLocationObservation(
+                latitude: $0.coordinate.latitude,
+                longitude: $0.coordinate.longitude,
+                horizontalAccuracyMeters: $0.horizontalAccuracy,
+                observedAt: $0.timestamp.ISO8601Format()
+            )
+        }
+        lock.withLock {
+            if let observation, let location {
+                latest = observation
+                latestObservedAt = location.timestamp
+            }
+            requestInFlight = false
+        }
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        if !locationAccessGranted(manager.authorizationStatus) {
+            lock.withLock {
+                latest = nil
+                latestObservedAt = nil
+                requestInFlight = false
+            }
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        lock.withLock { requestInFlight = false }
     }
 }
 
 final class NetworkObservationSource: @unchecked Sendable {
     private let monitor = NWPathMonitor()
     private let locationManager = CLLocationManager()
+    private let deviceLocationSource = DeviceLocationSource()
     private let queue = DispatchQueue(label: "com.pca.platform-bridge.network")
     private let lock = NSLock()
     private var latestPath: NWPath?
@@ -63,7 +173,8 @@ final class NetworkObservationSource: @unchecked Sendable {
             ssid: ssid,
             bssid: bssid,
             localIPv4: addresses.0,
-            localIPv6: addresses.1
+            localIPv6: addresses.1,
+            location: deviceLocationSource.current()
         )
     }
 

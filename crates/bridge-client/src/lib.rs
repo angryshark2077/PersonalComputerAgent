@@ -11,7 +11,8 @@ pub mod framing;
 pub mod supervisor;
 
 pub use client::{
-    BridgeClient, BridgeClientConfig, BridgeClientError, NetworkObservation, PROTOCOL_VERSION,
+    BridgeClient, BridgeClientConfig, BridgeClientError, DeviceLocationObservation,
+    NetworkObservation, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Default)]
@@ -64,6 +65,7 @@ mod tests {
             bssid: None,
             local_ipv4: Some("192.168.1.5".to_owned()),
             local_ipv6: None,
+            location: None,
         });
         assert!(state.current_if_enabled().is_none());
         state.set_enabled(true);

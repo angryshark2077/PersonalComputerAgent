@@ -199,17 +199,17 @@ export function createApp(options: CreateAppOptions): Hono {
     }
     const now = new Date();
     try {
-      const publicIp = heartbeat.network === null
+      const observedExitIp = heartbeat.network === null
         ? null
         : options.clientAddress?.(context.req.raw) ?? null;
-      const ipLocation = publicIp === null || options.geoEnricher === undefined
+      const ipLocation = observedExitIp === null || options.geoEnricher === undefined
         ? null
-        : await options.geoEnricher.locate(publicIp).catch(() => null);
+        : await options.geoEnricher.locate(observedExitIp).catch(() => null);
       await options.repository.recordHeartbeat({
         ...heartbeat,
         network: heartbeat.network === null ? null : {
           ...heartbeat.network,
-          publicIp,
+          observedExitIp,
           ipLocation,
         },
         workspaceId: device.workspaceId,
@@ -1028,8 +1028,14 @@ function ownerDeviceSummaryResponse(device: {
       bssid: string | null;
       localIpv4: string | null;
       localIpv6: string | null;
-      publicIp: string | null;
+      observedExitIp: string | null;
       ipLocation: { country: string | null; region: string | null; city: string | null; accuracy: string } | null;
+      location: {
+        latitude: number;
+        longitude: number;
+        horizontalAccuracyMeters: number;
+        observedAt: Date;
+      } | null;
     } | null;
     matchedLocation: {
       locationId: string;
@@ -1072,8 +1078,14 @@ function ownerDeviceSummaryResponse(device: {
               bssid: device.status.network.bssid,
               local_ipv4: device.status.network.localIpv4,
               local_ipv6: device.status.network.localIpv6,
-              public_ip: device.status.network.publicIp,
-              ip_location: device.status.network.ipLocation,
+              observed_exit_ip: device.status.network.observedExitIp,
+              exit_ip_location: device.status.network.ipLocation,
+              device_location: device.status.network.location === null ? null : {
+                latitude: device.status.network.location.latitude,
+                longitude: device.status.network.location.longitude,
+                horizontal_accuracy_meters: device.status.network.location.horizontalAccuracyMeters,
+                observed_at: device.status.network.location.observedAt.toISOString(),
+              },
               matched_location: device.status.matchedLocation === null
                 ? null
                 : networkLocationResponse(device.status.matchedLocation),

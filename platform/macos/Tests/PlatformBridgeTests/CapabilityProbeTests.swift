@@ -1,10 +1,27 @@
 import AVFoundation
+import BridgeProtocol
 import CoreLocation
 import Foundation
 @testable import PlatformBridge
 import XCTest
 
 final class CapabilityProbeTests: XCTestCase {
+    func testDeviceLocationObservationUsesStrictCoordinatePayload() {
+        let observation = DeviceLocationObservation(
+            latitude: 1.352083,
+            longitude: 103.819836,
+            horizontalAccuracyMeters: 24.5,
+            observedAt: "2026-08-04T09:00:00Z"
+        )
+
+        XCTAssertEqual(observation.payload, .object([
+            "latitude": .number(1.352083),
+            "longitude": .number(103.819836),
+            "horizontal_accuracy_meters": .number(24.5),
+            "observed_at": .string("2026-08-04T09:00:00Z"),
+        ]))
+    }
+
     func testWiFiLocationGateAcceptsOnlyTheGrantedMacOSCoreLocationStatus() {
         XCTAssertTrue(locationAccessGranted(.authorizedAlways))
         XCTAssertFalse(locationAccessGranted(.notDetermined))

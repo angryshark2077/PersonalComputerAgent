@@ -77,7 +77,7 @@
     "NetworkStatus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["interface_type", "wifi_identity_available", "ssid", "bssid", "local_ipv4", "local_ipv6", "public_ip", "ip_location", "matched_location"],
+      "required": ["interface_type", "wifi_identity_available", "ssid", "bssid", "local_ipv4", "local_ipv6", "observed_exit_ip", "exit_ip_location", "device_location", "matched_location"],
       "properties": {
         "interface_type": { "enum": ["wifi", "wired", "other", "none"] },
         "wifi_identity_available": { "type": "boolean" },
@@ -85,8 +85,8 @@
         "bssid": { "type": ["string", "null"] },
         "local_ipv4": { "type": ["string", "null"] },
         "local_ipv6": { "type": ["string", "null"] },
-        "public_ip": { "type": ["string", "null"] },
-        "ip_location": {
+        "observed_exit_ip": { "type": ["string", "null"] },
+        "exit_ip_location": {
           "anyOf": [
             {
               "type": "object",
@@ -97,6 +97,22 @@
                 "region": { "type": ["string", "null"] },
                 "city": { "type": ["string", "null"] },
                 "accuracy": { "const": "ip_city" }
+              }
+            },
+            { "type": "null" }
+          ]
+        },
+        "device_location": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["latitude", "longitude", "horizontal_accuracy_meters", "observed_at"],
+              "properties": {
+                "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+                "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+                "horizontal_accuracy_meters": { "type": "number", "minimum": 0, "maximum": 100000 },
+                "observed_at": { "type": "string", "format": "date-time" }
               }
             },
             { "type": "null" }

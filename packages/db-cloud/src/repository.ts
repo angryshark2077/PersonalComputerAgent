@@ -119,8 +119,16 @@ export interface NetworkHeartbeat {
   bssid: string | null;
   localIpv4: string | null;
   localIpv6: string | null;
-  publicIp: string | null;
+  observedExitIp: string | null;
   ipLocation: IpLocation | null;
+  location: DeviceLocation | null;
+}
+
+export interface DeviceLocation {
+  latitude: number;
+  longitude: number;
+  horizontalAccuracyMeters: number;
+  observedAt: Date;
 }
 
 export interface IpLocation {
@@ -750,7 +758,11 @@ export class MemoryControlRepository implements ControlRepository {
       agentVersion: input.agentVersion,
       outboxDepth: input.outboxDepth,
       localMedia: { ...input.localMedia },
-      network: input.network === null ? null : { ...input.network, ipLocation: input.network.ipLocation === null ? null : { ...input.network.ipLocation } },
+      network: input.network === null ? null : {
+        ...input.network,
+        ipLocation: input.network.ipLocation === null ? null : { ...input.network.ipLocation },
+        location: input.network.location === null ? null : { ...input.network.location },
+      },
       matchedLocation: null,
       observedAt: input.receivedAt,
     });
@@ -1652,11 +1664,15 @@ export class DrizzleControlRepository implements ControlRepository {
           networkBssid: input.network?.bssid ?? null,
           networkLocalIpv4: input.network?.localIpv4 ?? null,
           networkLocalIpv6: input.network?.localIpv6 ?? null,
-          networkPublicIp: input.network?.publicIp ?? null,
+          networkPublicIp: input.network?.observedExitIp ?? null,
           networkIpCountry: input.network?.ipLocation?.country ?? null,
           networkIpRegion: input.network?.ipLocation?.region ?? null,
           networkIpCity: input.network?.ipLocation?.city ?? null,
           networkIpAccuracy: input.network?.ipLocation?.accuracy ?? null,
+          networkLocationLatitude: input.network?.location?.latitude ?? null,
+          networkLocationLongitude: input.network?.location?.longitude ?? null,
+          networkLocationHorizontalAccuracyMeters: input.network?.location?.horizontalAccuracyMeters ?? null,
+          networkLocationObservedAt: input.network?.location?.observedAt ?? null,
         });
         await transaction
           .update(deviceHeartbeats)
@@ -1666,6 +1682,10 @@ export class DrizzleControlRepository implements ControlRepository {
             networkLocalIpv4: null,
             networkLocalIpv6: null,
             networkPublicIp: null,
+            networkLocationLatitude: null,
+            networkLocationLongitude: null,
+            networkLocationHorizontalAccuracyMeters: null,
+            networkLocationObservedAt: null,
           })
           .where(lt(
             deviceHeartbeats.receivedAt,
@@ -2008,6 +2028,10 @@ export class DrizzleControlRepository implements ControlRepository {
           networkIpRegion: deviceHeartbeats.networkIpRegion,
           networkIpCity: deviceHeartbeats.networkIpCity,
           networkIpAccuracy: deviceHeartbeats.networkIpAccuracy,
+          networkLocationLatitude: deviceHeartbeats.networkLocationLatitude,
+          networkLocationLongitude: deviceHeartbeats.networkLocationLongitude,
+          networkLocationHorizontalAccuracyMeters: deviceHeartbeats.networkLocationHorizontalAccuracyMeters,
+          networkLocationObservedAt: deviceHeartbeats.networkLocationObservedAt,
           observedAt: deviceHeartbeats.receivedAt,
         })
         .from(deviceHeartbeats)
@@ -2033,7 +2057,7 @@ export class DrizzleControlRepository implements ControlRepository {
             bssid: heartbeat.networkBssid,
             localIpv4: heartbeat.networkLocalIpv4,
             localIpv6: heartbeat.networkLocalIpv6,
-            publicIp: heartbeat.networkPublicIp,
+            observedExitIp: heartbeat.networkPublicIp,
             ipLocation: heartbeat.networkIpAccuracy === "ip_city"
               ? {
                   country: heartbeat.networkIpCountry,
@@ -2042,6 +2066,17 @@ export class DrizzleControlRepository implements ControlRepository {
                   accuracy: "ip_city",
                 }
               : null,
+            location: heartbeat.networkLocationLatitude === null
+              || heartbeat.networkLocationLongitude === null
+              || heartbeat.networkLocationHorizontalAccuracyMeters === null
+              || heartbeat.networkLocationObservedAt === null
+              ? null
+              : {
+                  latitude: heartbeat.networkLocationLatitude,
+                  longitude: heartbeat.networkLocationLongitude,
+                  horizontalAccuracyMeters: heartbeat.networkLocationHorizontalAccuracyMeters,
+                  observedAt: heartbeat.networkLocationObservedAt,
+                },
           };
       const matchedLocation = matchNetworkLocation(
         network,

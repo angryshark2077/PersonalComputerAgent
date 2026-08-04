@@ -4,6 +4,7 @@ import {
   boolean,
   char,
   check,
+  doublePrecision,
   foreignKey,
   index,
   inet,
@@ -317,6 +318,10 @@ export const deviceHeartbeats = pgTable(
     networkIpRegion: text("network_ip_region"),
     networkIpCity: text("network_ip_city"),
     networkIpAccuracy: text("network_ip_accuracy"),
+    networkLocationLatitude: doublePrecision("network_location_latitude"),
+    networkLocationLongitude: doublePrecision("network_location_longitude"),
+    networkLocationHorizontalAccuracyMeters: doublePrecision("network_location_horizontal_accuracy_meters"),
+    networkLocationObservedAt: timestampColumn("network_location_observed_at"),
   },
   (table) => [
     foreignKey({

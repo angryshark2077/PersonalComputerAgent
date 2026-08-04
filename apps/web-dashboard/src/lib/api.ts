@@ -35,8 +35,14 @@ export interface DashboardDevice {
       bssid: string | null;
       local_ipv4: string | null;
       local_ipv6: string | null;
-      public_ip: string | null;
-      ip_location: { country: string | null; region: string | null; city: string | null; accuracy: "ip_city" } | null;
+      observed_exit_ip: string | null;
+      exit_ip_location: { country: string | null; region: string | null; city: string | null; accuracy: "ip_city" } | null;
+      device_location: {
+        latitude: number;
+        longitude: number;
+        horizontal_accuracy_meters: number;
+        observed_at: string;
+      } | null;
       matched_location: DashboardNetworkLocation | null;
     } | null;
     observed_at: string;

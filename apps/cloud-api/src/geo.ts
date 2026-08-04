@@ -3,7 +3,7 @@ import { isIP } from "node:net";
 import type { IpLocation } from "@pca/db-cloud/src/repository.js";
 
 export interface GeoEnrichmentPort {
-  locate(publicIp: string): Promise<IpLocation | null>;
+  locate(observedExitIp: string): Promise<IpLocation | null>;
 }
 
 interface CountryResponse {
@@ -20,16 +20,16 @@ export class CountryIsGeoEnricher implements GeoEnrichmentPort {
     private readonly cacheMilliseconds = 60 * 60 * 1000,
   ) {}
 
-  async locate(publicIp: string): Promise<IpLocation | null> {
-    if (isIP(publicIp) === 0) return null;
-    const cached = this.#cache.get(publicIp);
+  async locate(observedExitIp: string): Promise<IpLocation | null> {
+    if (isIP(observedExitIp) === 0) return null;
+    const cached = this.#cache.get(observedExitIp);
     if (cached !== undefined && cached.expiresAt > Date.now()) return cached.value;
-    const url = new URL(`https://api.country.is/${encodeURIComponent(publicIp)}`);
+    const url = new URL(`https://api.country.is/${encodeURIComponent(observedExitIp)}`);
     url.searchParams.set("fields", "city,subdivision");
     const response = await this.request(url, { headers: { accept: "application/json" } });
     if (!response.ok) {
       if (response.status === 400 || response.status === 404) {
-        this.#cache.set(publicIp, { expiresAt: Date.now() + this.cacheMilliseconds, value: null });
+        this.#cache.set(observedExitIp, { expiresAt: Date.now() + this.cacheMilliseconds, value: null });
         return null;
       }
       throw new Error("geo provider unavailable");
@@ -41,7 +41,7 @@ export class CountryIsGeoEnricher implements GeoEnrichmentPort {
       city: textOrNull(body.city),
       accuracy: "ip_city",
     };
-    this.#cache.set(publicIp, { expiresAt: Date.now() + this.cacheMilliseconds, value });
+    this.#cache.set(observedExitIp, { expiresAt: Date.now() + this.cacheMilliseconds, value });
     return value;
   }
 }

@@ -255,8 +255,8 @@ test("network heartbeat is IP-enriched and matched against the Owner location li
     ownerAuthenticator: async () => owner,
     clientAddress: () => "203.0.113.25",
     geoEnricher: {
-      locate: async (publicIp) => {
-        assert.equal(publicIp, "203.0.113.25");
+      locate: async (observedExitIp) => {
+        assert.equal(observedExitIp, "203.0.113.25");
         return { country: "SG", region: "Singapore", city: "Singapore", accuracy: "ip_city" };
       },
     },
@@ -300,6 +300,12 @@ test("network heartbeat is IP-enriched and matched against the Owner location li
         bssid: "AA:BB:CC:DD:EE:FF",
         local_ipv4: "192.168.71.120",
         local_ipv6: null,
+        location: {
+          latitude: 1.352083,
+          longitude: 103.819836,
+          horizontal_accuracy_meters: 24.5,
+          observed_at: "2026-08-04T09:00:00.000Z",
+        },
       },
     }),
   });
@@ -307,11 +313,18 @@ test("network heartbeat is IP-enriched and matched against the Owner location li
 
   const detail = await api.request(`/v1/devices/${paired.credentials.device_id}`);
   const body = await detail.json() as {
-    status: { network: { public_ip: string; matched_location: { name: string }; ip_location: { city: string } } };
+    status: { network: {
+      observed_exit_ip: string;
+      matched_location: { name: string };
+      exit_ip_location: { city: string };
+      device_location: { latitude: number; horizontal_accuracy_meters: number };
+    } };
   };
-  assert.equal(body.status.network.public_ip, "203.0.113.25");
+  assert.equal(body.status.network.observed_exit_ip, "203.0.113.25");
   assert.equal(body.status.network.matched_location.name, "Home");
-  assert.equal(body.status.network.ip_location.city, "Singapore");
+  assert.equal(body.status.network.exit_ip_location.city, "Singapore");
+  assert.equal(body.status.network.device_location.latitude, 1.352083);
+  assert.equal(body.status.network.device_location.horizontal_accuracy_meters, 24.5);
 });
 
 test("Owner reads only its device control state and configuration audit", async () => {

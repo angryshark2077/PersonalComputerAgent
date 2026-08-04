@@ -31,6 +31,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationFileProjectionSchema(pool);
     await assertCommunicationProjectionBackfill(pool);
     await assertCommunicationMediaUpgrade(pool);
+    await assertDeviceLocationSchema(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
     await assertHashedSessionSchema(pool);
@@ -38,7 +39,8 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationEventSchema(pool);
     await assertCommunicationProjectionSchema(pool);
     await assertCommunicationObjectSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015"]);
+    await assertDeviceLocationSchema(pool);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -78,6 +80,29 @@ async function assertSystemEventSchema(pool: Pool) {
     "SELECT to_regclass('public.system_events') IS NOT NULL AS exists",
   );
   assert.equal(result.rows[0]?.exists, true);
+}
+
+async function assertDeviceLocationSchema(pool: Pool) {
+  const columns = await pool.query<{ column_name: string }>(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'device_heartbeats'
+       AND column_name LIKE 'network_location_%'
+     ORDER BY column_name`,
+  );
+  assert.deepEqual(columns.rows.map((row) => row.column_name), [
+    "network_location_horizontal_accuracy_meters",
+    "network_location_latitude",
+    "network_location_longitude",
+    "network_location_observed_at",
+  ]);
+  const constraints = await pool.query<{ constraint_name: string }>(
+    `SELECT constraint_name FROM information_schema.table_constraints
+     WHERE table_schema = 'public'
+       AND table_name = 'device_heartbeats'
+       AND constraint_name = 'device_heartbeats_device_location_shape'`,
+  );
+  assert.equal(constraints.rows.length, 1);
 }
 
 async function assertCommunicationEventSchema(pool: Pool) {

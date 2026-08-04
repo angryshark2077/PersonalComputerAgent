@@ -36,7 +36,7 @@ test("device configuration exposes the approved WeChat scope", () => {
 test("device configuration shows only the approved Network collection detail", () => {
   const page = renderDeviceConfiguration(snapshotWithWechatEnabled());
 
-  assert.match(page, /SSID, BSSID and local IP/);
+  assert.match(page, /SSID, BSSID, local IP and precise device location/);
   assert.equal(page.includes("Gateway"), false);
   assert.equal(page.includes("Traffic"), false);
 });

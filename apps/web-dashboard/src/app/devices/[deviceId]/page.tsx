@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import {
   DashboardApiError,
@@ -125,9 +125,9 @@ export default function DevicePage() {
         name,
         match_ssid: network.ssid,
         match_bssid: network.bssid,
-        country: network.ip_location?.country ?? null,
-        region: network.ip_location?.region ?? null,
-        city: network.ip_location?.city ?? null,
+        country: null,
+        region: null,
+        city: null,
       });
       setLocationName("");
       await refresh();
@@ -168,7 +168,7 @@ export default function DevicePage() {
       {error !== null ? <p role="alert">{error}</p> : null}
       <CollectorScopeCard
           name="Network"
-          detail="SSID, BSSID and local IP"
+          detail="SSID, BSSID, local IP and precise device location"
           enabled={screen.device.collectors.network.enabled}
           disabled={disabled}
           onToggle={() => void save({
@@ -199,8 +199,10 @@ export default function DevicePage() {
               <div><dt>Wi-Fi / SSID</dt><dd>{screen.device.status.network.ssid ?? "Unavailable (Location permission required)"}</dd></div>
               <div><dt>BSSID</dt><dd>{screen.device.status.network.bssid ?? "Unavailable"}</dd></div>
               <div><dt>Local IP</dt><dd>{screen.device.status.network.local_ipv4 ?? screen.device.status.network.local_ipv6 ?? "Unavailable"}</dd></div>
-              <div><dt>Public IP</dt><dd>{screen.device.status.network.public_ip ?? "Unavailable"}</dd></div>
-              <div><dt>Matched location</dt><dd>{networkLocationLabel(screen.device.status.network)}</dd></div>
+              <div><dt>Observed exit IP</dt><dd>{screen.device.status.network.observed_exit_ip ?? "Unavailable"}</dd></div>
+              <div><dt>Exit IP estimate</dt><dd>{exitIpLocationLabel(screen.device.status.network)}</dd></div>
+              <div><dt>Device location</dt><dd>{deviceLocationLabel(screen.device.status.network)}</dd></div>
+              <div><dt>Saved location match</dt><dd>{networkLocationLabel(screen.device.status.network)}</dd></div>
             </dl>
           )}
           <label>
@@ -349,7 +351,28 @@ function cleanupSummary(cleanup: DashboardDevice["local_media_cleanup"]): string
 
 function networkLocationLabel(network: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>): string {
   if (network.matched_location !== null) return network.matched_location.name;
-  const parts = [network.ip_location?.city, network.ip_location?.region, network.ip_location?.country]
+  return "No saved match";
+}
+
+function exitIpLocationLabel(network: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>): string {
+  const parts = [network.exit_ip_location?.city, network.exit_ip_location?.region, network.exit_ip_location?.country]
     .filter((value): value is string => value !== null && value !== undefined);
-  return parts.length > 0 ? `${parts.join(", ")} (IP estimate)` : "Unavailable";
+  return parts.length > 0
+    ? `${[...new Set(parts)].join(", ")} (low confidence; may be VPN/proxy)`
+    : "Unavailable";
+}
+
+function deviceLocationLabel(network: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>): ReactNode {
+  const location = network.device_location;
+  if (location === null) return "Unavailable";
+  const coordinates = `${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`;
+  return (
+    <a
+      href={`https://maps.google.com/?q=${encodeURIComponent(`${location.latitude},${location.longitude}`)}`}
+      target="_blank"
+      rel="noreferrer"
+    >
+      {coordinates} (±{Math.round(location.horizontal_accuracy_meters)} m)
+    </a>
+  );
 }

@@ -15,7 +15,28 @@
       "protected_file_count": 1,
       "protected_bytes": 256
     },
-    "network": null,
+    "network": {
+      "interface_type": "wifi",
+      "wifi_identity_available": true,
+      "ssid": "Jacob WiFi",
+      "bssid": "AA:BB:CC:DD:EE:FF",
+      "local_ipv4": "192.168.71.120",
+      "local_ipv6": null,
+      "observed_exit_ip": "203.0.113.25",
+      "exit_ip_location": {
+        "country": "SG",
+        "region": "Singapore",
+        "city": "Singapore",
+        "accuracy": "ip_city"
+      },
+      "device_location": {
+        "latitude": 1.352083,
+        "longitude": 103.819836,
+        "horizontal_accuracy_meters": 24.5,
+        "observed_at": "2026-07-31T10:00:30.000Z"
+      },
+      "matched_location": null
+    },
     "observed_at": "2026-07-31T10:01:00.000Z"
   },
   "local_media_cleanup": null,
