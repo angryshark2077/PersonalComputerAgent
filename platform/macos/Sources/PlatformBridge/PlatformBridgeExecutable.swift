@@ -131,7 +131,8 @@ public enum PlatformBridgeExecutable {
         Task {
             exit(await run(arguments: CommandLine.arguments, signalRuntime: signalRuntime))
         }
-        dispatchMain()
+        NSApplication.shared.run()
+        exit(3)
     }
 
     @MainActor
