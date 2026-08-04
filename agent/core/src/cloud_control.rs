@@ -2047,6 +2047,21 @@ fn remember_screenshot_request(
     }
 }
 
+fn screenshot_prepare_payload(screenshot: &PendingScreenshot) -> serde_json::Value {
+    serde_json::json!({
+        "screenshot_id": screenshot.screenshot_id,
+        "request_id": screenshot.request_id,
+        "trigger": screenshot.trigger,
+        "captured_at": screenshot.captured_at,
+        "app_bundle_id": screenshot.app_bundle_id,
+        "pixel_width": screenshot.pixel_width,
+        "pixel_height": screenshot.pixel_height,
+        "sha256": screenshot.sha256,
+        "size_bytes": screenshot.size_bytes,
+        "mime_type": screenshot.mime_type,
+    })
+}
+
 fn screenshot_spool_root() -> Result<PathBuf, ControlError> {
     let home = std::env::var_os("HOME").ok_or(ControlError::Contract)?;
     let root = PathBuf::from(home)
@@ -2659,7 +2674,7 @@ impl ControlClient for HttpControlClient {
             let response = client
                 .post(self.endpoint("v1/agent/screenshots/prepare")?)
                 .bearer_auth(credentials.access_credential())
-                .json(screenshot)
+                .json(&screenshot_prepare_payload(screenshot))
                 .send()
                 .await
                 .map_err(|_| ControlError::Transient)?;
@@ -2899,11 +2914,11 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 mod tests {
     use super::{
         apply_communication_upload_headers, next_media_wait, remember_screenshot_request,
-        retry_delay, sync_pending_communication_events, sync_pending_system_events,
-        AgentControlSnapshot, ControlClient, ControlError, ControlFuture, DeviceCredential,
-        HttpControlClient, PendingScreenshot, ScreenshotTrigger, SyncEventsResponse,
-        CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE,
-        MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
+        retry_delay, screenshot_prepare_payload, sync_pending_communication_events,
+        sync_pending_system_events, AgentControlSnapshot, ControlClient, ControlError,
+        ControlFuture, DeviceCredential, HttpControlClient, PendingScreenshot, ScreenshotTrigger,
+        SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF,
+        MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
     use pca_domain::{
@@ -3044,6 +3059,29 @@ mod tests {
         remember_screenshot_request(&screenshot, &mut handled);
 
         assert!(handled.contains(&request_id));
+    }
+
+    #[test]
+    fn screenshot_prepare_payload_excludes_the_local_spool_file_name() {
+        let screenshot = PendingScreenshot {
+            screenshot_id: "01985555-7555-8555-8555-555555555555".to_owned(),
+            request_id: None,
+            trigger: ScreenshotTrigger::Activity,
+            captured_at: "2026-08-05T00:00:00Z".to_owned(),
+            app_bundle_id: Some("com.example.App".to_owned()),
+            pixel_width: 1920,
+            pixel_height: 1080,
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+            mime_type: "image/jpeg".to_owned(),
+            image_file_name: "local-only.jpg".to_owned(),
+        };
+
+        let payload = screenshot_prepare_payload(&screenshot);
+
+        assert_eq!(payload.as_object().expect("object").len(), 10);
+        assert!(payload.get("image_file_name").is_none());
+        assert_eq!(payload["trigger"], "activity");
     }
 
     #[test]
