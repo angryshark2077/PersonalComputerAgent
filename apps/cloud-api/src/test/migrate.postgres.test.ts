@@ -40,7 +40,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationProjectionSchema(pool);
     await assertCommunicationObjectSchema(pool);
     await assertDeviceLocationSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019"]);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -61,6 +61,32 @@ test("PostgreSQL migrations reject a changed completed migration", async () => {
     await pool.end();
     await postgres.stop();
     await rm(changedDirectory, { recursive: true, force: true });
+  }
+});
+
+test("migration 0020 repairs a thumbnail projection when an immutable full image event exists", async () => {
+  const postgres = await startTemporaryPostgres();
+  const pool = new Pool({ connectionString: postgres.connectionString });
+  const previousMigrations = await copyMigrationsBefore0020();
+  try {
+    await runCloudMigrations(postgres.connectionString, previousMigrations);
+    await seedIncorrectMediaProjection(pool);
+    await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
+    const result = await pool.query<{ event_id: string; attachment_id: string; size_bytes: string }>(
+      `SELECT message.event_id, attachment.attachment_id, attachment.size_bytes
+       FROM communication_messages AS message
+       INNER JOIN communication_message_attachments AS attachment USING (event_id)
+       WHERE message.message_id = 'message-migration-upgrade'`,
+    );
+    assert.deepEqual(result.rows, [{
+      event_id: "01986666-7666-8666-8666-666666666675",
+      attachment_id: "attachment-migration-full",
+      size_bytes: "4096",
+    }]);
+  } finally {
+    await pool.end();
+    await postgres.stop();
+    await rm(previousMigrations, { recursive: true, force: true });
   }
 });
 
@@ -279,19 +305,28 @@ async function assertCommunicationMediaUpgrade(pool: Pool) {
   await repository.appendCommunicationEvents(workspaceId, deviceId, [
     event(
       "01986666-7666-8666-8666-666666666671",
-      "source-key-media-thumbnail",
+      "source-key-media:image",
       "attachment-media-thumbnail",
       1024,
-      new Date("2026-08-02T00:02:01Z"),
+      new Date("2026-08-02T00:02:00Z"),
     ),
   ]);
   await repository.appendCommunicationEvents(workspaceId, deviceId, [
     event(
       "01986666-7666-8666-8666-666666666672",
-      "source-key-media-full",
+      "source-key-media:image:full",
       "attachment-media-full",
       4096,
-      new Date("2026-08-02T00:02:02Z"),
+      new Date("2026-08-02T00:02:00Z"),
+    ),
+  ]);
+  await repository.appendCommunicationEvents(workspaceId, deviceId, [
+    event(
+      "01986666-7666-8666-8666-666666666673",
+      "source-key-media:image:thumbnail-retry",
+      "attachment-media-thumbnail-retry",
+      2048,
+      new Date("2026-08-02T00:02:00Z"),
     ),
   ]);
 
@@ -313,6 +348,90 @@ async function migrationIds(pool: Pool): Promise<string[]> {
     "SELECT id FROM _pca_migrations WHERE status = 'completed' ORDER BY id",
   );
   return result.rows.map((row) => row.id);
+}
+
+async function seedIncorrectMediaProjection(pool: Pool) {
+  const workspaceId = "01982222-7222-8222-8222-222222222225";
+  const userId = "01983333-7333-8333-8333-333333333336";
+  const deviceId = "01981111-7111-8111-8111-111111111113";
+  const thumbnailEventId = "01986666-7666-8666-8666-666666666674";
+  const fullEventId = "01986666-7666-8666-8666-666666666675";
+  await pool.query(
+    "INSERT INTO auth_users (id, name, email, created_at, updated_at) VALUES ($1, 'Upgrade', 'upgrade@example.invalid', now(), now())",
+    [userId],
+  );
+  await pool.query(
+    "INSERT INTO workspaces (id, name, slug, created_at, updated_at) VALUES ($1, 'Upgrade', 'upgrade', now(), now())",
+    [workspaceId],
+  );
+  await pool.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES ($1, $2, 'owner', now())",
+    [workspaceId, userId],
+  );
+  await pool.query(
+    "INSERT INTO devices (id, workspace_id, owner_user_id, device_public_key_hash, platform, created_at) VALUES ($1, $2, $3, $4, 'macos', now())",
+    [deviceId, workspaceId, userId, "d".repeat(64)],
+  );
+  await pool.query(
+    `INSERT INTO communication_conversations (
+       workspace_id, device_id, conversation_id, display_name, scope, member_count, last_message_at
+     ) VALUES ($1, $2, 'conversation-migration-upgrade', 'Upgrade', 'direct', NULL, '2026-08-02T00:03:00Z')`,
+    [workspaceId, deviceId],
+  );
+  const eventPayload = (sourceKey: string, attachmentId: string, sizeBytes: number) => JSON.stringify({
+    message_id: "message-migration-upgrade",
+    conversation_id: "conversation-migration-upgrade",
+    sender_id: "wxid-self",
+    sender_display_name: "You",
+    source_key: sourceKey,
+    occurred_at: "2026-08-02T00:03:00Z",
+    direction: "outgoing",
+    kind: "image",
+    conversation: { scope: "direct" },
+    attachments: [{
+      attachment_id: attachmentId,
+      kind: "image",
+      sha256: "e".repeat(64),
+      size_bytes: sizeBytes,
+      mime_type: "image/jpeg",
+    }],
+  });
+  for (const [eventId, sourceKey, attachmentId, sizeBytes] of [
+    [thumbnailEventId, "source-key-migration:image", "attachment-migration-thumbnail", 1024],
+    [fullEventId, "source-key-migration:image:full", "attachment-migration-full", 4096],
+  ] as const) {
+    await pool.query(
+      `INSERT INTO communication_events (
+         event_id, workspace_id, device_id, event_type, source, schema_version,
+         occurred_at, created_at, sensitivity, payload, attachment_refs, idempotency_key
+       ) VALUES ($1, $2, $3, 'communication.message_recorded', 'communication.wechat', 1,
+         '2026-08-02T00:03:00Z', '2026-08-02T00:03:00Z', 'high', $4::jsonb, $5::jsonb, $6)`,
+      [eventId, workspaceId, deviceId, eventPayload(sourceKey, attachmentId, sizeBytes), JSON.stringify([attachmentId]), sourceKey],
+    );
+  }
+  await pool.query(
+    `INSERT INTO communication_messages (
+       event_id, workspace_id, device_id, conversation_id, message_id, sender_id,
+       sender_display_name, source_key, occurred_at, direction, kind, text_body
+     ) VALUES ($1, $2, $3, 'conversation-migration-upgrade', 'message-migration-upgrade',
+       'wxid-self', 'You', 'source-key-migration:image', '2026-08-02T00:03:00Z', 'outgoing', 'image', NULL)`,
+    [thumbnailEventId, workspaceId, deviceId],
+  );
+  await pool.query(
+    `INSERT INTO communication_message_attachments (
+       event_id, attachment_id, kind, sha256, size_bytes, mime_type
+     ) VALUES ($1, 'attachment-migration-thumbnail', 'image', $2, 1024, 'image/jpeg')`,
+    [thumbnailEventId, "e".repeat(64)],
+  );
+}
+
+async function copyMigrationsBefore0020(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "pca-before-0020-migrations-"));
+  for (const file of await readdir(committedMigrationDirectory)) {
+    if (!file.endsWith(".sql") || file.startsWith("0020_")) continue;
+    await writeFile(join(directory, file), await readFile(join(committedMigrationDirectory, file), "utf8"));
+  }
+  return directory;
 }
 
 async function copyMigrationsWithChanged0001(): Promise<string> {

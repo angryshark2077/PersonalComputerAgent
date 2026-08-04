@@ -229,7 +229,6 @@ function communicationImage(deviceId: string) {
 function communicationFullImage(deviceId: string) {
   const event = communicationImage(deviceId);
   event.event_id = "01986666-7666-8666-8666-666666666672";
-  event.created_at = "2026-08-02T00:02:00Z";
   event.payload.source_key = "opaque-source-key-2:full";
   event.payload.attachments = [{
     attachment_id: "attachment-1:full",
@@ -333,7 +332,15 @@ test("paired device syncs a private communication event only through its dedicat
 
 test("a later media projection replaces the earlier projection for the same message", async () => {
   const { api, credentials } = await pairedApi();
-  for (const event of [communicationImage(credentials.device_id), communicationFullImage(credentials.device_id)]) {
+  const lateThumbnail = communicationImage(credentials.device_id);
+  lateThumbnail.event_id = "01986666-7666-8666-8666-666666666673";
+  lateThumbnail.payload.source_key = "opaque-source-key-2:thumbnail-retry";
+  lateThumbnail.idempotency_key = "opaque-source-key-2:thumbnail-retry";
+  for (const event of [
+    communicationImage(credentials.device_id),
+    communicationFullImage(credentials.device_id),
+    lateThumbnail,
+  ]) {
     const response = await api.request("/v1/agent/sync/communication/events", {
       method: "POST",
       headers: {

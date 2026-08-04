@@ -1080,7 +1080,15 @@ export class MemoryControlRepository implements ControlRepository {
               ) {
                 throw new ControlRepositoryError("CONFLICT");
               }
-              if (stored.createdAt.getTime() <= event.createdAt.getTime()) {
+              const storedPriority = communicationProjectionPriority(stored.message.sourceKey);
+              const eventPriority = communicationProjectionPriority(event.message.sourceKey);
+              if (
+                eventPriority > storedPriority
+                || (
+                  eventPriority === storedPriority
+                  && stored.createdAt.getTime() <= event.createdAt.getTime()
+                )
+              ) {
                 this.#communicationEvents.delete(storedEventId);
               } else {
                 shouldProject = false;
@@ -2343,7 +2351,15 @@ export class DrizzleControlRepository implements ControlRepository {
             ) {
               throw new ControlRepositoryError("CONFLICT");
             }
-            if (existingMessage.createdAt.getTime() > event.createdAt.getTime()) return true;
+            const existingPriority = communicationProjectionPriority(existingMessage.sourceKey);
+            const eventPriority = communicationProjectionPriority(event.message.sourceKey);
+            if (
+              existingPriority > eventPriority
+              || (
+                existingPriority === eventPriority
+                && existingMessage.createdAt.getTime() > event.createdAt.getTime()
+              )
+            ) return true;
             await transaction
               .delete(communicationMessages)
               .where(eq(communicationMessages.eventId, existingMessage.eventId));
@@ -2848,6 +2864,12 @@ function cloneCommunicationMessageProjection(
     conversation: { ...message.conversation },
     attachments: message.attachments.map((attachment) => ({ ...attachment })),
   };
+}
+
+function communicationProjectionPriority(sourceKey: string): number {
+  if (sourceKey.endsWith(":full")) return 2;
+  if (sourceKey.endsWith("-pending")) return 0;
+  return 1;
 }
 
 function communicationMessageRecord(
