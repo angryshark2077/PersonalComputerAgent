@@ -118,6 +118,8 @@ public enum PlatformBridgeExecutable {
             exit(3)
         }
 
+        NSApplication.shared.setActivationPolicy(.prohibited)
+
         let signalRuntime: TerminationSignalRuntime
         do {
             signalRuntime = try TerminationSignalRuntime.install()
