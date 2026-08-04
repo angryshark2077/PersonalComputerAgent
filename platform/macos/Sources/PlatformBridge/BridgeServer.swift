@@ -168,6 +168,8 @@ private struct QuarantinedEntry {
 }
 
 actor BridgeServer {
+    static let defaultIdleTimeoutMilliseconds: UInt64 = 90_000
+
     private let socketURL: URL
     private let pathValidator: SocketPathValidator
     private let handshakeHandler: HandshakeHandler
@@ -190,7 +192,7 @@ actor BridgeServer {
         networkSource: NetworkObservationSource = NetworkObservationSource(),
         handshakeTimeoutMilliseconds: UInt64 = 1_000,
         credentialTimeoutMilliseconds: UInt64 = 1_000,
-        idleTimeoutMilliseconds: UInt64 = 30_000
+        idleTimeoutMilliseconds: UInt64 = BridgeServer.defaultIdleTimeoutMilliseconds
     ) {
         self.socketURL = socketURL
         self.pathValidator = pathValidator

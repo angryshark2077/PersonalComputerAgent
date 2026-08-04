@@ -5,6 +5,10 @@ import Foundation
 import XCTest
 
 final class HandshakeTests: XCTestCase {
+    func testDefaultIdleTimeoutOutlivesTheOneMinuteAgentNetworkInterval() {
+        XCTAssertGreaterThan(BridgeServer.defaultIdleTimeoutMilliseconds, 60_000)
+    }
+
     private let secret = Data(repeating: 0x5a, count: 32)
     private let nonce = Data(repeating: 0x11, count: 32)
 
