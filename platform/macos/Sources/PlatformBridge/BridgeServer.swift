@@ -175,6 +175,7 @@ actor BridgeServer {
     private let handshakeHandler: HandshakeHandler
     private let credentialProvider: any BridgeCredentialProviding
     private let networkSource: NetworkObservationSource
+    private let lifecycleSource: PlatformLifecycleEventBuffer
     private let handshakeTimeoutMilliseconds: UInt64
     private let credentialTimeoutMilliseconds: UInt64
     private let idleTimeoutMilliseconds: UInt64
@@ -189,7 +190,8 @@ actor BridgeServer {
         pathValidator: SocketPathValidator = SocketPathValidator(),
         handshakeHandler: HandshakeHandler,
         credentialProvider: any BridgeCredentialProviding,
-        networkSource: NetworkObservationSource = NetworkObservationSource(),
+        networkSource: NetworkObservationSource? = nil,
+        lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer(),
         handshakeTimeoutMilliseconds: UInt64 = 1_000,
         credentialTimeoutMilliseconds: UInt64 = 1_000,
         idleTimeoutMilliseconds: UInt64 = BridgeServer.defaultIdleTimeoutMilliseconds
@@ -198,10 +200,15 @@ actor BridgeServer {
         self.pathValidator = pathValidator
         self.handshakeHandler = handshakeHandler
         self.credentialProvider = credentialProvider
-        self.networkSource = networkSource
+        self.lifecycleSource = lifecycleSource
+        self.networkSource = networkSource ?? NetworkObservationSource(lifecycleSource: lifecycleSource)
         self.handshakeTimeoutMilliseconds = max(handshakeTimeoutMilliseconds, 1)
         self.credentialTimeoutMilliseconds = max(credentialTimeoutMilliseconds, 1)
         self.idleTimeoutMilliseconds = max(idleTimeoutMilliseconds, 1)
+    }
+
+    nonisolated func recordPowerLifecycleEvent(_ event: PowerLifecycleEvent) {
+        lifecycleSource.record(event == .systemSleep ? .systemSleep : .systemWake)
     }
 
     func start() throws {
@@ -354,7 +361,11 @@ actor BridgeServer {
                 reader: &reader,
                 timeoutMilliseconds: idleTimeoutMilliseconds
             )
-            let response = try CapabilityRequestHandler.respond(to: request, networkSource: networkSource)
+            let response = try CapabilityRequestHandler.respond(
+                to: request,
+                networkSource: networkSource,
+                lifecycleSource: lifecycleSource
+            )
             try await writeFrame(
                 descriptor,
                 payload: response.payload,
@@ -483,6 +494,7 @@ enum CapabilityRequestHandler {
     ]
     private static let capabilityPayloadKeys: Set<String> = ["include_permissions"]
     private static let networkPayloadKeys: Set<String> = ["include_wifi_identity"]
+    private static let lifecyclePayloadKeys: Set<String> = ["after_sequence"]
 
     struct Response {
         let payload: Data
@@ -491,7 +503,8 @@ enum CapabilityRequestHandler {
 
     static func respond(
         to requestJSON: Data,
-        networkSource: NetworkObservationSource = NetworkObservationSource()
+        networkSource: NetworkObservationSource = NetworkObservationSource(),
+        lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer()
     ) throws -> Response {
         let object = try StrictJSON.object(requestJSON)
         try StrictJSON.requireOnlyKeys(object, allowed: envelopeKeys)
@@ -505,6 +518,8 @@ enum CapabilityRequestHandler {
             try StrictJSON.requireExactKeys(payloadObject, expected: capabilityPayloadKeys)
         } else if capability == "network.observe" {
             try StrictJSON.requireExactKeys(payloadObject, expected: networkPayloadKeys)
+        } else if capability == "system.lifecycle.poll" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: lifecyclePayloadKeys)
         } else {
             throw BridgeServerError.invalidRequest
         }
@@ -524,10 +539,20 @@ enum CapabilityRequestHandler {
               request.error == nil else {
             throw BridgeServerError.invalidRequest
         }
-        let responsePayload: [String: JSONValue] = if capability == "network.observe" {
-            networkSource.capture().payload
+        let responsePayload: [String: JSONValue]
+        if capability == "network.observe" {
+            responsePayload = networkSource.capture().payload
+        } else if capability == "system.lifecycle.poll" {
+            guard let afterSequence = request.payload.afterSequence else {
+                throw BridgeServerError.invalidRequest
+            }
+            let snapshot = lifecycleSource.snapshot(after: afterSequence)
+            responsePayload = [
+                "events": .array(snapshot.events.map(\.payload)),
+                "latest_sequence": .number(Double(snapshot.latestSequence)),
+            ]
         } else {
-            ["screen_capture": .string("available")]
+            responsePayload = ["screen_capture": .string("available")]
         }
         let response = BridgeEnvelope(
             protocolVersion: Int(HandshakeHandler.protocolVersion),
@@ -567,9 +592,11 @@ private struct StrictCapabilityEnvelope: Decodable {
 private struct StrictCapabilityPayload: Decodable {
     let includePermissions: Bool?
     let includeWifiIdentity: Bool?
+    let afterSequence: UInt64?
 
     private enum CodingKeys: String, CodingKey {
         case includePermissions = "include_permissions"
         case includeWifiIdentity = "include_wifi_identity"
+        case afterSequence = "after_sequence"
     }
 }

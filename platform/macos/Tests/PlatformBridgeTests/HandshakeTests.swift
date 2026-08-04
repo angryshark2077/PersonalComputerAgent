@@ -415,6 +415,32 @@ final class HandshakeTests: XCTestCase {
         }
     }
 
+    func testLifecyclePollReturnsOnlyEventsAfterTheAuthenticatedCursor() throws {
+        let source = PlatformLifecycleEventBuffer()
+        source.record(.systemSleep, at: Date(timeIntervalSince1970: 1))
+        source.record(.systemWake, at: Date(timeIntervalSince1970: 2))
+        let requestID = UUID()
+        let request = Data("""
+        {"protocol_version":1,"request_id":"\(requestID.uuidString)","message_kind":"request","capability":"system.lifecycle.poll","deadline_ms":1000,"payload":{"after_sequence":1}}
+        """.utf8)
+
+        let result = try CapabilityRequestHandler.respond(to: request, lifecycleSource: source)
+        let response = try JSONDecoder().decode(BridgeEnvelope.self, from: result.payload)
+
+        XCTAssertEqual(response.requestID, requestID)
+        XCTAssertEqual(response.capability, "system.lifecycle.poll")
+        XCTAssertEqual(response.payload["latest_sequence"], .number(2))
+        guard case let .array(events)? = response.payload["events"] else {
+            return XCTFail("lifecycle events missing")
+        }
+        XCTAssertEqual(events.count, 1)
+        guard case let .object(event) = events[0] else {
+            return XCTFail("lifecycle event is not an object")
+        }
+        XCTAssertEqual(event["event_type"], .string("system.wake"))
+        XCTAssertEqual(event["sequence"], .number(2))
+    }
+
     func testSlowCredentialLookupTimesOutWithoutBlockingActorShutdown() async throws {
         let parent = URL(fileURLWithPath: "/tmp/pca-slow-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)

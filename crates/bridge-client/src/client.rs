@@ -26,6 +26,7 @@ use crate::{
 pub const PROTOCOL_VERSION: u32 = 1;
 const HANDSHAKE_CAPABILITY: &str = "bridge.handshake";
 const NETWORK_OBSERVE_CAPABILITY: &str = "network.observe";
+const LIFECYCLE_POLL_CAPABILITY: &str = "system.lifecycle.poll";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -154,6 +155,22 @@ pub struct DeviceLocationObservation {
     pub longitude: f64,
     pub horizontal_accuracy_meters: f64,
     pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformLifecycleEvent {
+    pub sequence: u64,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub occurred_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlatformLifecycleBatch {
+    events: Vec<PlatformLifecycleEvent>,
+    latest_sequence: u64,
 }
 
 impl std::fmt::Debug for BridgeClient {
@@ -312,6 +329,64 @@ impl BridgeClient {
         validate_network_observation(&observation)?;
         Ok(observation)
     }
+
+    /// Polls bounded platform lifecycle events after the last successfully consumed sequence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown event types, malformed timestamps, nil identifiers, and non-monotonic
+    /// sequence batches.
+    pub async fn poll_lifecycle(
+        &mut self,
+        after_sequence: u64,
+    ) -> Result<(Vec<PlatformLifecycleEvent>, u64), BridgeClientError> {
+        let request = BridgeEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            message_kind: BridgeMessageKind::Request,
+            capability: LIFECYCLE_POLL_CAPABILITY.to_owned(),
+            deadline_ms: duration_millis(self.operation_timeout)?,
+            payload: object_payload(&serde_json::json!({ "after_sequence": after_sequence }))?,
+            error: None,
+        };
+        let response = self.request(request).await?;
+        if response.error.is_some() {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        let batch: PlatformLifecycleBatch = serde_json::from_value(Value::Object(response.payload))
+            .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+        validate_lifecycle_batch(after_sequence, &batch)?;
+        Ok((batch.events, batch.latest_sequence))
+    }
+}
+
+fn validate_lifecycle_batch(
+    after_sequence: u64,
+    batch: &PlatformLifecycleBatch,
+) -> Result<(), BridgeClientError> {
+    if batch.latest_sequence < after_sequence {
+        return Err(BridgeClientError::InvalidEnvelope);
+    }
+    let mut previous = after_sequence;
+    for event in &batch.events {
+        if event.sequence <= previous
+            || event.sequence > batch.latest_sequence
+            || event.event_id.is_nil()
+            || !matches!(
+                event.event_type.as_str(),
+                "system.sleep" | "system.wake" | "network.offline" | "network.online"
+            )
+            || time::OffsetDateTime::parse(
+                &event.occurred_at,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .is_err()
+        {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        previous = event.sequence;
+    }
+    Ok(())
 }
 
 fn validate_network_observation(observation: &NetworkObservation) -> Result<(), BridgeClientError> {
@@ -555,7 +630,11 @@ struct StrictHandshakeResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_network_observation, DeviceLocationObservation, NetworkObservation};
+    use super::{
+        validate_lifecycle_batch, validate_network_observation, DeviceLocationObservation,
+        NetworkObservation, PlatformLifecycleBatch, PlatformLifecycleEvent,
+    };
+    use uuid::Uuid;
 
     #[test]
     fn network_observation_rejects_spoofed_wifi_and_unusable_addresses() {
@@ -594,5 +673,29 @@ mod tests {
             ..valid
         };
         assert!(validate_network_observation(&invalid).is_err());
+    }
+
+    #[test]
+    fn lifecycle_batch_requires_monotonic_known_events() {
+        let event = PlatformLifecycleEvent {
+            sequence: 3,
+            event_id: Uuid::new_v4(),
+            event_type: "system.wake".to_owned(),
+            occurred_at: "2026-08-04T15:00:00Z".to_owned(),
+        };
+        let valid = PlatformLifecycleBatch {
+            events: vec![event.clone()],
+            latest_sequence: 3,
+        };
+        validate_lifecycle_batch(2, &valid).expect("valid lifecycle batch");
+
+        let invalid = PlatformLifecycleBatch {
+            events: vec![PlatformLifecycleEvent {
+                event_type: "system.unknown".to_owned(),
+                ..event
+            }],
+            latest_sequence: 3,
+        };
+        assert!(validate_lifecycle_batch(2, &invalid).is_err());
     }
 }

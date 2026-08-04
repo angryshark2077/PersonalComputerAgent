@@ -1244,6 +1244,9 @@ fn should_retry(error: &DomainError) -> bool {
                 | "WECHAT_DATABASE_UNAVAILABLE"
                 | "WECHAT_PROBE_TIMEOUT"
                 | "WECHAT_PERMISSION_REQUIRED"
+                | "WECHAT_SESSION_READ_FAILED"
+                | "WECHAT_CONTACT_READ_FAILED"
+                | "WECHAT_MESSAGE_READ_FAILED"
         )
 }
 
@@ -1921,7 +1924,7 @@ impl CommunicationProviderFactory for UnavailableCommunicationProviderFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        persist_collector_state, stable_communication_event_id, CommunicationControl,
+        persist_collector_state, should_retry, stable_communication_event_id, CommunicationControl,
         CommunicationIdentity,
     };
     use pca_db_local::DbActorHandle;
@@ -1942,6 +1945,22 @@ mod tests {
 
         assert_eq!(first, replay);
         assert_ne!(first, different);
+    }
+
+    #[test]
+    fn transient_wechat_read_stage_failures_are_retried() {
+        for code in [
+            "WECHAT_SESSION_READ_FAILED",
+            "WECHAT_CONTACT_READ_FAILED",
+            "WECHAT_MESSAGE_READ_FAILED",
+        ] {
+            assert!(should_retry(&DomainError::new(code, "read failed", true)));
+        }
+        assert!(!should_retry(&DomainError::new(
+            "WECHAT_ACCOUNT_UNVERIFIED",
+            "account changed",
+            false,
+        )));
     }
 
     #[tokio::test]

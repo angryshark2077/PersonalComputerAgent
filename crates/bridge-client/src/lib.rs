@@ -12,7 +12,7 @@ pub mod supervisor;
 
 pub use client::{
     BridgeClient, BridgeClientConfig, BridgeClientError, DeviceLocationObservation,
-    NetworkObservation, PROTOCOL_VERSION,
+    NetworkObservation, PlatformLifecycleEvent, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Default)]

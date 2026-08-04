@@ -20,7 +20,7 @@ use pca_agentd::{
 use pca_bridge_client::supervisor::{
     BridgeSupervisor, BridgeSupervisorConfig, BridgeSupervisorError,
 };
-use pca_bridge_client::NetworkObservationState;
+use pca_bridge_client::{NetworkObservationState, PlatformLifecycleEvent};
 #[cfg(feature = "process-test-hooks")]
 use pca_db_local::ProcessTestHooks;
 use pca_db_local::{DbActorHandle, PairingState};
@@ -37,7 +37,10 @@ use pca_keychain::{
 use pca_wechat_provider::MacOSWechatProviderFactory;
 use reqwest::Url;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 #[cfg(feature = "process-test-hooks")]
@@ -45,7 +48,7 @@ use crate::config::ProcessTestFatalCleanupConfig;
 use crate::{
     collector_registry::CollectorIdentity,
     config::{CommandConfig, RunConfig},
-    lifecycle::{LifecycleRuntime, NoopCapabilityRefresher, RuntimeIdentity},
+    lifecycle::{LifecycleError, LifecycleRuntime, NoopCapabilityRefresher, RuntimeIdentity},
     system_runtime::SystemRuntimeHandle,
 };
 
@@ -213,6 +216,7 @@ struct RuntimeResources {
     pairing_shutdown: Option<watch::Sender<bool>>,
     pairing_task: Option<JoinHandle<Result<(), PairingIpcServerError>>>,
     control: Option<CloudControlOwner>,
+    control_bootstrap_task: Option<JoinHandle<()>>,
     heartbeat: Option<LocalHeartbeatWriter>,
     state: RuntimeStateMachine,
     schema_version: Option<u32>,
@@ -230,6 +234,7 @@ impl RuntimeResources {
             pairing_shutdown: None,
             pairing_task: None,
             control: None,
+            control_bootstrap_task: None,
             heartbeat: None,
             state: RuntimeStateMachine::starting(),
             schema_version: None,
@@ -261,7 +266,8 @@ impl RuntimeResources {
         let credential_store: Arc<dyn CredentialStore> = Arc::new(ProcessTestCredentialStore);
         let (bridge_status_sender, mut bridge_status_receiver) =
             watch::channel(BridgeStatus::Disconnected);
-        let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
+        let pairing_valid = false;
+        let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(pairing_valid);
         let communication_authorization = CommunicationAuthorization::new();
         let network_observations = Arc::new(NetworkObservationState::default());
         let (control, control_commands) = CloudControlOwner::start(
@@ -273,27 +279,25 @@ impl RuntimeResources {
             pairing_state_sender.clone(),
             communication_authorization.clone(),
         );
-        // A build with process hooks has no production Keychain identity; keeping those harnesses
-        // explicitly unpaired prevents test-only identities from becoming a release input.
-        let pairing_valid = if cfg!(feature = "process-test-hooks") {
-            false
-        } else {
-            start_paired_control(
-                Arc::clone(&credential_store),
-                &control_commands,
-                Arc::clone(&network_observations),
-            )
-            .await
-            .ok()
-            .unwrap_or(false)
-        };
+        if !cfg!(feature = "process-test-hooks") {
+            let bootstrap_store = Arc::clone(&credential_store);
+            let bootstrap_commands = control_commands.clone();
+            let bootstrap_network = Arc::clone(&network_observations);
+            self.control_bootstrap_task = Some(tokio::spawn(async move {
+                let _ =
+                    start_paired_control(bootstrap_store, &bootstrap_commands, bootstrap_network)
+                        .await;
+            }));
+        }
         self.control = Some(control);
         let (bridge_shutdown_sender, bridge_shutdown_receiver) = watch::channel(false);
+        let (platform_event_sender, mut platform_event_receiver) = mpsc::channel(64);
         let bridge_task = start_bridge(
             config,
             Arc::clone(&credential_store),
             bridge_status_sender.clone(),
             Arc::clone(&network_observations),
+            platform_event_sender,
             bridge_shutdown_receiver,
         );
         #[cfg(feature = "process-test-hooks")]
@@ -327,13 +331,19 @@ impl RuntimeResources {
             bridge_status_sender.send_replace(BridgeStatus::Degraded);
         }
 
+        let lifecycle_identity = config.collector_identity().map(|identity| {
+            RuntimeIdentity::new(
+                identity.workspace_id.hyphenated().to_string(),
+                identity.device_id.hyphenated().to_string(),
+            )
+        });
         self.lifecycle = Some(LifecycleRuntime::start(
             Arc::clone(
                 self.database
                     .as_ref()
                     .expect("database exists until cleanup"),
             ),
-            RuntimeIdentity::new("local-unpaired", "local-device"),
+            lifecycle_identity.clone(),
             LIFECYCLE_CAPACITY,
             Arc::new(NoopCapabilityRefresher),
         ));
@@ -341,16 +351,20 @@ impl RuntimeResources {
             .lifecycle
             .as_ref()
             .expect("lifecycle was just installed");
-        if recovered_from_crash {
+        if recovered_from_crash && lifecycle_identity.is_some() {
             lifecycle
                 .record_crash_recovery()
                 .await
                 .map_err(|_| FailureStage::Lifecycle)?;
         }
-        lifecycle
-            .record_startup()
-            .await
-            .map_err(|_| FailureStage::Lifecycle)?;
+        let mut crash_recovery_recorded = !recovered_from_crash || lifecycle_identity.is_some();
+        if lifecycle_identity.is_some() {
+            lifecycle
+                .record_startup()
+                .await
+                .map_err(|_| FailureStage::Lifecycle)?;
+        }
+        let mut lifecycle_started = lifecycle_identity.is_some();
 
         self.start_system_collector(config, pairing_valid).await?;
         self.communication_runtime = Some(
@@ -412,8 +426,44 @@ impl RuntimeResources {
                             paired,
                         )
                         .map_err(|_| FailureStage::State)?;
+                        let identity = if paired {
+                            lifecycle_identity_from_pairing_state(
+                                self.database()
+                                    .load_pairing_state()
+                                    .await
+                                    .map_err(|_| FailureStage::Lifecycle)?
+                                    .as_ref(),
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(lifecycle) = self.lifecycle.as_ref() {
+                            lifecycle.update_identity(identity).await;
+                            if paired && !lifecycle_started {
+                                if !crash_recovery_recorded {
+                                    lifecycle
+                                        .record_crash_recovery()
+                                        .await
+                                        .map_err(|_| FailureStage::Lifecycle)?;
+                                    crash_recovery_recorded = true;
+                                }
+                                lifecycle
+                                    .record_startup()
+                                    .await
+                                    .map_err(|_| FailureStage::Lifecycle)?;
+                            }
+                        }
+                        lifecycle_started = paired;
                         self.restart_system_collector(config, paired).await?;
                         self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
+                    }
+                }
+                Some(event) = platform_event_receiver.recv() => {
+                    if let Some(lifecycle) = self.lifecycle.as_ref() {
+                        match lifecycle.record_platform_event(&event).await {
+                            Ok(_) | Err(LifecycleError::IdentityUnavailable) => {}
+                            Err(_) => return Err(FailureStage::Lifecycle),
+                        }
                     }
                 }
             }
@@ -512,6 +562,11 @@ impl RuntimeResources {
         }
         if stop_pairing_server(self.pairing_task.take()).await.is_err() {
             failures.push(FailureStage::PairingCleanup);
+        }
+
+        if let Some(task) = self.control_bootstrap_task.take() {
+            task.abort();
+            let _ = task.await;
         }
 
         if let Some(control) = self.control.take() {
@@ -657,6 +712,7 @@ fn start_bridge(
     credential_store: Arc<dyn CredentialStore>,
     statuses: watch::Sender<BridgeStatus>,
     network_observations: Arc<NetworkObservationState>,
+    lifecycle_events: mpsc::Sender<PlatformLifecycleEvent>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), BridgeSupervisorError>>, ()> {
     let bridge_config = BridgeSupervisorConfig::new(
@@ -676,7 +732,8 @@ fn start_bridge(
         credential_store,
         statuses,
         network_observations,
-    );
+    )
+    .with_lifecycle_events(lifecycle_events);
     Ok(tokio::spawn(supervisor.run(shutdown)))
 }
 
@@ -756,6 +813,14 @@ fn collector_identity_from_pairing_state(
         workspace_id,
         device_id,
     })
+}
+
+fn lifecycle_identity_from_pairing_state(state: Option<&PairingState>) -> Option<RuntimeIdentity> {
+    let identity = collector_identity_from_pairing_state(state)?;
+    Some(RuntimeIdentity::new(
+        identity.workspace_id.hyphenated().to_string(),
+        identity.device_id.hyphenated().to_string(),
+    ))
 }
 
 fn transition_startup_agent_state(

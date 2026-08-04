@@ -16,11 +16,14 @@ use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use tokio::{
     process::{Child, Command},
-    sync::watch,
+    sync::{mpsc, watch},
     time::{sleep, Instant},
 };
 
-use crate::{BridgeClient, BridgeClientConfig, BridgeClientError, NetworkObservationState};
+use crate::{
+    BridgeClient, BridgeClientConfig, BridgeClientError, NetworkObservationState,
+    PlatformLifecycleEvent,
+};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(250);
@@ -31,6 +34,7 @@ const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STABLE_READY: Duration = Duration::from_secs(30);
 const NETWORK_OBSERVATION_INTERVAL: Duration = Duration::from_mins(1);
 const NETWORK_ENABLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct BridgeSupervisorConfig {
@@ -129,6 +133,7 @@ pub struct BridgeSupervisor {
     credential_store: Arc<dyn CredentialStore>,
     statuses: watch::Sender<BridgeStatus>,
     network_observations: Arc<NetworkObservationState>,
+    lifecycle_events: Option<mpsc::Sender<PlatformLifecycleEvent>>,
 }
 
 impl BridgeSupervisor {
@@ -158,7 +163,17 @@ impl BridgeSupervisor {
             credential_store,
             statuses,
             network_observations,
+            lifecycle_events: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_lifecycle_events(
+        mut self,
+        lifecycle_events: mpsc::Sender<PlatformLifecycleEvent>,
+    ) -> Self {
+        self.lifecycle_events = Some(lifecycle_events);
+        self
     }
 
     /// Runs the Bridge child lifecycle until cancellation or protocol incompatibility.
@@ -171,6 +186,7 @@ impl BridgeSupervisor {
     /// Returns only when confirmed socket cleanup fails. Child termination deliberately has no
     /// wall-clock deadline: the supervisor retries kill/wait observations and retains ownership
     /// until `wait` or `try_wait` confirms reap, even if process APIs repeatedly fail.
+    #[allow(clippy::too_many_lines)] // Child, bridge, network, and lifecycle signals share one cancellation boundary.
     pub async fn run(
         self,
         mut shutdown: watch::Receiver<bool>,
@@ -225,6 +241,9 @@ impl BridgeSupervisor {
             let mut network_timer = tokio::time::interval(NETWORK_ENABLE_POLL_INTERVAL);
             network_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_network_observation: Option<Instant> = None;
+            let mut lifecycle_timer = tokio::time::interval(LIFECYCLE_POLL_INTERVAL);
+            lifecycle_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_lifecycle_sequence = 0_u64;
             let child_exited = loop {
                 tokio::select! {
                     biased;
@@ -238,6 +257,15 @@ impl BridgeSupervisor {
                             reap_child(&mut child).await;
                         }
                         break true;
+                    }
+                    _ = lifecycle_timer.tick(), if self.lifecycle_events.is_some() => {
+                        let Some(sender) = self.lifecycle_events.as_ref() else {
+                            continue;
+                        };
+                        match poll_and_forward_lifecycle(&mut client, sender, last_lifecycle_sequence).await {
+                            Ok(latest_sequence) => last_lifecycle_sequence = latest_sequence,
+                            Err(()) => break false,
+                        }
                     }
                     _ = network_timer.tick() => {
                         if !self.network_observations.is_enabled()
@@ -275,6 +303,21 @@ impl BridgeSupervisor {
             }
         }
     }
+}
+
+async fn poll_and_forward_lifecycle(
+    client: &mut BridgeClient,
+    sender: &mpsc::Sender<PlatformLifecycleEvent>,
+    after_sequence: u64,
+) -> Result<u64, ()> {
+    let (events, latest_sequence) = client
+        .poll_lifecycle(after_sequence)
+        .await
+        .map_err(|_| ())?;
+    for event in events {
+        sender.send(event).await.map_err(|_| ())?;
+    }
+    Ok(latest_sequence)
 }
 
 fn network_observation_error_requires_reconnect(error: &BridgeClientError) -> bool {

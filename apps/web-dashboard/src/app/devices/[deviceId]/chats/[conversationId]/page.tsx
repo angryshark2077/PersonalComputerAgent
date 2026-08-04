@@ -13,6 +13,7 @@ import {
   getCommunicationConversations,
   getCommunicationMessages,
   getCommunicationObjectReadUrl,
+  mergeLatestCommunicationMessages,
   type DashboardMessage,
 } from "../../../../../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../../../../../lib/auth";
@@ -35,37 +36,53 @@ export default function ChatMessagesPage() {
 
   useEffect(() => {
     const origin = cloudApiOrigin();
-    void (async () => {
-      if ((await getBrowserSession(window.fetch, origin)) === null) {
-        redirectToSignIn();
-        return;
-      }
+    let active = true;
+    let loading = false;
+    const refresh = async (initial: boolean) => {
+      if (loading) return;
+      loading = true;
       try {
         const [latest, conversations] = await Promise.all([
-          getCommunicationMessages(
-            window.fetch,
-            origin,
-            deviceId,
-            conversationId,
-          ),
+          getCommunicationMessages(window.fetch, origin, deviceId, conversationId),
           getCommunicationConversations(window.fetch, origin, deviceId),
         ]);
+        if (!active) return;
         const conversation = conversations.find(
           (candidate) => candidate.conversation_id === conversationId,
         );
         setDisplayName(conversation?.display_name ?? conversationId);
         setConversationAvatarUrl(conversation?.avatar_url ?? null);
         setConversationScope(conversation?.scope ?? "direct");
-        setHasOlderMessages(latest.length === 100);
-        setMessages(latest.toReversed());
+        if (initial) setHasOlderMessages(latest.length === 100);
+        setMessages((current) => mergeLatestCommunicationMessages(current, latest));
         window.localStorage.setItem(
           chatReadStorageKey(deviceId, conversationId),
-          conversation?.last_message_at ?? new Date().toISOString(),
+          conversation?.last_message_at ?? latest[0]?.occurred_at ?? new Date().toISOString(),
         );
+        setError(null);
       } catch (cause) {
-        setError(messageFor(cause));
+        if (active) setError(messageFor(cause));
+      } finally {
+        loading = false;
       }
+    };
+    void (async () => {
+      if ((await getBrowserSession(window.fetch, origin)) === null) {
+        redirectToSignIn();
+        return;
+      }
+      await refresh(true);
     })();
+    const refreshLatest = () => void refresh(false);
+    const interval = window.setInterval(refreshLatest, 15_000);
+    window.addEventListener("focus", refreshLatest);
+    window.addEventListener("pageshow", refreshLatest);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refreshLatest);
+      window.removeEventListener("pageshow", refreshLatest);
+    };
   }, [conversationId, deviceId]);
 
   useEffect(() => {

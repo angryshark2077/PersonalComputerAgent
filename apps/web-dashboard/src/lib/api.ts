@@ -117,6 +117,18 @@ export interface DashboardMessage {
   attachments: DashboardMessageAttachment[];
 }
 
+export function mergeLatestCommunicationMessages(
+  current: DashboardMessage[] | null,
+  latestNewestFirst: DashboardMessage[],
+): DashboardMessage[] {
+  const byEventId = new Map((current ?? []).map((message) => [message.event_id, message]));
+  for (const message of latestNewestFirst) byEventId.set(message.event_id, message);
+  return [...byEventId.values()].sort((left, right) =>
+    Date.parse(left.occurred_at) - Date.parse(right.occurred_at)
+    || left.event_id.localeCompare(right.event_id)
+  );
+}
+
 export interface CollectorConfigAudit {
   actor_user_id: string;
   configuration_revision: number;

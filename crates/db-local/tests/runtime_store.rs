@@ -96,6 +96,23 @@ fn system_metric_event(event_id: &str) -> EventEnvelope {
     }
 }
 
+fn network_lifecycle_event(event_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        event_id: event_id.to_owned(),
+        workspace_id: "01983333-7333-8333-8333-333333333333".to_owned(),
+        device_id: "01982222-7222-8222-8222-222222222222".to_owned(),
+        event_type: "network.online".to_owned(),
+        source: "runtime.lifecycle".to_owned(),
+        schema_version: 1,
+        occurred_at: "2026-08-04T15:00:00Z".to_owned(),
+        created_at: "2026-08-04T15:00:01Z".to_owned(),
+        sensitivity: Sensitivity::Normal,
+        payload: Map::new(),
+        attachment_refs: Vec::new(),
+        idempotency_key: Some(format!("lifecycle:{event_id}")),
+    }
+}
+
 fn collector_state(status: CollectorStatus) -> CollectorState {
     CollectorState {
         collector_key: "system".to_owned(),
@@ -1112,6 +1129,29 @@ async fn legacy_lifecycle_outbox_rows_load_as_cloud_contract_events() {
     db.acknowledge_system_events(&["legacy-start".to_owned()])
         .await
         .expect("acknowledge legacy lifecycle event");
+    assert_eq!(db.active_outbox_depth().await.expect("outbox depth"), 0);
+}
+
+#[tokio::test]
+async fn network_lifecycle_rows_load_and_ack_as_system_events() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let event = network_lifecycle_event("network-online");
+    db.append_event_with_outbox(&event)
+        .await
+        .expect("persist network event");
+
+    assert_eq!(
+        db.load_pending_system_events(20)
+            .await
+            .expect("load network lifecycle event"),
+        vec![event.clone()],
+    );
+    db.acknowledge_system_events(&[event.event_id])
+        .await
+        .expect("acknowledge network lifecycle event");
     assert_eq!(db.active_outbox_depth().await.expect("outbox depth"), 0);
 }
 

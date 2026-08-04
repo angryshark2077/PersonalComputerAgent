@@ -99,6 +99,15 @@ function agentStarted(deviceId: string) {
   };
 }
 
+function networkOnline(deviceId: string) {
+  return {
+    ...agentStarted(deviceId),
+    event_id: "01986666-7666-8666-8666-66666666666a",
+    event_type: "network.online",
+    idempotency_key: "lifecycle:01986666-7666-8666-8666-66666666666a",
+  };
+}
+
 function communicationText(deviceId: string) {
   return {
     event_id: "01986666-7666-8666-8666-666666666667",
@@ -636,7 +645,7 @@ test("only a completed attachment receives a short Owner read URL", async () => 
   );
 });
 
-test("paired device uploads a strict lifecycle event", async () => {
+test("paired device uploads strict agent and network lifecycle events", async () => {
   const { api, credentials } = await pairedApi();
   const response = await api.request("/v1/agent/sync/events", {
     method: "POST",
@@ -648,12 +657,14 @@ test("paired device uploads a strict lifecycle event", async () => {
       batch_id: "01987777-7777-8777-8777-777777777776",
       device_id: credentials.device_id,
       protocol_version: 1,
-      events: [agentStarted(credentials.device_id)],
+      events: [agentStarted(credentials.device_id), networkOnline(credentials.device_id)],
     }),
   });
   assert.equal(response.status, 200);
-  assert.deepEqual((await response.json() as { accepted: string[] }).accepted,
-    ["01986666-7666-8666-8666-666666666669"]);
+  assert.deepEqual((await response.json() as { accepted: string[] }).accepted, [
+    "01986666-7666-8666-8666-666666666669",
+    "01986666-7666-8666-8666-66666666666a",
+  ]);
 
   const broadened = agentStarted(credentials.device_id);
   broadened.payload = { reason: "must remain local" };

@@ -98,8 +98,19 @@ final class CapabilityProbeTests: XCTestCase {
     func testSyntheticSleepAndWakeMapToCanonicalLifecycleEvents() {
         XCTAssertEqual(PowerMonitor.map(.willSleep), .systemSleep)
         XCTAssertEqual(PowerMonitor.map(.didWake), .systemWake)
-        XCTAssertEqual(PowerLifecycleEvent.systemSleep.rawValue, "SYSTEM_SLEEP")
-        XCTAssertEqual(PowerLifecycleEvent.systemWake.rawValue, "SYSTEM_WAKE")
+        XCTAssertEqual(PowerLifecycleEvent.systemSleep.rawValue, "system.sleep")
+        XCTAssertEqual(PowerLifecycleEvent.systemWake.rawValue, "system.wake")
+    }
+
+    func testLifecycleBufferReturnsStableEventsAfterTheRequestedSequence() {
+        let source = PlatformLifecycleEventBuffer(capacity: 4)
+        source.record(.systemSleep, at: Date(timeIntervalSince1970: 1))
+        source.record(.systemWake, at: Date(timeIntervalSince1970: 2))
+
+        let first = source.snapshot(after: 0)
+        XCTAssertEqual(first.events.map(\.eventType), [.systemSleep, .systemWake])
+        XCTAssertEqual(first.latestSequence, 2)
+        XCTAssertEqual(source.snapshot(after: 1).events.map(\.eventType), [.systemWake])
     }
 }
 

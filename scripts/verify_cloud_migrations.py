@@ -283,7 +283,9 @@ def verify_system_lifecycle_constraints(postgres: TemporaryPostgres, database: s
           ('01989999-7999-8999-8999-999999999991', '{workspace_id}', '{device_id}',
            'agent.started', 'runtime.lifecycle', 1, now(), now(), 'normal', '{{}}'),
           ('01989999-7999-8999-8999-999999999992', '{workspace_id}', '{device_id}',
-           'system.sleep', 'runtime.lifecycle', 1, now(), now(), 'normal', '{{}}');
+           'system.sleep', 'runtime.lifecycle', 1, now(), now(), 'normal', '{{}}'),
+          ('01989999-7999-8999-8999-999999999994', '{workspace_id}', '{device_id}',
+           'network.online', 'runtime.lifecycle', 1, now(), now(), 'normal', '{{}}');
         """,
     )
     wrong_source = postgres.psql(

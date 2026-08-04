@@ -268,7 +268,9 @@ export interface SystemEventRecord {
     | "agent.stopped"
     | "agent.crash_recovered"
     | "system.sleep"
-    | "system.wake";
+    | "system.wake"
+    | "network.offline"
+    | "network.online";
   source: "system" | "collector.registry" | "runtime.lifecycle";
   schemaVersion: number;
   occurredAt: Date;

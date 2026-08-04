@@ -10,7 +10,24 @@ import {
   getCommunicationObjectReadUrl,
   initializeChatReadAt,
   isConversationUnread,
+  mergeLatestCommunicationMessages,
+  type DashboardMessage,
 } from "../src/lib/api.ts";
+
+function message(eventId: string, occurredAt: string): DashboardMessage {
+  return {
+    event_id: eventId,
+    message_id: eventId,
+    sender_id: "sender",
+    sender_display_name: "Sender",
+    sender_avatar_url: null,
+    occurred_at: occurredAt,
+    direction: "incoming",
+    kind: "text",
+    text: eventId,
+    attachments: [],
+  };
+}
 
 test("decodes an encoded WeChat group identity exactly once", () => {
   assert.equal(decodeDashboardRouteParam("room%40chatroom"), "room@chatroom");
@@ -89,5 +106,16 @@ test("loads a short private read URL for one completed media object", async () =
   assert.equal(
     requested,
     "https://cloud.example/v1/devices/device%2Fid/communication/objects/object%2Fid/read",
+  );
+});
+
+test("merges polled chat messages without dropping history or duplicating events", () => {
+  const older = message("event-a", "2026-08-04T14:50:00Z");
+  const existing = message("event-b", "2026-08-04T14:51:00Z");
+  const latest = message("event-c", "2026-08-04T14:52:00Z");
+
+  assert.deepEqual(
+    mergeLatestCommunicationMessages([older, existing], [latest, existing]),
+    [older, existing, latest],
   );
 });

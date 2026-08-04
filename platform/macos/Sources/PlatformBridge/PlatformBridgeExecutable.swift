@@ -77,8 +77,8 @@ public enum PlatformBridgeExecutable {
 
     static func serveStarted(server: BridgeServer) async -> Int32 {
         let powerMonitor = await MainActor.run {
-            let monitor = PowerMonitor { _ in
-                // The typed callback is intentionally not serialized until the lifecycle wire schema is frozen.
+            let monitor = PowerMonitor { event in
+                server.recordPowerLifecycleEvent(event)
             }
             monitor.start()
             return monitor

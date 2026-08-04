@@ -161,11 +161,22 @@ final class NetworkObservationSource: @unchecked Sendable {
     private let deviceLocationSource = DeviceLocationSource()
     private let queue = DispatchQueue(label: "com.pca.platform-bridge.network")
     private let lock = NSLock()
+    private let lifecycleSource: PlatformLifecycleEventBuffer
     private var latestPath: NWPath?
 
-    init() {
+    init(lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer()) {
+        self.lifecycleSource = lifecycleSource
         monitor.pathUpdateHandler = { [weak self] path in
-            self?.lock.withLock { self?.latestPath = path }
+            guard let self else { return }
+            let transition = lock.withLock { () -> PlatformLifecycleEventType? in
+                let previous = latestPath?.status
+                latestPath = path
+                guard let previous, previous != path.status else { return nil }
+                if previous == .satisfied, path.status != .satisfied { return .networkOffline }
+                if previous != .satisfied, path.status == .satisfied { return .networkOnline }
+                return nil
+            }
+            if let transition { lifecycleSource.record(transition) }
         }
         monitor.start(queue: queue)
     }

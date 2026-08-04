@@ -597,6 +597,50 @@ async fn retryable_provider_failure_uses_bounded_backoff_but_terminal_failure_do
 }
 
 #[tokio::test(start_paused = true)]
+async fn transient_contact_read_failure_restarts_and_commits_the_next_message() {
+    let harness = Harness::new().await;
+    let time_guard = prevent_virtual_time_auto_advance();
+    harness.state.poll_results.lock().unwrap().extend([
+        Err(DomainError::new(
+            "WECHAT_CONTACT_READ_FAILED",
+            "redacted",
+            true,
+        )),
+        Ok(vec![text_record(1)]),
+    ]);
+
+    let runtime = harness.start(enabled(1)).await;
+    wait_for(&harness.state.poll_calls, 1).await;
+    wait_for_collector_code(&harness.database, "WECHAT_CONTACT_READ_FAILED").await;
+    settle().await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(harness.state.factory_calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    wait_for(&harness.state.poll_calls, 2).await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if harness
+                .database
+                .load_pending_communication_events(1)
+                .await
+                .expect("load recovered communication event")
+                .len()
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("message commits after transient contact read recovery");
+
+    runtime.shutdown().await.unwrap();
+    time_guard.abort();
+}
+
+#[tokio::test(start_paused = true)]
 async fn authoritative_disable_interrupts_retry_wait_without_an_app_command() {
     let harness = Harness::new().await;
     harness
