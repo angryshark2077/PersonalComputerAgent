@@ -1954,6 +1954,14 @@ fn control_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
         "configuration_revision": revision,
         "collectors": {
             "network": { "enabled": false },
+            "screen.capture": {
+                "enabled": false,
+                "scheduled_enabled": true,
+                "interval_seconds": 300,
+                "activity_enabled": true,
+                "activity_min_interval_seconds": 30,
+                "excluded_bundle_ids": []
+            },
             "communication.wechat": {
                 "enabled": enabled,
                 "directions": ["incoming", "outgoing"],

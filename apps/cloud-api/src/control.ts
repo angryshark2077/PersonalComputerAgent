@@ -189,17 +189,44 @@ function parseCleanupResult(value: unknown): HeartbeatRequest["cleanupResult"] |
 export function parseCollectorConfig(value: unknown): StoredCollectorConfig | null {
   if (
     !isRecord(value) ||
-    !hasOnly(value, ["network", "communication.wechat"]) ||
+    !hasOnly(value, ["network", "screen.capture", "communication.wechat"]) ||
     !("network" in value) ||
+    !("screen.capture" in value) ||
     !("communication.wechat" in value)
   ) {
     return null;
   }
   const network = value.network;
+  const screen = value["screen.capture"];
   const wechat = value["communication.wechat"];
   if (!isRecord(network) || !hasOnly(network, ["enabled"]) || typeof network.enabled !== "boolean") {
     return null;
   }
+  if (
+    !isRecord(screen)
+    || !hasOnly(screen, [
+      "enabled",
+      "scheduled_enabled",
+      "interval_seconds",
+      "activity_enabled",
+      "activity_min_interval_seconds",
+      "excluded_bundle_ids",
+    ])
+    || typeof screen.enabled !== "boolean"
+    || typeof screen.scheduled_enabled !== "boolean"
+    || !Number.isInteger(screen.interval_seconds)
+    || (screen.interval_seconds as number) < 60
+    || (screen.interval_seconds as number) > 86_400
+    || typeof screen.activity_enabled !== "boolean"
+    || !Number.isInteger(screen.activity_min_interval_seconds)
+    || (screen.activity_min_interval_seconds as number) < 10
+    || (screen.activity_min_interval_seconds as number) > 3_600
+    || !Array.isArray(screen.excluded_bundle_ids)
+    || screen.excluded_bundle_ids.length > 100
+    || screen.excluded_bundle_ids.some((item) =>
+      typeof item !== "string" || item.length === 0 || item.length > 255 || !/^[A-Za-z0-9.-]+$/.test(item))
+    || new Set(screen.excluded_bundle_ids).size !== screen.excluded_bundle_ids.length
+  ) return null;
   if (
     !isRecord(wechat) ||
     !hasOnly(wechat, [
@@ -221,7 +248,16 @@ export function parseCollectorConfig(value: unknown): StoredCollectorConfig | nu
   ) {
     return null;
   }
-  return { networkEnabled: network.enabled, wechatEnabled: wechat.enabled };
+  return {
+    networkEnabled: network.enabled,
+    wechatEnabled: wechat.enabled,
+    screenCaptureEnabled: screen.enabled,
+    screenCaptureScheduledEnabled: screen.scheduled_enabled,
+    screenCaptureIntervalSeconds: screen.interval_seconds as number,
+    screenCaptureActivityEnabled: screen.activity_enabled,
+    screenCaptureActivityMinIntervalSeconds: screen.activity_min_interval_seconds as number,
+    screenCaptureExcludedBundleIds: [...screen.excluded_bundle_ids] as string[],
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

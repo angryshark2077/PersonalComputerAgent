@@ -12,13 +12,31 @@
     "CollectorConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["network", "communication.wechat"],
+      "required": ["network", "screen.capture", "communication.wechat"],
       "properties": {
         "network": {
           "type": "object",
           "additionalProperties": false,
           "required": ["enabled"],
           "properties": { "enabled": { "type": "boolean" } }
+        },
+        "screen.capture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "scheduled_enabled", "interval_seconds", "activity_enabled", "activity_min_interval_seconds", "excluded_bundle_ids"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "scheduled_enabled": { "type": "boolean" },
+            "interval_seconds": { "type": "integer", "minimum": 60, "maximum": 86400 },
+            "activity_enabled": { "type": "boolean" },
+            "activity_min_interval_seconds": { "type": "integer", "minimum": 10, "maximum": 3600 },
+            "excluded_bundle_ids": {
+              "type": "array",
+              "maxItems": 100,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[A-Za-z0-9.-]+$" }
+            }
+          }
         },
         "communication.wechat": {
           "type": "object",

@@ -22,6 +22,12 @@ import {
 export interface StoredCollectorConfig {
   networkEnabled: boolean;
   wechatEnabled: boolean;
+  screenCaptureEnabled: boolean;
+  screenCaptureScheduledEnabled: boolean;
+  screenCaptureIntervalSeconds: number;
+  screenCaptureActivityEnabled: boolean;
+  screenCaptureActivityMinIntervalSeconds: number;
+  screenCaptureExcludedBundleIds: string[];
 }
 
 const timestampColumn = (name: string) =>
@@ -246,6 +252,12 @@ export const collectorConfigs = pgTable(
       .default(0),
     networkEnabled: boolean("network_enabled").notNull().default(false),
     wechatEnabled: boolean("wechat_enabled").notNull().default(false),
+    screenCaptureEnabled: boolean("screen_capture_enabled").notNull().default(false),
+    screenCaptureScheduledEnabled: boolean("screen_capture_scheduled_enabled").notNull().default(true),
+    screenCaptureIntervalSeconds: integer("screen_capture_interval_seconds").notNull().default(300),
+    screenCaptureActivityEnabled: boolean("screen_capture_activity_enabled").notNull().default(true),
+    screenCaptureActivityMinIntervalSeconds: integer("screen_capture_activity_min_interval_seconds").notNull().default(30),
+    screenCaptureExcludedBundleIds: jsonb("screen_capture_excluded_bundle_ids").$type<string[]>().notNull().default([]),
     updatedAt: timestampColumn("updated_at").notNull(),
   },
   (table) => [
@@ -255,6 +267,8 @@ export const collectorConfigs = pgTable(
       foreignColumns: [devices.workspaceId, devices.id],
     }).onDelete("cascade"),
     check("collector_configs_revision_nonnegative", sql`${table.configurationRevision} >= 0`),
+    check("collector_configs_screen_interval", sql`${table.screenCaptureIntervalSeconds} BETWEEN 60 AND 86400`),
+    check("collector_configs_screen_activity_interval", sql`${table.screenCaptureActivityMinIntervalSeconds} BETWEEN 10 AND 3600`),
   ],
 );
 
@@ -405,6 +419,72 @@ export const deviceMediaCleanupRequests = pgTable(
       "device_media_cleanup_status",
       sql`${table.status} IN ('queued', 'succeeded', 'failed')`,
     ),
+  ],
+);
+
+export const deviceScreenshotRequests = pgTable(
+  "device_screenshot_requests",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    actorUserId: uuid("actor_user_id").notNull().references(() => authUsers.id, { onDelete: "restrict" }),
+    status: text("status").notNull().default("queued"),
+    requestedAt: timestampColumn("requested_at").notNull(),
+    completedAt: timestampColumn("completed_at"),
+    screenshotId: uuid("screenshot_id"),
+    errorCode: text("error_code"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    uniqueIndex("device_screenshot_requests_one_queued")
+      .on(table.workspaceId, table.deviceId)
+      .where(sql`${table.status} = 'queued'`),
+    index("device_screenshot_requests_latest").on(table.workspaceId, table.deviceId, table.requestedAt.desc()),
+    check("device_screenshot_requests_status", sql`${table.status} IN ('queued', 'succeeded', 'failed')`),
+  ],
+);
+
+export const deviceScreenshots = pgTable(
+  "device_screenshots",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    requestId: uuid("request_id"),
+    trigger: text("trigger").notNull(),
+    capturedAt: timestampColumn("captured_at").notNull(),
+    appBundleId: text("app_bundle_id"),
+    pixelWidth: integer("pixel_width").notNull(),
+    pixelHeight: integer("pixel_height").notNull(),
+    objectKey: text("object_key").notNull(),
+    expectedSha256: char("expected_sha256", { length: 64 }).notNull(),
+    expectedSizeBytes: bigint("expected_size_bytes", { mode: "number" }).notNull(),
+    expectedMimeType: text("expected_mime_type").notNull(),
+    state: text("state").notNull().default("prepared"),
+    preparedAt: timestampColumn("prepared_at").notNull(),
+    completedAt: timestampColumn("completed_at"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.requestId],
+      foreignColumns: [deviceScreenshotRequests.id],
+    }).onDelete("set null"),
+    uniqueIndex("device_screenshots_request_unique").on(table.requestId),
+    index("device_screenshots_chronology").on(table.workspaceId, table.deviceId, table.capturedAt.desc()),
+    check("device_screenshots_trigger", sql`${table.trigger} IN ('manual', 'scheduled', 'activity')`),
+    check("device_screenshots_dimensions", sql`${table.pixelWidth} > 0 AND ${table.pixelHeight} > 0`),
+    check("device_screenshots_size", sql`${table.expectedSizeBytes} > 0`),
+    check("device_screenshots_sha256", sql`${table.expectedSha256} ~ '^[0-9a-f]{64}$'`),
+    check("device_screenshots_mime", sql`${table.expectedMimeType} = 'image/jpeg'`),
+    check("device_screenshots_state", sql`${table.state} IN ('prepared', 'completed')`),
   ],
 );
 

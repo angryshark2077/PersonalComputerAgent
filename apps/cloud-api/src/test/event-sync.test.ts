@@ -661,6 +661,87 @@ test("only a completed attachment receives a short Owner read URL", async () => 
   );
 });
 
+test("Owner manual screenshot request reaches the device and only a completed private JPEG is readable", async () => {
+  const store = new FakeR2ObjectStore();
+  const repository = new MemoryControlRepository([
+    { workspaceId: owner.workspaceId, userId: owner.userId },
+  ]);
+  const api = createApp({ repository, ownerAuthenticator: async () => owner, objectStore: store });
+  const { credentials } = await pairedApiWith(api);
+
+  const queued = await api.request(`/v1/devices/${credentials.device_id}/screenshots`, { method: "POST" });
+  assert.equal(queued.status, 202);
+  const queuedBody = await queued.json() as { request: { request_id: string; status: string } };
+  assert.equal(queuedBody.request.status, "queued");
+
+  const control = await api.request("/v1/agent/control", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      heartbeat_id: "01985555-7555-8555-8555-555555555558",
+      agent_version: "0.1.0",
+      presence: "online",
+      outbox_depth: 0,
+      local_media: {
+        completed_file_count: 0,
+        completed_bytes: 0,
+        protected_file_count: 0,
+        protected_bytes: 0,
+      },
+      cleanup_result: null,
+      network: null,
+    }),
+  });
+  const controlBody = await control.json() as { snapshot: { screenshot_request: { request_id: string } } };
+  assert.equal(controlBody.snapshot.screenshot_request.request_id, queuedBody.request.request_id);
+
+  const screenshotId = "01986666-7666-8666-8666-666666666690";
+  const prepared = await api.request("/v1/agent/screenshots/prepare", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      screenshot_id: screenshotId,
+      request_id: queuedBody.request.request_id,
+      trigger: "manual",
+      captured_at: "2026-08-05T12:00:00.000Z",
+      app_bundle_id: "com.google.Chrome",
+      pixel_width: 1728,
+      pixel_height: 1117,
+      sha256: "c".repeat(64),
+      size_bytes: 4096,
+      mime_type: "image/jpeg",
+    }),
+  });
+  assert.equal(prepared.status, 200);
+  assert.equal((await prepared.json() as { state: string }).state, "prepared");
+  assert.equal((await api.request(`/v1/devices/${credentials.device_id}/screenshots`)).status, 200);
+  assert.deepEqual(await (await api.request(`/v1/devices/${credentials.device_id}/screenshots`)).json(), { screenshots: [] });
+
+  store.uploaded = true;
+  assert.equal((await api.request("/v1/agent/screenshots/complete", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ screenshot_id: screenshotId }),
+  })).status, 200);
+
+  const list = await api.request(`/v1/devices/${credentials.device_id}/screenshots`);
+  const listBody = await list.json() as { screenshots: Array<{ screenshot_id: string; trigger: string }> };
+  assert.deepEqual(listBody.screenshots.map((item) => [item.screenshot_id, item.trigger]), [[screenshotId, "manual"]]);
+  assert.deepEqual(
+    await (await api.request(`/v1/devices/${credentials.device_id}/screenshots/${screenshotId}/read`)).json(),
+    { url: "https://private-media.example/read", expires_at: "2026-08-02T00:06:00.000Z" },
+  );
+});
+
 test("paired device uploads strict agent and network lifecycle events", async () => {
   const { api, credentials } = await pairedApi();
   const response = await api.request("/v1/agent/sync/events", {

@@ -65,6 +65,14 @@ test("owner config is scoped, strict, and reaches device control", async () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         network: { enabled: true },
+        "screen.capture": {
+          enabled: true,
+          scheduled_enabled: true,
+          interval_seconds: 300,
+          activity_enabled: true,
+          activity_min_interval_seconds: 30,
+          excluded_bundle_ids: ["com.1password.1password"],
+        },
         "communication.wechat": {
           enabled: true,
           directions: ["incoming", "outgoing"],
@@ -331,6 +339,14 @@ test("Owner reads only its device control state and configuration audit", async 
   const { api, credentials, repository } = await pairedApi();
   const config = {
     network: { enabled: true },
+    "screen.capture": {
+      enabled: true,
+      scheduled_enabled: true,
+      interval_seconds: 300,
+      activity_enabled: true,
+      activity_min_interval_seconds: 30,
+      excluded_bundle_ids: ["com.1password.1password"],
+    },
     "communication.wechat": {
       enabled: true,
       directions: ["incoming", "outgoing"],
@@ -419,7 +435,18 @@ test("Owner reads only its device control state and configuration audit", async 
       {
         actor_user_id: owner.userId,
         configuration_revision: 1,
-        old_config: { network: { enabled: false }, "communication.wechat": { ...config["communication.wechat"], enabled: false } },
+        old_config: {
+          network: { enabled: false },
+          "screen.capture": {
+            enabled: false,
+            scheduled_enabled: true,
+            interval_seconds: 300,
+            activity_enabled: true,
+            activity_min_interval_seconds: 30,
+            excluded_bundle_ids: [],
+          },
+          "communication.wechat": { ...config["communication.wechat"], enabled: false },
+        },
         new_config: config,
         created_at: (await repository.listCollectorConfigAudit(credentials.device_id, owner.workspaceId, owner.userId))[0]?.createdAt.toISOString(),
       },
@@ -452,6 +479,14 @@ test("owner endpoints cannot cross Workspace boundaries", async () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         network: { enabled: true },
+        "screen.capture": {
+          enabled: false,
+          scheduled_enabled: true,
+          interval_seconds: 300,
+          activity_enabled: true,
+          activity_min_interval_seconds: 30,
+          excluded_bundle_ids: [],
+        },
         "communication.wechat": {
           enabled: false,
           directions: ["incoming", "outgoing"],

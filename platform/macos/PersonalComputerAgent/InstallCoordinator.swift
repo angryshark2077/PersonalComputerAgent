@@ -33,6 +33,7 @@ enum InstallError: Error, Equatable {
     case credentialProvisioningFailed
     case fullDiskAccessRequired
     case locationAccessRequired
+    case screenCaptureAccessRequired
     case approvalTimedOut
     case healthCheckFailed
     case uninstallConfirmationRequired
@@ -57,6 +58,7 @@ extension InstallError: LocalizedError {
         case .credentialProvisioningFailed: "The Bridge credential could not be created in Keychain."
         case .fullDiskAccessRequired: "Full Disk Access was not granted, so the background Agent was not started."
         case .locationAccessRequired: "Location access was not granted, so Wi-Fi SSID and BSSID cannot be collected."
+        case .screenCaptureAccessRequired: "Screen Recording access was not granted, so screenshots cannot be collected."
         case .approvalTimedOut: "Background-item approval was not completed in time."
         case .healthCheckFailed: "The local runtime did not become healthy."
         case .uninstallConfirmationRequired: "Complete uninstall cancelled because the confirmation token did not match."
@@ -75,6 +77,8 @@ extension InstallError: LocalizedError {
             "Open System Settings > Privacy & Security > Full Disk Access, add and enable PersonalComputerAgent, then retry."
         case .locationAccessRequired:
             "Open System Settings > Privacy & Security > Location Services, enable PersonalComputerAgent, then retry."
+        case .screenCaptureAccessRequired:
+            "Open System Settings > Privacy & Security > Screen & System Audio Recording, enable PersonalComputerAgent, then retry."
         case .approvalTimedOut, .serviceRegistrationFailed:
             "Open System Settings > General > Login Items and allow Personal Computer Agent, then retry."
         case .keychainDeletionFailed:
@@ -541,6 +545,48 @@ protocol LocationAccessControlling: AnyObject {
 }
 
 @MainActor
+protocol ScreenCaptureAccessControlling: AnyObject {
+    func waitForAuthorization(
+        helperExecutableURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws
+}
+
+@MainActor
+final class ScreenCaptureAccessController: ScreenCaptureAccessControlling {
+    func waitForAuthorization(
+        helperExecutableURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        guard FileManager.default.isExecutableFile(atPath: helperExecutableURL.path) else {
+            throw InstallError.invalidBundle
+        }
+        onWaitingForAuthorization()
+        try Task.checkCancellation()
+        let process = Process()
+        process.executableURL = helperExecutableURL
+        process.arguments = ["--authorize-screen-capture"]
+        let status = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { process in
+                    continuation.resume(returning: process.terminationStatus)
+                }
+                do { try process.run() } catch { continuation.resume(throwing: error) }
+            }
+        } onCancel: {
+            if process.isRunning { process.terminate() }
+        }
+        try Task.checkCancellation()
+        guard status == 0 else {
+            if let settings = URL(
+                string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+            ) { NSWorkspace.shared.open(settings) }
+            throw InstallError.screenCaptureAccessRequired
+        }
+    }
+}
+
+@MainActor
 final class LocationAccessController: LocationAccessControlling {
     func waitForAuthorization(
         helperExecutableURL: URL,
@@ -693,6 +739,7 @@ final class InstallCoordinator: InstallCoordinating {
     private let relauncher: any Relaunching
     private let fullDiskAccess: any FullDiskAccessControlling
     private let locationAccess: any LocationAccessControlling
+    private let screenCaptureAccess: any ScreenCaptureAccessControlling
     private let credentialProvisioner: any BridgeCredentialProvisioning
     private let fileSystem: any InstallFileOperating
 
@@ -704,6 +751,7 @@ final class InstallCoordinator: InstallCoordinating {
         relauncher: any Relaunching,
         fullDiskAccess: any FullDiskAccessControlling = FullDiskAccessController(),
         locationAccess: any LocationAccessControlling = LocationAccessController(),
+        screenCaptureAccess: any ScreenCaptureAccessControlling = ScreenCaptureAccessController(),
         credentialProvisioner: any BridgeCredentialProvisioning = KeychainBridgeCredentialProvisioner(),
         fileSystem: any InstallFileOperating = LocalInstallFileSystem()
     ) {
@@ -714,6 +762,7 @@ final class InstallCoordinator: InstallCoordinating {
         self.relauncher = relauncher
         self.fullDiskAccess = fullDiskAccess
         self.locationAccess = locationAccess
+        self.screenCaptureAccess = screenCaptureAccess
         self.credentialProvisioner = credentialProvisioner
         self.fileSystem = fileSystem
     }
@@ -866,6 +915,9 @@ final class InstallCoordinator: InstallCoordinating {
         )
         try await locationAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
             onState(.waitingLocationAccess)
+        }
+        try await screenCaptureAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
+            onState(.waitingScreenCaptureAccess)
         }
         do {
             let trustedApplicationURLs = [

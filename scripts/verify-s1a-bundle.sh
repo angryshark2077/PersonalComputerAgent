@@ -97,6 +97,7 @@ plist_mode=$(stat -f '%Lp' "$launch_agent")
 [[ "$(plutil -extract CFBundleIdentifier raw -o - "$info")" == "com.pca.PersonalComputerAgent" ]] || fail "wrong bundle identifier"
 [[ "$(plutil -extract CFBundleIdentifier raw -o - "$bridge_app/Contents/Info.plist")" == "com.pca.PersonalComputerAgent.PlatformBridge" ]] || fail "wrong Bridge helper bundle identifier"
 [[ -n "$(plutil -extract NSLocationWhenInUseUsageDescription raw -o - "$bridge_app/Contents/Info.plist")" ]] || fail "missing Bridge helper location usage description"
+[[ -n "$(plutil -extract NSScreenCaptureUsageDescription raw -o - "$bridge_app/Contents/Info.plist")" ]] || fail "missing Bridge helper screen capture usage description"
 [[ -n "$(plutil -extract NSLocationUsageDescription raw -o - "$info")" ]] || fail "missing macOS location usage description"
 [[ "$(plutil -extract CFBundleExecutable raw -o - "$info")" == "PersonalComputerAgent" ]] || fail "wrong bundle executable"
 [[ "$(plutil -extract LSUIElement raw -o - "$info")" == "true" ]] || fail "LSUIElement must be true"

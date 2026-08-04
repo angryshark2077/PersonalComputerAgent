@@ -160,7 +160,16 @@ test("control state is Workspace-scoped, monotonic, and audited", async () => {
     actorUserId: ownerUserId,
     workspaceId,
     deviceId: "01981111-7111-8111-8111-111111111111",
-    config: { networkEnabled: true, wechatEnabled: false },
+    config: {
+      networkEnabled: true,
+      wechatEnabled: false,
+      screenCaptureEnabled: false,
+      screenCaptureScheduledEnabled: true,
+      screenCaptureIntervalSeconds: 300,
+      screenCaptureActivityEnabled: true,
+      screenCaptureActivityMinIntervalSeconds: 30,
+      screenCaptureExcludedBundleIds: [],
+    },
     now,
   });
   assert.equal(revision, 1);
@@ -267,7 +276,16 @@ test("pairing authorization and config audit require Owner membership", async ()
       actorUserId: "01987777-7777-8777-8777-777777777777",
       workspaceId,
       deviceId: "01981111-7111-8111-8111-111111111111",
-      config: { networkEnabled: false, wechatEnabled: false },
+      config: {
+        networkEnabled: false,
+        wechatEnabled: false,
+        screenCaptureEnabled: false,
+        screenCaptureScheduledEnabled: true,
+        screenCaptureIntervalSeconds: 300,
+        screenCaptureActivityEnabled: true,
+        screenCaptureActivityMinIntervalSeconds: 30,
+        screenCaptureExcludedBundleIds: [],
+      },
       now,
     }),
     (error) =>

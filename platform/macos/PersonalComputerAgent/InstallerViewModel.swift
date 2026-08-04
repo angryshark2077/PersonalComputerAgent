@@ -7,6 +7,7 @@ enum InstallerState: Equatable, Sendable {
     case validating
     case waitingFullDiskAccess
     case waitingLocationAccess
+    case waitingScreenCaptureAccess
     case waitingApproval
     case starting
     case pairing

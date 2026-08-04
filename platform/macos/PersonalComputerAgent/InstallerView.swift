@@ -50,6 +50,8 @@ struct InstallerView: View {
             }
         case .waitingLocationAccess:
             progress("Allow Location access once so Wi-Fi SSID and BSSID remain available after restarts.")
+        case .waitingScreenCaptureAccess:
+            progress("Allow Screen Recording once so Dashboard screenshots remain available after restarts.")
         case .waitingApproval:
             progress("Approve Personal Computer Agent in System Settings > General > Login Items.")
         case .starting:

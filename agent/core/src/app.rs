@@ -20,6 +20,7 @@ use pca_agentd::{
 use pca_bridge_client::supervisor::{
     BridgeSupervisor, BridgeSupervisorConfig, BridgeSupervisorError,
 };
+use pca_bridge_client::{screen_capture_command_channel, ScreenCaptureCommandReceiver};
 use pca_bridge_client::{NetworkObservationState, PlatformLifecycleEvent};
 #[cfg(feature = "process-test-hooks")]
 use pca_db_local::ProcessTestHooks;
@@ -270,7 +271,8 @@ impl RuntimeResources {
         let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(pairing_valid);
         let communication_authorization = CommunicationAuthorization::new();
         let network_observations = Arc::new(NetworkObservationState::default());
-        let (control, control_commands) = CloudControlOwner::start(
+        let (screen_capture, screen_capture_receiver) = screen_capture_command_channel();
+        let (control, control_commands) = CloudControlOwner::start_with_screen_capture(
             Arc::clone(
                 self.database
                     .as_ref()
@@ -278,6 +280,7 @@ impl RuntimeResources {
             ),
             pairing_state_sender.clone(),
             communication_authorization.clone(),
+            screen_capture,
         );
         if !cfg!(feature = "process-test-hooks") {
             let bootstrap_store = Arc::clone(&credential_store);
@@ -298,6 +301,7 @@ impl RuntimeResources {
             bridge_status_sender.clone(),
             Arc::clone(&network_observations),
             platform_event_sender,
+            screen_capture_receiver,
             bridge_shutdown_receiver,
         );
         #[cfg(feature = "process-test-hooks")]
@@ -713,6 +717,7 @@ fn start_bridge(
     statuses: watch::Sender<BridgeStatus>,
     network_observations: Arc<NetworkObservationState>,
     lifecycle_events: mpsc::Sender<PlatformLifecycleEvent>,
+    screen_capture_commands: ScreenCaptureCommandReceiver,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), BridgeSupervisorError>>, ()> {
     let bridge_config = BridgeSupervisorConfig::new(
@@ -720,7 +725,8 @@ fn start_bridge(
         &config.paths.socket_file,
         app_version(),
     )
-    .map_err(|_| ())?;
+    .map_err(|_| ())?
+    .with_operation_timeout(Duration::from_secs(10));
     #[cfg(feature = "process-test-hooks")]
     let bridge_config = if config.process_test_fatal_cleanup.is_some() {
         bridge_config.with_operation_timeout(Duration::from_secs(10))
@@ -733,7 +739,8 @@ fn start_bridge(
         statuses,
         network_observations,
     )
-    .with_lifecycle_events(lifecycle_events);
+    .with_lifecycle_events(lifecycle_events)
+    .with_screen_capture_commands(screen_capture_commands);
     Ok(tokio::spawn(supervisor.run(shutdown)))
 }
 

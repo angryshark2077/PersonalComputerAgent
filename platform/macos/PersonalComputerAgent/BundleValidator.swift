@@ -90,6 +90,7 @@ struct BundleValidator: BundleValidating {
         guard info["CFBundleIdentifier"] as? String == Self.bundleIdentifier,
               info["CFBundleExecutable"] as? String == "PersonalComputerAgent",
               info["LSUIElement"] as? Bool == true,
+              !(info["NSScreenCaptureUsageDescription"] as? String ?? "").isEmpty,
               let candidateVersion = info["CFBundleShortVersionString"] as? String,
               Version(candidateVersion).isValid
         else { throw InstallError.invalidBundle }
@@ -99,6 +100,15 @@ struct BundleValidator: BundleValidating {
         let bridge = candidate.appendingPathComponent(
             "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
         )
+        let bridgeInfo = try dictionary(
+            at: candidate.appendingPathComponent("Contents/Helpers/PCAPlatformBridge.app/Contents/Info.plist")
+        )
+        guard bridgeInfo["CFBundleIdentifier"] as? String == "com.pca.PersonalComputerAgent.PlatformBridge",
+              bridgeInfo["CFBundleExecutable"] as? String == "PCAPlatformBridge",
+              bridgeInfo["LSUIElement"] as? Bool == true,
+              !(bridgeInfo["NSLocationWhenInUseUsageDescription"] as? String ?? "").isEmpty,
+              !(bridgeInfo["NSScreenCaptureUsageDescription"] as? String ?? "").isEmpty
+        else { throw InstallError.invalidBundle }
         let wechatRepair = candidate.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair")
         let ffmpeg = candidate.appendingPathComponent("Contents/Resources/bin/ffmpeg")
         let launchAgent = candidate.appendingPathComponent("Contents/Library/LaunchAgents/\(Self.launchAgentName)")

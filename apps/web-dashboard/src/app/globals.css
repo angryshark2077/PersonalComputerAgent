@@ -9,7 +9,8 @@
 body { margin: 0; min-width: 320px; }
 
 button,
-input { font: inherit; }
+input,
+textarea { font: inherit; }
 
 button { cursor: pointer; }
 
@@ -110,6 +111,8 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 
 .primary-link { color: #155eef; display: inline-block; font-size: 14px; font-weight: 700; margin-bottom: 16px; text-decoration: none; }
 
+.device-links { display: flex; gap: 18px; }
+
 .conversation-list { list-style: none; margin: 0; padding: 0; }
 
 .conversation-list li + li { border-top: 1px solid #edf0f5; }
@@ -182,6 +185,18 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 .collector-card h2 { font-size: 16px; margin: 0; }
 
 .collector-card p { color: #667085; margin: 8px 0 18px; }
+
+.settings-grid { display: grid; gap: 14px; margin: 18px 0; max-width: 620px; }
+.settings-grid label { color: #475467; display: grid; font-size: 14px; gap: 6px; }
+.settings-grid input[type="number"], .settings-grid textarea { border: 1px solid #d0d5dd; border-radius: 8px; padding: 9px 11px; }
+.settings-grid .checkbox-label { align-items: center; display: flex; gap: 9px; }
+.button-row { display: flex; flex-wrap: wrap; gap: 10px; }
+
+.screenshot-grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-top: 24px; }
+.screenshot-card { margin: 0; }
+.screenshot-card img { aspect-ratio: 16 / 10; display: block; object-fit: cover; width: 100%; }
+.screenshot-card figcaption { display: grid; font-size: 13px; gap: 5px; padding: 14px; }
+.screenshot-card figcaption span { color: #667085; overflow-wrap: anywhere; }
 
 .system-metrics { display: grid; gap: 12px; margin: 18px 0 0; }
 

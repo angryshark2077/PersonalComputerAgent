@@ -321,6 +321,7 @@ class S1APackagingTests(unittest.TestCase):
                     "CFBundleExecutable": "PersonalComputerAgent",
                     "LSUIElement": True,
                     "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
+                    "NSScreenCaptureUsageDescription": "Capture the active display.",
                 },
                 output,
             )
@@ -333,6 +334,7 @@ class S1APackagingTests(unittest.TestCase):
                     "LSUIElement": True,
                     "NSLocationWhenInUseUsageDescription": "Read Wi-Fi identity for location matching.",
                     "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
+                    "NSScreenCaptureUsageDescription": "Capture the active display.",
                 },
                 output,
             )

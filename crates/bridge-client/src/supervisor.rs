@@ -16,13 +16,13 @@ use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
 use tokio::{
     process::{Child, Command},
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     time::{sleep, Instant},
 };
 
 use crate::{
     BridgeClient, BridgeClientConfig, BridgeClientError, NetworkObservationState,
-    PlatformLifecycleEvent,
+    PlatformLifecycleEvent, ScreenCaptureResult, ScreenContext,
 };
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -35,6 +35,77 @@ const MAX_STABLE_READY: Duration = Duration::from_secs(30);
 const NETWORK_OBSERVATION_INTERVAL: Duration = Duration::from_mins(1);
 const NETWORK_ENABLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug)]
+pub struct ScreenCaptureCommandHandle {
+    sender: mpsc::Sender<ScreenCaptureCommand>,
+}
+
+impl ScreenCaptureCommandHandle {
+    /// Reads the current lock and activity state through the supervised Bridge connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Disconnected` when the supervisor is unavailable, otherwise the Bridge error.
+    pub async fn context(&self) -> Result<ScreenContext, BridgeClientError> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(ScreenCaptureCommand::Context { response: sender })
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?;
+        receiver
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?
+    }
+
+    /// Captures the active display through the supervised Bridge connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Disconnected` when the supervisor is unavailable, otherwise the Bridge error.
+    pub async fn capture(
+        &self,
+        excluded_bundle_ids: Vec<String>,
+    ) -> Result<ScreenCaptureResult, BridgeClientError> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(ScreenCaptureCommand::Capture {
+                excluded_bundle_ids,
+                response: sender,
+            })
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?;
+        receiver
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?
+    }
+}
+
+#[derive(Debug)]
+pub struct ScreenCaptureCommandReceiver {
+    receiver: mpsc::Receiver<ScreenCaptureCommand>,
+}
+
+#[derive(Debug)]
+enum ScreenCaptureCommand {
+    Context {
+        response: oneshot::Sender<Result<ScreenContext, BridgeClientError>>,
+    },
+    Capture {
+        excluded_bundle_ids: Vec<String>,
+        response: oneshot::Sender<Result<ScreenCaptureResult, BridgeClientError>>,
+    },
+}
+
+#[must_use]
+pub fn screen_capture_command_channel() -> (ScreenCaptureCommandHandle, ScreenCaptureCommandReceiver)
+{
+    let (sender, receiver) = mpsc::channel(8);
+    (
+        ScreenCaptureCommandHandle { sender },
+        ScreenCaptureCommandReceiver { receiver },
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct BridgeSupervisorConfig {
@@ -134,6 +205,7 @@ pub struct BridgeSupervisor {
     statuses: watch::Sender<BridgeStatus>,
     network_observations: Arc<NetworkObservationState>,
     lifecycle_events: Option<mpsc::Sender<PlatformLifecycleEvent>>,
+    screen_capture_commands: Option<ScreenCaptureCommandReceiver>,
 }
 
 impl BridgeSupervisor {
@@ -164,6 +236,7 @@ impl BridgeSupervisor {
             statuses,
             network_observations,
             lifecycle_events: None,
+            screen_capture_commands: None,
         }
     }
 
@@ -173,6 +246,12 @@ impl BridgeSupervisor {
         lifecycle_events: mpsc::Sender<PlatformLifecycleEvent>,
     ) -> Self {
         self.lifecycle_events = Some(lifecycle_events);
+        self
+    }
+
+    #[must_use]
+    pub fn with_screen_capture_commands(mut self, commands: ScreenCaptureCommandReceiver) -> Self {
+        self.screen_capture_commands = Some(commands);
         self
     }
 
@@ -188,7 +267,7 @@ impl BridgeSupervisor {
     /// until `wait` or `try_wait` confirms reap, even if process APIs repeatedly fail.
     #[allow(clippy::too_many_lines)] // Child, bridge, network, and lifecycle signals share one cancellation boundary.
     pub async fn run(
-        self,
+        mut self,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), BridgeSupervisorError> {
         let mut status = StatusEmitter::new(self.statuses);
@@ -284,6 +363,17 @@ impl BridgeSupervisor {
                             Err(_) => break false,
                         }
                     }
+                    command = receive_screen_capture_command(&mut self.screen_capture_commands), if self.screen_capture_commands.is_some() => {
+                        let Some(command) = command else { continue };
+                        match command {
+                            ScreenCaptureCommand::Context { response } => {
+                                let _ = response.send(client.screen_context().await);
+                            }
+                            ScreenCaptureCommand::Capture { excluded_bundle_ids, response } => {
+                                let _ = response.send(client.capture_screen(&excluded_bundle_ids).await);
+                            }
+                        }
+                    }
                 }
             };
             drop(client);
@@ -302,6 +392,15 @@ impl BridgeSupervisor {
                 }
             }
         }
+    }
+}
+
+async fn receive_screen_capture_command(
+    commands: &mut Option<ScreenCaptureCommandReceiver>,
+) -> Option<ScreenCaptureCommand> {
+    match commands {
+        Some(commands) => commands.receiver.recv().await,
+        None => std::future::pending().await,
     }
 }
 

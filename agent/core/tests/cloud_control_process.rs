@@ -514,6 +514,14 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
         "configuration_revision": 7,
         "collectors": {
             "network": { "enabled": false },
+            "screen.capture": {
+                "enabled": false,
+                "scheduled_enabled": true,
+                "interval_seconds": 300,
+                "activity_enabled": true,
+                "activity_min_interval_seconds": 30,
+                "excluded_bundle_ids": []
+            },
             "communication.wechat": {
                 "enabled": true,
                 "directions": ["incoming", "outgoing"],
@@ -532,6 +540,7 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
         .expect("new revision applies");
     assert_eq!(applied.configuration_revision, 7);
     assert!(applied.communication_wechat_enabled);
+    assert_eq!(applied.screen_capture.interval_seconds, 300);
     assert!(apply_snapshot(7, &snapshot).unwrap().is_none());
 
     for (field, invalid) in [
@@ -544,6 +553,17 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
         let mut malformed = exact.clone();
         malformed["collectors"]["communication.wechat"][field] = invalid;
         assert!(serde_json::from_value::<AgentControlSnapshot>(malformed).is_err());
+    }
+
+    for (field, invalid) in [
+        ("interval_seconds", serde_json::json!(59)),
+        ("activity_min_interval_seconds", serde_json::json!(3601)),
+        ("excluded_bundle_ids", serde_json::json!(["invalid/bundle"])),
+    ] {
+        let mut malformed = exact.clone();
+        malformed["collectors"]["screen.capture"][field] = invalid;
+        let parsed = serde_json::from_value::<AgentControlSnapshot>(malformed).unwrap();
+        assert!(apply_snapshot(6, &parsed).is_err());
     }
 }
 
@@ -587,6 +607,7 @@ async fn communication_revision_notifications_are_monotonic_and_invalid_control_
     controls.changed().await.unwrap();
     let first = controls
         .borrow_and_update()
+        .clone()
         .expect("valid revision is notified");
     assert_eq!(first.configuration_revision, 1);
     assert!(first.communication_wechat_enabled);
@@ -667,7 +688,7 @@ async fn persisted_enabled_revision_is_restored_even_when_published_before_subsc
     let restored = controls
         .borrow()
         .as_ref()
-        .copied()
+        .cloned()
         .expect("equal persisted revision is published for restart hydration");
     assert_eq!(restored.configuration_revision, 7);
     assert!(restored.communication_wechat_enabled);
@@ -1101,6 +1122,14 @@ fn exact_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
         "configuration_revision": revision,
         "collectors": {
             "network": { "enabled": false },
+            "screen.capture": {
+                "enabled": false,
+                "scheduled_enabled": true,
+                "interval_seconds": 300,
+                "activity_enabled": true,
+                "activity_min_interval_seconds": 30,
+                "excluded_bundle_ids": []
+            },
             "communication.wechat": {
                 "enabled": enabled,
                 "directions": ["incoming", "outgoing"],

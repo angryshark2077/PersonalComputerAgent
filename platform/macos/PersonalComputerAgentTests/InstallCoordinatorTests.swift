@@ -55,6 +55,8 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.service.registerCount, 1)
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
         XCTAssertEqual(fixture.locationAccess.helperExecutableURLs, [fixture.paths.installedBridgeExecutableURL])
+        XCTAssertEqual(fixture.screenCaptureAccess.checkCount, 1)
+        XCTAssertEqual(fixture.screenCaptureAccess.helperExecutableURLs, [fixture.paths.installedBridgeExecutableURL])
         XCTAssertEqual(fixture.health.checkCount, 1)
         XCTAssertTrue(fixture.relauncher.urls.isEmpty)
     }
@@ -91,6 +93,26 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertEqual(states, [.waitingLocationAccess])
         XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
+        XCTAssertEqual(fixture.service.registerCount, 0)
+        XCTAssertEqual(fixture.health.checkCount, 0)
+    }
+
+    func testMissingScreenCaptureAccessStopsBeforeCredentialsServiceAndHealth() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
+        fixture.screenCaptureAccess.error = .screenCaptureAccessRequired
+        var states: [InstallerState] = []
+
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.coordinator.finishInstalledSetup { states.append($0) }
+        ) { error in
+            XCTAssertEqual(error as? InstallError, .screenCaptureAccessRequired)
+        }
+
+        XCTAssertEqual(states, [.waitingScreenCaptureAccess])
+        XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
+        XCTAssertEqual(fixture.locationAccess.checkCount, 1)
+        XCTAssertEqual(fixture.screenCaptureAccess.checkCount, 1)
         XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
         XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertEqual(fixture.health.checkCount, 0)
@@ -494,6 +516,7 @@ private final class Fixture {
     let relauncher = FakeRelauncher()
     let fullDiskAccess = FakeFullDiskAccessController()
     let locationAccess = FakeLocationAccessController()
+    let screenCaptureAccess = FakeScreenCaptureAccessController()
     let credentialProvisioner = FakeBridgeCredentialProvisioner()
     let fileSystem: FaultingInstallFileSystem
     let coordinator: InstallCoordinator
@@ -520,6 +543,7 @@ private final class Fixture {
             relauncher: relauncher,
             fullDiskAccess: fullDiskAccess,
             locationAccess: locationAccess,
+            screenCaptureAccess: screenCaptureAccess,
             credentialProvisioner: credentialProvisioner,
             fileSystem: fileSystem
         )
@@ -594,6 +618,25 @@ private final class FakeFullDiskAccessController: FullDiskAccessControlling {
 
 @MainActor
 private final class FakeLocationAccessController: LocationAccessControlling {
+    var checkCount = 0
+    var helperExecutableURLs: [URL] = []
+    var error: InstallError?
+
+    func waitForAuthorization(
+        helperExecutableURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        checkCount += 1
+        helperExecutableURLs.append(helperExecutableURL)
+        if let error {
+            onWaitingForAuthorization()
+            throw error
+        }
+    }
+}
+
+@MainActor
+private final class FakeScreenCaptureAccessController: ScreenCaptureAccessControlling {
     var checkCount = 0
     var helperExecutableURLs: [URL] = []
     var error: InstallError?
@@ -1347,6 +1390,7 @@ final class BundleValidatorSigningTests: XCTestCase {
             "CFBundleExecutable": "PersonalComputerAgent",
             "CFBundleShortVersionString": "2.0.0",
             "LSUIElement": true,
+            "NSScreenCaptureUsageDescription": "Capture the active display.",
         ]
         XCTAssertTrue((info as NSDictionary).write(to: bundle.appendingPathComponent("Contents/Info.plist"), atomically: true))
         let bridgeInfo: [String: Any] = [
@@ -1355,6 +1399,7 @@ final class BundleValidatorSigningTests: XCTestCase {
             "CFBundleShortVersionString": "2.0.0",
             "LSUIElement": true,
             "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
+            "NSScreenCaptureUsageDescription": "Capture the active display.",
         ]
         XCTAssertTrue((bridgeInfo as NSDictionary).write(
             to: bridge.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist"),

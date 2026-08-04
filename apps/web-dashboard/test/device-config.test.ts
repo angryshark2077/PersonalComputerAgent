@@ -13,6 +13,14 @@ const snapshotWithWechatEnabled = () => ({
   status: null,
   collectors: {
     network: { enabled: true },
+    "screen.capture": {
+      enabled: true,
+      scheduled_enabled: true,
+      interval_seconds: 300,
+      activity_enabled: true,
+      activity_min_interval_seconds: 30,
+      excluded_bundle_ids: [],
+    },
     "communication.wechat": {
       enabled: true,
       directions: ["incoming", "outgoing"] as ["incoming", "outgoing"],
@@ -39,4 +47,11 @@ test("device configuration shows only the approved Network collection detail", (
   assert.match(page, /SSID, BSSID, local IP and precise device location/);
   assert.equal(page.includes("Gateway"), false);
   assert.equal(page.includes("Traffic"), false);
+});
+
+test("device configuration exposes active-display screenshot boundaries", () => {
+  const page = renderDeviceConfiguration(snapshotWithWechatEnabled());
+
+  assert.match(page, /Active display only/);
+  assert.match(page, /lock screen and excluded applications are skipped/);
 });

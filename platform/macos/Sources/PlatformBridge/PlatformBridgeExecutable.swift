@@ -27,6 +27,7 @@ private func safeFailure(_ message: String) {
 
 public enum PlatformBridgeExecutable {
     private static let locationAuthorizationArgument = "--authorize-location"
+    private static let screenCaptureAuthorizationArgument = "--authorize-screen-capture"
 
     static func run(
         arguments commandLineArguments: [String],
@@ -116,6 +117,11 @@ public enum PlatformBridgeExecutable {
             }
             NSApplication.shared.run()
             exit(3)
+        }
+        if CommandLine.arguments == [CommandLine.arguments[0], screenCaptureAuthorizationArgument] {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            exit(CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() ? 0 : 2)
         }
 
         NSApplication.shared.setActivationPolicy(.prohibited)

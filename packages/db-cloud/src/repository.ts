@@ -16,6 +16,8 @@ import {
   deviceCredentialGenerations,
   deviceHeartbeats,
   deviceMediaCleanupRequests,
+  deviceScreenshotRequests,
+  deviceScreenshots,
   devices,
   deviceRevocationAudit,
   networkLocationLibrary,
@@ -194,6 +196,57 @@ export interface LocalMediaCleanupRecord {
   deletedFileCount: number | null;
   freedBytes: number | null;
   errorCode: string | null;
+}
+
+export interface ScreenshotRequestRecord {
+  requestId: string;
+  status: "queued" | "succeeded" | "failed";
+  requestedAt: Date;
+  completedAt: Date | null;
+  screenshotId: string | null;
+  errorCode: string | null;
+}
+
+export interface ScreenshotRequestInput {
+  requestId: string;
+  actorUserId: string;
+  workspaceId: string;
+  deviceId: string;
+  now: Date;
+}
+
+export interface ScreenshotRecord {
+  screenshotId: string;
+  workspaceId: string;
+  deviceId: string;
+  requestId: string | null;
+  trigger: "manual" | "scheduled" | "activity";
+  capturedAt: Date;
+  appBundleId: string | null;
+  pixelWidth: number;
+  pixelHeight: number;
+  objectKey: string;
+  expectedSha256: string;
+  expectedSizeBytes: number;
+  expectedMimeType: "image/jpeg";
+  state: "prepared" | "completed";
+  preparedAt: Date;
+  completedAt: Date | null;
+}
+
+export interface PrepareScreenshotInput {
+  screenshotId: string;
+  objectKey: string;
+  requestId: string | null;
+  trigger: ScreenshotRecord["trigger"];
+  capturedAt: Date;
+  appBundleId: string | null;
+  pixelWidth: number;
+  pixelHeight: number;
+  expectedSha256: string;
+  expectedSizeBytes: number;
+  expectedMimeType: "image/jpeg";
+  now: Date;
 }
 
 export interface ConfigAuditInput {
@@ -449,6 +502,38 @@ export interface ControlRepository {
     workspaceId: string,
     userId: string,
   ): Promise<LocalMediaCleanupRecord | null>;
+  requestScreenshot(input: ScreenshotRequestInput): Promise<ScreenshotRequestRecord>;
+  failScreenshotRequest(
+    workspaceId: string,
+    deviceId: string,
+    requestId: string,
+    errorCode: string,
+    completedAt: Date,
+  ): Promise<void>;
+  prepareScreenshot(
+    workspaceId: string,
+    deviceId: string,
+    input: PrepareScreenshotInput,
+  ): Promise<ScreenshotRecord>;
+  loadDeviceScreenshot(workspaceId: string, deviceId: string, screenshotId: string): Promise<ScreenshotRecord>;
+  completeScreenshot(
+    workspaceId: string,
+    deviceId: string,
+    screenshotId: string,
+    completedAt: Date,
+  ): Promise<ScreenshotRecord>;
+  listOwnerScreenshots(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<ScreenshotRecord[]>;
+  loadOwnerCompletedScreenshot(
+    workspaceId: string,
+    userId: string,
+    deviceId: string,
+    screenshotId: string,
+  ): Promise<ScreenshotRecord>;
   listOwnerNetworkLocations(workspaceId: string, userId: string): Promise<NetworkLocationRecord[]>;
   createOwnerNetworkLocation(input: NetworkLocationInput): Promise<NetworkLocationRecord>;
   deleteOwnerNetworkLocation(locationId: string, workspaceId: string, userId: string): Promise<void>;
@@ -567,6 +652,8 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #workspaceNames = new Map<string, string>();
   readonly #latestHeartbeats = new Map<string, DeviceStatus>();
   readonly #mediaCleanupRequests = new Map<string, LocalMediaCleanupRecord & { workspaceId: string; deviceId: string }>();
+  readonly #screenshotRequests = new Map<string, ScreenshotRequestRecord & { workspaceId: string; deviceId: string }>();
+  readonly #screenshots = new Map<string, ScreenshotRecord>();
   readonly #networkLocations = new Map<string, NetworkLocationRecord & { workspaceId: string }>();
   readonly #configAudit: Array<CollectorConfigAuditRecord & { workspaceId: string; deviceId: string }> = [];
   readonly #systemEvents = new Map<string, SystemEventRecord>();
@@ -670,8 +757,7 @@ export class MemoryControlRepository implements ControlRepository {
     ]);
     this.#configs.set(configKey(code.workspaceId, input.deviceId), {
       configurationRevision: 0,
-      networkEnabled: false,
-      wechatEnabled: false,
+      ...defaultCollectorConfig(),
     });
     return grant;
   }
@@ -737,12 +823,13 @@ export class MemoryControlRepository implements ControlRepository {
     const device = this.#requireDevice(deviceId, workspaceId, true);
     const config = this.#configs.get(configKey(workspaceId, deviceId)) ?? {
       configurationRevision: 0,
-      networkEnabled: false,
-      wechatEnabled: false,
+      ...defaultCollectorConfig(),
     };
     const cleanup = [...this.#mediaCleanupRequests.values()]
       .find((request) => request.workspaceId === workspaceId && request.deviceId === deviceId && request.status === "queued");
-    return snapshot(device, config, cleanup?.requestId ?? null);
+    const screenshot = [...this.#screenshotRequests.values()]
+      .find((request) => request.workspaceId === workspaceId && request.deviceId === deviceId && request.status === "queued");
+    return snapshot(device, config, cleanup?.requestId ?? null, screenshot?.requestId ?? null);
   }
 
   async recordHeartbeat(input: HeartbeatInput): Promise<void> {
@@ -855,6 +942,144 @@ export class MemoryControlRepository implements ControlRepository {
     return latest === undefined ? null : cleanupRecord(latest);
   }
 
+  async requestScreenshot(input: ScreenshotRequestInput): Promise<ScreenshotRequestRecord> {
+    this.#requireOwnerMembership(input.workspaceId, input.actorUserId);
+    this.#requireDevice(input.deviceId, input.workspaceId, false);
+    if ([...this.#screenshotRequests.values()].some((request) =>
+      request.workspaceId === input.workspaceId
+      && request.deviceId === input.deviceId
+      && request.status === "queued")) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    const record: ScreenshotRequestRecord & { workspaceId: string; deviceId: string } = {
+      requestId: input.requestId,
+      workspaceId: input.workspaceId,
+      deviceId: input.deviceId,
+      status: "queued",
+      requestedAt: input.now,
+      completedAt: null,
+      screenshotId: null,
+      errorCode: null,
+    };
+    this.#screenshotRequests.set(input.requestId, record);
+    return screenshotRequestRecord(record);
+  }
+
+  async failScreenshotRequest(
+    workspaceId: string,
+    deviceId: string,
+    requestId: string,
+    errorCode: string,
+    completedAt: Date,
+  ): Promise<void> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const request = this.#screenshotRequests.get(requestId);
+    if (request === undefined || request.workspaceId !== workspaceId || request.deviceId !== deviceId) {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    if (request.status === "queued") {
+      request.status = "failed";
+      request.completedAt = completedAt;
+      request.errorCode = errorCode;
+    }
+  }
+
+  async prepareScreenshot(
+    workspaceId: string,
+    deviceId: string,
+    input: PrepareScreenshotInput,
+  ): Promise<ScreenshotRecord> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const existing = this.#screenshots.get(input.screenshotId);
+    if (existing !== undefined) return { ...existing };
+    if (input.requestId !== null) {
+      const request = this.#screenshotRequests.get(input.requestId);
+      if (request === undefined || request.workspaceId !== workspaceId || request.deviceId !== deviceId || request.status !== "queued") {
+        throw new ControlRepositoryError("CONFLICT");
+      }
+    }
+    const record: ScreenshotRecord = {
+      screenshotId: input.screenshotId,
+      workspaceId,
+      deviceId,
+      requestId: input.requestId,
+      trigger: input.trigger,
+      capturedAt: input.capturedAt,
+      appBundleId: input.appBundleId,
+      pixelWidth: input.pixelWidth,
+      pixelHeight: input.pixelHeight,
+      objectKey: input.objectKey,
+      expectedSha256: input.expectedSha256,
+      expectedSizeBytes: input.expectedSizeBytes,
+      expectedMimeType: input.expectedMimeType,
+      state: "prepared",
+      preparedAt: input.now,
+      completedAt: null,
+    };
+    this.#screenshots.set(record.screenshotId, record);
+    return { ...record };
+  }
+
+  async loadDeviceScreenshot(workspaceId: string, deviceId: string, screenshotId: string): Promise<ScreenshotRecord> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const screenshot = this.#screenshots.get(screenshotId);
+    if (screenshot === undefined || screenshot.workspaceId !== workspaceId || screenshot.deviceId !== deviceId) {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    return { ...screenshot };
+  }
+
+  async completeScreenshot(
+    workspaceId: string,
+    deviceId: string,
+    screenshotId: string,
+    completedAt: Date,
+  ): Promise<ScreenshotRecord> {
+    const screenshot = await this.loadDeviceScreenshot(workspaceId, deviceId, screenshotId);
+    const stored = this.#screenshots.get(screenshotId)!;
+    stored.state = "completed";
+    stored.completedAt = completedAt;
+    if (stored.requestId !== null) {
+      const request = this.#screenshotRequests.get(stored.requestId);
+      if (request !== undefined && request.status === "queued") {
+        request.status = "succeeded";
+        request.completedAt = completedAt;
+        request.screenshotId = screenshotId;
+      }
+    }
+    return { ...stored };
+  }
+
+  async listOwnerScreenshots(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<ScreenshotRecord[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    return [...this.#screenshots.values()]
+      .filter((record) => record.workspaceId === workspaceId && record.deviceId === deviceId && record.state === "completed")
+      .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime())
+      .slice(0, limit)
+      .map((record) => ({ ...record }));
+  }
+
+  async loadOwnerCompletedScreenshot(
+    workspaceId: string,
+    userId: string,
+    deviceId: string,
+    screenshotId: string,
+  ): Promise<ScreenshotRecord> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    const screenshot = this.#screenshots.get(screenshotId);
+    if (screenshot === undefined || screenshot.workspaceId !== workspaceId || screenshot.deviceId !== deviceId || screenshot.state !== "completed") {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    return { ...screenshot };
+  }
+
   async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
     this.#requireOwnerMembership(input.workspaceId, input.actorUserId);
     this.#requireDevice(input.deviceId, input.workspaceId, false);
@@ -864,8 +1089,7 @@ export class MemoryControlRepository implements ControlRepository {
     const key = configKey(input.workspaceId, input.deviceId);
     const current = this.#configs.get(key) ?? {
       configurationRevision: 0,
-      networkEnabled: false,
-      wechatEnabled: false,
+      ...defaultCollectorConfig(),
     };
     const revision = current.configurationRevision + 1;
     this.#configs.set(key, { ...input.config, configurationRevision: revision });
@@ -875,10 +1099,7 @@ export class MemoryControlRepository implements ControlRepository {
       deviceId: input.deviceId,
       actorUserId: input.actorUserId,
       configurationRevision: revision,
-      oldConfig: {
-        networkEnabled: current.networkEnabled,
-        wechatEnabled: current.wechatEnabled,
-      },
+      oldConfig: storedConfig(current),
       newConfig: { ...input.config },
       createdAt: input.now,
     });
@@ -1395,6 +1616,200 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
+  async requestScreenshot(input: ScreenshotRequestInput): Promise<ScreenshotRequestRecord> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, input.workspaceId, input.actorUserId);
+      await requireDatabaseDevice(this.database, input.deviceId, input.workspaceId, false);
+      const [row] = await this.database.insert(deviceScreenshotRequests).values({
+        id: input.requestId,
+        workspaceId: input.workspaceId,
+        deviceId: input.deviceId,
+        actorUserId: input.actorUserId,
+        status: "queued",
+        requestedAt: input.now,
+      }).returning();
+      if (row === undefined) throw new ControlRepositoryError("CONFLICT");
+      return screenshotRequestFromRow(row);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async failScreenshotRequest(
+    workspaceId: string,
+    deviceId: string,
+    requestId: string,
+    errorCode: string,
+    completedAt: Date,
+  ): Promise<void> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      const [updated] = await this.database.update(deviceScreenshotRequests).set({
+        status: "failed",
+        completedAt,
+        errorCode,
+      }).where(and(
+        eq(deviceScreenshotRequests.id, requestId),
+        eq(deviceScreenshotRequests.workspaceId, workspaceId),
+        eq(deviceScreenshotRequests.deviceId, deviceId),
+        eq(deviceScreenshotRequests.status, "queued"),
+      )).returning({ id: deviceScreenshotRequests.id });
+      if (updated === undefined) {
+        const [existing] = await this.database.select({ id: deviceScreenshotRequests.id })
+          .from(deviceScreenshotRequests)
+          .where(and(
+            eq(deviceScreenshotRequests.id, requestId),
+            eq(deviceScreenshotRequests.workspaceId, workspaceId),
+            eq(deviceScreenshotRequests.deviceId, deviceId),
+          ))
+          .limit(1);
+        if (existing === undefined) throw new ControlRepositoryError("CONFLICT");
+      }
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async prepareScreenshot(
+    workspaceId: string,
+    deviceId: string,
+    input: PrepareScreenshotInput,
+  ): Promise<ScreenshotRecord> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      const [existing] = await this.database.select().from(deviceScreenshots)
+        .where(and(
+          eq(deviceScreenshots.id, input.screenshotId),
+          eq(deviceScreenshots.workspaceId, workspaceId),
+          eq(deviceScreenshots.deviceId, deviceId),
+        )).limit(1);
+      if (existing !== undefined) return screenshotFromRow(existing);
+      if (input.requestId !== null) {
+        const [request] = await this.database.select({ id: deviceScreenshotRequests.id })
+          .from(deviceScreenshotRequests).where(and(
+            eq(deviceScreenshotRequests.id, input.requestId),
+            eq(deviceScreenshotRequests.workspaceId, workspaceId),
+            eq(deviceScreenshotRequests.deviceId, deviceId),
+            eq(deviceScreenshotRequests.status, "queued"),
+          )).limit(1);
+        if (request === undefined) throw new ControlRepositoryError("CONFLICT");
+      }
+      const [created] = await this.database.insert(deviceScreenshots).values({
+        id: input.screenshotId,
+        workspaceId,
+        deviceId,
+        requestId: input.requestId,
+        trigger: input.trigger,
+        capturedAt: input.capturedAt,
+        appBundleId: input.appBundleId,
+        pixelWidth: input.pixelWidth,
+        pixelHeight: input.pixelHeight,
+        objectKey: input.objectKey,
+        expectedSha256: input.expectedSha256,
+        expectedSizeBytes: input.expectedSizeBytes,
+        expectedMimeType: input.expectedMimeType,
+        state: "prepared",
+        preparedAt: input.now,
+      }).returning();
+      if (created === undefined) throw new ControlRepositoryError("CONFLICT");
+      return screenshotFromRow(created);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async loadDeviceScreenshot(workspaceId: string, deviceId: string, screenshotId: string): Promise<ScreenshotRecord> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      const [row] = await this.database.select().from(deviceScreenshots).where(and(
+        eq(deviceScreenshots.id, screenshotId),
+        eq(deviceScreenshots.workspaceId, workspaceId),
+        eq(deviceScreenshots.deviceId, deviceId),
+      )).limit(1);
+      if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      return screenshotFromRow(row);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async completeScreenshot(
+    workspaceId: string,
+    deviceId: string,
+    screenshotId: string,
+    completedAt: Date,
+  ): Promise<ScreenshotRecord> {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        const [row] = await transaction.update(deviceScreenshots).set({
+          state: "completed",
+          completedAt,
+        }).where(and(
+          eq(deviceScreenshots.id, screenshotId),
+          eq(deviceScreenshots.workspaceId, workspaceId),
+          eq(deviceScreenshots.deviceId, deviceId),
+        )).returning();
+        if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+        if (row.requestId !== null) {
+          await transaction.update(deviceScreenshotRequests).set({
+            status: "succeeded",
+            completedAt,
+            screenshotId,
+            errorCode: null,
+          }).where(and(
+            eq(deviceScreenshotRequests.id, row.requestId),
+            eq(deviceScreenshotRequests.status, "queued"),
+          ));
+        }
+        return screenshotFromRow(row);
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listOwnerScreenshots(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+  ): Promise<ScreenshotRecord[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const rows = await this.database.select().from(deviceScreenshots).where(and(
+        eq(deviceScreenshots.workspaceId, workspaceId),
+        eq(deviceScreenshots.deviceId, deviceId),
+        eq(deviceScreenshots.state, "completed"),
+      )).orderBy(desc(deviceScreenshots.capturedAt)).limit(limit);
+      return rows.map(screenshotFromRow);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async loadOwnerCompletedScreenshot(
+    workspaceId: string,
+    userId: string,
+    deviceId: string,
+    screenshotId: string,
+  ): Promise<ScreenshotRecord> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const [row] = await this.database.select().from(deviceScreenshots).where(and(
+        eq(deviceScreenshots.id, screenshotId),
+        eq(deviceScreenshots.workspaceId, workspaceId),
+        eq(deviceScreenshots.deviceId, deviceId),
+        eq(deviceScreenshots.state, "completed"),
+      )).limit(1);
+      if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      return screenshotFromRow(row);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
   async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string> {
     try {
       return await this.database.transaction(async (transaction) => {
@@ -1512,8 +1927,7 @@ export class DrizzleControlRepository implements ControlRepository {
           workspaceId: binding.workspaceId,
           deviceId: input.deviceId,
           configurationRevision: 0,
-          networkEnabled: false,
-          wechatEnabled: false,
+          ...defaultCollectorConfig(),
           updatedAt: input.now,
         });
         return {
@@ -1630,11 +2044,20 @@ export class DrizzleControlRepository implements ControlRepository {
         )
         .orderBy(desc(deviceMediaCleanupRequests.requestedAt))
         .limit(1);
+      const [screenshot] = await this.database
+        .select({ requestId: deviceScreenshotRequests.id })
+        .from(deviceScreenshotRequests)
+        .where(and(
+          eq(deviceScreenshotRequests.workspaceId, workspaceId),
+          eq(deviceScreenshotRequests.deviceId, deviceId),
+          eq(deviceScreenshotRequests.status, "queued"),
+        ))
+        .orderBy(desc(deviceScreenshotRequests.requestedAt))
+        .limit(1);
       return snapshot(device, {
         configurationRevision: config?.configurationRevision ?? 0,
-        networkEnabled: config?.networkEnabled ?? false,
-        wechatEnabled: config?.wechatEnabled ?? false,
-      }, cleanup?.requestId ?? null);
+        ...storedConfig(config ?? defaultCollectorConfig()),
+      }, cleanup?.requestId ?? null, screenshot?.requestId ?? null);
     } catch (error) {
       throw repositoryError(error);
     }
@@ -1839,8 +2262,7 @@ export class DrizzleControlRepository implements ControlRepository {
           )
           .limit(1);
         const oldConfig: StoredCollectorConfig = {
-          networkEnabled: current?.networkEnabled ?? false,
-          wechatEnabled: current?.wechatEnabled ?? false,
+          ...storedConfig(current ?? defaultCollectorConfig()),
         };
         const revision = (current?.configurationRevision ?? 0) + 1;
         if (current === undefined) {
@@ -2064,8 +2486,7 @@ export class DrizzleControlRepository implements ControlRepository {
         .limit(1);
       const configRecord: ConfigRecord = {
         configurationRevision: config?.configurationRevision ?? 0,
-        networkEnabled: config?.networkEnabled ?? false,
-        wechatEnabled: config?.wechatEnabled ?? false,
+        ...storedConfig(config ?? defaultCollectorConfig()),
       };
       const network: NetworkHeartbeat | null = heartbeat?.networkInterfaceType === null || heartbeat?.networkInterfaceType === undefined
         ? null
@@ -2141,7 +2562,7 @@ export class DrizzleControlRepository implements ControlRepository {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
       await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
-      return await this.database
+      const rows = await this.database
         .select({
           actorUserId: collectorConfigAudit.actorUserId,
           configurationRevision: collectorConfigAudit.configurationRevision,
@@ -2157,6 +2578,11 @@ export class DrizzleControlRepository implements ControlRepository {
           ),
         )
         .orderBy(desc(collectorConfigAudit.createdAt));
+      return rows.map((row) => ({
+        ...row,
+        oldConfig: storedConfig(row.oldConfig),
+        newConfig: storedConfig(row.newConfig),
+      }));
     } catch (error) {
       throw repositoryError(error);
     }
@@ -2929,6 +3355,7 @@ function snapshot(
   device: DeviceRecord,
   config: ConfigRecord,
   cleanupRequestId: string | null = null,
+  screenshotRequestId: string | null = null,
 ): AgentControlSnapshot {
   return {
     device_id: device.id,
@@ -2936,8 +3363,17 @@ function snapshot(
     revoked: device.revokedAt !== null,
     configuration_revision: config.configurationRevision,
     local_media_cleanup: cleanupRequestId === null ? null : { request_id: cleanupRequestId },
+    screenshot_request: screenshotRequestId === null ? null : { request_id: screenshotRequestId },
     collectors: {
       network: { enabled: config.networkEnabled },
+      "screen.capture": {
+        enabled: config.screenCaptureEnabled,
+        scheduled_enabled: config.screenCaptureScheduledEnabled,
+        interval_seconds: config.screenCaptureIntervalSeconds,
+        activity_enabled: config.screenCaptureActivityEnabled,
+        activity_min_interval_seconds: config.screenCaptureActivityMinIntervalSeconds,
+        excluded_bundle_ids: [...config.screenCaptureExcludedBundleIds],
+      },
       "communication.wechat": {
         enabled: config.wechatEnabled,
         directions: ["incoming", "outgoing"],
@@ -2948,6 +3384,75 @@ function snapshot(
         retention_days: 180,
       },
     },
+  };
+}
+
+function defaultCollectorConfig(): StoredCollectorConfig {
+  return {
+    networkEnabled: false,
+    wechatEnabled: false,
+    screenCaptureEnabled: false,
+    screenCaptureScheduledEnabled: true,
+    screenCaptureIntervalSeconds: 300,
+    screenCaptureActivityEnabled: true,
+    screenCaptureActivityMinIntervalSeconds: 30,
+    screenCaptureExcludedBundleIds: [],
+  };
+}
+
+function storedConfig(config: Partial<StoredCollectorConfig>): StoredCollectorConfig {
+  const defaults = defaultCollectorConfig();
+  return {
+    networkEnabled: config.networkEnabled ?? defaults.networkEnabled,
+    wechatEnabled: config.wechatEnabled ?? defaults.wechatEnabled,
+    screenCaptureEnabled: config.screenCaptureEnabled ?? defaults.screenCaptureEnabled,
+    screenCaptureScheduledEnabled: config.screenCaptureScheduledEnabled ?? defaults.screenCaptureScheduledEnabled,
+    screenCaptureIntervalSeconds: config.screenCaptureIntervalSeconds ?? defaults.screenCaptureIntervalSeconds,
+    screenCaptureActivityEnabled: config.screenCaptureActivityEnabled ?? defaults.screenCaptureActivityEnabled,
+    screenCaptureActivityMinIntervalSeconds: config.screenCaptureActivityMinIntervalSeconds ?? defaults.screenCaptureActivityMinIntervalSeconds,
+    screenCaptureExcludedBundleIds: [...(config.screenCaptureExcludedBundleIds ?? defaults.screenCaptureExcludedBundleIds)],
+  };
+}
+
+function screenshotRequestRecord(record: ScreenshotRequestRecord): ScreenshotRequestRecord {
+  return {
+    ...record,
+    requestedAt: new Date(record.requestedAt),
+    completedAt: record.completedAt === null ? null : new Date(record.completedAt),
+  };
+}
+
+function screenshotRequestFromRow(
+  row: typeof deviceScreenshotRequests.$inferSelect,
+): ScreenshotRequestRecord {
+  return screenshotRequestRecord({
+    requestId: row.id,
+    status: row.status as ScreenshotRequestRecord["status"],
+    requestedAt: row.requestedAt,
+    completedAt: row.completedAt,
+    screenshotId: row.screenshotId,
+    errorCode: row.errorCode,
+  });
+}
+
+function screenshotFromRow(row: typeof deviceScreenshots.$inferSelect): ScreenshotRecord {
+  return {
+    screenshotId: row.id,
+    workspaceId: row.workspaceId,
+    deviceId: row.deviceId,
+    requestId: row.requestId,
+    trigger: row.trigger as ScreenshotRecord["trigger"],
+    capturedAt: row.capturedAt,
+    appBundleId: row.appBundleId,
+    pixelWidth: row.pixelWidth,
+    pixelHeight: row.pixelHeight,
+    objectKey: row.objectKey,
+    expectedSha256: row.expectedSha256,
+    expectedSizeBytes: row.expectedSizeBytes,
+    expectedMimeType: row.expectedMimeType as "image/jpeg",
+    state: row.state as ScreenshotRecord["state"],
+    preparedAt: row.preparedAt,
+    completedAt: row.completedAt,
   };
 }
 

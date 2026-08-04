@@ -11,12 +11,14 @@ import {
   DrizzleControlRepository,
   type CommunicationObjectRecord,
   type ControlRepository,
+  type ScreenshotRecord,
 } from "@pca/db-cloud/src/repository.js";
 import {
   authAccounts,
   authSessions,
   authUsers,
   cloudSchema,
+  type StoredCollectorConfig,
 } from "@pca/db-cloud/src/schema.js";
 
 import {
@@ -377,6 +379,132 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.post("/v1/agent/screenshots/prepare", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const input = parseScreenshotPrepare(await context.req.json().catch(() => null));
+    if (input === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid screenshot upload request.");
+    }
+    if (options.objectStore === undefined) {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private screenshot storage is unavailable.");
+    }
+    let screenshot: ScreenshotRecord;
+    try {
+      screenshot = await options.repository.prepareScreenshot(device.workspaceId, device.deviceId, {
+        screenshotId: input.screenshotId,
+        objectKey: `screenshots/${randomUUID()}`,
+        requestId: input.requestId,
+        trigger: input.trigger,
+        capturedAt: input.capturedAt,
+        appBundleId: input.appBundleId,
+        pixelWidth: input.pixelWidth,
+        pixelHeight: input.pixelHeight,
+        expectedSha256: input.sha256,
+        expectedSizeBytes: input.sizeBytes,
+        expectedMimeType: "image/jpeg",
+        now: new Date(),
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+    if (screenshot.state === "completed") {
+      return context.json({ screenshot_id: screenshot.screenshotId, state: "completed" });
+    }
+    try {
+      const upload = await options.objectStore.signUpload(screenshot);
+      return context.json({
+        screenshot_id: screenshot.screenshotId,
+        state: "prepared",
+        upload: {
+          url: upload.url,
+          headers: upload.headers,
+          expires_at: new Date(Date.now() + 300_000).toISOString(),
+        },
+      });
+    } catch {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private screenshot storage is unavailable.");
+    }
+  });
+
+  app.post("/v1/agent/screenshots/complete", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const input = parseScreenshotId(await context.req.json().catch(() => null));
+    if (input === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid screenshot completion.");
+    }
+    if (options.objectStore === undefined) {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private screenshot storage is unavailable.");
+    }
+    let screenshot: ScreenshotRecord;
+    try {
+      screenshot = await options.repository.loadDeviceScreenshot(
+        device.workspaceId,
+        device.deviceId,
+        input.screenshotId,
+      );
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+    if (screenshot.state === "completed") {
+      return context.json({ screenshot_id: screenshot.screenshotId, state: "completed" });
+    }
+    let actual: R2ObjectHead | null;
+    try {
+      actual = await options.objectStore.headObject(screenshot.objectKey);
+    } catch {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private screenshot storage is unavailable.");
+    }
+    if (
+      actual === null
+      || actual.sizeBytes !== screenshot.expectedSizeBytes
+      || actual.mimeType !== screenshot.expectedMimeType
+      || actual.sha256 !== screenshot.expectedSha256
+    ) {
+      if (actual !== null) {
+        try {
+          await options.objectStore.deleteObject(screenshot.objectKey);
+        } catch {
+          return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private screenshot storage is unavailable.");
+        }
+      }
+      return errorResponse(context, 409, "OBJECT_INVALID", "The uploaded screenshot does not match its manifest.");
+    }
+    try {
+      const completed = await options.repository.completeScreenshot(
+        device.workspaceId,
+        device.deviceId,
+        screenshot.screenshotId,
+        new Date(),
+      );
+      return context.json({ screenshot_id: completed.screenshotId, state: completed.state });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.post("/v1/agent/screenshots/fail", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const input = parseScreenshotFailure(await context.req.json().catch(() => null));
+    if (input === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid screenshot failure report.");
+    }
+    try {
+      await options.repository.failScreenshotRequest(
+        device.workspaceId,
+        device.deviceId,
+        input.requestId,
+        input.errorCode,
+        new Date(),
+      );
+      return context.body(null, 204);
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.get("/v1/workspaces", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
@@ -689,6 +817,66 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.post("/v1/devices/:deviceId/screenshots", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    try {
+      const request = await options.repository.requestScreenshot({
+        requestId: randomUUID(),
+        actorUserId: principal.userId,
+        workspaceId: principal.workspaceId,
+        deviceId: context.req.param("deviceId"),
+        now: new Date(),
+      });
+      return context.json({ request: screenshotRequestResponse(request) }, 202);
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.get("/v1/devices/:deviceId/screenshots", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const limit = parseScreenshotLimit(context.req.query("limit"));
+    if (limit === null) return errorResponse(context, 400, "REQUEST_INVALID", "Invalid screenshot limit.");
+    try {
+      const screenshots = await options.repository.listOwnerScreenshots(
+        context.req.param("deviceId"),
+        principal.workspaceId,
+        principal.userId,
+        limit,
+      );
+      return context.json({ screenshots: screenshots.map(screenshotResponse) });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.get("/v1/devices/:deviceId/screenshots/:screenshotId/read", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    if (options.objectStore === undefined) {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private screenshot storage is unavailable.");
+    }
+    let screenshot: ScreenshotRecord;
+    try {
+      screenshot = await options.repository.loadOwnerCompletedScreenshot(
+        principal.workspaceId,
+        principal.userId,
+        context.req.param("deviceId"),
+        context.req.param("screenshotId"),
+      );
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+    try {
+      const read = await options.objectStore.signRead(screenshot.objectKey);
+      return context.json({ url: read.url, expires_at: read.expiresAt.toISOString() });
+    } catch {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private screenshot storage is unavailable.");
+    }
+  });
+
   return app;
 }
 
@@ -705,6 +893,12 @@ function parseMetricLimit(value: string | undefined): number | null {
 }
 
 function parseCommunicationLimit(value: string | undefined): number | null {
+  if (value === undefined) return 50;
+  const limit = Number(value);
+  return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
+}
+
+function parseScreenshotLimit(value: string | undefined): number | null {
   if (value === undefined) return 50;
   const limit = Number(value);
   return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
@@ -735,6 +929,89 @@ function parseObjectId(value: unknown): { objectId: string } | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const body = value as Record<string, unknown>;
   return Object.keys(body).length === 1 && isUuid(body.object_id) ? { objectId: body.object_id } : null;
+}
+
+function parseScreenshotPrepare(value: unknown): {
+  screenshotId: string;
+  requestId: string | null;
+  trigger: "manual" | "scheduled" | "activity";
+  capturedAt: Date;
+  appBundleId: string | null;
+  pixelWidth: number;
+  pixelHeight: number;
+  sha256: string;
+  sizeBytes: number;
+} | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  if (Object.keys(body).some((key) => ![
+    "screenshot_id",
+    "request_id",
+    "trigger",
+    "captured_at",
+    "app_bundle_id",
+    "pixel_width",
+    "pixel_height",
+    "sha256",
+    "size_bytes",
+    "mime_type",
+  ].includes(key)) || Object.keys(body).length !== 10) return null;
+  const capturedAt = typeof body.captured_at === "string" ? new Date(body.captured_at) : null;
+  if (
+    !isUuid(body.screenshot_id)
+    || !(body.request_id === null || isUuid(body.request_id))
+    || (body.trigger !== "manual" && body.trigger !== "scheduled" && body.trigger !== "activity")
+    || capturedAt === null
+    || Number.isNaN(capturedAt.getTime())
+    || !(body.app_bundle_id === null || (
+      typeof body.app_bundle_id === "string"
+      && body.app_bundle_id.length > 0
+      && body.app_bundle_id.length <= 255
+      && /^[A-Za-z0-9.-]+$/.test(body.app_bundle_id)
+    ))
+    || !Number.isInteger(body.pixel_width)
+    || (body.pixel_width as number) <= 0
+    || (body.pixel_width as number) > 20_000
+    || !Number.isInteger(body.pixel_height)
+    || (body.pixel_height as number) <= 0
+    || (body.pixel_height as number) > 20_000
+    || typeof body.sha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(body.sha256)
+    || !Number.isSafeInteger(body.size_bytes)
+    || (body.size_bytes as number) <= 0
+    || (body.size_bytes as number) > 100 * 1024 * 1024
+    || body.mime_type !== "image/jpeg"
+  ) return null;
+  return {
+    screenshotId: body.screenshot_id,
+    requestId: body.request_id,
+    trigger: body.trigger,
+    capturedAt,
+    appBundleId: body.app_bundle_id,
+    pixelWidth: body.pixel_width as number,
+    pixelHeight: body.pixel_height as number,
+    sha256: body.sha256,
+    sizeBytes: body.size_bytes as number,
+  };
+}
+
+function parseScreenshotId(value: unknown): { screenshotId: string } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  return Object.keys(body).length === 1 && isUuid(body.screenshot_id)
+    ? { screenshotId: body.screenshot_id }
+    : null;
+}
+
+function parseScreenshotFailure(value: unknown): { requestId: string; errorCode: string } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  return Object.keys(body).length === 2
+    && isUuid(body.request_id)
+    && typeof body.error_code === "string"
+    && /^[A-Z][A-Z0-9_]{0,63}$/.test(body.error_code)
+    ? { requestId: body.request_id, errorCode: body.error_code }
+    : null;
 }
 
 function isUuid(value: unknown): value is string {
@@ -1139,9 +1416,17 @@ function localMediaCleanupResponse(cleanup: {
   };
 }
 
-function collectorConfigResponse(config: { networkEnabled: boolean; wechatEnabled: boolean }) {
+function collectorConfigResponse(config: StoredCollectorConfig) {
   return {
     network: { enabled: config.networkEnabled },
+    "screen.capture": {
+      enabled: config.screenCaptureEnabled,
+      scheduled_enabled: config.screenCaptureScheduledEnabled,
+      interval_seconds: config.screenCaptureIntervalSeconds,
+      activity_enabled: config.screenCaptureActivityEnabled,
+      activity_min_interval_seconds: config.screenCaptureActivityMinIntervalSeconds,
+      excluded_bundle_ids: [...config.screenCaptureExcludedBundleIds],
+    },
     "communication.wechat": {
       enabled: config.wechatEnabled,
       directions: ["incoming", "outgoing"] as const,
@@ -1151,6 +1436,38 @@ function collectorConfigResponse(config: { networkEnabled: boolean; wechatEnable
       sync_mode: "full" as const,
       retention_days: 180,
     },
+  };
+}
+
+function screenshotRequestResponse(request: {
+  requestId: string;
+  status: string;
+  requestedAt: Date;
+  completedAt: Date | null;
+  screenshotId: string | null;
+  errorCode: string | null;
+}) {
+  return {
+    request_id: request.requestId,
+    status: request.status,
+    requested_at: request.requestedAt.toISOString(),
+    completed_at: request.completedAt?.toISOString() ?? null,
+    screenshot_id: request.screenshotId,
+    error_code: request.errorCode,
+  };
+}
+
+function screenshotResponse(screenshot: ScreenshotRecord) {
+  return {
+    screenshot_id: screenshot.screenshotId,
+    request_id: screenshot.requestId,
+    trigger: screenshot.trigger,
+    captured_at: screenshot.capturedAt.toISOString(),
+    app_bundle_id: screenshot.appBundleId,
+    pixel_width: screenshot.pixelWidth,
+    pixel_height: screenshot.pixelHeight,
+    size_bytes: screenshot.expectedSizeBytes,
+    mime_type: screenshot.expectedMimeType,
   };
 }
 

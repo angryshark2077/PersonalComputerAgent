@@ -42,6 +42,14 @@
   "local_media_cleanup": null,
   "collectors": {
     "network": { "enabled": true },
+    "screen.capture": {
+      "enabled": true,
+      "scheduled_enabled": true,
+      "interval_seconds": 300,
+      "activity_enabled": true,
+      "activity_min_interval_seconds": 30,
+      "excluded_bundle_ids": ["com.1password.1password"]
+    },
     "communication.wechat": {
       "enabled": true,
       "directions": ["incoming", "outgoing"],

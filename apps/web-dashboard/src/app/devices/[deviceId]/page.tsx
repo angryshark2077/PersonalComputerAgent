@@ -15,6 +15,7 @@ import {
   getSystemMetrics,
   revokeDevice,
   requestLocalMediaCleanup,
+  requestScreenshot,
   updateCollectorConfig,
   type CollectorConfig,
   type CollectorConfigAudit,
@@ -40,6 +41,8 @@ export default function DevicePage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [locationName, setLocationName] = useState("");
+  const [screenDraft, setScreenDraft] = useState<CollectorConfig["screen.capture"] | null>(null);
+  const [captureQueued, setCaptureQueued] = useState(false);
 
   async function refresh(): Promise<void> {
     const origin = cloudApiOrigin();
@@ -50,6 +53,7 @@ export default function DevicePage() {
       getNetworkLocations(window.fetch, origin),
     ]);
     setScreen({ device, audit, metrics, locations });
+    setScreenDraft(device.collectors["screen.capture"]);
   }
 
   useEffect(() => {
@@ -114,6 +118,25 @@ export default function DevicePage() {
     }
   }
 
+  async function captureNow(): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      await requestScreenshot(window.fetch, cloudApiOrigin(), deviceId);
+      setCaptureQueued(true);
+      window.setTimeout(() => setCaptureQueued(false), 35_000);
+    } catch (cause) {
+      setError(messageFor(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveScreenSettings(): Promise<void> {
+    if (screenDraft === null || screen === null) return;
+    await save({ ...screen.device.collectors, "screen.capture": screenDraft });
+  }
+
   async function saveCurrentLocation(): Promise<void> {
     const network = screen?.device.status?.network;
     const name = locationName.trim();
@@ -155,6 +178,14 @@ export default function DevicePage() {
   if (screen === null) return <DashboardShell><p className="status-note">Loading device…</p></DashboardShell>;
 
   const disabled = busy || screen.device.revoked;
+  const screenSettingsValid = screenDraft !== null
+    && Number.isInteger(screenDraft.interval_seconds)
+    && screenDraft.interval_seconds >= 60
+    && screenDraft.interval_seconds <= 86400
+    && Number.isInteger(screenDraft.activity_min_interval_seconds)
+    && screenDraft.activity_min_interval_seconds >= 10
+    && screenDraft.activity_min_interval_seconds <= 3600
+    && screenDraft.excluded_bundle_ids.every((value) => /^[A-Za-z0-9.-]{1,255}$/.test(value));
   const metrics = summarizeSystemMetrics(screen.metrics);
   return (
     <DashboardShell>
@@ -164,7 +195,10 @@ export default function DevicePage() {
         <h1>Device</h1>
         <p>Review collection permissions and device access.</p>
       </section>
-      <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>View chats</Link>
+      <div className="device-links">
+        <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>View chats</Link>
+        <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/screenshots`}>View screenshots</Link>
+      </div>
       {error !== null ? <p role="alert">{error}</p> : null}
       <CollectorScopeCard
           name="Network"
@@ -189,6 +223,90 @@ export default function DevicePage() {
             },
           })}
         />
+        <section className="dashboard-panel collector-card" aria-labelledby="screenshots-heading">
+          <h2 id="screenshots-heading">Screenshots</h2>
+          <p>Capture the active display only. Locked/login screens and excluded applications are skipped.</p>
+          {screenDraft === null ? null : (
+            <div className="settings-grid">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={screenDraft.enabled}
+                  onChange={(event) => setScreenDraft({ ...screenDraft, enabled: event.target.checked })}
+                />
+                Enable screenshot collection
+              </label>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={screenDraft.scheduled_enabled}
+                  onChange={(event) => setScreenDraft({ ...screenDraft, scheduled_enabled: event.target.checked })}
+                />
+                Scheduled screenshots
+              </label>
+              <label>
+                Schedule interval (minutes)
+                <input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={screenDraft.interval_seconds / 60}
+                  onChange={(event) => setScreenDraft({
+                    ...screenDraft,
+                    interval_seconds: Math.round(Number(event.target.value) * 60),
+                  })}
+                />
+              </label>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={screenDraft.activity_enabled}
+                  onChange={(event) => setScreenDraft({ ...screenDraft, activity_enabled: event.target.checked })}
+                />
+                Activity-triggered screenshots
+              </label>
+              <label>
+                Activity minimum interval (seconds)
+                <input
+                  type="number"
+                  min={10}
+                  max={3600}
+                  value={screenDraft.activity_min_interval_seconds}
+                  onChange={(event) => setScreenDraft({
+                    ...screenDraft,
+                    activity_min_interval_seconds: Math.round(Number(event.target.value)),
+                  })}
+                />
+              </label>
+              <label>
+                Excluded app Bundle IDs (one per line)
+                <textarea
+                  rows={4}
+                  value={screenDraft.excluded_bundle_ids.join("\n")}
+                  placeholder="com.1password.1password"
+                  onChange={(event) => setScreenDraft({
+                    ...screenDraft,
+                    excluded_bundle_ids: [...new Set(event.target.value.split("\n").map((value) => value.trim()).filter(Boolean))],
+                  })}
+                />
+              </label>
+              <div className="button-row">
+                <button className="primary-button" type="button" disabled={disabled || !screenSettingsValid} onClick={() => void saveScreenSettings()}>
+                  Save screenshot settings
+                </button>
+                <button
+                  className="primary-button"
+                  type="button"
+                  disabled={disabled || captureQueued || !screenDraft.enabled || screen.device.status?.presence !== "online"}
+                  onClick={() => void captureNow()}
+                >
+                  {captureQueued ? "Capture queued" : "Capture now"}
+                </button>
+              </div>
+            </div>
+          )}
+          <p>Screen Recording permission is granted once during installation and remains tied to the signed helper.</p>
+        </section>
         <section className="dashboard-panel collector-card" aria-labelledby="network-status-heading">
           <h2 id="network-status-heading">Network and location</h2>
           {screen.device.status?.network === null || screen.device.status?.network === undefined ? (

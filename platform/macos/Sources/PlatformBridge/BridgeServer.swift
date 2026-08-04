@@ -176,6 +176,7 @@ actor BridgeServer {
     private let credentialProvider: any BridgeCredentialProviding
     private let networkSource: NetworkObservationSource
     private let lifecycleSource: PlatformLifecycleEventBuffer
+    private let screenSource: ScreenCaptureSource
     private let handshakeTimeoutMilliseconds: UInt64
     private let credentialTimeoutMilliseconds: UInt64
     private let idleTimeoutMilliseconds: UInt64
@@ -192,6 +193,7 @@ actor BridgeServer {
         credentialProvider: any BridgeCredentialProviding,
         networkSource: NetworkObservationSource? = nil,
         lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer(),
+        screenSource: ScreenCaptureSource = ScreenCaptureSource(),
         handshakeTimeoutMilliseconds: UInt64 = 1_000,
         credentialTimeoutMilliseconds: UInt64 = 1_000,
         idleTimeoutMilliseconds: UInt64 = BridgeServer.defaultIdleTimeoutMilliseconds
@@ -201,6 +203,7 @@ actor BridgeServer {
         self.handshakeHandler = handshakeHandler
         self.credentialProvider = credentialProvider
         self.lifecycleSource = lifecycleSource
+        self.screenSource = screenSource
         self.networkSource = networkSource ?? NetworkObservationSource(lifecycleSource: lifecycleSource)
         self.handshakeTimeoutMilliseconds = max(handshakeTimeoutMilliseconds, 1)
         self.credentialTimeoutMilliseconds = max(credentialTimeoutMilliseconds, 1)
@@ -364,7 +367,8 @@ actor BridgeServer {
             let response = try CapabilityRequestHandler.respond(
                 to: request,
                 networkSource: networkSource,
-                lifecycleSource: lifecycleSource
+                lifecycleSource: lifecycleSource,
+                screenSource: screenSource
             )
             try await writeFrame(
                 descriptor,
@@ -495,6 +499,8 @@ enum CapabilityRequestHandler {
     private static let capabilityPayloadKeys: Set<String> = ["include_permissions"]
     private static let networkPayloadKeys: Set<String> = ["include_wifi_identity"]
     private static let lifecyclePayloadKeys: Set<String> = ["after_sequence"]
+    private static let screenContextPayloadKeys: Set<String> = []
+    private static let screenCapturePayloadKeys: Set<String> = ["excluded_bundle_ids"]
 
     struct Response {
         let payload: Data
@@ -504,7 +510,8 @@ enum CapabilityRequestHandler {
     static func respond(
         to requestJSON: Data,
         networkSource: NetworkObservationSource = NetworkObservationSource(),
-        lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer()
+        lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer(),
+        screenSource: ScreenCaptureSource = ScreenCaptureSource()
     ) throws -> Response {
         let object = try StrictJSON.object(requestJSON)
         try StrictJSON.requireOnlyKeys(object, allowed: envelopeKeys)
@@ -520,6 +527,10 @@ enum CapabilityRequestHandler {
             try StrictJSON.requireExactKeys(payloadObject, expected: networkPayloadKeys)
         } else if capability == "system.lifecycle.poll" {
             try StrictJSON.requireExactKeys(payloadObject, expected: lifecyclePayloadKeys)
+        } else if capability == "screen.context" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: screenContextPayloadKeys)
+        } else if capability == "screen.capture" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: screenCapturePayloadKeys)
         } else {
             throw BridgeServerError.invalidRequest
         }
@@ -551,6 +562,15 @@ enum CapabilityRequestHandler {
                 "events": .array(snapshot.events.map(\.payload)),
                 "latest_sequence": .number(Double(snapshot.latestSequence)),
             ]
+        } else if capability == "screen.context" {
+            responsePayload = screenSource.context().payload
+        } else if capability == "screen.capture" {
+            guard let excludedBundleIDs = request.payload.excludedBundleIDs,
+                  excludedBundleIDs.count <= 100,
+                  excludedBundleIDs.allSatisfy({ !$0.isEmpty && $0.count <= 255 }) else {
+                throw BridgeServerError.invalidRequest
+            }
+            responsePayload = screenSource.capture(excludedBundleIDs: Set(excludedBundleIDs)).payload
         } else {
             responsePayload = ["screen_capture": .string("available")]
         }
@@ -593,10 +613,12 @@ private struct StrictCapabilityPayload: Decodable {
     let includePermissions: Bool?
     let includeWifiIdentity: Bool?
     let afterSequence: UInt64?
+    let excludedBundleIDs: [String]?
 
     private enum CodingKeys: String, CodingKey {
         case includePermissions = "include_permissions"
         case includeWifiIdentity = "include_wifi_identity"
         case afterSequence = "after_sequence"
+        case excludedBundleIDs = "excluded_bundle_ids"
     }
 }

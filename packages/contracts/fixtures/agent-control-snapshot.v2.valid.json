@@ -3,8 +3,18 @@
   "workspace_id": "workspace-test-001",
   "revoked": false,
   "configuration_revision": 3,
+  "local_media_cleanup": null,
+  "screenshot_request": null,
   "collectors": {
     "network": { "enabled": true },
+    "screen.capture": {
+      "enabled": true,
+      "scheduled_enabled": true,
+      "interval_seconds": 300,
+      "activity_enabled": true,
+      "activity_min_interval_seconds": 30,
+      "excluded_bundle_ids": []
+    },
     "communication.wechat": {
       "enabled": true,
       "directions": ["incoming", "outgoing"],

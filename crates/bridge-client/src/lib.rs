@@ -10,9 +10,14 @@ mod client;
 pub mod framing;
 pub mod supervisor;
 
+pub use supervisor::{
+    screen_capture_command_channel, ScreenCaptureCommandHandle, ScreenCaptureCommandReceiver,
+};
+
 pub use client::{
     BridgeClient, BridgeClientConfig, BridgeClientError, DeviceLocationObservation,
-    NetworkObservation, PlatformLifecycleEvent, PROTOCOL_VERSION,
+    NetworkObservation, PlatformLifecycleEvent, ScreenCaptureResult, ScreenCaptureStatus,
+    ScreenContext, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Default)]

@@ -32,6 +32,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationProjectionBackfill(pool);
     await assertCommunicationMediaUpgrade(pool);
     await assertDeviceLocationSchema(pool);
+    await assertScreenshotSchema(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
     await assertHashedSessionSchema(pool);
@@ -40,7 +41,8 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationProjectionSchema(pool);
     await assertCommunicationObjectSchema(pool);
     await assertDeviceLocationSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020"]);
+    await assertScreenshotSchema(pool);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -129,6 +131,32 @@ async function assertDeviceLocationSchema(pool: Pool) {
        AND constraint_name = 'device_heartbeats_device_location_shape'`,
   );
   assert.equal(constraints.rows.length, 1);
+}
+
+async function assertScreenshotSchema(pool: Pool) {
+  const tables = await pool.query<{ name: string | null }>(
+    `SELECT to_regclass('public.device_screenshot_requests')::text AS name
+     UNION ALL
+     SELECT to_regclass('public.device_screenshots')::text AS name`,
+  );
+  assert.deepEqual(tables.rows.map((row) => row.name), [
+    "device_screenshot_requests",
+    "device_screenshots",
+  ]);
+  const columns = await pool.query<{ column_name: string }>(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'collector_configs'
+       AND column_name LIKE 'screen_capture_%'
+     ORDER BY column_name`,
+  );
+  assert.deepEqual(columns.rows.map((row) => row.column_name), [
+    "screen_capture_activity_enabled",
+    "screen_capture_activity_min_interval_seconds",
+    "screen_capture_enabled",
+    "screen_capture_excluded_bundle_ids",
+    "screen_capture_interval_seconds",
+    "screen_capture_scheduled_enabled",
+  ]);
 }
 
 async function assertCommunicationEventSchema(pool: Pool) {
@@ -428,7 +456,7 @@ async function seedIncorrectMediaProjection(pool: Pool) {
 async function copyMigrationsBefore0020(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "pca-before-0020-migrations-"));
   for (const file of await readdir(committedMigrationDirectory)) {
-    if (!file.endsWith(".sql") || file.startsWith("0020_")) continue;
+    if (!file.endsWith(".sql") || file.slice(0, 4) >= "0020") continue;
     await writeFile(join(directory, file), await readFile(join(committedMigrationDirectory, file), "utf8"));
   }
   return directory;

@@ -158,8 +158,17 @@ export interface AgentControlSnapshot {
   revoked: boolean;
   configuration_revision: number;
   local_media_cleanup?: { request_id: string } | null;
+  screenshot_request?: { request_id: string } | null;
   collectors: {
     network: { enabled: boolean };
+    "screen.capture": {
+      enabled: boolean;
+      scheduled_enabled: boolean;
+      interval_seconds: number;
+      activity_enabled: boolean;
+      activity_min_interval_seconds: number;
+      excluded_bundle_ids: string[];
+    };
     "communication.wechat": {
       enabled: boolean;
       directions: ["incoming", "outgoing"];

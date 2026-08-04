@@ -1,5 +1,13 @@
 export interface CollectorConfig {
   network: { enabled: boolean };
+  "screen.capture": {
+    enabled: boolean;
+    scheduled_enabled: boolean;
+    interval_seconds: number;
+    activity_enabled: boolean;
+    activity_min_interval_seconds: number;
+    excluded_bundle_ids: string[];
+  };
   "communication.wechat": {
     enabled: boolean;
     directions: ["incoming", "outgoing"];
@@ -9,6 +17,18 @@ export interface CollectorConfig {
     sync_mode: "full";
     retention_days: 180;
   };
+}
+
+export interface DashboardScreenshot {
+  screenshot_id: string;
+  request_id: string | null;
+  trigger: "manual" | "scheduled" | "activity";
+  captured_at: string;
+  app_bundle_id: string | null;
+  pixel_width: number;
+  pixel_height: number;
+  size_bytes: number;
+  mime_type: "image/jpeg";
 }
 
 export interface DashboardDevice {
@@ -333,6 +353,47 @@ export async function requestLocalMediaCleanup(
     ),
     { method: "POST" },
   );
+}
+
+export async function requestScreenshot(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+): Promise<void> {
+  await jsonRequest(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/screenshots`),
+    { method: "POST" },
+  );
+}
+
+export async function getScreenshots(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+  limit = 100,
+): Promise<DashboardScreenshot[]> {
+  const result = await jsonRequest<{ screenshots: DashboardScreenshot[] }>(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/screenshots?limit=${limit}`),
+  );
+  return result.screenshots;
+}
+
+export async function getScreenshotReadUrl(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+  screenshotId: string,
+): Promise<string> {
+  const result = await jsonRequest<{ url: string; expires_at: string }>(
+    fetcher,
+    apiUrl(
+      cloudApiOrigin,
+      `/v1/devices/${encodeURIComponent(deviceId)}/screenshots/${encodeURIComponent(screenshotId)}/read`,
+    ),
+  );
+  return result.url;
 }
 
 export async function getNetworkLocations(

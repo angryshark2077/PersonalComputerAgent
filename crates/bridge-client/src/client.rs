@@ -27,6 +27,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 const HANDSHAKE_CAPABILITY: &str = "bridge.handshake";
 const NETWORK_OBSERVE_CAPABILITY: &str = "network.observe";
 const LIFECYCLE_POLL_CAPABILITY: &str = "system.lifecycle.poll";
+const SCREEN_CONTEXT_CAPABILITY: &str = "screen.context";
+const SCREEN_CAPTURE_CAPABILITY: &str = "screen.capture";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -171,6 +173,34 @@ pub struct PlatformLifecycleEvent {
 struct PlatformLifecycleBatch {
     events: Vec<PlatformLifecycleEvent>,
     latest_sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenContext {
+    pub locked: bool,
+    pub app_bundle_id: Option<String>,
+    pub activity_token: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenCaptureStatus {
+    Captured,
+    SkippedLocked,
+    SkippedExcluded,
+    PermissionRequired,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenCaptureResult {
+    pub status: ScreenCaptureStatus,
+    pub path: Option<PathBuf>,
+    pub app_bundle_id: Option<String>,
+    pub pixel_width: Option<u32>,
+    pub pixel_height: Option<u32>,
 }
 
 impl std::fmt::Debug for BridgeClient {
@@ -358,6 +388,122 @@ impl BridgeClient {
         validate_lifecycle_batch(after_sequence, &batch)?;
         Ok((batch.events, batch.latest_sequence))
     }
+
+    /// Reads lock and frontmost-window activity state without capturing pixels.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed Bridge transport, timeout, or strict response-validation error.
+    pub async fn screen_context(&mut self) -> Result<ScreenContext, BridgeClientError> {
+        let request = BridgeEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            message_kind: BridgeMessageKind::Request,
+            capability: SCREEN_CONTEXT_CAPABILITY.to_owned(),
+            deadline_ms: duration_millis(self.operation_timeout)?,
+            payload: Map::new(),
+            error: None,
+        };
+        let response = self.request(request).await?;
+        if response.error.is_some() {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        let context: ScreenContext = serde_json::from_value(Value::Object(response.payload))
+            .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+        validate_screen_context(&context)?;
+        Ok(context)
+    }
+
+    /// Captures the active display while enforcing the exact excluded Bundle ID list.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid Bundle IDs and returns typed Bridge transport, timeout, or response errors.
+    pub async fn capture_screen(
+        &mut self,
+        excluded_bundle_ids: &[String],
+    ) -> Result<ScreenCaptureResult, BridgeClientError> {
+        if excluded_bundle_ids.len() > 100
+            || excluded_bundle_ids
+                .iter()
+                .any(|value| !valid_bundle_id(value))
+        {
+            return Err(BridgeClientError::InvalidConfiguration);
+        }
+        let request = BridgeEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            message_kind: BridgeMessageKind::Request,
+            capability: SCREEN_CAPTURE_CAPABILITY.to_owned(),
+            deadline_ms: duration_millis(self.operation_timeout)?,
+            payload: object_payload(&serde_json::json!({
+                "excluded_bundle_ids": excluded_bundle_ids,
+            }))?,
+            error: None,
+        };
+        let response = self.request(request).await?;
+        if response.error.is_some() {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        let result: ScreenCaptureResult = serde_json::from_value(Value::Object(response.payload))
+            .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+        validate_screen_capture_result(&result)?;
+        Ok(result)
+    }
+}
+
+fn validate_screen_context(context: &ScreenContext) -> Result<(), BridgeClientError> {
+    if context.locked && (context.app_bundle_id.is_some() || context.activity_token.is_some())
+        || context
+            .app_bundle_id
+            .as_ref()
+            .is_some_and(|value| !valid_bundle_id(value))
+        || context.activity_token.as_ref().is_some_and(|value| {
+            value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(BridgeClientError::InvalidEnvelope);
+    }
+    Ok(())
+}
+
+fn validate_screen_capture_result(result: &ScreenCaptureResult) -> Result<(), BridgeClientError> {
+    let captured_fields_valid = result.path.as_ref().is_some_and(|path| {
+        path.is_absolute()
+            && path.extension().is_some_and(|extension| extension == "jpg")
+            && !path
+                .components()
+                .any(|component| component == Component::ParentDir)
+    }) && result
+        .pixel_width
+        .is_some_and(|value| (1..=20_000).contains(&value))
+        && result
+            .pixel_height
+            .is_some_and(|value| (1..=20_000).contains(&value));
+    if result
+        .app_bundle_id
+        .as_ref()
+        .is_some_and(|value| !valid_bundle_id(value))
+        || match result.status {
+            ScreenCaptureStatus::Captured => !captured_fields_valid,
+            _ => {
+                result.path.is_some()
+                    || result.pixel_width.is_some()
+                    || result.pixel_height.is_some()
+            }
+        }
+    {
+        return Err(BridgeClientError::InvalidEnvelope);
+    }
+    Ok(())
+}
+
+fn valid_bundle_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
 }
 
 fn validate_lifecycle_batch(
@@ -635,9 +781,11 @@ struct StrictHandshakeResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_lifecycle_batch, validate_network_observation, DeviceLocationObservation,
-        NetworkObservation, PlatformLifecycleBatch, PlatformLifecycleEvent,
+        validate_lifecycle_batch, validate_network_observation, validate_screen_capture_result,
+        DeviceLocationObservation, NetworkObservation, PlatformLifecycleBatch,
+        PlatformLifecycleEvent, ScreenCaptureResult, ScreenCaptureStatus,
     };
+    use std::path::PathBuf;
     use uuid::Uuid;
 
     #[test]
@@ -677,6 +825,26 @@ mod tests {
             ..valid
         };
         assert!(validate_network_observation(&invalid).is_err());
+    }
+
+    #[test]
+    fn screen_capture_requires_a_complete_bounded_jpeg_result() {
+        let valid = ScreenCaptureResult {
+            status: ScreenCaptureStatus::Captured,
+            path: Some(PathBuf::from("/tmp/screenshot.jpg")),
+            app_bundle_id: Some("com.google.Chrome".to_owned()),
+            pixel_width: Some(1728),
+            pixel_height: Some(1117),
+        };
+        validate_screen_capture_result(&valid).expect("valid screenshot result");
+
+        let mut invalid = valid.clone();
+        invalid.path = Some(PathBuf::from("../screenshot.jpg"));
+        assert!(validate_screen_capture_result(&invalid).is_err());
+
+        invalid = valid;
+        invalid.status = ScreenCaptureStatus::SkippedLocked;
+        assert!(validate_screen_capture_result(&invalid).is_err());
     }
 
     #[test]

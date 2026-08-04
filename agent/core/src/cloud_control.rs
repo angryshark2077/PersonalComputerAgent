@@ -1,10 +1,20 @@
 use std::{
-    collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
+    collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt,
+    future::Future,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use pca_bridge_client::{NetworkObservation, NetworkObservationState};
+use pca_bridge_client::{
+    NetworkObservation, NetworkObservationState, ScreenCaptureCommandHandle, ScreenCaptureStatus,
+};
 use pca_db_local::{
     CommunicationMediaStorageStats, DbActorHandle, DbError, PairingState,
     PendingCommunicationAttachment,
@@ -178,6 +188,23 @@ pub trait ControlClient: Send + Sync {
             ))
         })
     }
+
+    fn sync_screenshot<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: &'a PendingScreenshot,
+    ) -> ControlFuture<'a, ()> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+
+    fn fail_screenshot_request<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: &'a str,
+        _: &'static str,
+    ) -> ControlFuture<'a, ()> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -210,6 +237,43 @@ struct PreparedCommunicationUpload {
 #[derive(Deserialize)]
 struct CompletedCommunicationObject {
     object_id: String,
+    state: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingScreenshot {
+    screenshot_id: String,
+    request_id: Option<String>,
+    trigger: ScreenshotTrigger,
+    captured_at: String,
+    app_bundle_id: Option<String>,
+    pixel_width: u32,
+    pixel_height: u32,
+    sha256: String,
+    size_bytes: u64,
+    mime_type: String,
+    image_file_name: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScreenshotTrigger {
+    Manual,
+    Scheduled,
+    Activity,
+}
+
+#[derive(Deserialize)]
+struct PreparedScreenshot {
+    screenshot_id: String,
+    state: String,
+    upload: Option<PreparedCommunicationUpload>,
+}
+
+#[derive(Deserialize)]
+struct CompletedScreenshot {
+    screenshot_id: String,
     state: String,
 }
 
@@ -434,12 +498,20 @@ pub struct AgentControlSnapshot {
     pub configuration_revision: u64,
     #[serde(default)]
     pub local_media_cleanup: Option<LocalMediaCleanupRequest>,
+    #[serde(default)]
+    pub screenshot_request: Option<ScreenshotRequest>,
     pub collectors: CollectorControls,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalMediaCleanupRequest {
+    pub request_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenshotRequest {
     pub request_id: String,
 }
 
@@ -457,8 +529,34 @@ pub struct LocalMediaCleanupResult {
 #[serde(deny_unknown_fields)]
 pub struct CollectorControls {
     pub network: EnabledControl,
+    #[serde(rename = "screen.capture", default)]
+    pub screen_capture: ScreenCaptureControl,
     #[serde(rename = "communication.wechat")]
     pub communication_wechat: CommunicationScopeV2,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenCaptureControl {
+    pub enabled: bool,
+    pub scheduled_enabled: bool,
+    pub interval_seconds: u64,
+    pub activity_enabled: bool,
+    pub activity_min_interval_seconds: u64,
+    pub excluded_bundle_ids: Vec<String>,
+}
+
+impl Default for ScreenCaptureControl {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scheduled_enabled: true,
+            interval_seconds: 300,
+            activity_enabled: true,
+            activity_min_interval_seconds: 30,
+            excluded_bundle_ids: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -480,16 +578,34 @@ impl AgentControlSnapshot {
         {
             return Err(ControlError::Contract);
         }
+        if self
+            .screenshot_request
+            .as_ref()
+            .is_some_and(|request| Uuid::parse_str(&request.request_id).is_err())
+            || !(60..=86_400).contains(&self.collectors.screen_capture.interval_seconds)
+            || !(10..=3_600).contains(&self.collectors.screen_capture.activity_min_interval_seconds)
+            || self.collectors.screen_capture.excluded_bundle_ids.len() > 100
+            || self
+                .collectors
+                .screen_capture
+                .excluded_bundle_ids
+                .iter()
+                .any(|value| !valid_bundle_id(value))
+        {
+            return Err(ControlError::Contract);
+        }
         Ok(())
     }
 }
 
 /// Complete, durable desired configuration. S1B intentionally does not start either source.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppliedControl {
     pub configuration_revision: u64,
     pub network_enabled: bool,
     pub communication_wechat_enabled: bool,
+    pub screen_capture: ScreenCaptureControl,
+    pub screenshot_request_id: Option<String>,
 }
 
 /// Rejects malformed scopes and ignores snapshots that cannot advance the durable revision.
@@ -510,7 +626,20 @@ pub fn apply_snapshot(
         configuration_revision: snapshot.configuration_revision,
         network_enabled: snapshot.collectors.network.enabled,
         communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+        screen_capture: snapshot.collectors.screen_capture.clone(),
+        screenshot_request_id: snapshot
+            .screenshot_request
+            .as_ref()
+            .map(|request| request.request_id.clone()),
     }))
+}
+
+fn valid_bundle_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -734,6 +863,7 @@ impl CloudControlRuntime {
             communication_controls,
             publication,
             owner_epoch,
+            None,
         )
         .await
     }
@@ -752,6 +882,7 @@ async fn start_control_worker(
     communication_controls: watch::Sender<Option<AppliedControl>>,
     publication: ControlPublication,
     owner_epoch: u64,
+    screen_capture: Option<ScreenCaptureCommandHandle>,
 ) -> Result<CloudControlHandle, CloudControlRuntimeError> {
     let applied_revision = ensure_pairing_state(&database, credentials.credential()).await?;
     pairing_state_sender.send_replace(true);
@@ -772,6 +903,8 @@ async fn start_control_worker(
         publication.clone(),
         authorization.clone(),
         owner_epoch,
+        communication_controls.subscribe(),
+        screen_capture,
     ));
     Ok(CloudControlHandle {
         state,
@@ -798,6 +931,8 @@ async fn run_cloud_workers(
     publication: ControlPublication,
     authorization: CommunicationAuthorization,
     owner_epoch: u64,
+    screen_controls: watch::Receiver<Option<AppliedControl>>,
+    screen_capture: Option<ScreenCaptureCommandHandle>,
 ) -> Result<(), CloudControlRuntimeError> {
     let (media_credentials, media_credential_receiver) =
         watch::channel(credentials.credential.clone());
@@ -808,6 +943,15 @@ async fn run_cloud_workers(
         Arc::clone(&client),
         media_shutdown_receiver,
     ));
+    let screen_worker = screen_capture.map(|bridge| {
+        tokio::spawn(run_screenshot_loop(
+            screen_controls,
+            media_credentials.subscribe(),
+            Arc::clone(&client),
+            bridge,
+            media_shutdown.subscribe(),
+        ))
+    });
     let control_result = run_control_loop(
         database,
         credentials,
@@ -823,13 +967,25 @@ async fn run_cloud_workers(
     .await;
     media_shutdown.send_replace(true);
     media_worker.abort();
+    if let Some(worker) = &screen_worker {
+        worker.abort();
+    }
     let media_result = match media_worker.await {
         Ok(result) => result,
         Err(error) if error.is_cancelled() => Ok(()),
         Err(_) => Err(CloudControlRuntimeError::WorkerStopped),
     };
     control_result?;
-    media_result
+    media_result?;
+    if let Some(worker) = screen_worker {
+        match worker.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(_) => Err(CloudControlRuntimeError::WorkerStopped),
+        }
+    } else {
+        Ok(())
+    }
 }
 
 impl CloudControlOwner {
@@ -838,6 +994,30 @@ impl CloudControlOwner {
         database: Arc<DbActorHandle>,
         pairing_state_sender: watch::Sender<bool>,
         authorization: CommunicationAuthorization,
+    ) -> (Self, CloudControlCommands) {
+        Self::start_owner(database, pairing_state_sender, authorization, None)
+    }
+
+    #[must_use]
+    pub fn start_with_screen_capture(
+        database: Arc<DbActorHandle>,
+        pairing_state_sender: watch::Sender<bool>,
+        authorization: CommunicationAuthorization,
+        screen_capture: ScreenCaptureCommandHandle,
+    ) -> (Self, CloudControlCommands) {
+        Self::start_owner(
+            database,
+            pairing_state_sender,
+            authorization,
+            Some(screen_capture),
+        )
+    }
+
+    fn start_owner(
+        database: Arc<DbActorHandle>,
+        pairing_state_sender: watch::Sender<bool>,
+        authorization: CommunicationAuthorization,
+        screen_capture: Option<ScreenCaptureCommandHandle>,
     ) -> (Self, CloudControlCommands) {
         let (communication_controls, _) = watch::channel(None);
         let publication = ControlPublication::new(communication_controls.clone(), 0);
@@ -849,6 +1029,7 @@ impl CloudControlOwner {
             authorization,
             communication_controls.clone(),
             publication,
+            screen_capture,
             command_receiver,
             shutdown_receiver,
         ));
@@ -945,6 +1126,7 @@ async fn run_control_owner(
     authorization: CommunicationAuthorization,
     communication_controls: watch::Sender<Option<AppliedControl>>,
     publication: ControlPublication,
+    screen_capture: Option<ScreenCaptureCommandHandle>,
     mut commands: mpsc::Receiver<CloudControlOwnerCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CloudControlRuntimeError> {
@@ -975,6 +1157,7 @@ async fn run_control_owner(
                             &authorization,
                             &communication_controls,
                             &publication,
+                            screen_capture.clone(),
                             &mut current,
                         )
                         .await;
@@ -993,6 +1176,7 @@ async fn run_control_owner(
                             &authorization,
                             &communication_controls,
                             &publication,
+                            screen_capture.clone(),
                             &mut current,
                         )
                         .await;
@@ -1033,6 +1217,7 @@ async fn replace_owned_control(
     authorization: &CommunicationAuthorization,
     communication_controls: &watch::Sender<Option<AppliedControl>>,
     publication: &ControlPublication,
+    screen_capture: Option<ScreenCaptureCommandHandle>,
     current: &mut Option<CloudControlHandle>,
 ) -> Result<(), CloudControlRuntimeError> {
     let owner_epoch =
@@ -1047,6 +1232,7 @@ async fn replace_owned_control(
             communication_controls.clone(),
             publication.clone(),
             owner_epoch,
+            screen_capture,
         )
         .await?,
     );
@@ -1065,6 +1251,7 @@ async fn replace_owned_control_from_keychain(
     authorization: &CommunicationAuthorization,
     communication_controls: &watch::Sender<Option<AppliedControl>>,
     publication: &ControlPublication,
+    screen_capture: Option<ScreenCaptureCommandHandle>,
     current: &mut Option<CloudControlHandle>,
 ) -> Result<bool, CloudControlRuntimeError> {
     let owner_epoch =
@@ -1088,6 +1275,7 @@ async fn replace_owned_control_from_keychain(
             communication_controls.clone(),
             publication.clone(),
             owner_epoch,
+            screen_capture,
         )
         .await?,
     );
@@ -1441,6 +1629,17 @@ async fn apply_control_snapshot(
     owner_epoch: u64,
     snapshot: AgentControlSnapshot,
 ) -> Result<(), ControlError> {
+    snapshot.validate_exact_scopes()?;
+    let observed_control = AppliedControl {
+        configuration_revision: snapshot.configuration_revision,
+        network_enabled: snapshot.collectors.network.enabled,
+        communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+        screen_capture: snapshot.collectors.screen_capture.clone(),
+        screenshot_request_id: snapshot
+            .screenshot_request
+            .as_ref()
+            .map(|request| request.request_id.clone()),
+    };
     let (current, hydrated) = {
         let state = state.lock().await;
         (
@@ -1454,22 +1653,30 @@ async fn apply_control_snapshot(
             configuration_revision: snapshot.configuration_revision,
             network_enabled: snapshot.collectors.network.enabled,
             communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+            screen_capture: snapshot.collectors.screen_capture.clone(),
+            screenshot_request_id: snapshot
+                .screenshot_request
+                .as_ref()
+                .map(|request| request.request_id.clone()),
         })
     } else {
         apply_snapshot(current, &snapshot)?
     };
-    if applied.is_some_and(|applied| !applied.communication_wechat_enabled) {
+    if applied
+        .as_ref()
+        .is_some_and(|applied| !applied.communication_wechat_enabled)
+    {
         if !apply_communication_authorization(
             authorization,
             &credentials.credential,
-            applied.unwrap(),
+            applied.clone().unwrap(),
             owner_epoch,
         )
         .await?
         {
             return Err(ControlError::Transient);
         }
-        publication.publish(owner_epoch, applied).await;
+        publication.publish(owner_epoch, applied.clone()).await;
     }
     sync_pending_system_events(database, &credentials.credential, client).await?;
     sync_pending_communication_events(database, &credentials.credential, client).await?;
@@ -1490,7 +1697,7 @@ async fn apply_control_snapshot(
             if !apply_communication_authorization(
                 authorization,
                 &credentials.credential,
-                applied,
+                applied.clone(),
                 owner_epoch,
             )
             .await?
@@ -1503,6 +1710,9 @@ async fn apply_control_snapshot(
     if let Some(request) = snapshot.local_media_cleanup {
         handle_local_media_cleanup(database, state, request).await?;
     }
+    publication
+        .publish(owner_epoch, Some(observed_control))
+        .await;
     Ok(())
 }
 
@@ -1571,6 +1781,283 @@ async fn run_media_loop(
                 .unwrap_or(0);
         wait = next_media_wait(completed_media);
     }
+}
+
+async fn run_screenshot_loop(
+    mut controls: watch::Receiver<Option<AppliedControl>>,
+    credentials: watch::Receiver<DeviceCredential>,
+    client: Arc<dyn ControlClient>,
+    bridge: ScreenCaptureCommandHandle,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), CloudControlRuntimeError> {
+    let mut timer = time::interval(Duration::from_secs(5));
+    timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut last_scheduled = Instant::now();
+    let mut last_activity_capture = Instant::now();
+    let mut last_activity_token: Option<String> = None;
+    let mut handled_requests = HashSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow_and_update() { return Ok(()); }
+            }
+            changed = controls.changed() => {
+                if changed.is_err() { return Ok(()); }
+            }
+            _ = timer.tick() => {}
+        }
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let credential = credentials.borrow().clone();
+        let _ =
+            upload_pending_screenshots(client.as_ref(), &credential, &mut handled_requests).await;
+        let Some(control) = controls.borrow().clone() else {
+            continue;
+        };
+        if !control.screen_capture.enabled {
+            continue;
+        }
+
+        if let Some(request_id) = control.screenshot_request_id.as_deref() {
+            if !handled_requests.contains(request_id) {
+                match capture_screenshot(
+                    &bridge,
+                    &control.screen_capture.excluded_bundle_ids,
+                    ScreenshotTrigger::Manual,
+                    Some(request_id.to_owned()),
+                )
+                .await
+                {
+                    Ok(CaptureAttempt::Queued) => {
+                        handled_requests.insert(request_id.to_owned());
+                    }
+                    Ok(CaptureAttempt::Terminal(error_code)) => {
+                        if client
+                            .fail_screenshot_request(&credential, request_id, error_code)
+                            .await
+                            .is_ok()
+                        {
+                            handled_requests.insert(request_id.to_owned());
+                        }
+                    }
+                    Ok(CaptureAttempt::Retry) | Err(_) => {}
+                }
+            }
+        }
+
+        if control.screen_capture.scheduled_enabled
+            && last_scheduled.elapsed()
+                >= Duration::from_secs(control.screen_capture.interval_seconds)
+            && capture_screenshot(
+                &bridge,
+                &control.screen_capture.excluded_bundle_ids,
+                ScreenshotTrigger::Scheduled,
+                None,
+            )
+            .await
+            .is_ok()
+        {
+            last_scheduled = Instant::now();
+        }
+
+        if control.screen_capture.activity_enabled {
+            if let Ok(context) = bridge.context().await {
+                if !context.locked {
+                    let changed = context.activity_token != last_activity_token;
+                    last_activity_token = context.activity_token;
+                    if changed
+                        && last_activity_capture.elapsed()
+                            >= Duration::from_secs(
+                                control.screen_capture.activity_min_interval_seconds,
+                            )
+                        && capture_screenshot(
+                            &bridge,
+                            &control.screen_capture.excluded_bundle_ids,
+                            ScreenshotTrigger::Activity,
+                            None,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        last_activity_capture = Instant::now();
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum CaptureAttempt {
+    Queued,
+    Retry,
+    Terminal(&'static str),
+}
+
+async fn capture_screenshot(
+    bridge: &ScreenCaptureCommandHandle,
+    excluded_bundle_ids: &[String],
+    trigger: ScreenshotTrigger,
+    request_id: Option<String>,
+) -> Result<CaptureAttempt, ControlError> {
+    let result = bridge
+        .capture(excluded_bundle_ids.to_vec())
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    match result.status {
+        ScreenCaptureStatus::SkippedLocked | ScreenCaptureStatus::Unavailable => {
+            return Ok(CaptureAttempt::Retry);
+        }
+        ScreenCaptureStatus::SkippedExcluded => {
+            return Ok(CaptureAttempt::Terminal("SCREEN_CAPTURE_APP_EXCLUDED"));
+        }
+        ScreenCaptureStatus::PermissionRequired => {
+            return Ok(CaptureAttempt::Terminal(
+                "SCREEN_CAPTURE_PERMISSION_REQUIRED",
+            ));
+        }
+        ScreenCaptureStatus::Captured => {}
+    }
+    let path = result.path.ok_or(ControlError::Contract)?;
+    let spool_root = screenshot_spool_root()?;
+    if path.parent() != Some(spool_root.as_path())
+        || path.extension().is_none_or(|value| value != "jpg")
+    {
+        return Err(ControlError::Contract);
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 {
+        return Err(ControlError::Contract);
+    }
+    let image_file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(ControlError::Contract)?
+        .to_owned();
+    let screenshot = PendingScreenshot {
+        screenshot_id: Uuid::new_v4().to_string(),
+        request_id,
+        trigger,
+        captured_at: OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|_| ControlError::Contract)?,
+        app_bundle_id: result.app_bundle_id,
+        pixel_width: result.pixel_width.ok_or(ControlError::Contract)?,
+        pixel_height: result.pixel_height.ok_or(ControlError::Contract)?,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        size_bytes: u64::try_from(bytes.len()).map_err(|_| ControlError::Contract)?,
+        mime_type: "image/jpeg".to_owned(),
+        image_file_name,
+    };
+    if let Err(error) = persist_screenshot_manifest(&spool_root, &screenshot).await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error);
+    }
+    Ok(CaptureAttempt::Queued)
+}
+
+async fn persist_screenshot_manifest(
+    spool_root: &Path,
+    screenshot: &PendingScreenshot,
+) -> Result<(), ControlError> {
+    let manifest = serde_json::to_vec(screenshot).map_err(|_| ControlError::Contract)?;
+    let final_path = spool_root.join(format!("{}.json", screenshot.screenshot_id));
+    let temporary_path = spool_root.join(format!(".{}.tmp", screenshot.screenshot_id));
+    tokio::fs::write(&temporary_path, manifest)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::rename(&temporary_path, &final_path)
+        .await
+        .map_err(|_| ControlError::Transient)
+}
+
+async fn upload_pending_screenshots(
+    client: &dyn ControlClient,
+    credentials: &DeviceCredential,
+    handled_requests: &mut HashSet<String>,
+) -> Result<(), ControlError> {
+    let spool_root = screenshot_spool_root()?;
+    let mut entries = match tokio::fs::read_dir(&spool_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ControlError::Transient),
+    };
+    let mut processed = 0_u8;
+    while processed < 4 {
+        let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|_| ControlError::Transient)?
+        else {
+            break;
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|value| value != "json") {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        let screenshot: PendingScreenshot =
+            serde_json::from_slice(&bytes).map_err(|_| ControlError::Contract)?;
+        if screenshot.mime_type != "image/jpeg"
+            || Uuid::parse_str(&screenshot.screenshot_id).is_err()
+            || screenshot
+                .request_id
+                .as_ref()
+                .is_some_and(|value| Uuid::parse_str(value).is_err())
+        {
+            return Err(ControlError::Contract);
+        }
+        remember_screenshot_request(&screenshot, handled_requests);
+        if client
+            .sync_screenshot(credentials, &screenshot)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let image_path = spool_root.join(&screenshot.image_file_name);
+        if image_path.parent() != Some(spool_root.as_path()) {
+            return Err(ControlError::Contract);
+        }
+        tokio::fs::remove_file(&image_path)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        processed = processed.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn remember_screenshot_request(
+    screenshot: &PendingScreenshot,
+    handled_requests: &mut HashSet<String>,
+) {
+    if let Some(request_id) = &screenshot.request_id {
+        handled_requests.insert(request_id.clone());
+    }
+}
+
+fn screenshot_spool_root() -> Result<PathBuf, ControlError> {
+    let home = std::env::var_os("HOME").ok_or(ControlError::Contract)?;
+    let root = PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("PersonalComputerAgent")
+        .join("ScreenshotSpool");
+    if !root.is_absolute() {
+        return Err(ControlError::Contract);
+    }
+    Ok(root)
 }
 
 async fn sync_pending_system_events(
@@ -1871,6 +2358,40 @@ async fn upload_communication_attachment(
     }
 }
 
+async fn upload_screenshot(
+    client: &Client,
+    upload_url: Url,
+    headers: &BTreeMap<String, String>,
+    screenshot: &PendingScreenshot,
+    spool_root: &Path,
+) -> Result<(), ControlError> {
+    let path = spool_root.join(&screenshot.image_file_name);
+    if path.parent() != Some(spool_root) || path.extension().is_none_or(|value| value != "jpg") {
+        return Err(ControlError::Contract);
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    if u64::try_from(bytes.len()).map_err(|_| ControlError::Contract)? != screenshot.size_bytes
+        || format!("{:x}", Sha256::digest(&bytes)) != screenshot.sha256
+    {
+        return Err(ControlError::Contract);
+    }
+    let request = client
+        .put(upload_url)
+        .timeout(MEDIA_UPLOAD_TIMEOUT)
+        .body(bytes);
+    let request = apply_communication_upload_headers(request, headers, screenshot.size_bytes)?;
+    let response = request.send().await.map_err(|_| ControlError::Transient)?;
+    if response.status().is_success() {
+        Ok(())
+    } else if response.status().is_server_error() {
+        Err(ControlError::Transient)
+    } else {
+        Err(ControlError::Contract)
+    }
+}
+
 fn apply_communication_upload_headers(
     mut request: reqwest::RequestBuilder,
     headers: &BTreeMap<String, String>,
@@ -2127,6 +2648,97 @@ impl ControlClient for HttpControlClient {
             Ok(())
         })
     }
+
+    fn sync_screenshot<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        screenshot: &'a PendingScreenshot,
+    ) -> ControlFuture<'a, ()> {
+        Box::pin(async move {
+            let client = Self::client()?;
+            let response = client
+                .post(self.endpoint("v1/agent/screenshots/prepare")?)
+                .bearer_auth(credentials.access_credential())
+                .json(screenshot)
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            let prepared = parse_response::<PreparedScreenshot>(response).await?;
+            if prepared.screenshot_id != screenshot.screenshot_id {
+                return Err(ControlError::Contract);
+            }
+            if prepared.state != "completed" {
+                if prepared.state != "prepared" {
+                    return Err(ControlError::Contract);
+                }
+                let upload = prepared.upload.ok_or(ControlError::Contract)?;
+                let upload_url = Url::parse(&upload.url).map_err(|_| ControlError::Contract)?;
+                if upload_url.scheme() != "https" {
+                    return Err(ControlError::Contract);
+                }
+                let spool_root = screenshot_spool_root()?;
+                if upload_screenshot(
+                    &client,
+                    upload_url.clone(),
+                    &upload.headers,
+                    screenshot,
+                    &spool_root,
+                )
+                .await
+                .is_err()
+                {
+                    upload_screenshot(
+                        &Self::direct_client()?,
+                        upload_url,
+                        &upload.headers,
+                        screenshot,
+                        &spool_root,
+                    )
+                    .await?;
+                }
+            }
+            let completed = parse_response::<CompletedScreenshot>(
+                Self::client()?
+                    .post(self.endpoint("v1/agent/screenshots/complete")?)
+                    .bearer_auth(credentials.access_credential())
+                    .json(&serde_json::json!({ "screenshot_id": screenshot.screenshot_id }))
+                    .send()
+                    .await
+                    .map_err(|_| ControlError::Transient)?,
+            )
+            .await?;
+            if completed.screenshot_id != screenshot.screenshot_id || completed.state != "completed"
+            {
+                return Err(ControlError::Contract);
+            }
+            Ok(())
+        })
+    }
+
+    fn fail_screenshot_request<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        request_id: &'a str,
+        error_code: &'static str,
+    ) -> ControlFuture<'a, ()> {
+        Box::pin(async move {
+            let response = Self::client()?
+                .post(self.endpoint("v1/agent/screenshots/fail")?)
+                .bearer_auth(credentials.access_credential())
+                .json(&serde_json::json!({
+                    "request_id": request_id,
+                    "error_code": error_code,
+                }))
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            if response.status() == StatusCode::NO_CONTENT {
+                Ok(())
+            } else {
+                Err(classify_status(response.status()))
+            }
+        })
+    }
 }
 
 impl PairingClient for HttpControlClient {
@@ -2265,6 +2877,19 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
     Err(ControlError::Contract)
 }
 
+fn classify_status(status: StatusCode) -> ControlError {
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        ControlError::Transient
+    } else if matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE
+    ) {
+        ControlError::InvalidCredential
+    } else {
+        ControlError::Contract
+    }
+}
+
 fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
     let timestamp = OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ControlError::Contract)?;
     i64::try_from(timestamp.unix_timestamp_nanos() / 1_000_000).map_err(|_| ControlError::Contract)
@@ -2273,11 +2898,12 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_communication_upload_headers, next_media_wait, retry_delay,
-        sync_pending_communication_events, sync_pending_system_events, AgentControlSnapshot,
-        ControlClient, ControlError, ControlFuture, DeviceCredential, HttpControlClient,
-        SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF,
-        MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
+        apply_communication_upload_headers, next_media_wait, remember_screenshot_request,
+        retry_delay, sync_pending_communication_events, sync_pending_system_events,
+        AgentControlSnapshot, ControlClient, ControlError, ControlFuture, DeviceCredential,
+        HttpControlClient, PendingScreenshot, ScreenshotTrigger, SyncEventsResponse,
+        CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE,
+        MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
     use pca_domain::{
@@ -2395,6 +3021,29 @@ mod tests {
             next_media_wait(usize::from(MEDIA_BATCH_SIZE - 1)),
             CONTROL_INTERVAL
         );
+    }
+
+    #[test]
+    fn restored_manual_screenshot_is_remembered_before_upload() {
+        let request_id = "01984444-7444-8444-8444-444444444444".to_owned();
+        let screenshot = PendingScreenshot {
+            screenshot_id: "01985555-7555-8555-8555-555555555555".to_owned(),
+            request_id: Some(request_id.clone()),
+            trigger: ScreenshotTrigger::Manual,
+            captured_at: "2026-08-05T00:00:00Z".to_owned(),
+            app_bundle_id: Some("com.example.App".to_owned()),
+            pixel_width: 1920,
+            pixel_height: 1080,
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+            mime_type: "image/jpeg".to_owned(),
+            image_file_name: "capture.jpg".to_owned(),
+        };
+        let mut handled = std::collections::HashSet::new();
+
+        remember_screenshot_request(&screenshot, &mut handled);
+
+        assert!(handled.contains(&request_id));
     }
 
     #[test]
