@@ -53,7 +53,7 @@ final class NetworkObservationSource: @unchecked Sendable {
         let interfaceName = Self.interfaceName(path, type: interfaceType)
         let addresses = interfaceName.map(Self.addresses) ?? (nil, nil)
         let wifi = interfaceType == "wifi" && locationAccessGranted(locationManager.authorizationStatus)
-            ? CWWiFiClient.shared().interface(withName: interfaceName)
+            ? CWWiFiClient.shared().interface()
             : nil
         let ssid = wifi?.ssid()?.precomposedStringWithCanonicalMapping
         let bssid = wifi?.bssid()?.uppercased()
