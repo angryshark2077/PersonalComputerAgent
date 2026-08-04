@@ -1432,6 +1432,13 @@ async fn sync_pending_system_events(
     credentials: &DeviceCredential,
     client: &dyn ControlClient,
 ) -> Result<(), ControlError> {
+    database
+        .acknowledge_mismatched_lifecycle_events(
+            credentials.workspace_id(),
+            credentials.device_id(),
+        )
+        .await
+        .map_err(|_| ControlError::Transient)?;
     let events = database
         .load_pending_system_events(20)
         .await

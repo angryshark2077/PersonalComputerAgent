@@ -1191,6 +1191,75 @@ pub(crate) fn load_pending_system_events(
     .collect()
 }
 
+pub(crate) fn acknowledge_mismatched_lifecycle_events(
+    connection: &mut Connection,
+    workspace_id: &str,
+    device_id: &str,
+) -> Result<u64, DbError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start lifecycle identity quarantine", error))?;
+    let updated = transaction
+        .execute(
+            "UPDATE sync_outbox
+             SET state = 'acked'
+             WHERE state = 'pending'
+               AND EXISTS (
+                   SELECT 1 FROM events_local AS e
+                   WHERE e.event_id = sync_outbox.event_id
+                     AND e.event_type IN (
+                         'agent.started',
+                         'agent.stopped',
+                         'agent.crash_recovered',
+                         'system.sleep',
+                         'system.wake',
+                         'AGENT_STARTED',
+                         'AGENT_STOPPED',
+                         'AGENT_CRASH_RECOVERED',
+                         'SYSTEM_SLEEP',
+                         'SYSTEM_WAKE'
+                     )
+                     AND (e.workspace_id <> ?1 OR e.device_id <> ?2)
+               )",
+            params![workspace_id, device_id],
+        )
+        .map_err(|error| DbError::sqlite("acknowledge mismatched lifecycle events", error))?;
+    if updated > 0 {
+        let occurred_at_ms = i64::try_from(
+            OffsetDateTime::now_utc()
+                .unix_timestamp_nanos()
+                .div_euclid(1_000_000),
+        )
+        .unwrap_or(i64::MAX);
+        let redacted_json = serde_json::json!({ "discarded_event_count": updated }).to_string();
+        transaction
+            .execute(
+                "INSERT INTO diagnostic_events (
+                    diagnostic_id, occurred_at_ms, level, code, redacted_json
+                 ) VALUES (
+                    'LIFECYCLE_IDENTITY_MISMATCH', ?1, 'warning',
+                    'LIFECYCLE_IDENTITY_MISMATCH', ?2
+                 )
+                 ON CONFLICT(diagnostic_id) DO UPDATE SET
+                    occurred_at_ms = excluded.occurred_at_ms,
+                    level = excluded.level,
+                    code = excluded.code,
+                    redacted_json = excluded.redacted_json",
+                params![occurred_at_ms, redacted_json],
+            )
+            .map_err(|error| DbError::sqlite("record lifecycle identity diagnostic", error))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit lifecycle identity quarantine", error))?;
+    u64::try_from(updated).map_err(|_| {
+        DbError::sqlite(
+            "acknowledge mismatched lifecycle events",
+            "row count overflow",
+        )
+    })
+}
+
 pub(crate) fn acknowledge_system_events(
     connection: &mut Connection,
     event_ids: &[String],

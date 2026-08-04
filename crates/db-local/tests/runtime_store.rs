@@ -1116,6 +1116,73 @@ async fn legacy_lifecycle_outbox_rows_load_as_cloud_contract_events() {
 }
 
 #[tokio::test]
+async fn mismatched_lifecycle_identity_is_acknowledged_without_rewriting_local_events() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let connection = Connection::open(&path).expect("open fixture database");
+    connection
+        .execute_batch(
+            "INSERT INTO events_local VALUES
+                ('legacy-unpaired', 'local-unpaired', 'local-device', 'AGENT_STARTED',
+                 'runtime.lifecycle', 1, 1, 1, 'normal', '{}', '[]', 'legacy-unpaired'),
+                ('current-start', 'workspace-current', 'device-current', 'agent.started',
+                 'runtime.lifecycle', 1, 2, 2, 'normal', '{}', '[]', 'current-start'),
+                ('prior-pairing', 'workspace-prior', 'device-prior', 'system.wake',
+                 'runtime.lifecycle', 1, 3, 3, 'normal', '{}', '[]', 'prior-pairing');
+             INSERT INTO sync_outbox VALUES
+                ('event:legacy-unpaired', 'legacy-unpaired', 'pending', 1),
+                ('event:current-start', 'current-start', 'pending', 2),
+                ('event:prior-pairing', 'prior-pairing', 'pending', 3);",
+        )
+        .expect("insert lifecycle fixtures");
+    drop(connection);
+
+    assert_eq!(
+        db.acknowledge_mismatched_lifecycle_events("workspace-current", "device-current")
+            .await
+            .expect("acknowledge mismatched lifecycle rows"),
+        2
+    );
+    let pending = db
+        .load_pending_system_events(20)
+        .await
+        .expect("load current lifecycle row");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event_id, "current-start");
+    assert_eq!(db.active_outbox_depth().await.expect("outbox depth"), 1);
+
+    let connection = Connection::open(&path).expect("inspect lifecycle quarantine");
+    let preserved = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events_local
+             WHERE event_id IN ('legacy-unpaired', 'prior-pairing')",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .expect("count preserved lifecycle events");
+    assert_eq!(preserved, 2);
+    let diagnostic = connection
+        .query_row(
+            "SELECT level, code, redacted_json FROM diagnostic_events
+             WHERE diagnostic_id = 'LIFECYCLE_IDENTITY_MISMATCH'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .expect("load lifecycle diagnostic");
+    assert_eq!(diagnostic.0, "warning");
+    assert_eq!(diagnostic.1, "LIFECYCLE_IDENTITY_MISMATCH");
+    assert_eq!(diagnostic.2, r#"{"discarded_event_count":2}"#);
+}
+
+#[tokio::test]
 async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body() {
     let (directory, path) = database_path();
     let db = DbActorHandle::open(&path, "0.1.0")

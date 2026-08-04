@@ -158,6 +158,11 @@ enum Request {
         limit: u16,
         response: oneshot::Sender<Result<Vec<EventEnvelope>, DbError>>,
     },
+    AcknowledgeMismatchedLifecycleEvents {
+        workspace_id: String,
+        device_id: String,
+        response: oneshot::Sender<Result<u64, DbError>>,
+    },
     AcknowledgeSystemEvents {
         event_ids: Vec<String>,
         response: oneshot::Sender<Result<(), DbError>>,
@@ -223,6 +228,7 @@ impl Request {
             Self::CommunicationMediaStorageStats { response } => response.is_closed(),
             Self::LoadPendingSystemEvents { response, .. }
             | Self::LoadPendingCommunicationEvents { response, .. } => response.is_closed(),
+            Self::AcknowledgeMismatchedLifecycleEvents { response, .. } => response.is_closed(),
             Self::LoadPendingCommunicationAttachments { response, .. } => response.is_closed(),
         }
     }
@@ -571,6 +577,29 @@ impl DbActorHandle {
         let (response_sender, response_receiver) = oneshot::channel();
         self.send(Request::LoadPendingSystemEvents {
             limit,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Acknowledges lifecycle rows that cannot belong to the currently paired Cloud identity.
+    ///
+    /// The immutable local Event remains available for diagnostics; only its upload attempt is
+    /// terminated so a pre-pairing or previously paired identity cannot block later System data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, transaction, or `SQLite` write error.
+    pub async fn acknowledge_mismatched_lifecycle_events(
+        &self,
+        workspace_id: &str,
+        device_id: &str,
+    ) -> Result<u64, DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::AcknowledgeMismatchedLifecycleEvents {
+            workspace_id: workspace_id.to_owned(),
+            device_id: device_id.to_owned(),
             response: response_sender,
         })
         .await?;
@@ -955,6 +984,17 @@ fn run(
             }
             Request::LoadPendingSystemEvents { limit, response } => {
                 let _ = response.send(repository::load_pending_system_events(&connection, limit));
+            }
+            Request::AcknowledgeMismatchedLifecycleEvents {
+                workspace_id,
+                device_id,
+                response,
+            } => {
+                let _ = response.send(repository::acknowledge_mismatched_lifecycle_events(
+                    &mut connection,
+                    &workspace_id,
+                    &device_id,
+                ));
             }
             Request::AcknowledgeSystemEvents {
                 event_ids,
