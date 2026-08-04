@@ -21,6 +21,21 @@ export interface CommunicationSyncBatchRequest {
   events: CommunicationEventRecord[];
 }
 
+type LifecycleEventType =
+  | "agent.started"
+  | "agent.stopped"
+  | "agent.crash_recovered"
+  | "system.sleep"
+  | "system.wake";
+
+const lifecycleEventTypes: readonly LifecycleEventType[] = [
+  "agent.started",
+  "agent.stopped",
+  "agent.crash_recovered",
+  "system.sleep",
+  "system.wake",
+];
+
 export function parseSyncBatch(value: unknown): SyncBatchRequest | null {
   if (!validateContract("sync-batch-request", value).valid || !isRecord(value)) return null;
   if (value.compressed === true) return null;
@@ -56,6 +71,12 @@ function parseSystemEvent(event: EventEnvelope): SystemEventRecord | null {
     if (event.source !== "system" || !validateContract("system-health-changed", event.payload).valid) return null;
   } else if (event.event_type === "collector.status_changed") {
     if (event.source !== "collector.registry" || !validateContract("collector-status-changed", event.payload).valid) return null;
+  } else if (isLifecycleEventType(event.event_type)) {
+    if (
+      event.source !== "runtime.lifecycle"
+      || !isRecord(event.payload)
+      || Object.keys(event.payload).length !== 0
+    ) return null;
   } else {
     return null;
   }
@@ -75,6 +96,10 @@ function parseSystemEvent(event: EventEnvelope): SystemEventRecord | null {
     payload: event.payload as unknown as Record<string, unknown>,
     idempotencyKey: event.idempotency_key ?? null,
   };
+}
+
+function isLifecycleEventType(value: string): value is LifecycleEventType {
+  return (lifecycleEventTypes as readonly string[]).includes(value);
 }
 
 function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord | null {

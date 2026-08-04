@@ -348,8 +348,8 @@ fn run_writes_fresh_local_health_when_bridge_is_missing_and_stops_cleanly() {
     assert_eq!(
         lifecycle,
         vec![
-            ("AGENT_STARTED".to_owned(), 1),
-            ("AGENT_STOPPED".to_owned(), 1)
+            ("agent.started".to_owned(), 1),
+            ("agent.stopped".to_owned(), 1)
         ]
     );
     let mismatched_pairs: u64 = connection
@@ -552,7 +552,7 @@ fn forced_kill_leaves_marker_and_next_start_records_crash_recovery() {
     let connection = Connection::open(&paths.database_file).expect("open runtime database");
     let crash_events: u64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM events_local WHERE event_type = 'AGENT_CRASH_RECOVERED'",
+            "SELECT COUNT(*) FROM events_local WHERE event_type = 'agent.crash_recovered'",
             [],
             |row| row.get(0),
         )

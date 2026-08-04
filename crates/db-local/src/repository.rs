@@ -1099,7 +1099,23 @@ pub(crate) fn load_pending_system_events(
 ) -> Result<Vec<EventEnvelope>, DbError> {
     let mut statement = connection
         .prepare(
-            "SELECT e.event_id, e.workspace_id, e.device_id, e.event_type, e.source,
+            "SELECT e.event_id, e.workspace_id, e.device_id,
+                    CASE e.event_type
+                        WHEN 'AGENT_STARTED' THEN 'agent.started'
+                        WHEN 'AGENT_STOPPED' THEN 'agent.stopped'
+                        WHEN 'AGENT_CRASH_RECOVERED' THEN 'agent.crash_recovered'
+                        WHEN 'SYSTEM_SLEEP' THEN 'system.sleep'
+                        WHEN 'SYSTEM_WAKE' THEN 'system.wake'
+                        ELSE e.event_type
+                    END AS event_type,
+                    CASE
+                        WHEN e.event_type IN (
+                            'AGENT_STARTED', 'AGENT_STOPPED', 'AGENT_CRASH_RECOVERED',
+                            'SYSTEM_SLEEP', 'SYSTEM_WAKE'
+                        ) AND e.source = 'runtime'
+                        THEN 'runtime.lifecycle'
+                        ELSE e.source
+                    END AS source,
                     e.schema_version, e.occurred_at_ms, e.created_at_ms, e.payload_json,
                     e.idempotency_key
              FROM sync_outbox AS o
@@ -1108,7 +1124,17 @@ pub(crate) fn load_pending_system_events(
                AND e.event_type IN (
                    'system.metric_sampled',
                    'system.health_changed',
-                   'collector.status_changed'
+                   'collector.status_changed',
+                   'agent.started',
+                   'agent.stopped',
+                   'agent.crash_recovered',
+                   'system.sleep',
+                   'system.wake',
+                   'AGENT_STARTED',
+                   'AGENT_STOPPED',
+                   'AGENT_CRASH_RECOVERED',
+                   'SYSTEM_SLEEP',
+                   'SYSTEM_WAKE'
                )
                AND e.sensitivity = 'normal'
                AND e.attachment_refs_json = '[]'
@@ -1185,7 +1211,17 @@ pub(crate) fn acknowledge_system_events(
                          AND events_local.event_type IN (
                              'system.metric_sampled',
                              'system.health_changed',
-                             'collector.status_changed'
+                             'collector.status_changed',
+                             'agent.started',
+                             'agent.stopped',
+                             'agent.crash_recovered',
+                             'system.sleep',
+                             'system.wake',
+                             'AGENT_STARTED',
+                             'AGENT_STOPPED',
+                             'AGENT_CRASH_RECOVERED',
+                             'SYSTEM_SLEEP',
+                             'SYSTEM_WAKE'
                          )
                    )",
                 [event_id],
@@ -1319,6 +1355,16 @@ pub(crate) fn acknowledge_communication_events(
         .map_err(|error| DbError::sqlite("commit communication event acknowledgement", error))
 }
 
+struct PendingAttachmentManifest {
+    event_id: String,
+    attachment_id: String,
+    sha256: String,
+    size_bytes: i64,
+    mime_type: String,
+    file_name: String,
+    transfer_state: String,
+}
+
 pub(crate) fn load_pending_communication_attachments(
     connection: &Connection,
     spool_root: &Path,
@@ -1327,37 +1373,87 @@ pub(crate) fn load_pending_communication_attachments(
     let mut statement = connection
         .prepare(
             "SELECT m.event_id, s.attachment_id, s.sha256, s.size_bytes, s.mime_type,
-                    s.spool_relative_path
+                    s.spool_relative_path, s.transfer_state
              FROM attachment_spool AS s
              INNER JOIN communication_messages AS m
                 ON m.local_message_id = s.local_message_id
              INNER JOIN sync_outbox AS o ON o.event_id = m.event_id
              WHERE o.state = 'acked' AND s.transfer_state <> 'completed'
-             ORDER BY CASE s.transfer_state WHEN 'failed' THEN 1 ELSE 0 END,
-                      s.created_at_ms, s.attachment_id
-             LIMIT ?1",
+             ORDER BY s.created_at_ms, s.attachment_id",
         )
         .map_err(|error| DbError::sqlite("prepare pending attachment query", error))?;
     let rows = statement
-        .query_map([i64::from(limit)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
+        .query_map([], |row| {
+            Ok(PendingAttachmentManifest {
+                event_id: row.get(0)?,
+                attachment_id: row.get(1)?,
+                sha256: row.get(2)?,
+                size_bytes: row.get(3)?,
+                mime_type: row.get(4)?,
+                file_name: row.get(5)?,
+                transfer_state: row.get(6)?,
+            })
         })
         .map_err(|error| DbError::sqlite("query pending attachments", error))?;
-    let mut pending = Vec::new();
-    for row in rows {
-        let (event_id, attachment_id, sha256, size_bytes, mime_type, file_name) =
-            row.map_err(|error| DbError::sqlite("read pending attachment", error))?;
-        let expected_size = u64::try_from(size_bytes).map_err(|_| {
+    let manifests = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| DbError::sqlite("read pending attachment", error))?;
+    drop(statement);
+    let (pending, failed): (Vec<_>, Vec<_>) = manifests
+        .into_iter()
+        .partition(|manifest| manifest.transfer_state != "failed");
+    let limit = usize::from(limit);
+    let pending_target = if !pending.is_empty() && !failed.is_empty() && limit > 1 {
+        limit - 1
+    } else {
+        limit
+    };
+    let mut pending = pending.into_iter();
+    let mut failed = failed.into_iter();
+    let mut loaded = Vec::with_capacity(limit);
+    load_valid_attachments(
+        connection,
+        spool_root,
+        &mut pending,
+        pending_target,
+        &mut loaded,
+    )?;
+    load_valid_attachments(connection, spool_root, &mut failed, limit, &mut loaded)?;
+    load_valid_attachments(connection, spool_root, &mut pending, limit, &mut loaded)?;
+    Ok(loaded)
+}
+
+fn load_valid_attachments(
+    connection: &Connection,
+    spool_root: &Path,
+    manifests: &mut impl Iterator<Item = PendingAttachmentManifest>,
+    target: usize,
+    loaded: &mut Vec<PendingCommunicationAttachment>,
+) -> Result<(), DbError> {
+    while loaded.len() < target {
+        let Some(manifest) = manifests.next() else {
+            break;
+        };
+        match load_valid_attachment(spool_root, manifest) {
+            Ok(attachment) => loaded.push(attachment),
+            Err((attachment_id, _error)) => {
+                quarantine_invalid_attachment(connection, &attachment_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_valid_attachment(
+    spool_root: &Path,
+    manifest: PendingAttachmentManifest,
+) -> Result<PendingCommunicationAttachment, (String, DbError)> {
+    let attachment_id = manifest.attachment_id.clone();
+    let result = (|| {
+        let expected_size = u64::try_from(manifest.size_bytes).map_err(|_| {
             DbError::sqlite("read pending attachment", "attachment size is invalid")
         })?;
-        let mut file = open_communication_spool_file(spool_root, &file_name)?;
+        let mut file = open_communication_spool_file(spool_root, &manifest.file_name)?;
         let mut hasher = Sha256::new();
         let mut bytes_read = 0_u64;
         let mut buffer = vec![0_u8; 1024 * 1024];
@@ -1377,7 +1473,7 @@ pub(crate) fn load_pending_communication_attachments(
                 })?;
             hasher.update(&buffer[..read]);
         }
-        if bytes_read != expected_size || format!("{:x}", hasher.finalize()) != sha256 {
+        if bytes_read != expected_size || format!("{:x}", hasher.finalize()) != manifest.sha256 {
             return Err(DbError::sqlite(
                 "verify pending attachment body",
                 "attachment body does not match immutable manifest",
@@ -1385,16 +1481,36 @@ pub(crate) fn load_pending_communication_attachments(
         }
         file.seek(SeekFrom::Start(0))
             .map_err(|error| DbError::sqlite("rewind pending attachment body", error))?;
-        pending.push(PendingCommunicationAttachment {
-            event_id,
-            attachment_id,
-            sha256,
+        Ok(PendingCommunicationAttachment {
+            event_id: manifest.event_id,
+            attachment_id: manifest.attachment_id,
+            sha256: manifest.sha256,
             size_bytes: expected_size,
-            mime_type,
+            mime_type: manifest.mime_type,
             file,
-        });
-    }
-    Ok(pending)
+        })
+    })();
+    result.map_err(|error| (attachment_id, error))
+}
+
+fn quarantine_invalid_attachment(
+    connection: &Connection,
+    attachment_id: &str,
+) -> Result<(), DbError> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| DbError::sqlite("start invalid attachment quarantine", error))?;
+    transaction
+        .execute(
+            "UPDATE attachment_spool SET transfer_state = 'failed'
+             WHERE attachment_id = ?1 AND transfer_state <> 'completed'",
+            [attachment_id],
+        )
+        .map_err(|error| DbError::sqlite("quarantine invalid attachment", error))?;
+    record_media_diagnostic(&transaction, attachment_id, "MEDIA_LOCAL_BODY_INVALID")?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit invalid attachment quarantine", error))
 }
 
 pub(crate) fn complete_communication_attachment(
@@ -1424,7 +1540,10 @@ pub(crate) fn defer_communication_attachment(
     connection: &Connection,
     attachment_id: &str,
 ) -> Result<(), DbError> {
-    let updated = connection
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| DbError::sqlite("start attachment deferral", error))?;
+    let updated = transaction
         .execute(
             "UPDATE attachment_spool
              SET transfer_state = 'failed'
@@ -1432,14 +1551,46 @@ pub(crate) fn defer_communication_attachment(
             [attachment_id],
         )
         .map_err(|error| DbError::sqlite("defer communication attachment", error))?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(DbError::sqlite(
+    if updated != 1 {
+        return Err(DbError::sqlite(
             "defer communication attachment",
             "attachment was not pending",
-        ))
+        ));
     }
+    record_media_diagnostic(&transaction, attachment_id, "MEDIA_UPLOAD_FAILED")?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit attachment deferral", error))
+}
+
+fn record_media_diagnostic(
+    transaction: &Transaction<'_>,
+    attachment_id: &str,
+    code: &str,
+) -> Result<(), DbError> {
+    let attachment_id_hash = format!("{:x}", Sha256::digest(attachment_id.as_bytes()));
+    let diagnostic_id = format!("{code}:{attachment_id_hash}");
+    let redacted_json = serde_json::json!({ "attachment_id_hash": attachment_id_hash }).to_string();
+    let occurred_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    transaction
+        .execute(
+            "INSERT INTO diagnostic_events (
+                diagnostic_id, occurred_at_ms, level, code, redacted_json
+             ) VALUES (?1, ?2, 'error', ?3, ?4)
+             ON CONFLICT(diagnostic_id) DO UPDATE SET
+                occurred_at_ms = excluded.occurred_at_ms,
+                level = excluded.level,
+                code = excluded.code,
+                redacted_json = excluded.redacted_json",
+            params![diagnostic_id, occurred_at_ms, code, redacted_json],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("record media diagnostic", error))
 }
 
 pub(crate) fn cleanup_completed_communication_attachments(

@@ -1085,6 +1085,37 @@ async fn clean_database_has_no_pending_communication_attachments() {
 }
 
 #[tokio::test]
+async fn legacy_lifecycle_outbox_rows_load_as_cloud_contract_events() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let connection = Connection::open(&path).expect("open fixture database");
+    connection
+        .execute_batch(
+            "INSERT INTO events_local VALUES
+                ('legacy-start', 'workspace-1', 'device-1', 'AGENT_STARTED',
+                 'runtime.lifecycle', 1, 1, 1, 'normal', '{}', '[]', 'legacy-start');
+             INSERT INTO sync_outbox VALUES
+                ('event:legacy-start', 'legacy-start', 'pending', 1);",
+        )
+        .expect("insert legacy lifecycle event");
+    drop(connection);
+
+    let pending = db
+        .load_pending_system_events(20)
+        .await
+        .expect("load normalized lifecycle event");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event_type, "agent.started");
+    assert_eq!(pending[0].source, "runtime.lifecycle");
+    db.acknowledge_system_events(&["legacy-start".to_owned()])
+        .await
+        .expect("acknowledge legacy lifecycle event");
+    assert_eq!(db.active_outbox_depth().await.expect("outbox depth"), 0);
+}
+
+#[tokio::test]
 async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body() {
     let (directory, path) = database_path();
     let db = DbActorHandle::open(&path, "0.1.0")
@@ -1158,6 +1189,9 @@ async fn failed_attachment_is_deferred_behind_unattempted_media() {
     let bodies = [
         ("first", b"first".as_slice()),
         ("second", b"second".as_slice()),
+        ("third", b"third".as_slice()),
+        ("fourth", b"fourth".as_slice()),
+        ("fifth", b"fifth".as_slice()),
     ];
     let manifests = bodies
         .iter()
@@ -1210,10 +1244,102 @@ async fn failed_attachment_is_deferred_behind_unattempted_media() {
         .await
         .expect("defer failed attachment");
     assert_eq!(
+        Connection::open(&path)
+            .expect("inspect upload diagnostic")
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostic_events WHERE code = 'MEDIA_UPLOAD_FAILED'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("count upload diagnostic"),
+        1
+    );
+    assert_eq!(
         db.load_pending_communication_attachments(1)
             .await
             .expect("load unattempted attachment")[0]
             .attachment_id,
         "second"
+    );
+    assert_eq!(
+        db.load_pending_communication_attachments(4)
+            .await
+            .expect("load fair attachment batch")
+            .into_iter()
+            .map(|attachment| attachment.attachment_id)
+            .collect::<Vec<_>>(),
+        vec!["second", "third", "fourth", "first"]
+    );
+}
+
+#[tokio::test]
+async fn invalid_attachment_is_quarantined_without_blocking_later_media() {
+    let (directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let spool = directory.0.join("communication-spool");
+    let valid_body = b"valid";
+    let valid_sha256 = format!("{:x}", Sha256::digest(valid_body));
+    let missing_sha256 = format!("{:x}", Sha256::digest(b"missing"));
+    std::fs::write(spool.join(&valid_sha256), valid_body).expect("write valid attachment");
+    let connection = Connection::open(&path).expect("open fixture database");
+    connection
+        .execute_batch(
+            "INSERT INTO events_local VALUES
+                ('quarantine-event', 'workspace-1', 'device-1', 'communication.message_recorded',
+                 'wechat', 1, 1, 1, 'high', '{}', '[]', NULL);
+             INSERT INTO sync_outbox VALUES
+                ('event:quarantine-event', 'quarantine-event', 'acked', 1);
+             INSERT INTO communication_conversations VALUES
+                ('account-1', 'conversation-1', 'direct', NULL, 1, 1);
+             INSERT INTO communication_messages VALUES
+                (1, 'quarantine-event', 'account-1', 'conversation-1', 1, 'source-1',
+                 'incoming', 'image', 1, NULL, 1);",
+        )
+        .expect("insert attachment owner fixture");
+    for (attachment_id, sha256, size, created_at) in [
+        ("missing", missing_sha256.as_str(), 7_i64, 1_i64),
+        ("valid", valid_sha256.as_str(), 5_i64, 2_i64),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO attachment_spool (
+                    attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                    spool_relative_path, transfer_state, created_at_ms, completed_at_ms
+                 ) VALUES (?1, 1, 'image', ?2, ?3, 'image/png', ?2, 'pending', ?4, NULL)",
+                rusqlite::params![attachment_id, sha256, size, created_at],
+            )
+            .expect("insert attachment fixture");
+    }
+    drop(connection);
+
+    let pending = db
+        .load_pending_communication_attachments(2)
+        .await
+        .expect("skip invalid attachment");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attachment_id, "valid");
+
+    let connection = Connection::open(&path).expect("inspect quarantine result");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT transfer_state FROM attachment_spool WHERE attachment_id = 'missing'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read quarantined state"),
+        "failed"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostic_events WHERE code = 'MEDIA_LOCAL_BODY_INVALID'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("count media diagnostic"),
+        1
     );
 }

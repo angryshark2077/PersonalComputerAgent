@@ -691,7 +691,8 @@ impl DbActorHandle {
     ///
     /// # Errors
     ///
-    /// Returns an actor, query, spool-open, or immutable-manifest verification error.
+    /// Returns an actor, query, or quarantine-persistence error. Invalid local bodies are
+    /// quarantined with a redacted diagnostic and do not block later attachments.
     pub async fn load_pending_communication_attachments(
         &self,
         limit: u16,

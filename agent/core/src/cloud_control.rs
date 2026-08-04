@@ -34,7 +34,7 @@ const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_UPLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 const MEDIA_BATCH_SIZE: u16 = 4;
-const MAX_BACKOFF: Duration = Duration::from_mins(5);
+const MAX_BACKOFF: Duration = CONTROL_INTERVAL;
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
 const CONTROL_OWNER_COMMAND_CAPACITY: usize = 8;
 pub const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.up.railway.app";
@@ -2193,6 +2193,7 @@ mod tests {
     fn retry_backoff_is_jittered_and_bounded() {
         assert_ne!(retry_delay(1), Duration::from_secs(1));
         assert!(retry_delay(20) <= MAX_BACKOFF);
+        assert!(retry_delay(20) <= CONTROL_INTERVAL);
         assert_eq!(CONTROL_INTERVAL, Duration::from_secs(30));
     }
 
@@ -2430,7 +2431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_system_events_are_acknowledged_without_touching_other_outbox_rows() {
+    async fn accepted_system_and_legacy_lifecycle_events_are_acknowledged() {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
             .await
@@ -2477,7 +2478,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             database.active_outbox_depth().await.expect("outbox depth"),
-            1
+            0
         );
         database.shutdown().await.expect("shutdown database");
     }

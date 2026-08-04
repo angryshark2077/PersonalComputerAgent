@@ -561,7 +561,15 @@ async fn communication_revision_notifications_are_monotonic_and_invalid_control_
         tokio::task::yield_now().await;
     }
 
-    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    for _ in 0..3 {
+        if client.calls.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
     wait_for_calls(&client.calls, 3).await;
     controls.changed().await.unwrap();
     assert!(controls.borrow_and_update().is_none());
@@ -605,9 +613,15 @@ async fn persisted_enabled_revision_is_restored_even_when_published_before_subsc
     .unwrap();
 
     wait_for_calls(&client.calls, 1).await;
-    for _ in 0..50 {
+    let mut published = false;
+    for _ in 0..10_000 {
+        if runtime.communication_controls().borrow().is_some() {
+            published = true;
+            break;
+        }
         tokio::task::yield_now().await;
     }
+    assert!(published, "persisted revision was not published");
     let controls = runtime.communication_controls();
     let restored = controls
         .borrow()
@@ -977,7 +991,7 @@ fn exact_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
 }
 
 async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
-    for _ in 0..100 {
+    for _ in 0..10_000 {
         if calls.load(Ordering::SeqCst) >= expected {
             return;
         }

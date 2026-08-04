@@ -260,8 +260,16 @@ export interface SystemEventRecord {
   eventId: string;
   workspaceId: string;
   deviceId: string;
-  eventType: "system.metric_sampled" | "system.health_changed" | "collector.status_changed";
-  source: "system" | "collector.registry";
+  eventType:
+    | "system.metric_sampled"
+    | "system.health_changed"
+    | "collector.status_changed"
+    | "agent.started"
+    | "agent.stopped"
+    | "agent.crash_recovered"
+    | "system.sleep"
+    | "system.wake";
+  source: "system" | "collector.registry" | "runtime.lifecycle";
   schemaVersion: number;
   occurredAt: Date;
   createdAt: Date;

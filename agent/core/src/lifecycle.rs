@@ -112,11 +112,11 @@ impl LifecycleRuntime {
     }
 
     pub(crate) async fn record_startup(&self) -> Result<String, LifecycleError> {
-        self.persist("AGENT_STARTED", false).await
+        self.persist("agent.started", false).await
     }
 
     pub(crate) async fn record_crash_recovery(&self) -> Result<String, LifecycleError> {
-        self.persist("AGENT_CRASH_RECOVERED", false).await
+        self.persist("agent.crash_recovered", false).await
     }
 
     /// Stops new lifecycle side effects, drains earlier queue items, records sleep, and checkpoints.
@@ -130,7 +130,7 @@ impl LifecycleRuntime {
             return Err(LifecycleError::NotAccepting);
         }
         *accepting = false;
-        let event = lifecycle_event(&self.identity, "SYSTEM_SLEEP")?;
+        let event = lifecycle_event(&self.identity, "system.sleep")?;
         let result = send_persist(&self.sender, event, true).await;
         drop(accepting);
         result
@@ -146,7 +146,7 @@ impl LifecycleRuntime {
         if *accepting {
             return Err(LifecycleError::NotAccepting);
         }
-        let event = lifecycle_event(&self.identity, "SYSTEM_WAKE")?;
+        let event = lifecycle_event(&self.identity, "system.wake")?;
         let result = send_persist(&self.sender, event, false).await;
         let event_id = result?;
         self.capability_refresher
@@ -158,7 +158,7 @@ impl LifecycleRuntime {
 
     /// Rejects new producers, drains queued work, records clean stop, and joins the worker.
     pub(crate) async fn stop_and_drain(self) -> Result<String, LifecycleError> {
-        self.finish(Some("AGENT_STOPPED"))
+        self.finish(Some("agent.stopped"))
             .await?
             .ok_or(LifecycleError::WorkerStopped)
     }
@@ -354,7 +354,7 @@ mod tests {
                 let connection = rusqlite::Connection::open(path).expect("inspect refresh order");
                 let wake_pairs: u64 = connection
                     .query_row(
-                        "SELECT COUNT(*) FROM events_local e JOIN sync_outbox o ON o.event_id = e.event_id WHERE e.event_type = 'SYSTEM_WAKE'",
+                        "SELECT COUNT(*) FROM events_local e JOIN sync_outbox o ON o.event_id = e.event_id WHERE e.event_type = 'system.wake'",
                         [],
                         |row| row.get(0),
                     )
@@ -453,7 +453,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).expect("inspect wake event ordering");
         let wake_pairs: u64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM events_local e JOIN sync_outbox o ON o.event_id = e.event_id WHERE e.event_type = 'SYSTEM_WAKE'",
+                "SELECT COUNT(*) FROM events_local e JOIN sync_outbox o ON o.event_id = e.event_id WHERE e.event_type = 'system.wake'",
                 [],
                 |row| row.get(0),
             )

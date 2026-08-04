@@ -35,3 +35,25 @@ test("country.is adapter keeps only city-level fields and caches by public IP", 
   assert.deepEqual(await adapter.locate("203.0.113.7"), expected);
   assert.equal(calls, 1);
 });
+
+test("country.is adapter bounds request time and cache cardinality", async () => {
+  let calls = 0;
+  const adapter = new CountryIsGeoEnricher(async (_input, init) => {
+    calls += 1;
+    assert.ok(init?.signal instanceof AbortSignal);
+    return new Response(JSON.stringify({ country: "SG" }), { status: 200 });
+  }, 60_000, 2, 1_000);
+
+  await adapter.locate("203.0.113.1");
+  await adapter.locate("203.0.113.2");
+  await adapter.locate("203.0.113.3");
+  await adapter.locate("203.0.113.1");
+  assert.equal(calls, 4, "oldest IP must be evicted once the cache reaches its bound");
+});
+
+test("country.is adapter aborts a stalled request", async () => {
+  const adapter = new CountryIsGeoEnricher((_input, init) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+  }), 60_000, 2, 1);
+  await assert.rejects(adapter.locate("203.0.113.7"), /timeout|aborted/i);
+});

@@ -82,6 +82,23 @@ function systemMetric(deviceId: string) {
   };
 }
 
+function agentStarted(deviceId: string) {
+  return {
+    event_id: "01986666-7666-8666-8666-666666666669",
+    workspace_id: owner.workspaceId,
+    device_id: deviceId,
+    event_type: "agent.started",
+    source: "runtime.lifecycle",
+    schema_version: 1,
+    occurred_at: "2026-08-02T00:00:00Z",
+    created_at: "2026-08-02T00:00:00Z",
+    sensitivity: "normal",
+    payload: {},
+    attachment_refs: [],
+    idempotency_key: "lifecycle:01986666-7666-8666-8666-666666666669",
+  };
+}
+
 function communicationText(deviceId: string) {
   return {
     event_id: "01986666-7666-8666-8666-666666666667",
@@ -617,6 +634,43 @@ test("only a completed attachment receives a short Owner read URL", async () => 
     )).status,
     403,
   );
+});
+
+test("paired device uploads a strict lifecycle event", async () => {
+  const { api, credentials } = await pairedApi();
+  const response = await api.request("/v1/agent/sync/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777776",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [agentStarted(credentials.device_id)],
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json() as { accepted: string[] }).accepted,
+    ["01986666-7666-8666-8666-666666666669"]);
+
+  const broadened = agentStarted(credentials.device_id);
+  broadened.payload = { reason: "must remain local" };
+  const rejected = await api.request("/v1/agent/sync/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777775",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [broadened],
+    }),
+  });
+  assert.equal(rejected.status, 400);
 });
 
 test("paired device uploads one strict system metric idempotently and its owner can read it", async () => {
