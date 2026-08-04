@@ -42,6 +42,69 @@ pub const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.
 /// Future returned by the small Cloud-control port.
 pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlError>> + Send + 'a>>;
 
+/// Future returned by the media-transfer control port with a redacted failure stage.
+pub type MediaControlFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), MediaUploadFailure>> + Send + 'a>>;
+
+/// Bounded stage at which an attachment transfer failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaUploadFailureStage {
+    /// Cloud API object preparation.
+    Prepare,
+    /// Upload through the currently configured proxy route.
+    ProxyUpload,
+    /// Upload after bypassing the configured proxy route.
+    DirectUpload,
+    /// Cloud API object completion verification.
+    Complete,
+    /// A non-HTTP control-client implementation.
+    Client,
+}
+
+impl MediaUploadFailureStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::ProxyUpload => "proxy_upload",
+            Self::DirectUpload => "direct_upload",
+            Self::Complete => "complete",
+            Self::Client => "client",
+        }
+    }
+}
+
+/// Redacted attachment-transfer failure safe for local diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaUploadFailure {
+    stage: MediaUploadFailureStage,
+    error: ControlError,
+    fallback_from: Option<MediaUploadFailureStage>,
+}
+
+impl MediaUploadFailure {
+    /// Creates a failure without a prior fallback attempt.
+    #[must_use]
+    pub const fn new(stage: MediaUploadFailureStage, error: ControlError) -> Self {
+        Self {
+            stage,
+            error,
+            fallback_from: None,
+        }
+    }
+
+    const fn after_fallback(
+        stage: MediaUploadFailureStage,
+        error: ControlError,
+        fallback_from: MediaUploadFailureStage,
+    ) -> Self {
+        Self {
+            stage,
+            error,
+            fallback_from: Some(fallback_from),
+        }
+    }
+}
+
 /// Failures a Cloud-control adapter can return without exposing response bodies or credentials.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlError {
@@ -49,6 +112,17 @@ pub enum ControlError {
     Revoked,
     InvalidCredential,
     Contract,
+}
+
+impl ControlError {
+    const fn diagnostic_category(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::Revoked => "revoked",
+            Self::InvalidCredential => "invalid_credential",
+            Self::Contract => "contract",
+        }
+    }
 }
 
 /// Authenticated, bounded Cloud-control operations owned by Agent Core.
@@ -96,8 +170,13 @@ pub trait ControlClient: Send + Sync {
         &'a self,
         _: &'a DeviceCredential,
         _: &'a PendingCommunicationAttachment,
-    ) -> ControlFuture<'a, ()> {
-        Box::pin(async { Err(ControlError::Contract) })
+    ) -> MediaControlFuture<'a> {
+        Box::pin(async {
+            Err(MediaUploadFailure::new(
+                MediaUploadFailureStage::Client,
+                ControlError::Contract,
+            ))
+        })
     }
 }
 
@@ -683,7 +762,7 @@ async fn start_control_worker(
         pending_media_cleanup_result: None,
     }));
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    let worker = tokio::spawn(run_control_loop(
+    let worker = tokio::spawn(run_cloud_workers(
         database,
         credentials,
         client,
@@ -703,6 +782,54 @@ async fn start_control_worker(
         shutdown: Some(shutdown_sender),
         worker: Some(worker),
     })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the joined Cloud runtime owns one control worker and one independent media worker"
+)]
+async fn run_cloud_workers(
+    database: Arc<DbActorHandle>,
+    credentials: LoadedDeviceCredentials,
+    client: Arc<dyn ControlClient>,
+    state: Arc<Mutex<ControlState>>,
+    shutdown: watch::Receiver<bool>,
+    pairing_state_sender: watch::Sender<bool>,
+    publication: ControlPublication,
+    authorization: CommunicationAuthorization,
+    owner_epoch: u64,
+) -> Result<(), CloudControlRuntimeError> {
+    let (media_credentials, media_credential_receiver) =
+        watch::channel(credentials.credential.clone());
+    let (media_shutdown, media_shutdown_receiver) = watch::channel(false);
+    let media_worker = tokio::spawn(run_media_loop(
+        Arc::clone(&database),
+        media_credential_receiver,
+        Arc::clone(&client),
+        media_shutdown_receiver,
+    ));
+    let control_result = run_control_loop(
+        database,
+        credentials,
+        client,
+        state,
+        shutdown,
+        pairing_state_sender,
+        publication,
+        authorization,
+        owner_epoch,
+        media_credentials,
+    )
+    .await;
+    media_shutdown.send_replace(true);
+    media_worker.abort();
+    let media_result = match media_worker.await {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(_) => Err(CloudControlRuntimeError::WorkerStopped),
+    };
+    control_result?;
+    media_result
 }
 
 impl CloudControlOwner {
@@ -1026,7 +1153,7 @@ impl CloudControlHandle {
         self.communication_controls.subscribe()
     }
 
-    /// Stops the worker without aborting an in-flight HTTPS request.
+    /// Stops the control worker and cancels any independently retryable media transfer.
     ///
     /// # Errors
     ///
@@ -1106,6 +1233,7 @@ async fn ensure_pairing_state(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the control owner receives one shared authorization gate and its existing runtime dependencies"
 )]
 async fn run_control_loop(
@@ -1118,6 +1246,7 @@ async fn run_control_loop(
     publication: ControlPublication,
     authorization: CommunicationAuthorization,
     owner_epoch: u64,
+    media_credentials: watch::Sender<DeviceCredential>,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut retry_attempt = 0_u8;
     let mut wait = Duration::ZERO;
@@ -1140,9 +1269,9 @@ async fn run_control_loop(
         )
         .await
         {
-            Ok(completed_media) => {
+            Ok(()) => {
                 retry_attempt = 0;
-                wait = next_control_wait(completed_media);
+                wait = CONTROL_INTERVAL;
             }
             Err(ControlError::Transient) => {
                 retry_attempt = retry_attempt.saturating_add(1);
@@ -1174,6 +1303,7 @@ async fn run_control_loop(
                             .await;
                         }
                         store_device_credential(credentials.store.as_ref(), &next)?;
+                        media_credentials.send_replace(next.clone());
                         credentials.credential = next;
                         ensure_pairing_state(&database, &credentials.credential).await?;
                         retry_attempt = 0;
@@ -1228,7 +1358,7 @@ async fn control_once(
     publication: &ControlPublication,
     authorization: &CommunicationAuthorization,
     owner_epoch: u64,
-) -> Result<usize, ControlError> {
+) -> Result<(), ControlError> {
     let snapshot = send_control_heartbeat(database, credentials, client, state).await?;
     if snapshot.revoked {
         client.set_network_enabled(false);
@@ -1310,7 +1440,7 @@ async fn apply_control_snapshot(
     authorization: &CommunicationAuthorization,
     owner_epoch: u64,
     snapshot: AgentControlSnapshot,
-) -> Result<usize, ControlError> {
+) -> Result<(), ControlError> {
     let (current, hydrated) = {
         let state = state.lock().await;
         (
@@ -1370,17 +1500,10 @@ async fn apply_control_snapshot(
             publication.publish(owner_epoch, Some(applied)).await;
         }
     }
-    // Media transfer is independently retryable and runs only after heartbeat, event sync, and
-    // control publication. A full successful batch schedules the next control cycle immediately.
-    let completed_media =
-        sync_pending_communication_attachments(database, &credentials.credential, client)
-            .await
-            .unwrap_or(0);
     if let Some(request) = snapshot.local_media_cleanup {
         handle_local_media_cleanup(database, state, request).await?;
-        return Ok(usize::from(MEDIA_BATCH_SIZE));
     }
-    Ok(completed_media)
+    Ok(())
 }
 
 async fn handle_local_media_cleanup(
@@ -1419,11 +1542,34 @@ async fn handle_local_media_cleanup(
     Ok(())
 }
 
-fn next_control_wait(completed_media: usize) -> Duration {
+fn next_media_wait(completed_media: usize) -> Duration {
     if completed_media == usize::from(MEDIA_BATCH_SIZE) {
         Duration::ZERO
     } else {
         CONTROL_INTERVAL
+    }
+}
+
+async fn run_media_loop(
+    database: Arc<DbActorHandle>,
+    credentials: watch::Receiver<DeviceCredential>,
+    client: Arc<dyn ControlClient>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), CloudControlRuntimeError> {
+    let mut wait = Duration::ZERO;
+    loop {
+        if wait != Duration::ZERO && wait_or_shutdown(wait, &mut shutdown).await {
+            return Ok(());
+        }
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let credential = credentials.borrow().clone();
+        let completed_media =
+            sync_pending_communication_attachments(&database, &credential, client.as_ref())
+                .await
+                .unwrap_or(0);
+        wait = next_media_wait(completed_media);
     }
 }
 
@@ -1522,13 +1668,17 @@ async fn sync_pending_communication_attachments(
     let attachment_count = attachments.len();
     let mut completed = 0_usize;
     for attachment in attachments {
-        if client
+        if let Err(failure) = client
             .sync_communication_attachment(credentials, &attachment)
             .await
-            .is_err()
         {
             database
-                .defer_communication_attachment(&attachment.attachment_id)
+                .defer_communication_attachment(
+                    &attachment.attachment_id,
+                    failure.stage.as_str(),
+                    failure.error.diagnostic_category(),
+                    failure.fallback_from.map(MediaUploadFailureStage::as_str),
+                )
                 .await
                 .map_err(|_| ControlError::Transient)?;
             continue;
@@ -1888,12 +2038,17 @@ impl ControlClient for HttpControlClient {
         &'a self,
         credentials: &'a DeviceCredential,
         attachment: &'a PendingCommunicationAttachment,
-    ) -> ControlFuture<'a, ()> {
+    ) -> MediaControlFuture<'a> {
         Box::pin(async move {
-            let client = Self::client()?;
+            let prepare_failure =
+                |error| MediaUploadFailure::new(MediaUploadFailureStage::Prepare, error);
+            let client = Self::client().map_err(prepare_failure)?;
             let prepared = parse_response::<PreparedCommunicationObject>(
                 client
-                    .post(self.endpoint("v1/agent/communication/objects/prepare")?)
+                    .post(
+                        self.endpoint("v1/agent/communication/objects/prepare")
+                            .map_err(prepare_failure)?,
+                    )
                     .bearer_auth(credentials.access_credential())
                     .json(&serde_json::json!({
                         "event_id": attachment.event_id,
@@ -1901,19 +2056,23 @@ impl ControlClient for HttpControlClient {
                     }))
                     .send()
                     .await
-                    .map_err(|_| ControlError::Transient)?,
+                    .map_err(|_| prepare_failure(ControlError::Transient))?,
             )
-            .await?;
+            .await
+            .map_err(prepare_failure)?;
             if prepared.state == "completed" {
                 return Ok(());
             }
             if prepared.state != "prepared" {
-                return Err(ControlError::Contract);
+                return Err(prepare_failure(ControlError::Contract));
             }
-            let upload = prepared.upload.ok_or(ControlError::Contract)?;
-            let upload_url = Url::parse(&upload.url).map_err(|_| ControlError::Contract)?;
+            let upload = prepared
+                .upload
+                .ok_or_else(|| prepare_failure(ControlError::Contract))?;
+            let upload_url =
+                Url::parse(&upload.url).map_err(|_| prepare_failure(ControlError::Contract))?;
             if upload_url.scheme() != "https" {
-                return Err(ControlError::Contract);
+                return Err(prepare_failure(ControlError::Contract));
             }
             if upload_communication_attachment(
                 &client,
@@ -1925,25 +2084,45 @@ impl ControlClient for HttpControlClient {
             .is_err()
             {
                 upload_communication_attachment(
-                    &Self::direct_client()?,
+                    &Self::direct_client().map_err(|error| {
+                        MediaUploadFailure::after_fallback(
+                            MediaUploadFailureStage::DirectUpload,
+                            error,
+                            MediaUploadFailureStage::ProxyUpload,
+                        )
+                    })?,
                     upload_url,
                     &upload.headers,
                     attachment,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    MediaUploadFailure::after_fallback(
+                        MediaUploadFailureStage::DirectUpload,
+                        error,
+                        MediaUploadFailureStage::ProxyUpload,
+                    )
+                })?;
             }
+            let complete_failure =
+                |error| MediaUploadFailure::new(MediaUploadFailureStage::Complete, error);
             let completed = parse_response::<CompletedCommunicationObject>(
-                Self::client()?
-                    .post(self.endpoint("v1/agent/communication/objects/complete")?)
+                Self::client()
+                    .map_err(complete_failure)?
+                    .post(
+                        self.endpoint("v1/agent/communication/objects/complete")
+                            .map_err(complete_failure)?,
+                    )
                     .bearer_auth(credentials.access_credential())
                     .json(&serde_json::json!({ "object_id": prepared.object_id }))
                     .send()
                     .await
-                    .map_err(|_| ControlError::Transient)?,
+                    .map_err(|_| complete_failure(ControlError::Transient))?,
             )
-            .await?;
+            .await
+            .map_err(complete_failure)?;
             if completed.object_id != prepared.object_id || completed.state != "completed" {
-                return Err(ControlError::Contract);
+                return Err(complete_failure(ControlError::Contract));
             }
             Ok(())
         })
@@ -2094,7 +2273,7 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_communication_upload_headers, next_control_wait, retry_delay,
+        apply_communication_upload_headers, next_media_wait, retry_delay,
         sync_pending_communication_events, sync_pending_system_events, AgentControlSnapshot,
         ControlClient, ControlError, ControlFuture, DeviceCredential, HttpControlClient,
         SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF,
@@ -2209,11 +2388,11 @@ mod tests {
         assert_eq!(CONTROL_REQUEST_TIMEOUT, Duration::from_secs(15));
         assert_eq!(MEDIA_UPLOAD_TIMEOUT, Duration::from_mins(5));
         assert_eq!(
-            next_control_wait(usize::from(MEDIA_BATCH_SIZE)),
+            next_media_wait(usize::from(MEDIA_BATCH_SIZE)),
             Duration::ZERO
         );
         assert_eq!(
-            next_control_wait(usize::from(MEDIA_BATCH_SIZE - 1)),
+            next_media_wait(usize::from(MEDIA_BATCH_SIZE - 1)),
             CONTROL_INTERVAL
         );
     }

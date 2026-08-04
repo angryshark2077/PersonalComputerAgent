@@ -9,7 +9,8 @@ use std::{
 
 use pca_agentd::cloud_control::{
     apply_snapshot, AgentControlSnapshot, CloudControlOwner, CloudControlRuntime,
-    CloudControlRuntimeError, ControlClient, ControlError, ControlFuture,
+    CloudControlRuntimeError, ControlClient, ControlError, ControlFuture, MediaControlFuture,
+    MediaUploadFailure, MediaUploadFailureStage,
 };
 use pca_agentd::communication::{
     CommunicationAuthorization, CommunicationControl, CommunicationIdentity, CommunicationRuntime,
@@ -21,6 +22,8 @@ use pca_keychain::{
     CredentialError, CredentialStore, DeviceCredential, DEVICE_CREDENTIAL_ACCOUNT,
     DEVICE_CREDENTIAL_SERVICE,
 };
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::{watch, Notify};
 
@@ -88,6 +91,13 @@ struct BlockingSyncClient {
     snapshots: Mutex<VecDeque<Result<AgentControlSnapshot, ControlError>>>,
     sync_entered: Notify,
     sync_release: Notify,
+}
+
+struct BlockingMediaClient {
+    calls: AtomicUsize,
+    media_entered: Notify,
+    media_release: Notify,
+    snapshot: AgentControlSnapshot,
 }
 
 #[derive(Default)]
@@ -181,6 +191,37 @@ impl ControlClient for BlockingSyncClient {
             self.sync_entered.notify_waiters();
             self.sync_release.notified().await;
             Err(ControlError::Transient)
+        })
+    }
+}
+
+impl ControlClient for BlockingMediaClient {
+    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let snapshot = self.snapshot.clone();
+        Box::pin(async move { Ok(snapshot) })
+    }
+
+    fn sync_communication_attachment<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: &'a pca_db_local::PendingCommunicationAttachment,
+    ) -> MediaControlFuture<'a> {
+        Box::pin(async move {
+            self.media_entered.notify_one();
+            self.media_release.notified().await;
+            Err(MediaUploadFailure::new(
+                MediaUploadFailureStage::Client,
+                ControlError::Transient,
+            ))
         })
     }
 }
@@ -699,6 +740,90 @@ async fn valid_disable_gates_communication_before_blocked_system_sync() {
         Err(error) => {
             drop(error);
             panic!("control runtime released database after shutdown");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_media_upload_does_not_delay_control_heartbeats() {
+    let (temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    database
+        .save_pairing_state(&PairingState::paired(
+            loaded.credential().device_id(),
+            loaded.credential().workspace_id(),
+            "keychain://pca/device/current",
+            1,
+            "https://pca-cloud-api-production.up.railway.app",
+        ))
+        .await
+        .unwrap();
+
+    let body = b"blocked media fixture";
+    let sha256 = format!("{:x}", Sha256::digest(body));
+    std::fs::write(temp.path().join("communication-spool").join(&sha256), body).unwrap();
+    Connection::open(temp.path().join("agent.sqlite"))
+        .unwrap()
+        .execute_batch(&format!(
+            "INSERT INTO events_local VALUES (
+                'media-event', '22222222-2222-4222-8222-222222222222',
+                '11111111-1111-4111-8111-111111111111',
+                'communication.message_recorded', 'communication.wechat', 1, 1, 1,
+                'high', '{{}}', '[]', NULL
+             );
+             INSERT INTO sync_outbox VALUES ('outbox-media', 'media-event', 'acked', 1);
+             INSERT INTO communication_conversations VALUES (
+                'account-1', 'conversation-1', 'direct', NULL, 1, 1
+             );
+             INSERT INTO communication_messages VALUES (
+                1, 'media-event', 'account-1', 'conversation-1', 1, 'source-1',
+                'incoming', 'image', 1, NULL, 1
+             );
+             INSERT INTO attachment_spool (
+                attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
+                spool_relative_path, transfer_state, created_at_ms, completed_at_ms
+             ) VALUES (
+                'attachment-1', 1, 'image', '{sha256}', {size}, 'image/jpeg',
+                '{sha256}', 'pending', 1, NULL
+             );",
+            size = body.len(),
+        ))
+        .unwrap();
+
+    let client = Arc::new(BlockingMediaClient {
+        calls: AtomicUsize::new(0),
+        media_entered: Notify::new(),
+        media_release: Notify::new(),
+        snapshot: exact_snapshot(1, true),
+    });
+    let media_entered = client.media_entered.notified();
+    tokio::pin!(media_entered);
+    let runtime = CloudControlRuntime::start(
+        Arc::clone(&database),
+        loaded,
+        Arc::clone(&client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+    let mut controls = runtime.communication_controls();
+
+    media_entered.as_mut().await;
+    wait_for_calls(&client.calls, 1).await;
+    if controls.borrow().is_none() {
+        controls.changed().await.unwrap();
+    }
+    assert!(controls.borrow_and_update().is_some());
+    tokio::time::advance(Duration::from_secs(30)).await;
+    wait_for_calls(&client.calls, 2).await;
+
+    client.media_release.notify_one();
+    runtime.shutdown().await.unwrap();
+    match Arc::try_unwrap(database) {
+        Ok(database) => database.shutdown().await.unwrap(),
+        Err(error) => {
+            drop(error);
+            panic!("control and media workers released database after shutdown");
         }
     }
 }

@@ -270,7 +270,8 @@ export interface SystemEventRecord {
     | "system.sleep"
     | "system.wake"
     | "network.offline"
-    | "network.online";
+    | "network.online"
+    | "network.changed";
   source: "system" | "collector.registry" | "runtime.lifecycle";
   schemaVersion: number;
   occurredAt: Date;

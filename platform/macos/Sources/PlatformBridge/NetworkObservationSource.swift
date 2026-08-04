@@ -31,6 +31,35 @@ struct NetworkObservation: Equatable, Sendable {
     }
 }
 
+enum NetworkReachabilityState: Equatable, Sendable {
+    case offline
+    case online
+}
+
+struct NetworkPathIdentity: Equatable, Sendable {
+    let interfaceName: String?
+    let ssid: String?
+    let bssid: String?
+    let localIPv4: String?
+    let localIPv6: String?
+}
+
+func networkLifecycleTransition(
+    previousState: NetworkReachabilityState?,
+    currentState: NetworkReachabilityState,
+    previousIdentity: NetworkPathIdentity?,
+    currentIdentity: NetworkPathIdentity?
+) -> PlatformLifecycleEventType? {
+    guard let previousState else { return nil }
+    if previousState == .online, currentState == .offline { return .networkOffline }
+    if previousState == .offline, currentState == .online { return .networkOnline }
+    if currentState == .online,
+       let previousIdentity,
+       let currentIdentity,
+       previousIdentity != currentIdentity { return .networkChanged }
+    return nil
+}
+
 struct DeviceLocationObservation: Equatable, Sendable {
     let latitude: Double
     let longitude: Double
@@ -157,32 +186,46 @@ final class DeviceLocationSource: NSObject, CLLocationManagerDelegate, @unchecke
 
 final class NetworkObservationSource: @unchecked Sendable {
     private let monitor = NWPathMonitor()
+    private let wifiMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let locationManager = CLLocationManager()
     private let deviceLocationSource = DeviceLocationSource()
     private let queue = DispatchQueue(label: "com.pca.platform-bridge.network")
     private let lock = NSLock()
     private let lifecycleSource: PlatformLifecycleEventBuffer
     private var latestPath: NWPath?
+    private var latestWiFiState: NetworkReachabilityState?
+    private var latestWiFiIdentity: NetworkPathIdentity?
 
     init(lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer()) {
         self.lifecycleSource = lifecycleSource
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
+            lock.withLock { latestPath = path }
+        }
+        monitor.start(queue: queue)
+        wifiMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let currentState: NetworkReachabilityState = path.status == .satisfied ? .online : .offline
+            let currentIdentity = currentState == .online ? networkPathIdentity(path) : nil
             let transition = lock.withLock { () -> PlatformLifecycleEventType? in
-                let previous = latestPath?.status
-                latestPath = path
-                guard let previous, previous != path.status else { return nil }
-                if previous == .satisfied, path.status != .satisfied { return .networkOffline }
-                if previous != .satisfied, path.status == .satisfied { return .networkOnline }
-                return nil
+                let transition = networkLifecycleTransition(
+                    previousState: latestWiFiState,
+                    currentState: currentState,
+                    previousIdentity: latestWiFiIdentity,
+                    currentIdentity: currentIdentity
+                )
+                latestWiFiState = currentState
+                latestWiFiIdentity = currentIdentity
+                return transition
             }
             if let transition { lifecycleSource.record(transition) }
         }
-        monitor.start(queue: queue)
+        wifiMonitor.start(queue: queue)
     }
 
     deinit {
         monitor.cancel()
+        wifiMonitor.cancel()
     }
 
     func capture() -> NetworkObservation {
@@ -223,6 +266,21 @@ final class NetworkObservationSource: @unchecked Sendable {
             default: false
             }
         }?.name
+    }
+
+    private func networkPathIdentity(_ path: NWPath) -> NetworkPathIdentity {
+        let interfaceName = Self.interfaceName(path, type: "wifi")
+        let addresses = interfaceName.map(Self.addresses) ?? (nil, nil)
+        let wifi = locationAccessGranted(locationManager.authorizationStatus)
+            ? CWWiFiClient.shared().interface()
+            : nil
+        return NetworkPathIdentity(
+            interfaceName: interfaceName,
+            ssid: wifi?.ssid()?.precomposedStringWithCanonicalMapping,
+            bssid: wifi?.bssid()?.uppercased(),
+            localIPv4: addresses.0,
+            localIPv6: addresses.1
+        )
     }
 
     private static func addresses(_ interfaceName: String) -> (String?, String?) {

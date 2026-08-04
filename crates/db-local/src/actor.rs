@@ -189,6 +189,9 @@ enum Request {
     },
     DeferCommunicationAttachment {
         attachment_id: String,
+        failure_stage: String,
+        failure_category: String,
+        fallback_from: Option<String>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
     CleanupCompletedCommunicationAttachments {
@@ -759,10 +762,19 @@ impl DbActorHandle {
     /// # Errors
     ///
     /// Returns an actor or database error, including when the attachment is already completed.
-    pub async fn defer_communication_attachment(&self, attachment_id: &str) -> Result<(), DbError> {
+    pub async fn defer_communication_attachment(
+        &self,
+        attachment_id: &str,
+        failure_stage: &str,
+        failure_category: &str,
+        fallback_from: Option<&str>,
+    ) -> Result<(), DbError> {
         let (response_sender, response_receiver) = oneshot::channel();
         self.send(Request::DeferCommunicationAttachment {
             attachment_id: attachment_id.to_owned(),
+            failure_stage: failure_stage.to_owned(),
+            failure_category: failure_category.to_owned(),
+            fallback_from: fallback_from.map(str::to_owned),
             response: response_sender,
         })
         .await?;
@@ -1045,11 +1057,17 @@ fn run(
             }
             Request::DeferCommunicationAttachment {
                 attachment_id,
+                failure_stage,
+                failure_category,
+                fallback_from,
                 response,
             } => {
                 let _ = response.send(repository::defer_communication_attachment(
                     &connection,
                     &attachment_id,
+                    &failure_stage,
+                    &failure_category,
+                    fallback_from.as_deref(),
                 ));
             }
             Request::CleanupCompletedCommunicationAttachments {

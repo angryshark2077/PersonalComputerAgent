@@ -374,7 +374,11 @@ fn validate_lifecycle_batch(
             || event.event_id.is_nil()
             || !matches!(
                 event.event_type.as_str(),
-                "system.sleep" | "system.wake" | "network.offline" | "network.online"
+                "system.sleep"
+                    | "system.wake"
+                    | "network.offline"
+                    | "network.online"
+                    | "network.changed"
             )
             || time::OffsetDateTime::parse(
                 &event.occurred_at,
@@ -688,6 +692,15 @@ mod tests {
             latest_sequence: 3,
         };
         validate_lifecycle_batch(2, &valid).expect("valid lifecycle batch");
+
+        let changed = PlatformLifecycleBatch {
+            events: vec![PlatformLifecycleEvent {
+                event_type: "network.changed".to_owned(),
+                ..event.clone()
+            }],
+            latest_sequence: 3,
+        };
+        validate_lifecycle_batch(2, &changed).expect("network identity change is valid");
 
         let invalid = PlatformLifecycleBatch {
             events: vec![PlatformLifecycleEvent {

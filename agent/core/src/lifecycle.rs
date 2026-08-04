@@ -159,7 +159,7 @@ impl LifecycleRuntime {
                 *accepting = true;
                 Ok(Some(event_id))
             }
-            "network.offline" | "network.online" => {
+            "network.offline" | "network.online" | "network.changed" => {
                 let accepting = self.accepting.lock().await;
                 if !*accepting {
                     return Ok(None);
@@ -542,7 +542,7 @@ mod tests {
             .record_platform_event(&PlatformLifecycleEvent {
                 sequence: 1,
                 event_id,
-                event_type: "network.online".to_owned(),
+                event_type: "network.changed".to_owned(),
                 occurred_at: "2026-08-04T15:00:00Z".to_owned(),
             })
             .await
@@ -559,7 +559,7 @@ mod tests {
             .expect("platform lifecycle event exists");
         assert_eq!(stored.0, "01983333-7333-8333-8333-333333333333");
         assert_eq!(stored.1, "01982222-7222-8222-8222-222222222222");
-        assert_eq!(stored.2, "network.online");
+        assert_eq!(stored.2, "network.changed");
         assert_eq!(stored.3, "1785855600000");
     }
 

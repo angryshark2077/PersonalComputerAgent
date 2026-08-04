@@ -976,7 +976,7 @@ AND extension_reports_active_tab</th>
 
 | **Collector Key**    | **默认**   | **执行位置/能力**                            | **主要 Event**                                                       |
 |----------------------|------------|----------------------------------------------|----------------------------------------------------------------------|
-| system               | ON         | Rust + Swift Power/Network Bridge            | system.metric_sampled, system.sleep, system.wake, network.offline, network.online |
+| system               | ON         | Rust + Swift Power/Network Bridge            | system.metric_sampled, system.sleep, system.wake, network.offline, network.online, network.changed |
 | activity             | ON         | Swift Workspace/AX Bridge + Rust Sessionizer | activity.app_focused, activity.window_changed, activity.idle_started |
 | screenshot           | OFF        | Rust Scheduler + Swift ScreenCaptureKit      | screen.screenshot_created                                            |
 | browser              | OFF        | Extension + Rust Native Host                 | browser.visit_started, browser.visit_ended                           |

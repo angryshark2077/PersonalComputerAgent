@@ -28,7 +28,8 @@ type LifecycleEventType =
   | "system.sleep"
   | "system.wake"
   | "network.offline"
-  | "network.online";
+  | "network.online"
+  | "network.changed";
 
 const lifecycleEventTypes: readonly LifecycleEventType[] = [
   "agent.started",
@@ -38,6 +39,7 @@ const lifecycleEventTypes: readonly LifecycleEventType[] = [
   "system.wake",
   "network.offline",
   "network.online",
+  "network.changed",
 ];
 
 export function parseSyncBatch(value: unknown): SyncBatchRequest | null {

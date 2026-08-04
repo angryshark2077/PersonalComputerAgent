@@ -17,6 +17,7 @@ enum PlatformLifecycleEventType: String, Sendable {
     case systemWake = "system.wake"
     case networkOffline = "network.offline"
     case networkOnline = "network.online"
+    case networkChanged = "network.changed"
 }
 
 struct PlatformLifecycleEvent: Sendable, Equatable {

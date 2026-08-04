@@ -112,6 +112,59 @@ final class CapabilityProbeTests: XCTestCase {
         XCTAssertEqual(first.latestSequence, 2)
         XCTAssertEqual(source.snapshot(after: 1).events.map(\.eventType), [.systemWake])
     }
+
+    func testWiFiLifecycleTracksPhysicalReachabilityEvenWhenAnotherRouteRemainsOnline() {
+        let identity = NetworkPathIdentity(
+            interfaceName: "en0",
+            ssid: "Home",
+            bssid: "AA:BB:CC:DD:EE:FF",
+            localIPv4: "192.168.1.2",
+            localIPv6: nil
+        )
+
+        XCTAssertEqual(networkLifecycleTransition(
+            previousState: .online,
+            currentState: .offline,
+            previousIdentity: identity,
+            currentIdentity: nil
+        ), .networkOffline)
+        XCTAssertEqual(networkLifecycleTransition(
+            previousState: .offline,
+            currentState: .online,
+            previousIdentity: nil,
+            currentIdentity: identity
+        ), .networkOnline)
+    }
+
+    func testWiFiLifecycleReportsIdentityChangesWithoutAnOfflineGap() {
+        let home = NetworkPathIdentity(
+            interfaceName: "en0",
+            ssid: "Home",
+            bssid: "AA:BB:CC:DD:EE:FF",
+            localIPv4: "192.168.1.2",
+            localIPv6: nil
+        )
+        let hotspot = NetworkPathIdentity(
+            interfaceName: "en0",
+            ssid: "Jacob Hotspot",
+            bssid: "11:22:33:44:55:66",
+            localIPv4: "172.20.10.2",
+            localIPv6: nil
+        )
+
+        XCTAssertEqual(networkLifecycleTransition(
+            previousState: .online,
+            currentState: .online,
+            previousIdentity: home,
+            currentIdentity: hotspot
+        ), .networkChanged)
+        XCTAssertNil(networkLifecycleTransition(
+            previousState: .online,
+            currentState: .online,
+            previousIdentity: hotspot,
+            currentIdentity: hotspot
+        ))
+    }
 }
 
 private struct FixedCapabilityStatusSource: CapabilityStatusSource {

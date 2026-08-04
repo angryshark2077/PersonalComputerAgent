@@ -1132,6 +1132,7 @@ pub(crate) fn load_pending_system_events(
                    'system.wake',
                    'network.offline',
                    'network.online',
+                   'network.changed',
                    'AGENT_STARTED',
                    'AGENT_STOPPED',
                    'AGENT_CRASH_RECOVERED',
@@ -1217,6 +1218,7 @@ pub(crate) fn acknowledge_mismatched_lifecycle_events(
                          'system.wake',
                          'network.offline',
                          'network.online',
+                         'network.changed',
                          'AGENT_STARTED',
                          'AGENT_STOPPED',
                          'AGENT_CRASH_RECOVERED',
@@ -1292,6 +1294,7 @@ pub(crate) fn acknowledge_system_events(
                              'system.wake',
                              'network.offline',
                              'network.online',
+                             'network.changed',
                              'AGENT_STARTED',
                              'AGENT_STOPPED',
                              'AGENT_CRASH_RECOVERED',
@@ -1582,7 +1585,21 @@ fn quarantine_invalid_attachment(
             [attachment_id],
         )
         .map_err(|error| DbError::sqlite("quarantine invalid attachment", error))?;
-    record_media_diagnostic(&transaction, attachment_id, "MEDIA_LOCAL_BODY_INVALID")?;
+    let occurred_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    record_media_diagnostic(
+        &transaction,
+        attachment_id,
+        "MEDIA_LOCAL_BODY_INVALID",
+        "local_validation",
+        "contract",
+        None,
+        occurred_at_ms,
+    )?;
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit invalid attachment quarantine", error))
@@ -1614,16 +1631,48 @@ pub(crate) fn complete_communication_attachment(
 pub(crate) fn defer_communication_attachment(
     connection: &Connection,
     attachment_id: &str,
+    failure_stage: &str,
+    failure_category: &str,
+    fallback_from: Option<&str>,
 ) -> Result<(), DbError> {
+    const FAILURE_STAGES: &[&str] = &[
+        "prepare",
+        "proxy_upload",
+        "direct_upload",
+        "complete",
+        "client",
+        "local_validation",
+    ];
+    const FAILURE_CATEGORIES: &[&str] = &["transient", "revoked", "invalid_credential", "contract"];
+    if !FAILURE_STAGES.contains(&failure_stage)
+        || !FAILURE_CATEGORIES.contains(&failure_category)
+        || fallback_from.is_some_and(|stage| !FAILURE_STAGES.contains(&stage))
+    {
+        return Err(DbError::sqlite(
+            "defer communication attachment",
+            "media upload diagnostic classification is invalid",
+        ));
+    }
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| DbError::sqlite("start attachment deferral", error))?;
+    let attempted_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
     let updated = transaction
         .execute(
             "UPDATE attachment_spool
-             SET transfer_state = 'failed'
+             SET transfer_state = 'failed',
+                 created_at_ms = MAX(
+                    ?2,
+                    (SELECT COALESCE(MAX(queued.created_at_ms), 0) + 1
+                     FROM attachment_spool AS queued)
+                 )
              WHERE attachment_id = ?1 AND transfer_state <> 'completed'",
-            [attachment_id],
+            params![attachment_id, attempted_at_ms],
         )
         .map_err(|error| DbError::sqlite("defer communication attachment", error))?;
     if updated != 1 {
@@ -1632,7 +1681,15 @@ pub(crate) fn defer_communication_attachment(
             "attachment was not pending",
         ));
     }
-    record_media_diagnostic(&transaction, attachment_id, "MEDIA_UPLOAD_FAILED")?;
+    record_media_diagnostic(
+        &transaction,
+        attachment_id,
+        "MEDIA_UPLOAD_FAILED",
+        failure_stage,
+        failure_category,
+        fallback_from,
+        attempted_at_ms,
+    )?;
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit attachment deferral", error))
@@ -1642,16 +1699,20 @@ fn record_media_diagnostic(
     transaction: &Transaction<'_>,
     attachment_id: &str,
     code: &str,
+    failure_stage: &str,
+    failure_category: &str,
+    fallback_from: Option<&str>,
+    occurred_at_ms: i64,
 ) -> Result<(), DbError> {
     let attachment_id_hash = format!("{:x}", Sha256::digest(attachment_id.as_bytes()));
     let diagnostic_id = format!("{code}:{attachment_id_hash}");
-    let redacted_json = serde_json::json!({ "attachment_id_hash": attachment_id_hash }).to_string();
-    let occurred_at_ms = i64::try_from(
-        OffsetDateTime::now_utc()
-            .unix_timestamp_nanos()
-            .div_euclid(1_000_000),
-    )
-    .unwrap_or(i64::MAX);
+    let redacted_json = serde_json::json!({
+        "attachment_id_hash": attachment_id_hash,
+        "stage": failure_stage,
+        "category": failure_category,
+        "fallback_from": fallback_from,
+    })
+    .to_string();
     transaction
         .execute(
             "INSERT INTO diagnostic_events (

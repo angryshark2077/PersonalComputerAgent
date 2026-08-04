@@ -101,7 +101,7 @@ fn network_lifecycle_event(event_id: &str) -> EventEnvelope {
         event_id: event_id.to_owned(),
         workspace_id: "01983333-7333-8333-8333-333333333333".to_owned(),
         device_id: "01982222-7222-8222-8222-222222222222".to_owned(),
-        event_type: "network.online".to_owned(),
+        event_type: "network.changed".to_owned(),
         source: "runtime.lifecycle".to_owned(),
         schema_version: 1,
         occurred_at: "2026-08-04T15:00:00Z".to_owned(),
@@ -1287,6 +1287,10 @@ async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture proves both pending-first and failed-round-robin queue ordering"
+)]
 async fn failed_attachment_is_deferred_behind_unattempted_media() {
     let (directory, path) = database_path();
     let db = DbActorHandle::open(&path, "0.1.0")
@@ -1347,19 +1351,27 @@ async fn failed_attachment_is_deferred_behind_unattempted_media() {
             .attachment_id,
         "first"
     );
-    db.defer_communication_attachment("first")
+    db.defer_communication_attachment("first", "direct_upload", "transient", Some("proxy_upload"))
         .await
         .expect("defer failed attachment");
+    let diagnostic: (String, String, String) = Connection::open(&path)
+        .expect("inspect upload diagnostic")
+        .query_row(
+            "SELECT json_extract(redacted_json, '$.stage'),
+                    json_extract(redacted_json, '$.category'),
+                    json_extract(redacted_json, '$.fallback_from')
+             FROM diagnostic_events WHERE code = 'MEDIA_UPLOAD_FAILED'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read upload diagnostic");
     assert_eq!(
-        Connection::open(&path)
-            .expect("inspect upload diagnostic")
-            .query_row(
-                "SELECT COUNT(*) FROM diagnostic_events WHERE code = 'MEDIA_UPLOAD_FAILED'",
-                [],
-                |row| row.get::<_, u64>(0),
-            )
-            .expect("count upload diagnostic"),
-        1
+        diagnostic,
+        (
+            "direct_upload".into(),
+            "transient".into(),
+            "proxy_upload".into()
+        )
     );
     assert_eq!(
         db.load_pending_communication_attachments(1)
@@ -1376,6 +1388,25 @@ async fn failed_attachment_is_deferred_behind_unattempted_media() {
             .map(|attachment| attachment.attachment_id)
             .collect::<Vec<_>>(),
         vec!["second", "third", "fourth", "first"]
+    );
+    for attachment_id in ["second", "third", "fourth"] {
+        db.defer_communication_attachment(
+            attachment_id,
+            "direct_upload",
+            "transient",
+            Some("proxy_upload"),
+        )
+        .await
+        .expect("rotate another failed attachment");
+    }
+    assert_eq!(
+        db.load_pending_communication_attachments(4)
+            .await
+            .expect("load next fair retry batch")
+            .into_iter()
+            .map(|attachment| attachment.attachment_id)
+            .collect::<Vec<_>>(),
+        vec!["fifth", "first", "second", "third"]
     );
 }
 

@@ -108,6 +108,15 @@ function networkOnline(deviceId: string) {
   };
 }
 
+function networkChanged(deviceId: string) {
+  return {
+    ...agentStarted(deviceId),
+    event_id: "01986666-7666-8666-8666-66666666666b",
+    event_type: "network.changed",
+    idempotency_key: "lifecycle:01986666-7666-8666-8666-66666666666b",
+  };
+}
+
 function communicationText(deviceId: string) {
   return {
     event_id: "01986666-7666-8666-8666-666666666667",
@@ -657,13 +666,18 @@ test("paired device uploads strict agent and network lifecycle events", async ()
       batch_id: "01987777-7777-8777-8777-777777777776",
       device_id: credentials.device_id,
       protocol_version: 1,
-      events: [agentStarted(credentials.device_id), networkOnline(credentials.device_id)],
+      events: [
+        agentStarted(credentials.device_id),
+        networkOnline(credentials.device_id),
+        networkChanged(credentials.device_id),
+      ],
     }),
   });
   assert.equal(response.status, 200);
   assert.deepEqual((await response.json() as { accepted: string[] }).accepted, [
     "01986666-7666-8666-8666-666666666669",
     "01986666-7666-8666-8666-66666666666a",
+    "01986666-7666-8666-8666-66666666666b",
   ]);
 
   const broadened = agentStarted(credentials.device_id);

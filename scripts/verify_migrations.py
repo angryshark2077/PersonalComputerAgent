@@ -47,6 +47,7 @@ EXPECTED_MIGRATIONS = {
         "0016_device_location.sql",
         "0017_system_lifecycle_events.sql",
         "0018_network_lifecycle_events.sql",
+        "0019_network_changed_events.sql",
     ],
 }
 
