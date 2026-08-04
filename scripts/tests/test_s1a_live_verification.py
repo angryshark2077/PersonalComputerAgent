@@ -28,6 +28,7 @@ class S1ALiveVerificationTests(unittest.TestCase):
         self.agent = self.app / "Contents/Resources/bin/pca-agentd"
         self.bridge = self.app / "Contents/Resources/bin/PCAPlatformBridge"
         self.wechat_repair = self.app / "Contents/Resources/bin/pca-wechat-repair"
+        self.ffmpeg = self.app / "Contents/Resources/bin/ffmpeg"
         self.socket_path = self.run / "bridge.sock"
         self.database = self.data / "agent.sqlite3"
         self.status = self.run / "runtime-status.json"
@@ -410,6 +411,7 @@ class S1ALiveVerificationTests(unittest.TestCase):
             self.agent,
             self.bridge,
             self.wechat_repair,
+            self.ffmpeg,
         ):
             executable.parent.mkdir(parents=True, exist_ok=True)
             executable.write_bytes(b"synthetic executable")
@@ -552,6 +554,7 @@ case "$(basename "$target")" in
   pca-agentd) cdhash=cccccccccccccccccccccccccccccccccccccccc ;;
   PCAPlatformBridge) cdhash=dddddddddddddddddddddddddddddddddddddddd ;;
   pca-wechat-repair) cdhash=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee ;;
+  ffmpeg) cdhash=ffffffffffffffffffffffffffffffffffffffff ;;
   *) exit 65 ;;
 esac
 echo "CDHash=$cdhash" >&2
@@ -647,7 +650,7 @@ if [[ "$1" != "0" ]]; then /bin/sleep "$1"; fi
 set -euo pipefail
 echo "bundle-verifier $*" >> "${PCA_S1A_LIVE_TEST_TOOL_LOG:?}"
 [[ $# -eq 3 && "$1" == "--team-id" && "$2" == "ABCDEFGHIJ" && "$3" == /*.dmg ]]
-echo "S1A_BUNDLE_METADATA version=0.1.0 team_id=ABCDEFGHIJ app_cdhash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa main_cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb agent_cdhash=cccccccccccccccccccccccccccccccccccccccc bridge_cdhash=dddddddddddddddddddddddddddddddddddddddd wechat_repair_cdhash=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+echo "S1A_BUNDLE_METADATA version=0.1.0 team_id=ABCDEFGHIJ app_cdhash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa main_cdhash=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb agent_cdhash=cccccccccccccccccccccccccccccccccccccccc bridge_cdhash=dddddddddddddddddddddddddddddddddddddddd wechat_repair_cdhash=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee ffmpeg_cdhash=ffffffffffffffffffffffffffffffffffffffff"
 if [[ "${PCA_S1A_LIVE_TEST_REPLACE_SOURCE_AFTER_VERIFY:-0}" == "1" ]]; then
   printf 'attacker replacement' > "${PCA_S1A_LIVE_TEST_SOURCE_DMG:?}"
 fi

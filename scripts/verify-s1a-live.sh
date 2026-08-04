@@ -105,6 +105,7 @@ main="$app/Contents/MacOS/PersonalComputerAgent"
 agent="$app/Contents/Resources/bin/pca-agentd"
 bridge="$app/Contents/Resources/bin/PCAPlatformBridge"
 wechat_repair="$app/Contents/Resources/bin/pca-wechat-repair"
+ffmpeg="$app/Contents/Resources/bin/ffmpeg"
 launch_agent="$app/Contents/Library/LaunchAgents/com.pca.agentd.plist"
 status_file="$run_directory/runtime-status.json"
 socket_file="$run_directory/bridge.sock"
@@ -134,6 +135,7 @@ candidate_main_cdhash=""
 candidate_agent_cdhash=""
 candidate_bridge_cdhash=""
 candidate_wechat_repair_cdhash=""
+candidate_ffmpeg_cdhash=""
 pre_open_snapshot="<not-installed>"
 
 if [[ "$mode" == "dmg" ]]; then
@@ -183,7 +185,7 @@ if [[ "$mode" == "dmg" ]]; then
     fi
   done <<<"$bundle_output"
   [[ "$metadata_count" -eq 1 ]] || fail "bundle verifier did not return exactly one candidate identity"
-  if [[ "$metadata_line" =~ ^S1A_BUNDLE_METADATA\ version=([0-9]+\.[0-9]+\.[0-9]+)\ team_id=([A-Z0-9]{10})\ app_cdhash=([0-9A-Fa-f]{40})\ main_cdhash=([0-9A-Fa-f]{40})\ agent_cdhash=([0-9A-Fa-f]{40})\ bridge_cdhash=([0-9A-Fa-f]{40})\ wechat_repair_cdhash=([0-9A-Fa-f]{40})$ ]]; then
+  if [[ "$metadata_line" =~ ^S1A_BUNDLE_METADATA\ version=([0-9]+\.[0-9]+\.[0-9]+)\ team_id=([A-Z0-9]{10})\ app_cdhash=([0-9A-Fa-f]{40})\ main_cdhash=([0-9A-Fa-f]{40})\ agent_cdhash=([0-9A-Fa-f]{40})\ bridge_cdhash=([0-9A-Fa-f]{40})\ wechat_repair_cdhash=([0-9A-Fa-f]{40})\ ffmpeg_cdhash=([0-9A-Fa-f]{40})$ ]]; then
     candidate_version=${BASH_REMATCH[1]}
     candidate_team=${BASH_REMATCH[2]}
     candidate_app_cdhash=${BASH_REMATCH[3]}
@@ -191,6 +193,7 @@ if [[ "$mode" == "dmg" ]]; then
     candidate_agent_cdhash=${BASH_REMATCH[5]}
     candidate_bridge_cdhash=${BASH_REMATCH[6]}
     candidate_wechat_repair_cdhash=${BASH_REMATCH[7]}
+    candidate_ffmpeg_cdhash=${BASH_REMATCH[8]}
   else
     fail "bundle verifier returned malformed candidate identity"
   fi
@@ -266,7 +269,7 @@ fi
 
 installed=0
 for ((attempt = 1; attempt <= install_polls; attempt++)); do
-  if [[ -d "$app" && -x "$main" && -x "$agent" && -x "$bridge" ]]; then installed=1; break; fi
+  if [[ -d "$app" && -x "$main" && -x "$agent" && -x "$bridge" && -x "$ffmpeg" ]]; then installed=1; break; fi
   if (( attempt < install_polls )); then
     if ! capture sleep_output sleep "$poll_seconds"; then fail "installed app wait exceeded its bounded phase"; fi
   fi
@@ -278,13 +281,13 @@ if ! capture expected_uid id -u; then fail "could not identify installed user"; 
   || fail "live verification must run as the non-root installed user"
 
 if ! capture layout_error python3 - "$runtime_root" "$app_directory" "$data_directory" "$run_directory" \
-  "$app" "$info" "$agent" "$bridge" "$wechat_repair" "$launch_agent" "$status_file" "$socket_file" \
+  "$app" "$info" "$agent" "$bridge" "$wechat_repair" "$ffmpeg" "$launch_agent" "$status_file" "$socket_file" \
   "$database_file" "$expected_uid" <<'PY'
 import os, stat, sys
 from pathlib import Path
 
 (root_text, app_dir_text, data_text, run_text, app_text, info_text, agent_text,
- bridge_text, wechat_repair_text, launch_agent_text, status_text, socket_text, database_text, uid_text) = sys.argv[1:]
+ bridge_text, wechat_repair_text, ffmpeg_text, launch_agent_text, status_text, socket_text, database_text, uid_text) = sys.argv[1:]
 uid = int(uid_text)
 root, app_dir, data, run, app = map(Path, (root_text, app_dir_text, data_text, run_text, app_text))
 def reject(message):
@@ -305,7 +308,7 @@ for path in (root, app_dir, data, run, app):
     if metadata.st_uid != uid: reject(f"wrong directory owner: {path}")
 for path in (root, app_dir, data, run):
     if stat.S_IMODE(path.lstat().st_mode) != 0o700: reject(f"directory is not mode 0700: {path}")
-for path in map(Path, (info_text, agent_text, bridge_text, wechat_repair_text, launch_agent_text)):
+for path in map(Path, (info_text, agent_text, bridge_text, wechat_repair_text, ffmpeg_text, launch_agent_text)):
     try: metadata = path.lstat()
     except OSError as error: reject(f"missing required file: {path}: {error}")
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode): reject(f"required path is not a regular file: {path}")
@@ -374,19 +377,22 @@ signature_identity main_identity "$main"
 signature_identity agent_identity "$agent"
 signature_identity bridge_identity "$bridge"
 signature_identity wechat_repair_identity "$wechat_repair"
+signature_identity ffmpeg_identity "$ffmpeg"
 read -r installed_team app_cdhash <<<"$app_identity"
 read -r main_team main_cdhash <<<"$main_identity"
 read -r agent_team agent_cdhash <<<"$agent_identity"
 read -r bridge_team bridge_cdhash <<<"$bridge_identity"
 read -r wechat_repair_team wechat_repair_cdhash <<<"$wechat_repair_identity"
+read -r ffmpeg_team ffmpeg_cdhash <<<"$ffmpeg_identity"
 [[ "$main_team" == "$installed_team" && "$agent_team" == "$installed_team" && "$bridge_team" == "$installed_team" \
-  && "$wechat_repair_team" == "$installed_team" ]] \
-  || fail "TeamIdentifier mismatch between installed app, main, agent, Bridge, or WeChat repair"
+  && "$wechat_repair_team" == "$installed_team" && "$ffmpeg_team" == "$installed_team" ]] \
+  || fail "TeamIdentifier mismatch between installed app, main, agent, Bridge, WeChat repair, or ffmpeg"
 if [[ "$mode" == "dmg" ]]; then
   [[ "$installed_team" == "$candidate_team" && "$app_cdhash" == "$candidate_app_cdhash" \
     && "$main_cdhash" == "$candidate_main_cdhash" && "$agent_cdhash" == "$candidate_agent_cdhash" \
     && "$bridge_cdhash" == "$candidate_bridge_cdhash" \
-    && "$wechat_repair_cdhash" == "$candidate_wechat_repair_cdhash" ]] \
+    && "$wechat_repair_cdhash" == "$candidate_wechat_repair_cdhash" \
+    && "$ffmpeg_cdhash" == "$candidate_ffmpeg_cdhash" ]] \
     || fail "installed signatures do not match the verified candidate"
 fi
 
