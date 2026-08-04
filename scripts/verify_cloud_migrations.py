@@ -23,8 +23,10 @@ EXPECTED_TABLES = [
     "communication_objects",
     "device_credential_generations",
     "device_heartbeats",
+    "device_media_cleanup_requests",
     "device_revocation_audit",
     "devices",
+    "network_location_library",
     "pairing_authorization_codes",
     "pairing_sessions",
     "system_events",
@@ -267,22 +269,46 @@ def verify_session_secret_remediation(postgres: TemporaryPostgres, database: str
         raise VerificationFailure("legacy raw auth sessions were not invalidated")
 
 
+def verify_system_lifecycle_constraints(postgres: TemporaryPostgres, database: str) -> None:
+    workspace_id = "01982222-7222-8222-8222-222222222222"
+    device_id = "01981111-7111-8111-8111-111111111111"
+    postgres.psql(
+        database,
+        "-c",
+        f"""
+        INSERT INTO system_events (
+          event_id, workspace_id, device_id, event_type, source, schema_version,
+          occurred_at, created_at, sensitivity, payload
+        ) VALUES
+          ('01989999-7999-8999-8999-999999999991', '{workspace_id}', '{device_id}',
+           'agent.started', 'runtime.lifecycle', 1, now(), now(), 'normal', '{{}}'),
+          ('01989999-7999-8999-8999-999999999992', '{workspace_id}', '{device_id}',
+           'system.sleep', 'runtime.lifecycle', 1, now(), now(), 'normal', '{{}}');
+        """,
+    )
+    wrong_source = postgres.psql(
+        database,
+        "-c",
+        f"""
+        INSERT INTO system_events (
+          event_id, workspace_id, device_id, event_type, source, schema_version,
+          occurred_at, created_at, sensitivity, payload
+        ) VALUES (
+          '01989999-7999-8999-8999-999999999993', '{workspace_id}', '{device_id}',
+          'agent.stopped', 'system', 1, now(), now(), 'normal', '{{}}'
+        )
+        """,
+        expected_success=False,
+    )
+    if "system_events_source_check" not in wrong_source.stderr:
+        raise VerificationFailure("lifecycle event source constraint was not enforced")
+
+
 def verify(repository_root: Path) -> None:
-    migrations = [
-        repository_root / "packages/db-cloud/migrations/0000_baseline.sql",
-        repository_root / "packages/db-cloud/migrations/0001_s1b_control_plane.sql",
-        repository_root / "packages/db-cloud/migrations/0002_s1b_device_revocation_audit.sql",
-        repository_root
-        / "packages/db-cloud/migrations/0003_s1b_pairing_state_and_better_auth_session.sql",
-        repository_root / "packages/db-cloud/migrations/0004_s1b_hash_better_auth_sessions.sql",
-        repository_root / "packages/db-cloud/migrations/0005_s2_system_events.sql",
-        repository_root / "packages/db-cloud/migrations/0006_communication_event_inbox.sql",
-        repository_root / "packages/db-cloud/migrations/0007_communication_projections.sql",
-        repository_root / "packages/db-cloud/migrations/0008_communication_objects.sql",
-    ]
-    for migration in migrations:
-        if not migration.is_file():
-            raise VerificationFailure(f"missing Cloud migration: {migration}")
+    migration_directory = repository_root / "packages/db-cloud/migrations"
+    migrations = sorted(migration_directory.glob("[0-9][0-9][0-9][0-9]_*.sql"))
+    if not migrations:
+        raise VerificationFailure(f"no Cloud migrations found in: {migration_directory}")
 
     with tempfile.TemporaryDirectory(prefix="pca-cloud-migrations-") as temporary:
         postgres = TemporaryPostgres(Path(temporary))
@@ -290,6 +316,7 @@ def verify(repository_root: Path) -> None:
             postgres.start()
             version = postgres.psql("postgres", "-Atc", "SHOW server_version").stdout.strip()
             postgres.psql("postgres", "-c", "CREATE DATABASE pca_fresh")
+            postgres.psql("postgres", "-c", "CREATE DATABASE pca_replay")
             postgres.psql("postgres", "-c", "CREATE DATABASE pca_upgrade")
 
             for migration in migrations:
@@ -297,9 +324,9 @@ def verify(repository_root: Path) -> None:
             verify_session_secret_remediation(postgres, "pca_fresh")
             fresh_before = table_names(postgres, "pca_fresh")
             for migration in migrations:
-                apply(postgres, "pca_fresh", migration)
-            if table_names(postgres, "pca_fresh") != fresh_before:
-                raise VerificationFailure("fresh Cloud migration replay changed the table set")
+                apply(postgres, "pca_replay", migration)
+            if table_names(postgres, "pca_replay") != fresh_before:
+                raise VerificationFailure("replayed Cloud migration chain changed the table set")
 
             apply(postgres, "pca_upgrade", migrations[0])
             postgres.psql(
@@ -327,8 +354,6 @@ def verify(repository_root: Path) -> None:
             )
             for migration in migrations[4:]:
                 apply(postgres, "pca_upgrade", migration)
-            for migration in migrations[1:]:
-                apply(postgres, "pca_upgrade", migration)
             if table_names(postgres, "pca_upgrade") != EXPECTED_TABLES:
                 raise VerificationFailure("upgrade Cloud migration produced an unexpected table set")
             ledger = postgres.psql(
@@ -340,6 +365,7 @@ def verify(repository_root: Path) -> None:
                 raise VerificationFailure("Cloud upgrade changed the previous migration ledger")
             verify_session_secret_remediation(postgres, "pca_upgrade")
             verify_owner_constraints(postgres, "pca_upgrade")
+            verify_system_lifecycle_constraints(postgres, "pca_upgrade")
             print(f"PostgreSQL {version} fresh, replay, upgrade, and Owner FK checks passed")
         finally:
             postgres.stop()

@@ -45,6 +45,7 @@ EXPECTED_MIGRATIONS = {
         "0014_local_media_management.sql",
         "0015_network_locations.sql",
         "0016_device_location.sql",
+        "0017_system_lifecycle_events.sql",
     ],
 }
 
@@ -189,9 +190,13 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "communication_messages",
         "communication_message_attachments",
         "communication_objects",
+        "device_media_cleanup_requests",
+        "network_location_library",
     }
     actual_tables = set(
-        re.findall(r"CREATE TABLE IF NOT EXISTS\s+([a-z_]+)", sql, flags=re.IGNORECASE)
+        re.findall(
+            r"CREATE TABLE (?:IF NOT EXISTS\s+)?([a-z_]+)", sql, flags=re.IGNORECASE
+        )
     )
     if actual_tables != expected_tables:
         return f"unexpected S1B Cloud tables: {sorted(actual_tables)}"
