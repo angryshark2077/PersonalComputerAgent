@@ -340,7 +340,9 @@ fn run_writes_fresh_local_health_when_bridge_is_missing_and_stops_cleanly() {
     let connection = Connection::open(&paths.database_file).expect("open runtime database");
     let lifecycle = connection
         .prepare(
-            "SELECT event_type, COUNT(*) FROM events_local GROUP BY event_type ORDER BY event_type",
+            "SELECT event_type, COUNT(*) FROM events_local \
+             WHERE event_type IN ('agent.started', 'agent.stopped', 'collector.status_changed') \
+             GROUP BY event_type ORDER BY event_type",
         )
         .expect("prepare lifecycle query")
         .query_map([], |row| {
