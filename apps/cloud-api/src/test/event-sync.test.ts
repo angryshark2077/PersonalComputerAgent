@@ -172,6 +172,28 @@ function communicationText(deviceId: string) {
   };
 }
 
+function appleMessagesText(deviceId: string) {
+  const event = communicationText(deviceId);
+  return {
+    ...event,
+    event_id: "01986666-7666-8666-8666-666666666674",
+    source: "communication.messages",
+    occurred_at: "2026-08-02T00:02:00Z",
+    created_at: "2026-08-02T00:02:00Z",
+    payload: {
+      ...event.payload,
+      message_id: "apple-message-1",
+      conversation_id: "apple-conversation-1",
+      sender_id: "+15550000000",
+      sender_display_name: "Apple Contact",
+      source_key: "apple-source-key-1",
+      occurred_at: "2026-08-02T00:02:00Z",
+      text: "apple private body",
+    },
+    idempotency_key: "apple-source-key-1",
+  };
+}
+
 function communicationSender(deviceId: string) {
   return {
     event_id: "01986666-7666-8666-8666-666666666671",
@@ -471,6 +493,59 @@ test("only the device owner can read projected communication conversations and m
     (await otherApi.request(`/v1/devices/${credentials.device_id}/communication/conversations`)).status,
     403,
   );
+});
+
+test("WeChat and Apple Messages are isolated by communication source", async () => {
+  const { api, credentials } = await pairedApi();
+  const sync = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777794",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationText(credentials.device_id), appleMessagesText(credentials.device_id)],
+    }),
+  });
+  assert.equal(sync.status, 200);
+
+  const wechatConversations = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations`,
+  );
+  const wechatBody = await wechatConversations.json() as {
+    conversations: Array<{ conversation_id: string }>;
+  };
+  assert.deepEqual(wechatBody.conversations.map((item) => item.conversation_id), ["conversation-1"]);
+
+  const messagesConversations = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations?source=communication.messages`,
+  );
+  const messagesBody = await messagesConversations.json() as {
+    conversations: Array<{ conversation_id: string }>;
+  };
+  assert.deepEqual(messagesBody.conversations.map((item) => item.conversation_id), ["apple-conversation-1"]);
+
+  const wrongSource = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/apple-conversation-1/messages`,
+  );
+  assert.deepEqual(await wrongSource.json(), { messages: [] });
+
+  const appleMessages = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/apple-conversation-1/messages?source=communication.messages`,
+  );
+  const appleMessagesBody = await appleMessages.json() as {
+    messages: Array<{ message_id: string; text: string }>;
+  };
+  assert.deepEqual(appleMessagesBody.messages.map((item) => [item.message_id, item.text]), [
+    ["apple-message-1", "apple private body"],
+  ]);
+
+  assert.equal((await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations?source=unknown`,
+  )).status, 400);
 });
 
 test("owner pages backward through communication messages without duplicates", async () => {

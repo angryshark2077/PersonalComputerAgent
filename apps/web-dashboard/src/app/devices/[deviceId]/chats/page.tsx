@@ -13,11 +13,35 @@ import {
   getCommunicationConversations,
   initializeChatReadAt,
   isConversationUnread,
+  messagesReadBaselineStorageKey,
+  messagesReadStorageKey,
+  type CommunicationSource,
   type DashboardConversation,
 } from "../../../../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../../../../lib/auth";
 
 export default function DeviceChatsPage() {
+  return (
+    <CommunicationConversationsPage
+      source="communication.wechat"
+      rootPath="chats"
+      title="WeChat"
+      backLabel="Back to WeChat devices"
+    />
+  );
+}
+
+export function CommunicationConversationsPage({
+  source,
+  rootPath,
+  title,
+  backLabel,
+}: {
+  source: CommunicationSource;
+  rootPath: "chats" | "messages";
+  title: "WeChat" | "Messages";
+  backLabel: string;
+}) {
   const params = useParams<{ deviceId: string }>();
   const [conversations, setConversations] = useState<DashboardConversation[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -31,15 +55,18 @@ export default function DeviceChatsPage() {
       if (loading) return;
       loading = true;
       try {
-        const latest = await getCommunicationConversations(window.fetch, origin, params.deviceId);
+        const latest = await getCommunicationConversations(window.fetch, origin, params.deviceId, source);
         if (!active) return;
-        const baselineKey = chatReadBaselineStorageKey(params.deviceId);
+        const storageKey = source === "communication.wechat" ? chatReadStorageKey : messagesReadStorageKey;
+        const baselineKey = source === "communication.wechat"
+          ? chatReadBaselineStorageKey(params.deviceId)
+          : messagesReadBaselineStorageKey(params.deviceId);
         const baselineInitialized = window.localStorage.getItem(baselineKey) !== null
           || latest.some((conversation) => window.localStorage.getItem(
-            chatReadStorageKey(params.deviceId, conversation.conversation_id),
+            storageKey(params.deviceId, conversation.conversation_id),
           ) !== null);
         const nextReadTimes = Object.fromEntries(latest.map((conversation) => {
-          const key = chatReadStorageKey(params.deviceId, conversation.conversation_id);
+          const key = storageKey(params.deviceId, conversation.conversation_id);
           const storedReadAt = window.localStorage.getItem(key);
           const readAt = initializeChatReadAt(
             conversation.last_message_at,
@@ -76,30 +103,30 @@ export default function DeviceChatsPage() {
       window.removeEventListener("focus", refreshOnVisible);
       window.removeEventListener("pageshow", refreshOnVisible);
     };
-  }, [params.deviceId]);
+  }, [params.deviceId, source]);
 
   return (
     <DashboardShell>
-      <Link className="back-link" href="/chats">Back to chat devices</Link>
+      <Link className="back-link" href={`/${rootPath}`}>{backLabel}</Link>
       <section className="page-heading">
         <p className="workspace-name">Device {params.deviceId}</p>
-        <h1>Chats</h1>
-        <p>Conversations from WeChat and Apple Messages collected on this Mac.</p>
+        <h1>{title}</h1>
+        <p>{source === "communication.wechat" ? "WeChat conversations collected on this Mac." : "iMessage and SMS conversations collected on this Mac."}</p>
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
-      {conversations === null ? <p className="status-note">Loading chats…</p> : (
+      {conversations === null ? <p className="status-note">Loading conversations…</p> : (
         <section className="dashboard-panel" aria-labelledby="chats-heading">
           <div className="panel-header">
             <h2 id="chats-heading">Conversations</h2>
             <p className="panel-count">{conversations.length} total</p>
           </div>
-          {conversations.length === 0 ? <p className="empty-state">No synchronized chats yet.</p> : (
+          {conversations.length === 0 ? <p className="empty-state">No synchronized {title} conversations yet.</p> : (
             <ul className="conversation-list">
               {conversations.map((conversation) => (
                 <li key={conversation.conversation_id}>
                   <Link
                     className="conversation-link"
-                    href={`/devices/${encodeURIComponent(params.deviceId)}/chats/${encodeURIComponent(conversation.conversation_id)}`}
+                    href={`/devices/${encodeURIComponent(params.deviceId)}/${rootPath}/${encodeURIComponent(conversation.conversation_id)}`}
                   >
                     <div className="conversation-identity">
                       <Avatar
@@ -154,5 +181,5 @@ function formatTime(value: string): string {
 }
 
 function messageFor(cause: unknown): string {
-  return cause instanceof DashboardApiError ? cause.message : "Unable to load chats.";
+  return cause instanceof DashboardApiError ? cause.message : "Unable to load conversations.";
 }

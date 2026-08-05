@@ -11,7 +11,8 @@ import { signOut } from "../lib/auth";
 export function DashboardShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const chatsActive = pathname === "/chats" || pathname.includes("/chats/");
-  const devicesActive = !chatsActive && (pathname.startsWith("/devices") || pathname === "/");
+  const messagesActive = pathname === "/messages" || pathname.includes("/messages/");
+  const devicesActive = !chatsActive && !messagesActive && (pathname.startsWith("/devices") || pathname === "/");
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
 
@@ -36,7 +37,10 @@ export function DashboardShell({ children }: { children: ReactNode }) {
             Devices
           </Link>
           <Link className={chatsActive ? "is-active" : undefined} href="/chats">
-            Chats
+            WeChat
+          </Link>
+          <Link className={messagesActive ? "is-active" : undefined} href="/messages">
+            Messages
           </Link>
         </nav>
         <div className="dashboard-account">

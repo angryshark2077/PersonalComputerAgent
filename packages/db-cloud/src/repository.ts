@@ -374,11 +374,13 @@ export interface SystemEventAppendResult {
   duplicateEventIds: string[];
 }
 
+export type CommunicationSource = "communication.wechat" | "communication.messages";
+
 interface CommunicationEventRecordBase {
   eventId: string;
   workspaceId: string;
   deviceId: string;
-  source: "communication.wechat" | "communication.messages";
+  source: CommunicationSource;
   schemaVersion: 1;
   occurredAt: Date;
   createdAt: Date;
@@ -608,6 +610,7 @@ export interface ControlRepository {
     deviceId: string,
     workspaceId: string,
     userId: string,
+    source: CommunicationSource,
     limit: number,
   ): Promise<CommunicationConversationRecord[]>;
   listOwnerCommunicationMessages(
@@ -615,6 +618,7 @@ export interface ControlRepository {
     conversationId: string,
     workspaceId: string,
     userId: string,
+    source: CommunicationSource,
     limit: number,
     before: CommunicationMessageCursor | null,
   ): Promise<CommunicationMessageRecord[]>;
@@ -1476,6 +1480,7 @@ export class MemoryControlRepository implements ControlRepository {
     deviceId: string,
     workspaceId: string,
     userId: string,
+    source: CommunicationSource,
     limit: number,
   ): Promise<CommunicationConversationRecord[]> {
     this.#requireOwnerMembership(workspaceId, userId);
@@ -1486,6 +1491,7 @@ export class MemoryControlRepository implements ControlRepository {
         event.workspaceId !== workspaceId
         || event.deviceId !== deviceId
         || event.eventType !== "communication.message_recorded"
+        || event.source !== source
       ) continue;
       const metadata = this.#communicationConversations.get(
         `${workspaceId}:${deviceId}:${event.message.conversationId}`,
@@ -1519,6 +1525,7 @@ export class MemoryControlRepository implements ControlRepository {
     conversationId: string,
     workspaceId: string,
     userId: string,
+    source: CommunicationSource,
     limit: number,
     before: CommunicationMessageCursor | null,
   ): Promise<CommunicationMessageRecord[]> {
@@ -1529,6 +1536,7 @@ export class MemoryControlRepository implements ControlRepository {
         event.workspaceId === workspaceId
         && event.deviceId === deviceId
         && event.eventType === "communication.message_recorded"
+        && event.source === source
         && event.message.conversationId === conversationId
         && (before === null
           || event.message.occurredAt < before.occurredAt
@@ -3049,6 +3057,7 @@ export class DrizzleControlRepository implements ControlRepository {
     deviceId: string,
     workspaceId: string,
     userId: string,
+    source: CommunicationSource,
     limit: number,
   ): Promise<CommunicationConversationRecord[]> {
     try {
@@ -3063,6 +3072,7 @@ export class DrizzleControlRepository implements ControlRepository {
           memberCount: communicationConversations.memberCount,
           lastMessageAt: communicationConversations.lastMessageAt,
           messageCount: sql<number>`count(${communicationMessages.eventId})::integer`,
+          sourceLastMessageAt: sql<Date>`max(${communicationMessages.occurredAt})`,
         })
         .from(communicationConversations)
         .innerJoin(
@@ -3073,10 +3083,15 @@ export class DrizzleControlRepository implements ControlRepository {
             eq(communicationMessages.conversationId, communicationConversations.conversationId),
           ),
         )
+        .innerJoin(
+          communicationEvents,
+          eq(communicationEvents.eventId, communicationMessages.eventId),
+        )
         .where(
           and(
             eq(communicationConversations.workspaceId, workspaceId),
             eq(communicationConversations.deviceId, deviceId),
+            eq(communicationEvents.source, source),
           ),
         )
         .groupBy(
@@ -3087,7 +3102,7 @@ export class DrizzleControlRepository implements ControlRepository {
           communicationConversations.memberCount,
           communicationConversations.lastMessageAt,
         )
-        .orderBy(desc(communicationConversations.lastMessageAt))
+        .orderBy(desc(sql`max(${communicationMessages.occurredAt})`))
         .limit(limit);
       return rows.map((row) => ({
         conversationId: row.conversationId,
@@ -3096,7 +3111,7 @@ export class DrizzleControlRepository implements ControlRepository {
         scope: row.scope as "direct" | "group",
         memberCount: row.memberCount,
         messageCount: row.messageCount,
-        lastMessageAt: row.lastMessageAt,
+        lastMessageAt: row.sourceLastMessageAt,
       }));
     } catch (error) {
       throw repositoryError(error);
@@ -3108,6 +3123,7 @@ export class DrizzleControlRepository implements ControlRepository {
     conversationId: string,
     workspaceId: string,
     userId: string,
+    source: CommunicationSource,
     limit: number,
     before: CommunicationMessageCursor | null,
   ): Promise<CommunicationMessageRecord[]> {
@@ -3127,11 +3143,16 @@ export class DrizzleControlRepository implements ControlRepository {
           text: communicationMessages.textBody,
         })
         .from(communicationMessages)
+        .innerJoin(
+          communicationEvents,
+          eq(communicationEvents.eventId, communicationMessages.eventId),
+        )
         .where(
           and(
             eq(communicationMessages.workspaceId, workspaceId),
             eq(communicationMessages.deviceId, deviceId),
             eq(communicationMessages.conversationId, conversationId),
+            eq(communicationEvents.source, source),
             before === null ? undefined : or(
               lt(communicationMessages.occurredAt, before.occurredAt),
               and(

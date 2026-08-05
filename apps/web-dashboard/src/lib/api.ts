@@ -144,6 +144,8 @@ export interface DashboardConversation {
   last_message_at: string;
 }
 
+export type CommunicationSource = "communication.wechat" | "communication.messages";
+
 export interface DashboardMessageAttachment {
   attachment_id: string;
   kind: "audio" | "image" | "video" | "file";
@@ -285,6 +287,14 @@ export function chatReadBaselineStorageKey(deviceId: string): string {
   return `pca.chat-read-baseline:${deviceId}`;
 }
 
+export function messagesReadStorageKey(deviceId: string, conversationId: string): string {
+  return `pca.messages-read:${deviceId}:${conversationId}`;
+}
+
+export function messagesReadBaselineStorageKey(deviceId: string): string {
+  return `pca.messages-read-baseline:${deviceId}`;
+}
+
 export function initializeChatReadAt(
   lastMessageAt: string,
   storedReadAt: string | null,
@@ -340,13 +350,14 @@ export async function getCommunicationConversations(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,
   deviceId: string,
+  source: CommunicationSource,
   limit = 100,
 ): Promise<DashboardConversation[]> {
   const result = await jsonRequest<{ conversations: DashboardConversation[] }>(
     fetcher,
     apiUrl(
       cloudApiOrigin,
-      `/v1/devices/${encodeURIComponent(deviceId)}/communication/conversations?limit=${limit}`,
+      `/v1/devices/${encodeURIComponent(deviceId)}/communication/conversations?source=${encodeURIComponent(source)}&limit=${limit}`,
     ),
   );
   return result.conversations;
@@ -357,10 +368,11 @@ export async function getCommunicationMessages(
   cloudApiOrigin: string,
   deviceId: string,
   conversationId: string,
+  source: CommunicationSource,
   limit = 100,
   before?: Pick<DashboardMessage, "occurred_at" | "event_id">,
 ): Promise<DashboardMessage[]> {
-  const query = new URLSearchParams({ limit: String(limit) });
+  const query = new URLSearchParams({ source, limit: String(limit) });
   if (before !== undefined) {
     query.set("before", before.occurred_at);
     query.set("before_event_id", before.event_id);

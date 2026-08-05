@@ -10,6 +10,7 @@ import { Pool } from "pg";
 import {
   DrizzleControlRepository,
   type CommunicationObjectRecord,
+  type CommunicationSource,
   type ControlRepository,
   type PhotoLibraryAssetRecord,
   type ScreenshotRecord,
@@ -682,7 +683,8 @@ export function createApp(options: CreateAppOptions): Hono {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
     const limit = parseCommunicationLimit(context.req.query("limit"));
-    if (limit === null) {
+    const source = parseCommunicationSource(context.req.query("source"));
+    if (limit === null || source === null) {
       return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication limit.");
     }
     try {
@@ -690,6 +692,7 @@ export function createApp(options: CreateAppOptions): Hono {
         context.req.param("deviceId"),
         principal.workspaceId,
         principal.userId,
+        source,
         limit,
       );
       return context.json({
@@ -737,11 +740,12 @@ export function createApp(options: CreateAppOptions): Hono {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
     const limit = parseCommunicationLimit(context.req.query("limit"));
+    const source = parseCommunicationSource(context.req.query("source"));
     const before = parseCommunicationMessageCursor(
       context.req.query("before"),
       context.req.query("before_event_id"),
     );
-    if (limit === null || before === undefined) {
+    if (limit === null || source === null || before === undefined) {
       return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication limit.");
     }
     try {
@@ -750,6 +754,7 @@ export function createApp(options: CreateAppOptions): Hono {
         context.req.param("conversationId"),
         principal.workspaceId,
         principal.userId,
+        source,
         limit,
         before,
       );
@@ -961,6 +966,11 @@ function parseCommunicationLimit(value: string | undefined): number | null {
   if (value === undefined) return 50;
   const limit = Number(value);
   return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
+}
+
+function parseCommunicationSource(value: string | undefined): CommunicationSource | null {
+  if (value === undefined || value === "communication.wechat") return "communication.wechat";
+  return value === "communication.messages" ? value : null;
 }
 
 function parseScreenshotLimit(value: string | undefined): number | null {

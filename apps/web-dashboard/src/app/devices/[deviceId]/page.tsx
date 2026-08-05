@@ -196,7 +196,8 @@ export default function DevicePage() {
         <p>Review collection permissions and device access.</p>
       </section>
       <div className="device-links">
-        <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>View chats</Link>
+        <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>View WeChat</Link>
+        <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/messages`}>View Messages</Link>
         <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/screenshots`}>View screenshots</Link>
         <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/photos`}>View photos</Link>
       </div>

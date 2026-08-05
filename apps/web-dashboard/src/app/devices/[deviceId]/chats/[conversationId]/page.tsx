@@ -14,11 +14,23 @@ import {
   getCommunicationMessages,
   getCommunicationObjectReadUrl,
   mergeLatestCommunicationMessages,
+  messagesReadStorageKey,
+  type CommunicationSource,
   type DashboardMessage,
 } from "../../../../../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../../../../../lib/auth";
 
 export default function ChatMessagesPage() {
+  return <CommunicationMessagesPage source="communication.wechat" rootPath="chats" />;
+}
+
+export function CommunicationMessagesPage({
+  source,
+  rootPath,
+}: {
+  source: CommunicationSource;
+  rootPath: "chats" | "messages";
+}) {
   const params = useParams<{ deviceId: string; conversationId: string }>();
   const deviceId = decodeDashboardRouteParam(params.deviceId);
   const conversationId = decodeDashboardRouteParam(params.conversationId);
@@ -43,8 +55,8 @@ export default function ChatMessagesPage() {
       loading = true;
       try {
         const [latest, conversations] = await Promise.all([
-          getCommunicationMessages(window.fetch, origin, deviceId, conversationId),
-          getCommunicationConversations(window.fetch, origin, deviceId),
+          getCommunicationMessages(window.fetch, origin, deviceId, conversationId, source),
+          getCommunicationConversations(window.fetch, origin, deviceId, source),
         ]);
         if (!active) return;
         const conversation = conversations.find(
@@ -56,7 +68,7 @@ export default function ChatMessagesPage() {
         if (initial) setHasOlderMessages(latest.length === 100);
         setMessages((current) => mergeLatestCommunicationMessages(current, latest));
         window.localStorage.setItem(
-          chatReadStorageKey(deviceId, conversationId),
+          (source === "communication.wechat" ? chatReadStorageKey : messagesReadStorageKey)(deviceId, conversationId),
           conversation?.last_message_at ?? latest[0]?.occurred_at ?? new Date().toISOString(),
         );
         setError(null);
@@ -83,7 +95,7 @@ export default function ChatMessagesPage() {
       window.removeEventListener("focus", refreshLatest);
       window.removeEventListener("pageshow", refreshLatest);
     };
-  }, [conversationId, deviceId]);
+  }, [conversationId, deviceId, source]);
 
   useEffect(() => {
     if (messages !== null && !didInitialScroll.current) {
@@ -106,6 +118,7 @@ export default function ChatMessagesPage() {
         cloudApiOrigin(),
         deviceId,
         conversationId,
+        source,
         100,
         oldest,
       );
@@ -121,11 +134,11 @@ export default function ChatMessagesPage() {
       loadingOlderMessagesRef.current = false;
       setLoadingOlderMessages(false);
     }
-  }, [conversationId, deviceId, hasOlderMessages, messages]);
+  }, [conversationId, deviceId, hasOlderMessages, messages, source]);
 
   return (
     <DashboardShell>
-      <Link className="back-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>Back to chats</Link>
+      <Link className="back-link" href={`/devices/${encodeURIComponent(deviceId)}/${rootPath}`}>Back to {rootPath === "chats" ? "WeChat" : "Messages"}</Link>
       <section className="page-heading">
         <h1>{displayName}</h1>
         <p className="conversation-id">{conversationId}</p>

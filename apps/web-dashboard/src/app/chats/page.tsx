@@ -10,6 +10,16 @@ import { getBrowserSession, redirectToSignIn } from "../../lib/auth";
 type DashboardDeviceSummary = Awaited<ReturnType<typeof getDevices>>[number];
 
 export default function ChatsPage() {
+  return <CommunicationDevicesPage rootPath="chats" title="WeChat" />;
+}
+
+export function CommunicationDevicesPage({
+  rootPath,
+  title,
+}: {
+  rootPath: "chats" | "messages";
+  title: "WeChat" | "Messages";
+}) {
   const [devices, setDevices] = useState<DashboardDeviceSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -32,8 +42,8 @@ export default function ChatsPage() {
     <DashboardShell>
       <section className="page-heading">
         <p className="workspace-name">Communication collection</p>
-        <h1>Chats</h1>
-        <p>Select the Mac whose WeChat or Messages conversations you want to inspect.</p>
+        <h1>{title}</h1>
+        <p>Select the Mac whose {title === "WeChat" ? "WeChat" : "iMessage and SMS"} conversations you want to inspect.</p>
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
       {devices === null ? <p className="status-note">Loading devices…</p> : (
@@ -46,7 +56,7 @@ export default function ChatsPage() {
             <ul className="device-list">
               {devices.map((device) => (
                 <li key={device.device_id}>
-                  <Link href={`/devices/${encodeURIComponent(device.device_id)}/chats`}>
+                  <Link href={`/devices/${encodeURIComponent(device.device_id)}/${rootPath}`}>
                     Device {device.device_id}
                   </Link>
                 </li>
@@ -60,5 +70,5 @@ export default function ChatsPage() {
 }
 
 function messageFor(cause: unknown): string {
-  return cause instanceof DashboardApiError ? cause.message : "Unable to load chat devices.";
+  return cause instanceof DashboardApiError ? cause.message : "Unable to load communication devices.";
 }
