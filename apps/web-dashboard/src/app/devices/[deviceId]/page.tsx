@@ -13,6 +13,7 @@ import {
   getDevice,
   getNetworkLocations,
   getSystemMetrics,
+  purgeDevice,
   revokeDevice,
   requestLocalMediaCleanup,
   requestScreenshot,
@@ -100,6 +101,19 @@ export default function DevicePage() {
     } catch (cause) {
       setError(messageFor(cause));
     } finally {
+      setBusy(false);
+    }
+  }
+
+  async function purge(): Promise<void> {
+    if (window.prompt(`Type the device ID to permanently delete this device and all Cloud media:\n${deviceId}`) !== deviceId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await purgeDevice(window.fetch, cloudApiOrigin(), deviceId);
+      window.location.assign("/");
+    } catch (cause) {
+      setError(messageFor(cause));
       setBusy(false);
     }
   }
@@ -388,6 +402,9 @@ export default function DevicePage() {
         <div className="device-actions">
           <button className="danger-button" type="button" disabled={disabled} onClick={() => void revoke()}>
             {screen.device.revoked ? "Device revoked" : "Revoke device"}
+          </button>
+          <button className="danger-button" type="button" disabled={busy} onClick={() => void purge()}>
+            Permanently delete device
           </button>
         </div>
         <section className="dashboard-panel collector-card" aria-labelledby="metrics-heading">

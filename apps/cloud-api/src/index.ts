@@ -848,6 +848,27 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.post("/v1/devices/:deviceId/purge", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const deviceId = context.req.param("deviceId");
+    const body = await context.req.json().catch(() => null) as { confirmation?: unknown } | null;
+    if (body?.confirmation !== deviceId) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Device deletion confirmation does not match.");
+    }
+    if (options.objectStore === undefined) {
+      return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private media storage is unavailable.");
+    }
+    try {
+      const objectKeys = await options.repository.listOwnerDeviceObjectKeys(deviceId, principal.workspaceId, principal.userId);
+      for (const objectKey of objectKeys) await options.objectStore.deleteObject(objectKey);
+      await options.repository.deleteOwnerDevice(deviceId, principal.workspaceId, principal.userId);
+      return context.json({ deleted: true, deleted_object_count: objectKeys.length });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.post("/v1/devices/:deviceId/communication/local-media/cleanup", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;

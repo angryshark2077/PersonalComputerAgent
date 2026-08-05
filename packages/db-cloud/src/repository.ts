@@ -597,6 +597,8 @@ export interface ControlRepository {
   deleteOwnerNetworkLocation(locationId: string, workspaceId: string, userId: string): Promise<void>;
   appendConfigAudit(input: ConfigAuditInput): Promise<number>;
   revokeDevice(input: DeviceRevocationInput): Promise<void>;
+  listOwnerDeviceObjectKeys(deviceId: string, workspaceId: string, userId: string): Promise<string[]>;
+  deleteOwnerDevice(deviceId: string, workspaceId: string, userId: string): Promise<void>;
   resolveOwnerWorkspace(userId: string): Promise<string | null>;
   bootstrapOwnerWorkspace(userId: string): Promise<OwnerWorkspace>;
   listOwnerWorkspaces(userId: string): Promise<OwnerWorkspace[]>;
@@ -1279,6 +1281,23 @@ export class MemoryControlRepository implements ControlRepository {
       }
     }
     this.#revocationAuditIds.add(input.auditId);
+  }
+
+  async listOwnerDeviceObjectKeys(deviceId: string, workspaceId: string, userId: string): Promise<string[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    return [
+      ...[...this.#screenshots.values()].filter((record) => record.deviceId === deviceId).map((record) => record.objectKey),
+      ...[...this.#photoLibraryAssets.values()].filter((record) => record.deviceId === deviceId).map((record) => record.objectKey),
+      ...[...this.#communicationObjects.values()].filter((record) => record.deviceId === deviceId).map((record) => record.objectKey),
+    ];
+  }
+
+  async deleteOwnerDevice(deviceId: string, workspaceId: string, userId: string): Promise<void> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    this.#devices.delete(deviceId);
+    this.#credentials.delete(deviceId);
   }
 
   async resolveOwnerWorkspace(userId: string): Promise<string | null> {
@@ -2670,6 +2689,31 @@ export class DrizzleControlRepository implements ControlRepository {
           revokedAt: input.now,
         });
       });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listOwnerDeviceObjectKeys(deviceId: string, workspaceId: string, userId: string): Promise<string[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const [screenshots, photos, communication] = await Promise.all([
+        this.database.select({ objectKey: deviceScreenshots.objectKey }).from(deviceScreenshots).where(and(eq(deviceScreenshots.workspaceId, workspaceId), eq(deviceScreenshots.deviceId, deviceId))),
+        this.database.select({ objectKey: photoLibraryAssets.objectKey }).from(photoLibraryAssets).where(and(eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId))),
+        this.database.select({ objectKey: communicationObjects.objectKey }).from(communicationObjects).where(and(eq(communicationObjects.workspaceId, workspaceId), eq(communicationObjects.deviceId, deviceId))),
+      ]);
+      return [...screenshots, ...photos, ...communication].map((row) => row.objectKey);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async deleteOwnerDevice(deviceId: string, workspaceId: string, userId: string): Promise<void> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      const deleted = await this.database.delete(devices).where(and(eq(devices.id, deviceId), eq(devices.workspaceId, workspaceId), eq(devices.ownerUserId, userId))).returning({ id: devices.id });
+      if (deleted.length !== 1) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
     } catch (error) {
       throw repositoryError(error);
     }

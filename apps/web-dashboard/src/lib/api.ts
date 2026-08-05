@@ -438,6 +438,19 @@ export async function revokeDevice(
   if (response.status !== 204) throw await apiError(response);
 }
 
+export async function purgeDevice(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+): Promise<number> {
+  const result = await jsonRequest<{ deleted: true; deleted_object_count: number }>(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/purge`),
+    { method: "POST", body: JSON.stringify({ confirmation: deviceId }) },
+  );
+  return result.deleted_object_count;
+}
+
 export async function requestLocalMediaCleanup(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,
