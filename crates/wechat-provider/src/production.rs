@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     fs::OpenOptions,
     io::{Read, Write},
     os::unix::ffi::OsStrExt,
@@ -36,6 +38,7 @@ const SOURCE_ROOT: &str = "Library/Containers/com.tencent.xinWeChat/Data/Documen
 const SESSION_DATABASE: &str = "db_storage/session/session.db";
 const CONTACT_DATABASE: &str = "db_storage/contact/contact.db";
 const HARDLINK_DATABASE: &str = "db_storage/hardlink/hardlink.db";
+const EMOTICON_DATABASE: &str = "db_storage/emoticon/emoticon.db";
 const MESSAGE_DIRECTORY: &str = "db_storage/message";
 const MAX_BATCH: usize = 200;
 const MAX_PER_CONVERSATION: usize = 20;
@@ -86,6 +89,7 @@ struct SourcePaths {
     account_root: PathBuf,
     session_database: PathBuf,
     contact_database: PathBuf,
+    emoticon_database: Option<PathBuf>,
     message_databases: Vec<PathBuf>,
     media_databases: Vec<PathBuf>,
     local_username: String,
@@ -157,6 +161,10 @@ impl MacOSWechatSource {
                 account_root: account_root.clone(),
                 session_database: account_root.join(SESSION_DATABASE),
                 contact_database: account_root.join(CONTACT_DATABASE),
+                emoticon_database: account_root
+                    .join(EMOTICON_DATABASE)
+                    .is_file()
+                    .then(|| account_root.join(EMOTICON_DATABASE)),
                 message_databases,
                 media_databases,
                 local_username,
@@ -263,6 +271,11 @@ fn read_message_batch(
     let cutoff = retention_cutoff();
     let decoded_images = index_decoded_images(&paths.account_root, cutoff);
     let emoticon_files = index_emoticon_files(&paths.account_root);
+    let emoticon_keys = paths
+        .emoticon_database
+        .as_ref()
+        .and_then(|database| with_database(database, &material, read_emoticon_keys).ok())
+        .unwrap_or_default();
     let encrypted_images = index_encrypted_image_identities(&paths.account_root);
     let hardlink_path = paths.account_root.join(HARDLINK_DATABASE);
     let image_hardlinks = if hardlink_path.is_file() {
@@ -415,7 +428,14 @@ fn read_message_batch(
         }
         let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
         let emoticon_batch = with_database(database, &material, |connection| {
-            read_database_emoticons(connection, &context, &sessions, &emoticon_files, remaining)
+            read_database_emoticons(
+                connection,
+                &context,
+                &sessions,
+                &emoticon_files,
+                &emoticon_keys,
+                remaining,
+            )
         });
         let emoticon_batch = emoticon_batch.unwrap_or_else(|_| {
             eprintln!("WeChat media stage deferred: WECHAT_EMOTICON_READ_FAILED");
@@ -1298,6 +1318,7 @@ fn read_database_emoticons(
     context: &TextReadContext<'_>,
     sessions: &[Session],
     emoticon_files: &BTreeMap<String, PathBuf>,
+    emoticon_keys: &BTreeMap<String, String>,
     limit: usize,
 ) -> Result<EmoticonReadBatch, SqlcipherProbeFailure> {
     let my_rowid = local_sender_rowid(connection, context.local_username)?
@@ -1351,7 +1372,7 @@ fn read_database_emoticons(
         if !table_exists(connection, &table_name)? {
             continue;
         }
-        let cursor_key = format!("{}:{}:emoticon-v1", context.database_name, session.username);
+        let cursor_key = format!("{}:{}:emoticon-v2", context.database_name, session.username);
         let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
         let retry_prefix = format!("{cursor_key}:pending:");
         let retry_rows = context
@@ -1427,37 +1448,6 @@ fn read_database_emoticons(
             if !is_retry {
                 scanned_through = row.local_id;
             }
-            let Some(decoded_body) =
-                decode_message_content(&row.compress_content, &row.message_content)
-            else {
-                continue;
-            };
-            let Some(md5) = xml_attribute(&decoded_body, "md5").and_then(|value| valid_md5(&value))
-            else {
-                continue;
-            };
-            let Some(aes_key) = xml_attribute(&decoded_body, "aeskey") else {
-                continue;
-            };
-            let completed = emoticon_files.get(&md5).and_then(|source| {
-                emoticon_attachment(
-                    source,
-                    &aes_key,
-                    context.database_name,
-                    &table_name,
-                    row.local_id,
-                )
-            });
-            let Some((attachment, source_path)) = completed else {
-                if !is_retry {
-                    cursor_updates
-                        .push((format!("{retry_prefix}{}", row.local_id), row.create_time));
-                }
-                continue;
-            };
-            if is_retry {
-                cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
-            }
             let direction = if row.real_sender_id == my_rowid {
                 if row.server_id <= 0 || row.status < 0 {
                     continue;
@@ -1498,16 +1488,74 @@ fn read_database_emoticons(
                 .ok()
                 .and_then(|time| time.format(&Rfc3339).ok())
                 .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
+            let message_id = if row.server_id > 0 {
+                row.server_id.to_string()
+            } else {
+                format!("local-{}", row.local_id)
+            };
+            let finality = match direction {
+                SourceDirection::Incoming => SourceFinality::IncomingPersisted,
+                SourceDirection::Outgoing => SourceFinality::OutgoingSent,
+                SourceDirection::Unknown => SourceFinality::Unknown,
+            };
+            let completed = decode_message_content(&row.compress_content, &row.message_content)
+                .and_then(|decoded_body| {
+                    let md5 =
+                        xml_attribute(&decoded_body, "md5").and_then(|value| valid_md5(&value))?;
+                    let aes_key = xml_attribute(&decoded_body, "aeskey")
+                        .filter(|key| valid_emoticon_key(key))
+                        .or_else(|| emoticon_keys.get(&md5).cloned())?;
+                    emoticon_files.get(&md5).and_then(|source| {
+                        emoticon_attachment(
+                            source,
+                            &aes_key,
+                            context.database_name,
+                            &table_name,
+                            row.local_id,
+                        )
+                    })
+                });
+            let Some((attachment, source_path)) = completed else {
+                if !is_retry {
+                    cursor_updates
+                        .push((format!("{retry_prefix}{}", row.local_id), row.create_time));
+                    records.push(SourceMessageRecord {
+                        account_id: context.account_id.to_owned(),
+                        source_sequence: u64::try_from(row.local_id)
+                            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                        message_id,
+                        conversation_id: session.username.clone(),
+                        conversation_display_name: metadata.display_name.clone(),
+                        conversation_avatar_url: metadata.avatar_url.clone(),
+                        sender_id,
+                        sender_display_name,
+                        sender_avatar_url,
+                        source_key: format!(
+                            "wechat:{}:{table_name}:{}:emoticon-placeholder",
+                            context.database_name, row.local_id
+                        ),
+                        occurred_at,
+                        local_account: LocalAccountProof::Verified,
+                        direction,
+                        kind: SourceMessageKind::Text,
+                        conversation: conversation.clone(),
+                        finality,
+                        payload: SourcePayload::Text {
+                            body: "[表情]".to_owned(),
+                        },
+                    });
+                }
+                continue;
+            };
+            if is_retry {
+                cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
+            }
             let attachment_id = attachment.attachment_id().to_owned();
             records.push(SourceMessageRecord {
                 account_id: context.account_id.to_owned(),
                 source_sequence: u64::try_from(row.local_id)
                     .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
-                message_id: if row.server_id > 0 {
-                    row.server_id.to_string()
-                } else {
-                    format!("local-{}", row.local_id)
-                },
+                message_id,
                 conversation_id: session.username.clone(),
                 conversation_display_name: metadata.display_name.clone(),
                 conversation_avatar_url: metadata.avatar_url.clone(),
@@ -1523,11 +1571,7 @@ fn read_database_emoticons(
                 direction,
                 kind: SourceMessageKind::Image,
                 conversation: conversation.clone(),
-                finality: match direction {
-                    SourceDirection::Incoming => SourceFinality::IncomingPersisted,
-                    SourceDirection::Outgoing => SourceFinality::OutgoingSent,
-                    SourceDirection::Unknown => SourceFinality::Unknown,
-                },
+                finality,
                 payload: SourcePayload::Media {
                     attachment: Some(attachment),
                     completed_source: Some(crate::source::SourceCompletedMedia {
@@ -3604,51 +3648,104 @@ fn index_decoded_images(account_root: &Path, cutoff: i64) -> BTreeMap<(i64, i64)
 
 fn index_emoticon_files(account_root: &Path) -> BTreeMap<String, PathBuf> {
     let mut files = BTreeMap::new();
-    let Ok(months) = fs::read_dir(account_root.join("cache")) else {
-        return files;
-    };
-    for month in months.flatten().take(120) {
-        let root = month.path().join("Emoticon");
-        let Ok(prefixes) = fs::read_dir(root) else {
-            continue;
-        };
-        for prefix in prefixes.flatten().take(256) {
-            let Ok(entries) = fs::read_dir(prefix.path()) else {
-                continue;
-            };
-            for entry in entries.flatten().take(10_000) {
-                let path = entry.path();
-                let Ok(metadata) = path.symlink_metadata() else {
-                    continue;
-                };
-                if !metadata.file_type().is_file()
-                    || metadata.file_type().is_symlink()
-                    || metadata.len() == 0
-                    || metadata.len() > MAX_IMAGE_BYTES
-                {
-                    continue;
-                }
-                let Some(md5) = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(valid_md5)
-                else {
-                    continue;
-                };
-                files.entry(md5).or_insert(path);
-            }
+    if let Ok(months) = fs::read_dir(account_root.join("cache")) {
+        for month in months.flatten().take(120) {
+            index_emoticon_root(&month.path().join("Emoticon"), &mut files);
         }
     }
+    index_emoticon_root(&account_root.join("business/emoticon/Persist"), &mut files);
     files
+}
+
+fn index_emoticon_root(root: &Path, files: &mut BTreeMap<String, PathBuf>) {
+    let Ok(prefixes) = fs::read_dir(root) else {
+        return;
+    };
+    for prefix in prefixes.flatten().take(256) {
+        let Ok(entries) = fs::read_dir(prefix.path()) else {
+            continue;
+        };
+        for entry in entries.flatten().take(10_000) {
+            let path = entry.path();
+            let Ok(metadata) = path.symlink_metadata() else {
+                continue;
+            };
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() == 0
+                || metadata.len() > MAX_IMAGE_BYTES
+            {
+                continue;
+            }
+            let Some(md5) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(valid_md5)
+            else {
+                continue;
+            };
+            files.entry(md5).or_insert(path);
+        }
+    }
+}
+
+fn read_emoticon_keys(
+    connection: &Connection,
+) -> Result<BTreeMap<String, String>, SqlcipherProbeFailure> {
+    if !table_exists(connection, "kNonStoreEmoticonTable")? {
+        return Ok(BTreeMap::new());
+    }
+    let mut statement = connection
+        .prepare("SELECT md5, aes_key FROM kNonStoreEmoticonTable")
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Value>(1)?))
+        })
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .filter_map(|(md5, value)| {
+            let key = emoticon_key_from_value(value)?;
+            valid_md5(&md5)
+                .filter(|_| valid_emoticon_key(&key))
+                .map(|md5| (md5, key))
+        })
+        .collect())
+}
+
+fn emoticon_key_from_value(value: Value) -> Option<String> {
+    match value {
+        Value::Text(key) if valid_emoticon_key(&key) => Some(key),
+        Value::Blob(key) if key.len() == 16 => {
+            let mut encoded = String::with_capacity(32);
+            for byte in key {
+                write!(&mut encoded, "{byte:02x}").ok()?;
+            }
+            Some(encoded)
+        }
+        Value::Blob(key) => String::from_utf8(key)
+            .ok()
+            .filter(|key| valid_emoticon_key(key)),
+        _ => None,
+    }
+}
+
+fn valid_emoticon_key(key: &str) -> bool {
+    decode_hex(key).is_some_and(|bytes| bytes.len() == 16)
 }
 
 fn decrypt_emoticon(encrypted: &[u8], aes_key: &str) -> Option<Vec<u8>> {
     let key = decode_hex(aes_key)?;
     let key: [u8; 16] = key.try_into().ok()?;
+    decrypt_emoticon_with_key(encrypted, &key)
+}
+
+fn decrypt_emoticon_with_key(encrypted: &[u8], key: &[u8; 16]) -> Option<Vec<u8>> {
     if encrypted.is_empty() || !encrypted.len().is_multiple_of(16) {
         return None;
     }
-    let cipher = Aes128::new_from_slice(&key).ok()?;
+    let cipher = Aes128::new_from_slice(key).ok()?;
     let mut decrypted = Vec::with_capacity(encrypted.len());
     for chunk in encrypted.chunks_exact(16) {
         let mut block = GenericArray::clone_from_slice(chunk);
@@ -4269,6 +4366,7 @@ fn extend_message_database_routes(
         .message_databases
         .iter()
         .chain(paths.media_databases.iter())
+        .chain(paths.emoticon_database.iter())
     {
         if material.key_for_database(database).is_some() {
             continue;
@@ -5639,6 +5737,7 @@ mod tests {
             account_root: account,
             session_database: PathBuf::new(),
             contact_database: PathBuf::new(),
+            emoticon_database: None,
             message_databases: vec![message.clone()],
             media_databases: vec![media.clone()],
             local_username: "wxid_example".to_owned(),
@@ -5810,7 +5909,7 @@ mod tests {
                  );\
                  INSERT INTO \"{table_name}\" VALUES (\
                     63, 10063, 1000, 1, 3, 47,\
-                    '<msg><emoji md5=\"{md5}\" aeskey=\"00112233445566778899aabbccddeeff\" /></msg>',\
+                    '<msg><emoji md5=\"{md5}\" aeskey=\"\" /></msg>',\
                     NULL\
                  );"
             ))
@@ -5843,6 +5942,10 @@ mod tests {
                 username: conversation_id.to_owned(),
             }],
             &emoticons,
+            &std::collections::BTreeMap::from([(
+                md5.to_owned(),
+                "00112233445566778899aabbccddeeff".to_owned(),
+            )]),
             20,
         )
         .expect("read emoticon message");
@@ -5858,8 +5961,129 @@ mod tests {
         ));
         assert_eq!(
             batch.cursor_updates,
-            vec![("message_0.db:wxid_friend:emoticon-v1".to_owned(), 63)]
+            vec![("message_0.db:wxid_friend:emoticon-v2".to_owned(), 63)]
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the placeholder and later media upgrade share one cursor fixture"
+    )]
+    fn production_keeps_unreadable_emoticons_as_explicit_placeholders() {
+        let connection = Connection::open_in_memory().expect("open emoticon placeholder database");
+        let conversation_id = "wxid_friend";
+        let table_name = message_table_name(conversation_id);
+        let md5 = "7853df4386160c58e5276b9bb655e378";
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE Name2Id (user_name TEXT);\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'wxid_local');\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (2, '{conversation_id}');\
+                 CREATE TABLE \"{table_name}\" (\
+                    local_id INTEGER, server_id INTEGER, create_time INTEGER,\
+                    real_sender_id INTEGER, status INTEGER, local_type INTEGER,\
+                    message_content TEXT, compress_content BLOB\
+                 );\
+                 INSERT INTO \"{table_name}\" VALUES (\
+                    64, 10064, 1000, 2, 3, 47,\
+                    '<msg><emoji md5=\"{md5}\" aeskey=\"\" /></msg>',\
+                    NULL\
+                 );"
+            ))
+            .expect("create emoticon placeholder fixture");
+        let metadata = std::collections::BTreeMap::from([(
+            conversation_id.to_owned(),
+            ConversationMetadata {
+                display_name: "Friend".to_owned(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: std::collections::BTreeMap::new(),
+                participant_avatar_urls: std::collections::BTreeMap::new(),
+            },
+        )]);
+        let contact_cards = std::collections::BTreeMap::new();
+        let cursors = std::collections::BTreeMap::new();
+        let context = TextReadContext {
+            database_name: "message_0.db",
+            local_username: "wxid_local",
+            account_id: "account",
+            conversation_metadata: &metadata,
+            contact_cards: &contact_cards,
+            cursors: &cursors,
+            cutoff: 0,
+        };
+        let batch = read_database_emoticons(
+            &connection,
+            &context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            20,
+        )
+        .expect("read unreadable emoticon");
+
+        assert_eq!(batch.records.len(), 1);
+        assert!(matches!(
+            &batch.records[0].payload,
+            SourcePayload::Text { body } if body == "[表情]"
+        ));
+        assert!(matches!(
+            batch.records[0].kind,
+            crate::source::SourceMessageKind::Text
+        ));
+        assert!(batch.cursor_updates.contains(&(
+            "message_0.db:wxid_friend:emoticon-v2:pending:64".to_owned(),
+            1000,
+        )));
+        assert!(batch
+            .cursor_updates
+            .contains(&("message_0.db:wxid_friend:emoticon-v2".to_owned(), 64,)));
+
+        let fixture = tempfile::tempdir().expect("create recovered emoticon fixture");
+        let cache = fixture.path().join("emoticon-cache");
+        let key = *b"0123456789abcdef";
+        let plain = [b'G', b'I', b'F', b'8', b'9', b'a', 1, 0, 1, 0, 0x80, 0, 0];
+        let padding = 16 - plain.len() % 16;
+        let mut encrypted = plain.to_vec();
+        encrypted.resize(
+            encrypted.len() + padding,
+            u8::try_from(padding).expect("padding byte"),
+        );
+        let cipher = Aes128::new_from_slice(&key).expect("fixture emoticon key");
+        for block in encrypted.chunks_exact_mut(16) {
+            cipher.encrypt_block(GenericArray::from_mut_slice(block));
+        }
+        fs::write(&cache, encrypted).expect("write recovered emoticon");
+        let retry_cursors = batch.cursor_updates.into_iter().collect();
+        let retry_context = TextReadContext {
+            cursors: &retry_cursors,
+            ..context
+        };
+        let recovered = read_database_emoticons(
+            &connection,
+            &retry_context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            &std::collections::BTreeMap::from([(md5.to_owned(), cache)]),
+            &std::collections::BTreeMap::from([(
+                md5.to_owned(),
+                "30313233343536373839616263646566".to_owned(),
+            )]),
+            20,
+        )
+        .expect("upgrade recovered emoticon");
+        assert_eq!(recovered.records.len(), 1);
+        assert!(matches!(
+            recovered.records[0].kind,
+            crate::source::SourceMessageKind::Image
+        ));
+        assert!(recovered
+            .cursor_removals
+            .contains(&"message_0.db:wxid_friend:emoticon-v2:pending:64".to_owned()));
     }
 
     #[test]
