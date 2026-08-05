@@ -12,7 +12,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const chatsActive = pathname === "/chats" || pathname.includes("/chats/");
   const messagesActive = pathname === "/messages" || pathname.includes("/messages/");
-  const photosActive = pathname === "/photos" || pathname.includes("/photos/");
+  const photosActive = pathname === "/photos" || pathname.includes("/photos/") || pathname.endsWith("/photos");
   const devicesActive = !chatsActive && !messagesActive && !photosActive && (pathname.startsWith("/devices") || pathname === "/");
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
