@@ -62,6 +62,12 @@ export interface DashboardPhoto {
   size_bytes: number;
 }
 
+export const PHOTO_PAGE_SIZE = 20;
+
+export function nextPhotoPage<T>(records: readonly T[], loaded: number): T[] {
+  return records.slice(loaded, loaded + PHOTO_PAGE_SIZE);
+}
+
 export interface DashboardNetworkObservation {
   interface_type: "wifi" | "wired" | "other" | "none";
   wifi_identity_available: boolean;

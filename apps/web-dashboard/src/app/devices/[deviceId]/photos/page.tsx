@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { DashboardShell } from "../../../../components/dashboard-shell";
 import {
   DashboardApiError,
+  nextPhotoPage,
   cloudApiOrigin,
   getPhotoReadUrl,
   getPhotos,
@@ -18,6 +19,7 @@ interface PhotoWithUrl extends DashboardPhoto { url: string }
 
 export default function PhotosPage() {
   const { deviceId } = useParams<{ deviceId: string }>();
+  const [records, setRecords] = useState<DashboardPhoto[] | null>(null);
   const [photos, setPhotos] = useState<PhotoWithUrl[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -28,12 +30,33 @@ export default function PhotosPage() {
     try {
       const origin = cloudApiOrigin();
       const records = await getPhotos(window.fetch, origin, deviceId);
-      setPhotos(await Promise.all(records.map(async (record) => ({
+      const firstPage = nextPhotoPage(records, 0);
+      setRecords(records);
+      setPhotos(await Promise.all(firstPage.map(async (record) => ({
         ...record,
         url: await getPhotoReadUrl(window.fetch, origin, deviceId, record.photo_id),
       }))));
     } catch (cause) {
       setError(cause instanceof DashboardApiError ? cause.message : "Unable to load photos.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadMore(): Promise<void> {
+    if (records === null || photos === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const origin = cloudApiOrigin();
+      const page = nextPhotoPage(records, photos.length);
+      const signed = await Promise.all(page.map(async (record) => ({
+        ...record,
+        url: await getPhotoReadUrl(window.fetch, origin, deviceId, record.photo_id),
+      })));
+      setPhotos((current) => current === null ? signed : [...current, ...signed]);
+    } catch (cause) {
+      setError(cause instanceof DashboardApiError ? cause.message : "Unable to load more photos.");
     } finally {
       setBusy(false);
     }
@@ -68,7 +91,7 @@ export default function PhotosPage() {
           {photos.map((photo) => (
             <figure className="dashboard-panel screenshot-card" key={photo.photo_id}>
               {photo.media_type === "video" ? (
-                <video src={photo.url} controls preload="metadata" />
+                <video src={photo.url} controls preload="none" />
               ) : (
                 <a href={photo.url} target="_blank" rel="noreferrer">
                   <img src={photo.url} alt={photo.original_filename} loading="lazy" />
@@ -84,6 +107,11 @@ export default function PhotosPage() {
             </figure>
           ))}
         </div>
+      ) : null}
+      {records !== null && photos !== null && photos.length < records.length ? (
+        <button className="primary-button" type="button" disabled={busy} onClick={() => void loadMore()}>
+          {busy ? "Loading…" : "Load more"}
+        </button>
       ) : null}
     </DashboardShell>
   );
