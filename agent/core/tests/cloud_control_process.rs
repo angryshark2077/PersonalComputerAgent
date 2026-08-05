@@ -532,7 +532,7 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
                 "retention_days": 180
             },
             "communication.messages": { "enabled": false, "directions": ["incoming", "outgoing"], "message_types": ["text"], "conversation_scope": "all", "initial_lookback_days": 7, "sync_mode": "full", "attachments_enabled": false, "attachment_retention_days": 7 },
-            "photos.library": { "enabled": false, "media_types": ["image", "video"], "include_originals": true, "include_album_names": true, "initial_lookback_days": 7, "cloud_retention": "permanent" }
+            "photos.library": { "enabled": false, "media_types": ["image", "video"], "include_originals": true, "include_album_names": true, "initial_lookback_days": 60, "cloud_retention": "permanent" }
         }
     });
     let snapshot: AgentControlSnapshot =
@@ -544,6 +544,19 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
     assert!(applied.communication_wechat_enabled);
     assert_eq!(applied.screen_capture.interval_seconds, 300);
     assert!(apply_snapshot(7, &snapshot).unwrap().is_none());
+
+    let mut rollout_compatible = exact.clone();
+    rollout_compatible["collectors"]["photos.library"]["initial_lookback_days"] =
+        serde_json::json!(7);
+    let rollout_snapshot: AgentControlSnapshot = serde_json::from_value(rollout_compatible)
+        .expect("legacy Photos lookback remains rollout-compatible");
+    assert!(apply_snapshot(6, &rollout_snapshot).is_ok());
+
+    let mut invalid_photos = exact.clone();
+    invalid_photos["collectors"]["photos.library"]["initial_lookback_days"] = serde_json::json!(61);
+    let invalid_photos_snapshot: AgentControlSnapshot =
+        serde_json::from_value(invalid_photos).expect("shape remains parseable");
+    assert!(apply_snapshot(6, &invalid_photos_snapshot).is_err());
 
     let mut legacy = exact.clone();
     legacy["collectors"]
@@ -1159,7 +1172,7 @@ fn exact_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
                 "retention_days": 180
             },
             "communication.messages": { "enabled": false, "directions": ["incoming", "outgoing"], "message_types": ["text"], "conversation_scope": "all", "initial_lookback_days": 7, "sync_mode": "full", "attachments_enabled": false, "attachment_retention_days": 7 },
-            "photos.library": { "enabled": false, "media_types": ["image", "video"], "include_originals": true, "include_album_names": true, "initial_lookback_days": 7, "cloud_retention": "permanent" }
+            "photos.library": { "enabled": false, "media_types": ["image", "video"], "include_originals": true, "include_album_names": true, "initial_lookback_days": 60, "cloud_retention": "permanent" }
         }
     }))
     .unwrap()

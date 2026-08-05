@@ -986,7 +986,7 @@ AND extension_reports_active_tab</th>
 | communication.messages | OFF（Owner 开启） | Rust 只读 Messages DB + Swift typedstream 解码 | communication.conversation_observed, communication.message_sender_observed, communication.message_recorded |
 | photos.library       | OFF（Owner 开启） | Rust Collector + Swift PhotoKit Bridge       | photos.asset_recorded                                                 |
 
-Apple Messages 固定采集全部会话的文本，不读取或上传附件；首次回看 7 天，之后使用本地持久化游标补传离线期间新增文本。Photos 固定采集原始图片和视频、拍摄时间及相册名；首次回看 7 天，之后持续增量。Photos 原件存入私有 R2 并永久保留，短期签名 URL 只用于 Owner 读取。
+Apple Messages 固定采集全部会话的文本，不读取或上传附件；首次回看 7 天，之后使用本地持久化游标补传离线期间新增文本。Photos 固定采集原始图片和视频、拍摄时间及相册名；首次回看 60 天，之后持续增量。Photos 原件存入私有 R2 并永久保留，短期签名 URL 只用于 Owner 读取。
 
 # 14. Screenshot、Activity 与 System Collector
 

@@ -148,7 +148,7 @@
             },
             "include_originals": { "const": true },
             "include_album_names": { "const": true },
-            "initial_lookback_days": { "const": 7 },
+            "initial_lookback_days": { "const": 60 },
             "cloud_retention": { "const": "permanent" }
           }
         }

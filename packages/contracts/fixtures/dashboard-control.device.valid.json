@@ -37,6 +37,7 @@
       },
       "matched_location": null
     },
+    "previous_network": null,
     "observed_at": "2026-07-31T10:01:00.000Z"
   },
   "local_media_cleanup": null,
@@ -74,7 +75,7 @@
       "media_types": ["image", "video"],
       "include_originals": true,
       "include_album_names": true,
-      "initial_lookback_days": 7,
+      "initial_lookback_days": 60,
       "cloud_retention": "permanent"
     }
   }

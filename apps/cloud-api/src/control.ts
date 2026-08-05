@@ -277,7 +277,7 @@ export function parseCollectorConfig(value: unknown): StoredCollectorConfig | nu
     !isExact(photos.media_types, ["image", "video"]) ||
     photos.include_originals !== true ||
     photos.include_album_names !== true ||
-    photos.initial_lookback_days !== 7 ||
+    photos.initial_lookback_days !== 60 ||
     photos.cloud_retention !== "permanent"
   ) return null;
   return {

@@ -46,7 +46,7 @@ const snapshotWithWechatEnabled = () => ({
       media_types: ["image", "video"] as ["image", "video"],
       include_originals: true as const,
       include_album_names: true as const,
-      initial_lookback_days: 7 as const,
+      initial_lookback_days: 60 as const,
       cloud_retention: "permanent" as const,
     },
   },
@@ -57,7 +57,7 @@ test("device configuration exposes the approved WeChat scope", () => {
 
   assert.match(page, /Incoming and outgoing text, audio, images, video and files/);
   assert.match(page, /groups up to 15 members/);
-  assert.match(page, /180-day retention/);
+  assert.match(page, /permanent Cloud retention/);
 });
 
 test("device configuration shows only the approved Network collection detail", () => {

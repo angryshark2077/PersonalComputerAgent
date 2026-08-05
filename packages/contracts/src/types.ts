@@ -193,7 +193,7 @@ export interface AgentControlSnapshot {
       media_types: ["image", "video"];
       include_originals: true;
       include_album_names: true;
-      initial_lookback_days: 7;
+      initial_lookback_days: 60;
       cloud_retention: "permanent";
     };
   };

@@ -214,7 +214,7 @@ export default function DevicePage() {
         />
         <CollectorScopeCard
           name="WeChat messages"
-          detail="Incoming and outgoing text, audio, images and video; direct chats and groups up to 15 members; 180-day retention"
+          detail="Incoming and outgoing text, audio, images and video; direct chats and groups up to 15 members; permanent Cloud retention"
           enabled={screen.device.collectors["communication.wechat"].enabled}
           disabled={disabled}
           onToggle={() => void save({
@@ -240,7 +240,7 @@ export default function DevicePage() {
         />
         <CollectorScopeCard
           name="Photos"
-          detail="Original photos and videos with capture time and album names; initial 7-day history and future items; permanent Cloud retention"
+          detail="Original photos and videos with capture time and album names; initial 60-day history and future items; permanent Cloud retention"
           enabled={screen.device.collectors["photos.library"].enabled}
           disabled={disabled}
           onToggle={() => void save({
@@ -340,16 +340,20 @@ export default function DevicePage() {
           {screen.device.status?.network === null || screen.device.status?.network === undefined ? (
             <p>Waiting for an enabled Network Collector observation.</p>
           ) : (
-            <dl className="system-metrics">
-              <div><dt>Interface</dt><dd>{screen.device.status.network.interface_type}</dd></div>
-              <div><dt>Wi-Fi / SSID</dt><dd>{screen.device.status.network.ssid ?? "Unavailable (Location permission required)"}</dd></div>
-              <div><dt>BSSID</dt><dd>{screen.device.status.network.bssid ?? "Unavailable"}</dd></div>
-              <div><dt>Local IP</dt><dd>{screen.device.status.network.local_ipv4 ?? screen.device.status.network.local_ipv6 ?? "Unavailable"}</dd></div>
-              <div><dt>Observed exit IP</dt><dd>{screen.device.status.network.observed_exit_ip ?? "Unavailable"}</dd></div>
-              <div><dt>Exit IP estimate</dt><dd>{exitIpLocationLabel(screen.device.status.network)}</dd></div>
-              <div><dt>Device location</dt><dd>{deviceLocationLabel(screen.device.status.network)}</dd></div>
-              <div><dt>Saved location match</dt><dd>{networkLocationLabel(screen.device.status.network)}</dd></div>
-            </dl>
+            <>
+              <h3>Current record</h3>
+              <p>Recorded {new Date(screen.device.status.observed_at).toLocaleString()}</p>
+              <NetworkObservationDetails network={screen.device.status.network} />
+              <h3>Previous record</h3>
+              {screen.device.status.previous_network === null || screen.device.status.previous_network === undefined ? (
+                <p>No previous Network Collector observation.</p>
+              ) : (
+                <>
+                  <p>Recorded {new Date(screen.device.status.previous_network.observed_at).toLocaleString()}</p>
+                  <NetworkObservationDetails network={screen.device.status.previous_network} />
+                </>
+              )}
+            </>
           )}
           <label>
             Location name
@@ -493,6 +497,25 @@ function cleanupSummary(cleanup: DashboardDevice["local_media_cleanup"]): string
   if (cleanup.status === "queued") return `Cleanup requested at ${new Date(cleanup.requested_at).toLocaleString()}.`;
   if (cleanup.status === "failed") return `Cleanup failed: ${cleanup.error_code ?? "unknown error"}.`;
   return `Last cleanup removed ${cleanup.deleted_file_count ?? 0} files and freed ${formatBytes(cleanup.freed_bytes ?? 0)}.`;
+}
+
+function NetworkObservationDetails({
+  network,
+}: {
+  network: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>;
+}) {
+  return (
+    <dl className="system-metrics">
+      <div><dt>Interface</dt><dd>{network.interface_type}</dd></div>
+      <div><dt>Wi-Fi / SSID</dt><dd>{network.ssid ?? "Unavailable (Location permission required)"}</dd></div>
+      <div><dt>BSSID</dt><dd>{network.bssid ?? "Unavailable"}</dd></div>
+      <div><dt>Local IP</dt><dd>{network.local_ipv4 ?? network.local_ipv6 ?? "Unavailable"}</dd></div>
+      <div><dt>Observed exit IP</dt><dd>{network.observed_exit_ip ?? "Unavailable"}</dd></div>
+      <div><dt>Exit IP estimate</dt><dd>{exitIpLocationLabel(network)}</dd></div>
+      <div><dt>Device location</dt><dd>{deviceLocationLabel(network)}</dd></div>
+      <div><dt>Saved location match</dt><dd>{networkLocationLabel(network)}</dd></div>
+    </dl>
+  );
 }
 
 function networkLocationLabel(network: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>): string {

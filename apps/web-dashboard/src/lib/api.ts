@@ -32,7 +32,7 @@ export interface CollectorConfig {
     media_types: ["image", "video"];
     include_originals: true;
     include_album_names: true;
-    initial_lookback_days: 7;
+    initial_lookback_days: 60;
     cloud_retention: "permanent";
   };
 }
@@ -62,6 +62,24 @@ export interface DashboardPhoto {
   size_bytes: number;
 }
 
+export interface DashboardNetworkObservation {
+  interface_type: "wifi" | "wired" | "other" | "none";
+  wifi_identity_available: boolean;
+  ssid: string | null;
+  bssid: string | null;
+  local_ipv4: string | null;
+  local_ipv6: string | null;
+  observed_exit_ip: string | null;
+  exit_ip_location: { country: string | null; region: string | null; city: string | null; accuracy: "ip_city" } | null;
+  device_location: {
+    latitude: number;
+    longitude: number;
+    horizontal_accuracy_meters: number;
+    observed_at: string;
+  } | null;
+  matched_location: DashboardNetworkLocation | null;
+}
+
 export interface DashboardDevice {
   device_id: string;
   workspace_id: string;
@@ -79,23 +97,8 @@ export interface DashboardDevice {
       protected_file_count: number;
       protected_bytes: number;
     };
-    network: {
-      interface_type: "wifi" | "wired" | "other" | "none";
-      wifi_identity_available: boolean;
-      ssid: string | null;
-      bssid: string | null;
-      local_ipv4: string | null;
-      local_ipv6: string | null;
-      observed_exit_ip: string | null;
-      exit_ip_location: { country: string | null; region: string | null; city: string | null; accuracy: "ip_city" } | null;
-      device_location: {
-        latitude: number;
-        longitude: number;
-        horizontal_accuracy_meters: number;
-        observed_at: string;
-      } | null;
-      matched_location: DashboardNetworkLocation | null;
-    } | null;
+    network: DashboardNetworkObservation | null;
+    previous_network?: (DashboardNetworkObservation & { observed_at: string }) | null;
     observed_at: string;
   } | null;
   local_media_cleanup: {
@@ -231,7 +234,7 @@ const defaultPhotosConfig: CollectorConfig["photos.library"] = {
   media_types: ["image", "video"],
   include_originals: true,
   include_album_names: true,
-  initial_lookback_days: 7,
+  initial_lookback_days: 60,
   cloud_retention: "permanent",
 };
 

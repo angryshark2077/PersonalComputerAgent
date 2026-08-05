@@ -310,6 +310,11 @@ export interface DeviceStatus {
   localMedia: LocalMediaStorageStatus;
   network: NetworkHeartbeat | null;
   matchedLocation: NetworkLocationRecord | null;
+  previousNetwork: {
+    network: NetworkHeartbeat;
+    matchedLocation: NetworkLocationRecord | null;
+    observedAt: Date;
+  } | null;
   observedAt: Date;
 }
 
@@ -910,6 +915,14 @@ export class MemoryControlRepository implements ControlRepository {
         request.errorCode = input.cleanupResult.errorCode;
       }
     }
+    const current = this.#latestHeartbeats.get(input.deviceId);
+    const previousNetwork = current?.network === null || current?.network === undefined
+      ? current?.previousNetwork ?? null
+      : {
+          network: current.network,
+          matchedLocation: current.matchedLocation,
+          observedAt: current.observedAt,
+        };
     this.#latestHeartbeats.set(input.deviceId, {
       presence: input.presence,
       agentVersion: input.agentVersion,
@@ -921,6 +934,7 @@ export class MemoryControlRepository implements ControlRepository {
         location: input.network.location === null ? null : { ...input.network.location },
       },
       matchedLocation: null,
+      previousNetwork,
       observedAt: input.receivedAt,
     });
   }
@@ -1753,6 +1767,13 @@ export class MemoryControlRepository implements ControlRepository {
         storedStatus.network,
         [...this.#networkLocations.values()].filter((location) => location.workspaceId === device.workspaceId),
       ),
+      previousNetwork: storedStatus.previousNetwork === null ? null : {
+        ...storedStatus.previousNetwork,
+        matchedLocation: matchNetworkLocation(
+          storedStatus.previousNetwork.network,
+          [...this.#networkLocations.values()].filter((location) => location.workspaceId === device.workspaceId),
+        ),
+      },
     };
     return {
       deviceId: device.id,
@@ -2755,7 +2776,7 @@ export class DrizzleControlRepository implements ControlRepository {
           ),
         )
         .limit(1);
-      const [heartbeat] = await this.database
+      const heartbeats = await this.database
         .select({
           presence: deviceHeartbeats.presence,
           agentVersion: deviceHeartbeats.agentVersion,
@@ -2789,7 +2810,8 @@ export class DrizzleControlRepository implements ControlRepository {
           ),
         )
         .orderBy(desc(deviceHeartbeats.receivedAt))
-        .limit(1);
+        .limit(2);
+      const [heartbeat, previousHeartbeat] = heartbeats;
       const configRecord: ConfigRecord = {
         configurationRevision: config?.configurationRevision ?? 0,
         ...storedConfig(config ?? defaultCollectorConfig()),
@@ -2824,10 +2846,40 @@ export class DrizzleControlRepository implements ControlRepository {
                   observedAt: heartbeat.networkLocationObservedAt,
                 },
           };
-      const matchedLocation = matchNetworkLocation(
-        network,
-        await this.listOwnerNetworkLocations(workspaceId, userId),
-      );
+      const networkLocations = await this.listOwnerNetworkLocations(workspaceId, userId);
+      const matchedLocation = matchNetworkLocation(network, networkLocations);
+      const previousNetwork: NetworkHeartbeat | null = previousHeartbeat?.networkInterfaceType === null
+        || previousHeartbeat?.networkInterfaceType === undefined
+        ? null
+        : {
+            interfaceType: previousHeartbeat.networkInterfaceType as NetworkHeartbeat["interfaceType"],
+            wifiIdentityAvailable: previousHeartbeat.networkWifiIdentityAvailable ?? false,
+            ssid: previousHeartbeat.networkSsid,
+            bssid: previousHeartbeat.networkBssid,
+            localIpv4: previousHeartbeat.networkLocalIpv4,
+            localIpv6: previousHeartbeat.networkLocalIpv6,
+            observedExitIp: previousHeartbeat.networkPublicIp,
+            ipLocation: previousHeartbeat.networkIpAccuracy === "ip_city"
+              ? {
+                  country: previousHeartbeat.networkIpCountry,
+                  region: previousHeartbeat.networkIpRegion,
+                  city: previousHeartbeat.networkIpCity,
+                  accuracy: "ip_city",
+                }
+              : null,
+            location: previousHeartbeat.networkLocationLatitude === null
+              || previousHeartbeat.networkLocationLongitude === null
+              || previousHeartbeat.networkLocationHorizontalAccuracyMeters === null
+              || previousHeartbeat.networkLocationObservedAt === null
+              ? null
+              : {
+                  latitude: previousHeartbeat.networkLocationLatitude,
+                  longitude: previousHeartbeat.networkLocationLongitude,
+                  horizontalAccuracyMeters: previousHeartbeat.networkLocationHorizontalAccuracyMeters,
+                  observedAt: previousHeartbeat.networkLocationObservedAt,
+                },
+          };
+      const previousMatchedLocation = matchNetworkLocation(previousNetwork, networkLocations);
       return {
         deviceId: device.id,
         workspaceId: device.workspaceId,
@@ -2850,6 +2902,13 @@ export class DrizzleControlRepository implements ControlRepository {
                 },
                 network,
                 matchedLocation,
+                previousNetwork: previousNetwork === null || previousHeartbeat === undefined
+                  ? null
+                  : {
+                      network: previousNetwork,
+                      matchedLocation: previousMatchedLocation,
+                      observedAt: previousHeartbeat.observedAt,
+                    },
                 observedAt: heartbeat.observedAt,
               },
         snapshot: await this.loadControlSnapshot(deviceId, workspaceId),
@@ -3878,7 +3937,7 @@ function snapshot(
         media_types: ["image", "video"],
         include_originals: true,
         include_album_names: true,
-        initial_lookback_days: 7,
+        initial_lookback_days: 60,
         cloud_retention: "permanent",
       },
     },

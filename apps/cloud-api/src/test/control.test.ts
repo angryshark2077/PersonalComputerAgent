@@ -83,7 +83,7 @@ test("owner config is scoped, strict, and reaches device control", async () => {
           retention_days: 180,
         },
         "communication.messages": { enabled: true, directions: ["incoming", "outgoing"], message_types: ["text"], conversation_scope: "all", initial_lookback_days: 7, sync_mode: "full", attachments_enabled: false, attachment_retention_days: 7 },
-        "photos.library": { enabled: true, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 7, cloud_retention: "permanent" },
+        "photos.library": { enabled: true, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 60, cloud_retention: "permanent" },
       }),
     },
   );
@@ -285,6 +285,37 @@ test("network heartbeat is IP-enriched and matched against the Owner location li
   });
   assert.equal(created.status, 201);
 
+  const previousHeartbeat = await api.request("/v1/agent/control", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${paired.credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      heartbeat_id: "01985555-7555-8555-8555-555555555558",
+      agent_version: "0.1.70",
+      presence: "online",
+      outbox_depth: 0,
+      local_media: {
+        completed_file_count: 0,
+        completed_bytes: 0,
+        protected_file_count: 0,
+        protected_bytes: 0,
+      },
+      cleanup_result: null,
+      network: {
+        interface_type: "wifi",
+        wifi_identity_available: true,
+        ssid: "Previous WiFi",
+        bssid: "11:22:33:44:55:66",
+        local_ipv4: "192.168.1.20",
+        local_ipv6: null,
+        location: null,
+      },
+    }),
+  });
+  assert.equal(previousHeartbeat.status, 200);
+
   const heartbeat = await api.request("/v1/agent/control", {
     method: "POST",
     headers: {
@@ -328,13 +359,16 @@ test("network heartbeat is IP-enriched and matched against the Owner location li
       matched_location: { name: string };
       exit_ip_location: { city: string };
       device_location: { latitude: number; horizontal_accuracy_meters: number };
-    } };
+    }; previous_network: { ssid: string; local_ipv4: string; observed_at: string } };
   };
   assert.equal(body.status.network.observed_exit_ip, "203.0.113.25");
   assert.equal(body.status.network.matched_location.name, "Home");
   assert.equal(body.status.network.exit_ip_location.city, "Singapore");
   assert.equal(body.status.network.device_location.latitude, 1.352083);
   assert.equal(body.status.network.device_location.horizontal_accuracy_meters, 24.5);
+  assert.equal(body.status.previous_network.ssid, "Previous WiFi");
+  assert.equal(body.status.previous_network.local_ipv4, "192.168.1.20");
+  assert.equal(Number.isNaN(Date.parse(body.status.previous_network.observed_at)), false);
 });
 
 test("Owner reads only its device control state and configuration audit", async () => {
@@ -359,7 +393,7 @@ test("Owner reads only its device control state and configuration audit", async 
       retention_days: 180,
     },
     "communication.messages": { enabled: true, directions: ["incoming", "outgoing"], message_types: ["text"], conversation_scope: "all", initial_lookback_days: 7, sync_mode: "full", attachments_enabled: false, attachment_retention_days: 7 },
-    "photos.library": { enabled: true, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 7, cloud_retention: "permanent" },
+    "photos.library": { enabled: true, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 60, cloud_retention: "permanent" },
   };
   assert.equal(
     (
@@ -504,7 +538,7 @@ test("owner endpoints cannot cross Workspace boundaries", async () => {
           retention_days: 180,
         },
         "communication.messages": { enabled: false, directions: ["incoming", "outgoing"], message_types: ["text"], conversation_scope: "all", initial_lookback_days: 7, sync_mode: "full", attachments_enabled: false, attachment_retention_days: 7 },
-        "photos.library": { enabled: false, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 7, cloud_retention: "permanent" },
+        "photos.library": { enabled: false, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 60, cloud_retention: "permanent" },
       }),
     },
   );

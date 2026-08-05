@@ -626,7 +626,7 @@ impl Default for PhotosControl {
             media_types: ["image".to_owned(), "video".to_owned()],
             include_originals: true,
             include_album_names: true,
-            initial_lookback_days: 7,
+            initial_lookback_days: 60,
             cloud_retention: "permanent".to_owned(),
         }
     }
@@ -686,7 +686,7 @@ impl AgentControlSnapshot {
             || self.collectors.photos_library.media_types != ["image", "video"]
             || !self.collectors.photos_library.include_originals
             || !self.collectors.photos_library.include_album_names
-            || self.collectors.photos_library.initial_lookback_days != 7
+            || !matches!(self.collectors.photos_library.initial_lookback_days, 7 | 60)
             || self.collectors.photos_library.cloud_retention != "permanent"
         {
             return Err(ControlError::Contract);

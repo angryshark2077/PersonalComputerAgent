@@ -101,7 +101,7 @@
             "media_types": { "type": "array", "prefixItems": [{ "const": "image" }, { "const": "video" }], "items": false, "minItems": 2, "maxItems": 2 },
             "include_originals": { "const": true },
             "include_album_names": { "const": true },
-            "initial_lookback_days": { "const": 7 },
+            "initial_lookback_days": { "const": 60 },
             "cloud_retention": { "const": "permanent" }
           }
         }
@@ -110,13 +110,14 @@
     "DeviceStatus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "observed_at"],
+      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "previous_network", "observed_at"],
       "properties": {
         "presence": { "enum": ["online", "stale", "offline", "sleeping"] },
         "agent_version": { "type": "string", "minLength": 1 },
         "outbox_depth": { "type": "integer", "minimum": 0 },
         "local_media": { "$ref": "#/$defs/LocalMedia" },
         "network": { "anyOf": [{ "$ref": "#/$defs/NetworkStatus" }, { "type": "null" }] },
+        "previous_network": { "anyOf": [{ "$ref": "#/$defs/PreviousNetworkStatus" }, { "type": "null" }] },
         "observed_at": { "type": "string", "format": "date-time" }
       }
     },
@@ -135,6 +136,24 @@
         "exit_ip_location": { "anyOf": [{ "type": "object", "additionalProperties": false, "required": ["country", "region", "city", "accuracy"], "properties": { "country": { "type": ["string", "null"] }, "region": { "type": ["string", "null"] }, "city": { "type": ["string", "null"] }, "accuracy": { "const": "ip_city" } } }, { "type": "null" }] },
         "device_location": { "anyOf": [{ "type": "object", "additionalProperties": false, "required": ["latitude", "longitude", "horizontal_accuracy_meters", "observed_at"], "properties": { "latitude": { "type": "number", "minimum": -90, "maximum": 90 }, "longitude": { "type": "number", "minimum": -180, "maximum": 180 }, "horizontal_accuracy_meters": { "type": "number", "minimum": 0, "maximum": 100000 }, "observed_at": { "type": "string", "format": "date-time" } } }, { "type": "null" }] },
         "matched_location": { "anyOf": [{ "$ref": "#/$defs/NetworkLocation" }, { "type": "null" }] }
+      }
+    },
+    "PreviousNetworkStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interface_type", "wifi_identity_available", "ssid", "bssid", "local_ipv4", "local_ipv6", "observed_exit_ip", "exit_ip_location", "device_location", "matched_location", "observed_at"],
+      "properties": {
+        "interface_type": { "enum": ["wifi", "wired", "other", "none"] },
+        "wifi_identity_available": { "type": "boolean" },
+        "ssid": { "type": ["string", "null"] },
+        "bssid": { "type": ["string", "null"] },
+        "local_ipv4": { "type": ["string", "null"] },
+        "local_ipv6": { "type": ["string", "null"] },
+        "observed_exit_ip": { "type": ["string", "null"] },
+        "exit_ip_location": { "anyOf": [{ "type": "object", "additionalProperties": false, "required": ["country", "region", "city", "accuracy"], "properties": { "country": { "type": ["string", "null"] }, "region": { "type": ["string", "null"] }, "city": { "type": ["string", "null"] }, "accuracy": { "const": "ip_city" } } }, { "type": "null" }] },
+        "device_location": { "anyOf": [{ "type": "object", "additionalProperties": false, "required": ["latitude", "longitude", "horizontal_accuracy_meters", "observed_at"], "properties": { "latitude": { "type": "number", "minimum": -90, "maximum": 90 }, "longitude": { "type": "number", "minimum": -180, "maximum": 180 }, "horizontal_accuracy_meters": { "type": "number", "minimum": 0, "maximum": 100000 }, "observed_at": { "type": "string", "format": "date-time" } } }, { "type": "null" }] },
+        "matched_location": { "anyOf": [{ "$ref": "#/$defs/NetworkLocation" }, { "type": "null" }] },
+        "observed_at": { "type": "string", "format": "date-time" }
       }
     },
     "NetworkLocation": {

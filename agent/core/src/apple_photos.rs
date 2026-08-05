@@ -14,7 +14,7 @@ use crate::cloud_control::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_mins(1);
-const LOOKBACK_DAYS: i64 = 7;
+const LOOKBACK_DAYS: i64 = 60;
 const PAGE_SIZE: u8 = 50;
 
 pub(crate) async fn run(
@@ -207,7 +207,12 @@ fn object(value: &Value) -> Result<Map<String, Value>, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::stable_uuid;
+    use super::{stable_uuid, LOOKBACK_DAYS};
+
+    #[test]
+    fn photo_library_initial_history_is_sixty_days() {
+        assert_eq!(LOOKBACK_DAYS, 60);
+    }
 
     #[test]
     fn photo_identity_is_stable_and_kind_separated() {

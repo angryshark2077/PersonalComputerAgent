@@ -1457,6 +1457,36 @@ function ownerDeviceSummaryResponse(device: {
       createdAt: Date;
       updatedAt: Date;
     } | null;
+    previousNetwork: {
+      network: {
+        interfaceType: string;
+        wifiIdentityAvailable: boolean;
+        ssid: string | null;
+        bssid: string | null;
+        localIpv4: string | null;
+        localIpv6: string | null;
+        observedExitIp: string | null;
+        ipLocation: { country: string | null; region: string | null; city: string | null; accuracy: string } | null;
+        location: {
+          latitude: number;
+          longitude: number;
+          horizontalAccuracyMeters: number;
+          observedAt: Date;
+        } | null;
+      };
+      matchedLocation: {
+        locationId: string;
+        name: string;
+        matchSsid: string | null;
+        matchBssid: string | null;
+        country: string | null;
+        region: string | null;
+        city: string | null;
+        createdAt: Date;
+        updatedAt: Date;
+      } | null;
+      observedAt: Date;
+    } | null;
     observedAt: Date;
   } | null;
 }) {
@@ -1498,6 +1528,26 @@ function ownerDeviceSummaryResponse(device: {
               matched_location: device.status.matchedLocation === null
                 ? null
                 : networkLocationResponse(device.status.matchedLocation),
+            },
+            previous_network: device.status.previousNetwork === null ? null : {
+              interface_type: device.status.previousNetwork.network.interfaceType,
+              wifi_identity_available: device.status.previousNetwork.network.wifiIdentityAvailable,
+              ssid: device.status.previousNetwork.network.ssid,
+              bssid: device.status.previousNetwork.network.bssid,
+              local_ipv4: device.status.previousNetwork.network.localIpv4,
+              local_ipv6: device.status.previousNetwork.network.localIpv6,
+              observed_exit_ip: device.status.previousNetwork.network.observedExitIp,
+              exit_ip_location: device.status.previousNetwork.network.ipLocation,
+              device_location: device.status.previousNetwork.network.location === null ? null : {
+                latitude: device.status.previousNetwork.network.location.latitude,
+                longitude: device.status.previousNetwork.network.location.longitude,
+                horizontal_accuracy_meters: device.status.previousNetwork.network.location.horizontalAccuracyMeters,
+                observed_at: device.status.previousNetwork.network.location.observedAt.toISOString(),
+              },
+              matched_location: device.status.previousNetwork.matchedLocation === null
+                ? null
+                : networkLocationResponse(device.status.previousNetwork.matchedLocation),
+              observed_at: device.status.previousNetwork.observedAt.toISOString(),
             },
             observed_at: device.status.observedAt.toISOString(),
           },
@@ -1583,7 +1633,7 @@ function collectorConfigResponse(config: StoredCollectorConfig) {
       media_types: ["image", "video"] as const,
       include_originals: true,
       include_album_names: true,
-      initial_lookback_days: 7,
+      initial_lookback_days: 60,
       cloud_retention: "permanent" as const,
     },
   };
