@@ -3072,7 +3072,8 @@ export class DrizzleControlRepository implements ControlRepository {
           memberCount: communicationConversations.memberCount,
           lastMessageAt: communicationConversations.lastMessageAt,
           messageCount: sql<number>`count(${communicationMessages.eventId})::integer`,
-          sourceLastMessageAt: sql<Date>`max(${communicationMessages.occurredAt})`,
+          sourceLastMessageAt: sql<Date>`max(${communicationMessages.occurredAt})`
+            .mapWith(communicationMessages.occurredAt),
         })
         .from(communicationConversations)
         .innerJoin(

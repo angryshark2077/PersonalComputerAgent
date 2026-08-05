@@ -320,6 +320,18 @@ async function assertCommunicationProjectionBackfill(pool: Pool) {
     [fileEventId],
   );
   assert.deepEqual(fileResult.rows, [{ kind: "file", file_name: "example.bin" }]);
+
+  const repository = new DrizzleControlRepository(drizzle(pool, { schema: cloudSchema }));
+  const conversations = await repository.listOwnerCommunicationConversations(
+    deviceId,
+    workspaceId,
+    userId,
+    "communication.wechat",
+    100,
+  );
+  assert.equal(conversations.length, 1);
+  assert.ok(conversations[0]?.lastMessageAt instanceof Date);
+  assert.equal(conversations[0]?.lastMessageAt.toISOString(), "2026-08-02T00:01:00.000Z");
 }
 
 async function assertCommunicationMediaUpgrade(pool: Pool) {
