@@ -861,7 +861,9 @@ export function createApp(options: CreateAppOptions): Hono {
     }
     try {
       const objectKeys = await options.repository.listOwnerDeviceObjectKeys(deviceId, principal.workspaceId, principal.userId);
-      for (const objectKey of objectKeys) await options.objectStore.deleteObject(objectKey);
+      for (let offset = 0; offset < objectKeys.length; offset += 16) {
+        await Promise.all(objectKeys.slice(offset, offset + 16).map((objectKey) => options.objectStore!.deleteObject(objectKey)));
+      }
       await options.repository.deleteOwnerDevice(deviceId, principal.workspaceId, principal.userId);
       return context.json({ deleted: true, deleted_object_count: objectKeys.length });
     } catch (error) {
