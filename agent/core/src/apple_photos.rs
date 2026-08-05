@@ -16,6 +16,7 @@ use crate::cloud_control::{
 const POLL_INTERVAL: Duration = Duration::from_mins(1);
 const LOOKBACK_DAYS: i64 = 60;
 const PAGE_SIZE: u8 = 50;
+const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
 
 pub(crate) async fn run(
     database: Arc<DbActorHandle>,
@@ -103,6 +104,21 @@ async fn queue_asset(
     {
         return Ok(());
     }
+    let file_uuid = Uuid::parse_str(&photo_id).map_err(|_| ())?;
+    let exported = bridge
+        .export_photo_asset(asset.local_identifier.clone(), file_uuid)
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
+    validate_export_path(&exported, &spool_root, &photo_id)?;
+    let (sha256, size_bytes) = hash_file(&exported).await?;
+    if size_bytes == 0 {
+        return Err(());
+    }
+    if size_bytes > MAX_UPLOAD_BYTES {
+        let _ = tokio::fs::remove_file(&exported).await;
+        return Ok(());
+    }
     let payload = serde_json::json!({
         "asset_id": asset.local_identifier,
         "captured_at": asset.created_at,
@@ -132,18 +148,6 @@ async fn queue_asset(
         .commit_events(&EventCommit::try_new(vec![event], None).map_err(|_| ())?)
         .await
         .map_err(|_| ())?;
-
-    let file_uuid = Uuid::parse_str(&photo_id).map_err(|_| ())?;
-    let exported = bridge
-        .export_photo_asset(asset.local_identifier.clone(), file_uuid)
-        .await
-        .map_err(|_| ())?
-        .ok_or(())?;
-    validate_export_path(&exported, &spool_root, &photo_id)?;
-    let (sha256, size_bytes) = hash_file(&exported).await?;
-    if size_bytes == 0 {
-        return Err(());
-    }
     persist_photo_manifest(&PendingPhoto {
         photo_id: photo_id.clone(),
         event_id,
