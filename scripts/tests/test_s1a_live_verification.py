@@ -458,7 +458,7 @@ class S1ALiveVerificationTests(unittest.TestCase):
                     "heartbeat_at": datetime.now(timezone.utc).isoformat(),
                     "process_id": 4101,
                     "app_version": "0.1.0",
-                    "schema_version": 10,
+                    "schema_version": 12,
                 }
             ),
             encoding="utf-8",
@@ -522,6 +522,8 @@ echo 0007:completed
 echo 0008:completed
 echo 0009:completed
 echo 0010:completed
+echo 0011:completed
+echo 0012:completed
 exit "${PCA_S1A_LIVE_TEST_SQLITE_EXIT:-0}"
 """,
         )

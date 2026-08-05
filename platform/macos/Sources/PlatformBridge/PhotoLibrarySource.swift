@@ -15,12 +15,7 @@ struct PhotoLibrarySource: Sendable {
         guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
             return ["status": .string("permission_required"), "assets": .array([])]
         }
-        let options = PHFetchOptions()
-        options.predicate = NSPredicate(format: "creationDate >= %@", cutoff as NSDate)
-        options.sortDescriptors = [
-            NSSortDescriptor(key: "creationDate", ascending: true),
-            NSSortDescriptor(key: "localIdentifier", ascending: true),
-        ]
+        let options = Self.fetchOptions(cutoff: cutoff)
         let result = PHAsset.fetchAssets(with: options)
         var assets: [JSONValue] = []
         result.enumerateObjects { asset, _, stop in
@@ -154,6 +149,13 @@ struct PhotoLibrarySource: Sendable {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: date)
+    }
+
+    static func fetchOptions(cutoff: Date) -> PHFetchOptions {
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(format: "creationDate >= %@", cutoff as NSDate)
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+        return options
     }
 
     private static func primaryResource(for asset: PHAsset) -> PHAssetResource? {

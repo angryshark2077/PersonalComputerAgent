@@ -5,14 +5,14 @@ use sha2::{Digest, Sha256};
 
 use crate::error::DbError;
 
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 10;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 12;
 
 struct Migration {
     id: &'static str,
     sql: &'static str,
 }
 
-const MIGRATIONS: [Migration; 11] = [
+const MIGRATIONS: [Migration; 13] = [
     Migration {
         id: "0000",
         sql: crate::BASELINE_MIGRATION,
@@ -56,6 +56,14 @@ const MIGRATIONS: [Migration; 11] = [
     Migration {
         id: "0010",
         sql: crate::ADD_FILE_MESSAGES_MIGRATION,
+    },
+    Migration {
+        id: "0011",
+        sql: crate::REPAIR_APPLE_MESSAGE_IDEMPOTENCY_MIGRATION,
+    },
+    Migration {
+        id: "0012",
+        sql: crate::NORMALIZE_APPLE_MESSAGE_TIMESTAMPS_MIGRATION,
     },
 ];
 

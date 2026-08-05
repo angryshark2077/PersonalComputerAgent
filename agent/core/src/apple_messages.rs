@@ -233,12 +233,23 @@ fn message_events(
         "sender_display_name": source.sender_display_name,
         "observed_at": occurred_at,
     });
+    let conversation_key = format!("{}:{}", source.chat_guid, source.guid);
+    let mut recorded = event(
+        workspace_id,
+        device_id,
+        "communication.message_recorded",
+        &source.guid,
+        occurred_at.clone(),
+        created_at.clone(),
+        object(&serde_json::to_value(message).map_err(|_| ())?)?,
+    );
+    recorded.idempotency_key = Some(source_key);
     Ok(vec![
         event(
             workspace_id,
             device_id,
             "communication.conversation_observed",
-            &format!("conversation:{}", source.chat_guid),
+            &conversation_key,
             occurred_at.clone(),
             created_at.clone(),
             object(&conversation_payload)?,
@@ -252,15 +263,7 @@ fn message_events(
             created_at.clone(),
             object(&sender_payload)?,
         ),
-        event(
-            workspace_id,
-            device_id,
-            "communication.message_recorded",
-            &source.guid,
-            occurred_at,
-            created_at,
-            object(&serde_json::to_value(message).map_err(|_| ())?)?,
-        ),
+        recorded,
     ])
 }
 
@@ -307,7 +310,8 @@ fn apple_date_to_rfc3339(value: i64) -> Result<String, ()> {
         i128::from(value)
     };
     let unix_nanos = apple_nanos + APPLE_EPOCH_UNIX_SECONDS * 1_000_000_000;
-    OffsetDateTime::from_unix_timestamp_nanos(unix_nanos)
+    let unix_millis = unix_nanos.div_euclid(1_000_000);
+    OffsetDateTime::from_unix_timestamp_nanos(unix_millis * 1_000_000)
         .map_err(|_| ())?
         .format(&Rfc3339)
         .map_err(|_| ())
@@ -359,7 +363,7 @@ async fn persist_cursor(row_id: i64) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{message_events, stable_uuid, SourceMessage};
+    use super::{apple_date_to_rfc3339, message_events, stable_uuid, SourceMessage};
 
     #[test]
     fn outgoing_messages_use_local_sender_and_stable_private_events() {
@@ -385,6 +389,10 @@ mod tests {
         assert_eq!(first[2].source, "communication.messages");
         assert_eq!(first[2].occurred_at, "2001-01-01T00:00:00Z");
         assert_eq!(first[2].payload["sender_id"], "me");
+        assert_eq!(
+            first[2].idempotency_key.as_deref(),
+            first[2].payload["source_key"].as_str()
+        );
         assert_eq!(first[2].payload["conversation"]["member_count"], 20);
         assert_eq!(
             first[2].event_id,
@@ -394,6 +402,22 @@ mod tests {
                 "communication.message_recorded",
                 "message-guid"
             )
+        );
+
+        let mut later = message;
+        later.row_id = 43;
+        later.guid = "later-message-guid".to_owned();
+        later.apple_date = 1;
+        let later_events = message_events(&later, "later".to_owned(), "workspace", "device")
+            .expect("later message events");
+        assert_ne!(first[0].event_id, later_events[0].event_id);
+    }
+
+    #[test]
+    fn apple_message_timestamps_are_normalized_to_milliseconds() {
+        assert_eq!(
+            apple_date_to_rfc3339(800_000_000_123_999_999).as_deref(),
+            Ok("2026-05-09T06:13:20.123Z")
         );
     }
 }

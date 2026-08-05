@@ -71,6 +71,8 @@ class EngineeringGateTests(unittest.TestCase):
         self.assertIn("0003_s1b_pairing_state.sql sha256=", result.stdout)
         self.assertIn("0004_s1b_cloud_api_origin.sql sha256=", result.stdout)
         self.assertIn("0010_add_file_messages.sql sha256=", result.stdout)
+        self.assertIn("0011_repair_apple_message_idempotency.sql sha256=", result.stdout)
+        self.assertIn("0012_normalize_apple_message_timestamps.sql sha256=", result.stdout)
         self.assertIn("0001_s1b_control_plane.sql sha256=", result.stdout)
         self.assertIn("0002_s1b_device_revocation_audit.sql sha256=", result.stdout)
         self.assertIn("0003_s1b_pairing_state_and_better_auth_session.sql sha256=", result.stdout)

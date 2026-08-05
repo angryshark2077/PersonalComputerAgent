@@ -56,6 +56,12 @@ pub const ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION: &str =
 /// Adds file messages and file attachment spool rows without rewriting existing data.
 pub const ADD_FILE_MESSAGES_MIGRATION: &str =
     include_str!("../migrations/0010_add_file_messages.sql");
+/// Repairs unsynced Apple Messages rows created with the wrong Cloud idempotency key.
+pub const REPAIR_APPLE_MESSAGE_IDEMPOTENCY_MIGRATION: &str =
+    include_str!("../migrations/0011_repair_apple_message_idempotency.sql");
+/// Normalizes unsynced Apple Messages payload timestamps to the local event millisecond boundary.
+pub const NORMALIZE_APPLE_MESSAGE_TIMESTAMPS_MIGRATION: &str =
+    include_str!("../migrations/0012_normalize_apple_message_timestamps.sql");
 
 /// A private spool-file reference corresponding to one validated media manifest.
 ///

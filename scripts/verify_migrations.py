@@ -26,6 +26,8 @@ EXPECTED_MIGRATIONS = {
         "0008_attachment_completion_retention.sql",
         "0009_allow_message_kind_sequence_overlap.sql",
         "0010_add_file_messages.sql",
+        "0011_repair_apple_message_idempotency.sql",
+        "0012_normalize_apple_message_timestamps.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",
@@ -52,6 +54,7 @@ EXPECTED_MIGRATIONS = {
         "0021_screen_capture.sql",
         "0022_apple_photos_messages_collectors.sql",
         "0023_photo_library_assets.sql",
+        "0024_photo_system_event_constraints.sql",
     ],
 }
 

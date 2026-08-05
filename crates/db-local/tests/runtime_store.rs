@@ -10,7 +10,8 @@ use std::{
 };
 
 use pca_db_local::{
-    DbActorHandle, DbError, BASELINE_MIGRATION, S1A_RUNTIME_MIGRATION,
+    DbActorHandle, DbError, BASELINE_MIGRATION, NORMALIZE_APPLE_MESSAGE_TIMESTAMPS_MIGRATION,
+    REPAIR_APPLE_MESSAGE_IDEMPOTENCY_MIGRATION, S1A_RUNTIME_MIGRATION,
     S1B_CLOUD_API_ORIGIN_MIGRATION, S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION,
 };
 use pca_domain::{
@@ -259,7 +260,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 10);
+    assert_eq!(health.schema_version, 12);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -287,6 +288,73 @@ async fn empty_database_is_migrated_and_reports_healthy() {
             "schema_migrations",
             "sync_outbox",
         ]
+    );
+}
+
+#[test]
+fn apple_message_idempotency_repair_changes_only_unsynced_recorded_messages() {
+    let connection = Connection::open_in_memory().expect("open migration test database");
+    connection
+        .execute_batch(BASELINE_MIGRATION)
+        .expect("apply baseline migration");
+    connection
+        .execute_batch(S1A_RUNTIME_MIGRATION)
+        .expect("apply runtime migration");
+    for (event_id, state) in [("pending-message", "pending"), ("acked-message", "acked")] {
+        connection
+            .execute(
+                "INSERT INTO events_local (
+                    event_id, workspace_id, device_id, event_type, source, schema_version,
+                    occurred_at_ms, created_at_ms, sensitivity, payload_json,
+                    attachment_refs_json, idempotency_key
+                 ) VALUES (?1, 'workspace', 'device', 'communication.message_recorded',
+                    'communication.messages', 1, 1, 1, 'high',
+                    '{\"source_key\":\"messages:guid\"}', '[]', 'wrong')",
+                [event_id],
+            )
+            .expect("insert Apple message event");
+        connection
+            .execute(
+                "INSERT INTO sync_outbox (outbox_id, event_id, state, created_at_ms)
+                 VALUES ('outbox:' || ?1, ?1, ?2, 1)",
+                (event_id, state),
+            )
+            .expect("insert Apple message outbox row");
+    }
+
+    connection
+        .execute_batch(REPAIR_APPLE_MESSAGE_IDEMPOTENCY_MIGRATION)
+        .expect("repair Apple message keys");
+    connection
+        .execute_batch(NORMALIZE_APPLE_MESSAGE_TIMESTAMPS_MIGRATION)
+        .expect("normalize Apple message timestamps");
+
+    let pending = connection
+        .query_row(
+            "SELECT idempotency_key FROM events_local WHERE event_id = 'pending-message'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read pending message key");
+    let acked = connection
+        .query_row(
+            "SELECT idempotency_key FROM events_local WHERE event_id = 'acked-message'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read acked message key");
+    assert_eq!(pending, "messages:guid");
+    assert_eq!(acked, "wrong");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT json_extract(payload_json, '$.occurred_at')
+                 FROM events_local WHERE event_id = 'pending-message'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read normalized timestamp"),
+        "1970-01-01T00:00:00.001Z"
     );
 }
 
@@ -347,7 +415,7 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        10
+        12
     );
     db.shutdown().await.expect("close upgraded database");
 
@@ -918,7 +986,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0011', 'future', '11.0.0', 1, 1, 'completed')",
+             VALUES ('0013', 'future', '13.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -929,8 +997,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 11,
-            max_supported: 10
+            found: 13,
+            max_supported: 12
         })
     ));
 }
@@ -953,7 +1021,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 10);
+    assert_eq!(health.schema_version, 12);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(

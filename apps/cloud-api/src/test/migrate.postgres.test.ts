@@ -42,7 +42,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationObjectSchema(pool);
     await assertDeviceLocationSchema(pool);
     await assertScreenshotSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023"]);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -108,6 +108,44 @@ async function assertSystemEventSchema(pool: Pool) {
     "SELECT to_regclass('public.system_events') IS NOT NULL AS exists",
   );
   assert.equal(result.rows[0]?.exists, true);
+  const workspaceId = "01982222-7222-8222-8222-222222222222";
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  const userId = "01983333-7333-8333-8333-333333333333";
+  await pool.query(
+    `INSERT INTO auth_users (id, name, email, created_at, updated_at)
+     VALUES ($1, 'Photo Migration', 'photo-migration@example.invalid', now(), now())
+     ON CONFLICT (id) DO NOTHING`,
+    [userId],
+  );
+  await pool.query(
+    `INSERT INTO workspaces (id, name, slug, created_at, updated_at)
+     VALUES ($1, 'Photo Migration', 'photo-migration', now(), now())
+     ON CONFLICT (id) DO NOTHING`,
+    [workspaceId],
+  );
+  await pool.query(
+    `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+     VALUES ($1, $2, 'owner', now())
+     ON CONFLICT (workspace_id, user_id) DO NOTHING`,
+    [workspaceId, userId],
+  );
+  await pool.query(
+    `INSERT INTO devices (id, workspace_id, owner_user_id, device_public_key_hash, platform, created_at)
+     VALUES ($1, $2, $3, $4, 'macos', now())
+     ON CONFLICT (id) DO NOTHING`,
+    [deviceId, workspaceId, userId, "e".repeat(64)],
+  );
+  await pool.query(
+    `INSERT INTO system_events (
+       event_id, workspace_id, device_id, event_type, source, schema_version,
+       occurred_at, created_at, sensitivity, payload, idempotency_key
+     ) VALUES (
+       '01989999-7999-8999-8999-999999999996', $1, $2,
+       'photos.asset_recorded', 'photos.library', 1, now(), now(), 'high', '{}'::jsonb,
+       'photos:migration-check'
+     ) ON CONFLICT (event_id) DO NOTHING`,
+    [workspaceId, deviceId],
+  );
 }
 
 async function assertDeviceLocationSchema(pool: Pool) {
