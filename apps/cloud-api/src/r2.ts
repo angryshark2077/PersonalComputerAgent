@@ -1,6 +1,7 @@
 import {
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   DeleteObjectCommand,
   S3Client,
@@ -22,11 +23,16 @@ export interface R2ObjectHead {
   sha256: string;
 }
 
+export interface R2StoredObject extends R2ObjectHead {
+  objectKey: string;
+}
+
 export interface R2ObjectStore {
   signUpload(descriptor: R2ObjectDescriptor): Promise<{ url: string; headers: Record<string, string> }>;
   headObject(objectKey: string): Promise<R2ObjectHead | null>;
   deleteObject(objectKey: string): Promise<void>;
   signRead(objectKey: string): Promise<{ url: string; expiresAt: Date }>;
+  listObjects(prefix: string): Promise<R2StoredObject[]>;
 }
 
 export interface R2Environment {
@@ -133,6 +139,33 @@ class S3R2ObjectStore implements R2ObjectStore {
       url,
       expiresAt: new Date(Date.now() + r2SignedUrlLifetimeSeconds * 1000),
     };
+  }
+
+  async listObjects(prefix: string): Promise<R2StoredObject[]> {
+    const keys: string[] = [];
+    let continuationToken: string | undefined;
+    do {
+      const page = await this.client.send(new ListObjectsV2Command({
+        Bucket: this.bucket,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+      }));
+      for (const object of page.Contents ?? []) {
+        if (object.Key !== undefined) keys.push(object.Key);
+      }
+      continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (continuationToken !== undefined);
+
+    const objects: R2StoredObject[] = [];
+    const concurrency = 16;
+    for (let offset = 0; offset < keys.length; offset += concurrency) {
+      const batch = await Promise.all(keys.slice(offset, offset + concurrency).map(async (objectKey) => {
+        const head = await this.headObject(objectKey);
+        return head === null ? null : { objectKey, ...head };
+      }));
+      for (const object of batch) if (object !== null) objects.push(object);
+    }
+    return objects;
   }
 }
 

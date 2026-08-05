@@ -322,6 +322,10 @@ class FakeR2ObjectStore implements R2ObjectStore {
   async signRead() {
     return { url: "https://private-media.example/read", expiresAt: new Date("2026-08-02T00:06:00Z") };
   }
+
+  async listObjects() {
+    return [];
+  }
 }
 
 test("paired device syncs a private communication event only through its dedicated endpoint", async () => {
@@ -753,6 +757,26 @@ test("only a completed attachment receives a short Owner read URL", async () => 
     )).json(),
     { url: "https://private-media.example/read", expires_at: "2026-08-02T00:06:00.000Z" },
   );
+
+  const equalFidelityRetry = communicationImage(credentials.device_id);
+  equalFidelityRetry.event_id = "01986666-7666-8666-8666-66666666667a";
+  equalFidelityRetry.payload.source_key = "opaque-source-key-2:retry";
+  equalFidelityRetry.idempotency_key = "opaque-source-key-2:retry";
+  assert.equal((await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-77777777779a",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [equalFidelityRetry],
+    }),
+  })).status, 200);
+  const afterRetry = await (await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages`,
+  )).json() as { messages: Array<{ event_id: string; attachments: Array<{ object_id: string | null }> }> };
+  assert.equal(afterRetry.messages[0]?.event_id, "01986666-7666-8666-8666-666666666668");
+  assert.equal(afterRetry.messages[0]?.attachments[0]?.object_id, preparedBody.object_id);
 
   const otherApi = createApp({ repository, ownerAuthenticator: async () => otherOwner, objectStore: store });
   assert.equal(

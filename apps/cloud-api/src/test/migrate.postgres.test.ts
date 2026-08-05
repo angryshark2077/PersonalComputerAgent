@@ -332,6 +332,30 @@ async function assertCommunicationProjectionBackfill(pool: Pool) {
   assert.equal(conversations.length, 1);
   assert.ok(conversations[0]?.lastMessageAt instanceof Date);
   assert.equal(conversations[0]?.lastMessageAt.toISOString(), "2026-08-02T00:01:00.000Z");
+
+  const missing = await repository.listUnlinkedCommunicationAttachments(100);
+  const missingFile = missing.find((attachment) => attachment.eventId === fileEventId);
+  assert.ok(missingFile !== undefined);
+  assert.equal(await repository.recoverCompletedCommunicationObject({
+    ...missingFile,
+    objectId: "01986666-7666-8666-8666-666666666676",
+    objectKey: "communication/01986666-7666-8666-8666-666666666677",
+    now: new Date("2026-08-05T08:00:00Z"),
+  }), true);
+  assert.equal(await repository.recoverCompletedCommunicationObject({
+    ...missingFile,
+    objectId: "01986666-7666-8666-8666-666666666678",
+    objectKey: "communication/01986666-7666-8666-8666-666666666679",
+    now: new Date("2026-08-05T08:00:01Z"),
+  }), false);
+  assert.ok((await repository.listCommunicationObjectKeys()).includes(
+    "communication/01986666-7666-8666-8666-666666666677",
+  ));
+  assert.equal(
+    (await repository.listUnlinkedCommunicationAttachments(100))
+      .some((attachment) => attachment.eventId === fileEventId),
+    false,
+  );
 }
 
 async function assertCommunicationMediaUpgrade(pool: Pool) {

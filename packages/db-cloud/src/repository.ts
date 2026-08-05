@@ -483,6 +483,22 @@ export interface PrepareCommunicationObjectInput {
   now: Date;
 }
 
+export interface UnlinkedCommunicationAttachment {
+  workspaceId: string;
+  deviceId: string;
+  eventId: string;
+  attachmentId: string;
+  sha256: string;
+  sizeBytes: number;
+  mimeType: string;
+}
+
+export interface RecoverCommunicationObjectInput extends UnlinkedCommunicationAttachment {
+  objectId: string;
+  objectKey: string;
+  now: Date;
+}
+
 export interface CommunicationConversationRecord {
   conversationId: string;
   displayName: string;
@@ -644,6 +660,9 @@ export interface ControlRepository {
     deviceId: string,
     objectId: string,
   ): Promise<CommunicationObjectRecord>;
+  listUnlinkedCommunicationAttachments(limit: number): Promise<UnlinkedCommunicationAttachment[]>;
+  listCommunicationObjectKeys(): Promise<string[]>;
+  recoverCompletedCommunicationObject(input: RecoverCommunicationObjectInput): Promise<boolean>;
 }
 
 export interface OwnerMembership {
@@ -1427,10 +1446,14 @@ export class MemoryControlRepository implements ControlRepository {
               }
               const storedPriority = communicationProjectionPriority(stored.message.sourceKey);
               const eventPriority = communicationProjectionPriority(event.message.sourceKey);
+              const storedHasCompletedObject = [...this.#communicationObjects.values()].some((object) =>
+                object.eventId === storedEventId && object.state === "completed"
+              );
               if (
                 eventPriority > storedPriority
                 || (
                   eventPriority === storedPriority
+                  && !storedHasCompletedObject
                   && stored.createdAt.getTime() <= event.createdAt.getTime()
                 )
               ) {
@@ -1630,6 +1653,69 @@ export class MemoryControlRepository implements ControlRepository {
       throw new ControlRepositoryError("DEVICE_NOT_FOUND");
     }
     return { ...object };
+  }
+
+  async listUnlinkedCommunicationAttachments(limit: number): Promise<UnlinkedCommunicationAttachment[]> {
+    const missing: UnlinkedCommunicationAttachment[] = [];
+    for (const event of this.#communicationEvents.values()) {
+      if (event.eventType !== "communication.message_recorded") continue;
+      for (const attachment of event.message.attachments) {
+        const linked = [...this.#communicationObjects.values()].some((object) =>
+          object.eventId === event.eventId && object.attachmentId === attachment.attachmentId
+        );
+        if (linked) continue;
+        missing.push({
+          workspaceId: event.workspaceId,
+          deviceId: event.deviceId,
+          eventId: event.eventId,
+          attachmentId: attachment.attachmentId,
+          sha256: attachment.sha256,
+          sizeBytes: attachment.sizeBytes,
+          mimeType: attachment.mimeType,
+        });
+        if (missing.length === limit) return missing;
+      }
+    }
+    return missing;
+  }
+
+  async listCommunicationObjectKeys(): Promise<string[]> {
+    return [...this.#communicationObjects.values()].map((object) => object.objectKey);
+  }
+
+  async recoverCompletedCommunicationObject(input: RecoverCommunicationObjectInput): Promise<boolean> {
+    const event = this.#communicationEvents.get(input.eventId);
+    const attachment = event?.eventType === "communication.message_recorded"
+      ? event.message.attachments.find((candidate) => candidate.attachmentId === input.attachmentId)
+      : undefined;
+    if (
+      event === undefined
+      || event.workspaceId !== input.workspaceId
+      || event.deviceId !== input.deviceId
+      || attachment === undefined
+      || attachment.sha256 !== input.sha256
+      || attachment.sizeBytes !== input.sizeBytes
+      || attachment.mimeType !== input.mimeType
+    ) return false;
+    if ([...this.#communicationObjects.values()].some((object) =>
+      (object.eventId === input.eventId && object.attachmentId === input.attachmentId)
+      || object.objectKey === input.objectKey
+    )) return false;
+    this.#communicationObjects.set(input.objectId, {
+      objectId: input.objectId,
+      workspaceId: input.workspaceId,
+      deviceId: input.deviceId,
+      eventId: input.eventId,
+      attachmentId: input.attachmentId,
+      objectKey: input.objectKey,
+      expectedSha256: input.sha256,
+      expectedSizeBytes: input.sizeBytes,
+      expectedMimeType: input.mimeType,
+      state: "completed",
+      preparedAt: input.now,
+      completedAt: input.now,
+    });
+    return true;
   }
 
   async listOwnerSystemMetrics(
@@ -2999,7 +3085,19 @@ export class DrizzleControlRepository implements ControlRepository {
             }
             const existingPriority = communicationProjectionPriority(existingMessage.sourceKey);
             const eventPriority = communicationProjectionPriority(event.message.sourceKey);
+            const [completedObject] = existingPriority >= eventPriority
+              ? await transaction
+                  .select({ objectId: communicationObjects.objectId })
+                  .from(communicationObjects)
+                  .where(and(
+                    eq(communicationObjects.eventId, existingMessage.eventId),
+                    eq(communicationObjects.state, "completed"),
+                  ))
+                  .limit(1)
+              : [];
             if (
+              completedObject !== undefined
+              ||
               existingPriority > eventPriority
               || (
                 existingPriority === eventPriority
@@ -3355,6 +3453,102 @@ export class DrizzleControlRepository implements ControlRepository {
         .limit(1);
       if (object === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
       return communicationObjectRecord(object);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listUnlinkedCommunicationAttachments(limit: number): Promise<UnlinkedCommunicationAttachment[]> {
+    try {
+      return await this.database
+        .select({
+          workspaceId: communicationMessages.workspaceId,
+          deviceId: communicationMessages.deviceId,
+          eventId: communicationMessageAttachments.eventId,
+          attachmentId: communicationMessageAttachments.attachmentId,
+          sha256: communicationMessageAttachments.sha256,
+          sizeBytes: communicationMessageAttachments.sizeBytes,
+          mimeType: communicationMessageAttachments.mimeType,
+        })
+        .from(communicationMessageAttachments)
+        .innerJoin(
+          communicationMessages,
+          eq(communicationMessages.eventId, communicationMessageAttachments.eventId),
+        )
+        .leftJoin(
+          communicationObjects,
+          and(
+            eq(communicationObjects.eventId, communicationMessageAttachments.eventId),
+            eq(communicationObjects.attachmentId, communicationMessageAttachments.attachmentId),
+          ),
+        )
+        .where(isNull(communicationObjects.objectId))
+        .limit(limit);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listCommunicationObjectKeys(): Promise<string[]> {
+    try {
+      const rows = await this.database
+        .select({ objectKey: communicationObjects.objectKey })
+        .from(communicationObjects);
+      return rows.map((row) => row.objectKey);
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async recoverCompletedCommunicationObject(input: RecoverCommunicationObjectInput): Promise<boolean> {
+    try {
+      return await this.database.transaction(async (transaction) => {
+        const [attachment] = await transaction
+          .select({
+            workspaceId: communicationMessages.workspaceId,
+            deviceId: communicationMessages.deviceId,
+            sha256: communicationMessageAttachments.sha256,
+            sizeBytes: communicationMessageAttachments.sizeBytes,
+            mimeType: communicationMessageAttachments.mimeType,
+          })
+          .from(communicationMessageAttachments)
+          .innerJoin(
+            communicationMessages,
+            eq(communicationMessages.eventId, communicationMessageAttachments.eventId),
+          )
+          .where(and(
+            eq(communicationMessageAttachments.eventId, input.eventId),
+            eq(communicationMessageAttachments.attachmentId, input.attachmentId),
+          ))
+          .limit(1);
+        if (
+          attachment === undefined
+          || attachment.workspaceId !== input.workspaceId
+          || attachment.deviceId !== input.deviceId
+          || attachment.sha256 !== input.sha256
+          || attachment.sizeBytes !== input.sizeBytes
+          || attachment.mimeType !== input.mimeType
+        ) return false;
+        const inserted = await transaction
+          .insert(communicationObjects)
+          .values({
+            objectId: input.objectId,
+            workspaceId: input.workspaceId,
+            deviceId: input.deviceId,
+            eventId: input.eventId,
+            attachmentId: input.attachmentId,
+            objectKey: input.objectKey,
+            expectedSha256: input.sha256,
+            expectedSizeBytes: input.sizeBytes,
+            expectedMimeType: input.mimeType,
+            state: "completed",
+            preparedAt: input.now,
+            completedAt: input.now,
+          })
+          .onConflictDoNothing()
+          .returning({ objectId: communicationObjects.objectId });
+        return inserted[0] !== undefined;
+      });
     } catch (error) {
       throw repositoryError(error);
     }
