@@ -2301,6 +2301,20 @@ async fn upload_pending_photos(
         if photo.completed {
             continue;
         }
+        if photo.size_bytes > 500 * 1024 * 1024 {
+            let media_path = root.join(
+                photo
+                    .media_file_name
+                    .as_deref()
+                    .ok_or(ControlError::Contract)?,
+            );
+            remove_uploaded_photo_file(&media_path).await?;
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            processed = processed.saturating_add(1);
+            continue;
+        }
         if Uuid::parse_str(&photo.photo_id).is_err()
             || Uuid::parse_str(&photo.event_id).is_err()
             || photo.media_file_name.as_deref() != Some(photo.photo_id.as_str())
