@@ -17,8 +17,8 @@ export function CommunicationDevicesPage({
   rootPath,
   title,
 }: {
-  rootPath: "chats" | "messages";
-  title: "WeChat" | "Messages";
+  rootPath: "chats" | "messages" | "photos";
+  title: "WeChat" | "Messages" | "Photos";
 }) {
   const [devices, setDevices] = useState<DashboardDeviceSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -41,9 +41,11 @@ export function CommunicationDevicesPage({
   return (
     <DashboardShell>
       <section className="page-heading">
-        <p className="workspace-name">Communication collection</p>
+        <p className="workspace-name">{title === "Photos" ? "Photo library" : "Communication collection"}</p>
         <h1>{title}</h1>
-        <p>Select the Mac whose {title === "WeChat" ? "WeChat" : "iMessage and SMS"} conversations you want to inspect.</p>
+        <p>{title === "Photos"
+          ? "Select the Mac whose original photos and videos you want to inspect."
+          : `Select the Mac whose ${title === "WeChat" ? "WeChat" : "iMessage and SMS"} conversations you want to inspect.`}</p>
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
       {devices === null ? <p className="status-note">Loading devices…</p> : (

@@ -43,6 +43,7 @@ const MESSAGE_DIRECTORY: &str = "db_storage/message";
 const MAX_BATCH: usize = 200;
 const MAX_PER_CONVERSATION: usize = 20;
 const MAX_PENDING_IMAGE_RETRIES_PER_CONVERSATION: usize = 256;
+const MAX_PENDING_FILE_RETRIES_PER_CONVERSATION: usize = 256;
 const MAX_PENDING_VIDEO_RETRIES_PER_CONVERSATION: usize = 256;
 const KIND_BATCH_QUOTA: usize = MAX_BATCH / 5;
 const MEDIA_CURSOR_LOOKBACK: i64 = 200;
@@ -52,6 +53,7 @@ const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const FILE_TIMESTAMP_FALLBACK_SECONDS: u64 = 5 * 60;
 const VOICE_SAMPLE_RATE: u32 = 24_000;
 const IMAGE_CODE_CACHE: &str =
     "Library/Application Support/PersonalComputerAgent/Data/wechat-image-codes-v1";
@@ -362,8 +364,12 @@ fn read_message_batch(
             FileReadBatch {
                 records: Vec::new(),
                 cursor_updates: Vec::new(),
+                cursor_removals: Vec::new(),
             }
         });
+        for cursor_key in file_batch.cursor_removals {
+            cursor_guard.remove(&cursor_key);
+        }
         for (cursor_key, sequence) in file_batch.cursor_updates {
             cursor_guard
                 .entry(cursor_key)
@@ -1606,6 +1612,7 @@ struct VideoReadBatch {
 struct FileReadBatch {
     records: Vec<SourceMessageRecord>,
     cursor_updates: Vec<(String, i64)>,
+    cursor_removals: Vec<String>,
 }
 
 #[allow(
@@ -1626,6 +1633,7 @@ fn read_database_files(
         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
     let mut records = Vec::new();
     let mut cursor_updates = Vec::new();
+    let mut cursor_removals = Vec::new();
     for session in sessions {
         if records.len() >= limit {
             break;
@@ -1660,13 +1668,51 @@ fn read_database_files(
         if !table_exists(connection, &table_name)? {
             continue;
         }
-        let cursor_key = format!("{}:{}:file", read_context.database_name, session.username);
+        let cursor_key = format!(
+            "{}:{}:file-v2",
+            read_context.database_name, session.username
+        );
         let after = read_context.cursors.get(&cursor_key).copied().unwrap_or(0);
+        let retry_prefix = format!("{cursor_key}:pending:");
+        let retry_rows = read_context
+            .cursors
+            .iter()
+            .filter_map(|(key, create_time)| {
+                key.strip_prefix(&retry_prefix)
+                    .and_then(|local_id| local_id.parse::<i64>().ok())
+                    .map(|local_id| (key.clone(), local_id, *create_time))
+            })
+            .collect::<Vec<_>>();
+        cursor_removals.extend(
+            retry_rows
+                .iter()
+                .filter(|(_, _, create_time)| *create_time < read_context.cutoff)
+                .map(|(key, _, _)| key.clone()),
+        );
+        let retry_ids = retry_rows
+            .iter()
+            .filter(|(_, _, create_time)| *create_time >= read_context.cutoff)
+            .take(MAX_PENDING_FILE_RETRIES_PER_CONVERSATION)
+            .map(|(_, local_id, _)| *local_id)
+            .collect::<BTreeSet<_>>();
         let per_conversation = MAX_PER_CONVERSATION.min(limit - records.len());
+        let retry_clause = if retry_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " OR local_id IN ({})",
+                retry_ids
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         let sql = format!(
             "SELECT local_id, server_id, create_time, real_sender_id, status, message_content, compress_content \
              FROM \"{table_name}\" \
-             WHERE (local_type & 4294967295) = 49 AND local_id > ?1 AND create_time >= ?2 \
+             WHERE (local_type & 4294967295) = 49 \
+               AND (local_id > ?1{retry_clause}) AND create_time >= ?2 \
              ORDER BY local_id ASC"
         );
         let mut statement = connection
@@ -1696,36 +1742,23 @@ fn read_database_files(
             if row.local_id <= 0 || row.create_time <= 0 {
                 continue;
             }
+            let is_retry = row.local_id <= after && retry_ids.contains(&row.local_id);
+            if !is_retry {
+                scanned_through = row.local_id;
+            }
             let Some(content) = decode_message_content(&row.compress_content, &row.message_content)
             else {
-                scanned_through = row.local_id;
                 continue;
             };
             if app_message_type(&content) != Some(6) {
-                scanned_through = row.local_id;
                 continue;
             }
             let Some(file_name) = xml_text(&content, "title") else {
-                scanned_through = row.local_id;
                 continue;
             };
             let expected_size = xml_text(&content, "totallen")
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|value| *value > 0);
-            let completed_file = resolve_message_file(message_files, &file_name, expected_size)
-                .and_then(|source| {
-                    file_attachment(
-                        source,
-                        read_context.database_name,
-                        &table_name,
-                        row.local_id,
-                    )
-                });
-            let Some((attachment, source_path)) = completed_file else {
-                scanned_through = row.local_id;
-                continue;
-            };
-            scanned_through = row.local_id;
             let direction = if row.real_sender_id == my_rowid {
                 if row.server_id <= 0 || row.status < 0 {
                     continue;
@@ -1768,16 +1801,67 @@ fn read_database_files(
                 .ok()
                 .and_then(|time| time.format(&Rfc3339).ok())
                 .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
+            let message_id = if row.server_id > 0 {
+                row.server_id.to_string()
+            } else {
+                format!("local-{}", row.local_id)
+            };
+            let finality = match direction {
+                SourceDirection::Incoming => SourceFinality::IncomingPersisted,
+                SourceDirection::Outgoing => SourceFinality::OutgoingSent,
+                SourceDirection::Unknown => SourceFinality::Unknown,
+            };
+            let completed_file =
+                resolve_message_file(message_files, &file_name, expected_size, row.create_time)
+                    .and_then(|source| {
+                        file_attachment(
+                            source,
+                            read_context.database_name,
+                            &table_name,
+                            row.local_id,
+                        )
+                    });
+            let Some((attachment, source_path)) = completed_file else {
+                if !is_retry {
+                    cursor_updates
+                        .push((format!("{retry_prefix}{}", row.local_id), row.create_time));
+                    records.push(SourceMessageRecord {
+                        account_id: read_context.account_id.to_owned(),
+                        source_sequence: u64::try_from(row.local_id)
+                            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                        message_id,
+                        conversation_id: session.username.clone(),
+                        conversation_display_name: metadata.display_name.clone(),
+                        conversation_avatar_url: metadata.avatar_url.clone(),
+                        sender_id,
+                        sender_display_name,
+                        sender_avatar_url,
+                        source_key: format!(
+                            "wechat:{}:{table_name}:{}:file-pending",
+                            read_context.database_name, row.local_id
+                        ),
+                        occurred_at,
+                        local_account: LocalAccountProof::Verified,
+                        direction,
+                        kind: SourceMessageKind::Text,
+                        conversation: conversation.clone(),
+                        finality,
+                        payload: SourcePayload::Text {
+                            body: "[文件] 等待微信保存原始文件".to_owned(),
+                        },
+                    });
+                }
+                continue;
+            };
+            if is_retry {
+                cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
+            }
             let attachment_id = attachment.attachment_id().to_owned();
             records.push(SourceMessageRecord {
                 account_id: read_context.account_id.to_owned(),
                 source_sequence: u64::try_from(row.local_id)
                     .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
-                message_id: if row.server_id > 0 {
-                    row.server_id.to_string()
-                } else {
-                    format!("local-{}", row.local_id)
-                },
+                message_id,
                 conversation_id: session.username.clone(),
                 conversation_display_name: metadata.display_name.clone(),
                 conversation_avatar_url: metadata.avatar_url.clone(),
@@ -1793,11 +1877,7 @@ fn read_database_files(
                 direction,
                 kind: SourceMessageKind::File,
                 conversation: conversation.clone(),
-                finality: match direction {
-                    SourceDirection::Incoming => SourceFinality::IncomingPersisted,
-                    SourceDirection::Outgoing => SourceFinality::OutgoingSent,
-                    SourceDirection::Unknown => SourceFinality::Unknown,
-                },
+                finality,
                 payload: SourcePayload::Media {
                     attachment: Some(attachment),
                     completed_source: Some(crate::source::SourceCompletedMedia {
@@ -1814,6 +1894,7 @@ fn read_database_files(
     Ok(FileReadBatch {
         records,
         cursor_updates,
+        cursor_removals,
     })
 }
 
@@ -3537,17 +3618,29 @@ fn resolve_message_file<'a>(
     files: &'a BTreeMap<String, Vec<PathBuf>>,
     file_name: &str,
     expected_size: Option<u64>,
+    create_time: i64,
 ) -> Option<&'a Path> {
     let candidates = files.get(file_name)?;
-    candidates
-        .iter()
-        .find(|path| {
-            expected_size.is_none_or(|expected| {
-                path.symlink_metadata()
-                    .is_ok_and(|metadata| metadata.len() == expected)
-            })
+    if let Some(candidate) = candidates.iter().find(|path| {
+        expected_size.is_none_or(|expected| {
+            path.symlink_metadata()
+                .is_ok_and(|metadata| metadata.len() == expected)
         })
-        .map(PathBuf::as_path)
+    }) {
+        return Some(candidate.as_path());
+    }
+    let create_time = u64::try_from(create_time).ok()?;
+    let mut nearby = candidates.iter().filter(|path| {
+        path.symlink_metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .is_some_and(|modified| {
+                modified.as_secs().abs_diff(create_time) <= FILE_TIMESTAMP_FALLBACK_SECONDS
+            })
+    });
+    let candidate = nearby.next()?;
+    nearby.next().is_none().then_some(candidate.as_path())
 }
 
 fn valid_path_component(value: &str) -> bool {
@@ -5076,7 +5169,7 @@ fn bootstrap_source_cursors(
                 *sequence,
             );
             let media_sequence = sequence.saturating_sub(MEDIA_CURSOR_LOOKBACK);
-            for kind in ["file", "image", "emoticon-v1", "audio", "video"] {
+            for kind in ["file-v2", "image", "emoticon-v1", "audio", "video"] {
                 cursors.insert(
                     format!("{database_name}:{conversation_id}:{kind}"),
                     media_sequence,
@@ -5163,11 +5256,11 @@ mod tests {
         normalize_decrypted_image, parse_group_nicknames, parse_image_dat_name,
         parse_image_md5_candidates, parse_video_file_key, parse_video_length,
         parse_video_md5_candidates, read_contact_cards, read_conversation_metadata,
-        read_database_emoticons, read_database_images, read_database_text, read_database_videos,
-        read_voice_blob, resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
-        resolve_video_path, retention_cutoff_from, stage_decrypted_image, video_attachment,
-        voice_same_time_index, ContactCardProfile, ConversationMetadata, ImageKeys, Session,
-        SourcePaths, SourcePayload, TextReadContext,
+        read_database_emoticons, read_database_files, read_database_images, read_database_text,
+        read_database_videos, read_voice_blob, resolve_full_image_dat_path, resolve_group_sender,
+        resolve_image_dat_path, resolve_message_file, resolve_video_path, retention_cutoff_from,
+        stage_decrypted_image, video_attachment, voice_same_time_index, ContactCardProfile,
+        ConversationMetadata, ImageKeys, Session, SourcePaths, SourcePayload, TextReadContext,
     };
     use pca_keychain::{WechatDatabaseKeyMaterial, WechatKeyMaterial};
 
@@ -5197,7 +5290,7 @@ mod tests {
             &[fixture.path().join("message_0.db")],
         );
         assert_eq!(cursors["message_0.db:wxid_friend:display-text-v2"], 9_876);
-        for kind in ["file", "image", "emoticon-v1", "audio", "video"] {
+        for kind in ["file-v2", "image", "emoticon-v1", "audio", "video"] {
             assert_eq!(cursors[&format!("message_0.db:wxid_friend:{kind}")], 9_676);
         }
         assert!(!cursors.keys().any(|key| key.contains("wxid_other")));
@@ -5721,6 +5814,112 @@ mod tests {
         assert_eq!(second.records.len(), 1);
         assert_eq!(second.records[0].source_sequence, 7);
         assert_eq!(second.cursor_removals, vec![retry_key]);
+    }
+
+    #[test]
+    fn production_retries_a_file_that_materializes_after_its_message_row() {
+        let connection = Connection::open_in_memory().expect("open delayed file fixture");
+        let conversation_id = "wxid_friend";
+        let table_name = message_table_name(conversation_id);
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE Name2Id (user_name TEXT);\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'wxid_local');\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (2, '{conversation_id}');\
+                 CREATE TABLE \"{table_name}\" (\
+                    local_id INTEGER, server_id INTEGER, create_time INTEGER,\
+                    real_sender_id INTEGER, status INTEGER, local_type INTEGER,\
+                    message_content TEXT, compress_content BLOB\
+                 );\
+                 INSERT INTO \"{table_name}\" VALUES (7, 107, 1000, 1, 0, 49,\
+                    '<appmsg><type>6</type><title>report.xlsx</title><totallen>4</totallen></appmsg>', X'');"
+            ))
+            .expect("create delayed file schema");
+        let account = tempfile::tempdir().expect("create delayed file source");
+        let metadata = std::collections::BTreeMap::from([(
+            conversation_id.to_owned(),
+            ConversationMetadata {
+                display_name: "Friend".to_owned(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: std::collections::BTreeMap::new(),
+                participant_avatar_urls: std::collections::BTreeMap::new(),
+            },
+        )]);
+        let contact_cards = std::collections::BTreeMap::new();
+        let cursors = std::collections::BTreeMap::new();
+        let context = TextReadContext {
+            database_name: "message_0.db",
+            local_username: "wxid_local",
+            account_id: "account",
+            conversation_metadata: &metadata,
+            contact_cards: &contact_cards,
+            cursors: &cursors,
+            cutoff: 0,
+        };
+
+        let first = read_database_files(
+            &connection,
+            &context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            &std::collections::BTreeMap::new(),
+            20,
+        )
+        .expect("record delayed file retry");
+        assert_eq!(first.records.len(), 1);
+        assert!(matches!(
+            &first.records[0].payload,
+            SourcePayload::Text { body } if body == "[文件] 等待微信保存原始文件"
+        ));
+        let retry_key = format!("message_0.db:{conversation_id}:file-v2:pending:7");
+        assert!(first.cursor_updates.contains(&(retry_key.clone(), 1000)));
+
+        let directory = account.path().join("msg/file/1970-01");
+        std::fs::create_dir_all(&directory).expect("create delayed file directory");
+        std::fs::write(directory.join("report.xlsx"), b"xlsx").expect("materialize delayed file");
+        let retry_cursors = first.cursor_updates.into_iter().collect();
+        let retry_context = TextReadContext {
+            cursors: &retry_cursors,
+            ..context
+        };
+        let second = read_database_files(
+            &connection,
+            &retry_context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            &index_message_files(account.path(), 0),
+            20,
+        )
+        .expect("read materialized delayed file");
+        assert_eq!(second.records.len(), 1);
+        assert!(matches!(
+            second.records[0].kind,
+            crate::source::SourceMessageKind::File
+        ));
+        assert_eq!(second.cursor_removals, vec![retry_key]);
+    }
+
+    #[test]
+    fn production_accepts_a_unique_recent_file_when_wechat_reports_the_wrong_size() {
+        let fixture = tempfile::tempdir().expect("create recent file fixture");
+        let file = fixture.path().join("report.xlsx");
+        std::fs::write(&file, b"actual file bytes").expect("write recent file");
+        let create_time = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("current time after epoch")
+                .as_secs(),
+        )
+        .expect("current time fits i64");
+        let files =
+            std::collections::BTreeMap::from([("report.xlsx".to_owned(), vec![file.clone()])]);
+
+        let resolved = resolve_message_file(&files, "report.xlsx", Some(4), create_time);
+
+        assert_eq!(resolved, Some(file.as_path()));
     }
 
     #[test]
