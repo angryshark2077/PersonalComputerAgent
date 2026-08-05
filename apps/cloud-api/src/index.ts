@@ -11,6 +11,7 @@ import {
   DrizzleControlRepository,
   type CommunicationObjectRecord,
   type ControlRepository,
+  type PhotoLibraryAssetRecord,
   type ScreenshotRecord,
 } from "@pca/db-cloud/src/repository.js";
 import {
@@ -425,6 +426,48 @@ export function createApp(options: CreateAppOptions): Hono {
     } catch {
       return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private screenshot storage is unavailable.");
     }
+  });
+
+  app.post("/v1/agent/photos/prepare", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const input = parsePhotoPrepare(await context.req.json().catch(() => null));
+    if (input === null) return errorResponse(context, 400, "REQUEST_INVALID", "Invalid photo upload request.");
+    if (options.objectStore === undefined) return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private photo storage is unavailable.");
+    let photo: PhotoLibraryAssetRecord;
+    try {
+      photo = await options.repository.preparePhotoLibraryAsset(device.workspaceId, device.deviceId, {
+        ...input, objectKey: `photos/${device.deviceId}/${input.photoId}`, now: new Date(),
+      });
+    } catch (error) { return repositoryErrorResponse(context, error); }
+    if (photo.state === "completed") return context.json({ photo_id: photo.photoId, state: "completed" });
+    try {
+      const upload = await options.objectStore.signUpload(photo);
+      return context.json({ photo_id: photo.photoId, state: "prepared", upload: { url: upload.url, headers: upload.headers, expires_at: new Date(Date.now() + 300_000).toISOString() } });
+    } catch { return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private photo storage is unavailable."); }
+  });
+
+  app.post("/v1/agent/photos/complete", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const input = parsePhotoId(await context.req.json().catch(() => null));
+    if (input === null) return errorResponse(context, 400, "REQUEST_INVALID", "Invalid photo completion.");
+    if (options.objectStore === undefined) return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private photo storage is unavailable.");
+    let photo: PhotoLibraryAssetRecord;
+    try { photo = await options.repository.loadDevicePhotoLibraryAsset(device.workspaceId, device.deviceId, input.photoId); }
+    catch (error) { return repositoryErrorResponse(context, error); }
+    if (photo.state === "completed") return context.json({ photo_id: photo.photoId, state: "completed" });
+    let actual: R2ObjectHead | null;
+    try { actual = await options.objectStore.headObject(photo.objectKey); }
+    catch { return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private photo storage is unavailable."); }
+    if (actual === null || actual.sizeBytes !== photo.expectedSizeBytes || actual.mimeType !== photo.expectedMimeType || actual.sha256 !== photo.expectedSha256) {
+      if (actual !== null) await options.objectStore.deleteObject(photo.objectKey).catch(() => undefined);
+      return errorResponse(context, 409, "OBJECT_INVALID", "The uploaded photo does not match its manifest.");
+    }
+    try {
+      const completed = await options.repository.completePhotoLibraryAsset(device.workspaceId, device.deviceId, photo.photoId, new Date());
+      return context.json({ photo_id: completed.photoId, state: completed.state });
+    } catch (error) { return repositoryErrorResponse(context, error); }
   });
 
   app.post("/v1/agent/screenshots/complete", async (context) => {
@@ -877,6 +920,28 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.get("/v1/devices/:deviceId/photos", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const limit = parseScreenshotLimit(context.req.query("limit"));
+    if (limit === null) return errorResponse(context, 400, "REQUEST_INVALID", "Invalid photo limit.");
+    try {
+      const photos = await options.repository.listOwnerPhotoLibraryAssets(context.req.param("deviceId"), principal.workspaceId, principal.userId, limit);
+      return context.json({ photos: photos.map(photoResponse) });
+    } catch (error) { return repositoryErrorResponse(context, error); }
+  });
+
+  app.get("/v1/devices/:deviceId/photos/:photoId/read", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    if (options.objectStore === undefined) return errorResponse(context, 503, "OBJECT_STORE_UNAVAILABLE", "Private photo storage is unavailable.");
+    try {
+      const photo = await options.repository.loadOwnerCompletedPhotoLibraryAsset(principal.workspaceId, principal.userId, context.req.param("deviceId"), context.req.param("photoId"));
+      const read = await options.objectStore.signRead(photo.objectKey);
+      return context.json({ url: read.url, expires_at: read.expiresAt.toISOString() });
+    } catch (error) { return repositoryErrorResponse(context, error); }
+  });
+
   return app;
 }
 
@@ -929,6 +994,47 @@ function parseObjectId(value: unknown): { objectId: string } | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const body = value as Record<string, unknown>;
   return Object.keys(body).length === 1 && isUuid(body.object_id) ? { objectId: body.object_id } : null;
+}
+
+function parsePhotoPrepare(value: unknown) {
+  if (!isObjectRecord(value) || !hasOnlyKeys(value, [
+    "photo_id", "event_id", "asset_id", "captured_at", "media_type", "original_filename",
+    "mime_type", "pixel_width", "pixel_height", "duration_seconds", "album_names", "sha256", "size_bytes",
+  ])) return null;
+  const capturedAt = new Date(String(value.captured_at));
+  if (!isUuid(value.photo_id) || !isUuid(value.event_id)
+    || typeof value.asset_id !== "string" || value.asset_id.length === 0 || value.asset_id.length > 1024
+    || Number.isNaN(capturedAt.getTime()) || (value.media_type !== "image" && value.media_type !== "video")
+    || typeof value.original_filename !== "string" || value.original_filename.length === 0 || value.original_filename.length > 1024
+    || typeof value.mime_type !== "string" || value.mime_type.length === 0 || value.mime_type.length > 255
+    || !Number.isInteger(value.pixel_width) || (value.pixel_width as number) <= 0
+    || !Number.isInteger(value.pixel_height) || (value.pixel_height as number) <= 0
+    || typeof value.duration_seconds !== "number" || !Number.isFinite(value.duration_seconds) || value.duration_seconds < 0
+    || !Array.isArray(value.album_names) || value.album_names.length > 100 || value.album_names.some((name) => typeof name !== "string" || name.length === 0 || name.length > 1024)
+    || typeof value.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.sha256)
+    || !Number.isSafeInteger(value.size_bytes) || (value.size_bytes as number) <= 0) return null;
+  return {
+    photoId: value.photo_id, eventId: value.event_id, assetId: value.asset_id, capturedAt,
+    mediaType: value.media_type as "image" | "video", originalFilename: value.original_filename,
+    expectedMimeType: value.mime_type, pixelWidth: value.pixel_width as number, pixelHeight: value.pixel_height as number,
+    durationSeconds: value.duration_seconds, albumNames: [...value.album_names] as string[],
+    expectedSha256: value.sha256, expectedSizeBytes: value.size_bytes as number,
+  };
+}
+
+function parsePhotoId(value: unknown): { photoId: string } | null {
+  return isObjectRecord(value) && hasOnlyKeys(value, ["photo_id"]) && isUuid(value.photo_id)
+    ? { photoId: value.photo_id }
+    : null;
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).length === keys.length && Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function parseScreenshotPrepare(value: unknown): {
@@ -1452,6 +1558,24 @@ function collectorConfigResponse(config: StoredCollectorConfig) {
       sync_mode: "full" as const,
       retention_days: 180,
     },
+    "communication.messages": {
+      enabled: config.messagesEnabled,
+      directions: ["incoming", "outgoing"] as const,
+      message_types: ["text"] as const,
+      conversation_scope: "all" as const,
+      initial_lookback_days: 7,
+      sync_mode: "full" as const,
+      attachments_enabled: false,
+      attachment_retention_days: 7,
+    },
+    "photos.library": {
+      enabled: config.photosEnabled,
+      media_types: ["image", "video"] as const,
+      include_originals: true,
+      include_album_names: true,
+      initial_lookback_days: 7,
+      cloud_retention: "permanent" as const,
+    },
   };
 }
 
@@ -1484,6 +1608,21 @@ function screenshotResponse(screenshot: ScreenshotRecord) {
     pixel_height: screenshot.pixelHeight,
     size_bytes: screenshot.expectedSizeBytes,
     mime_type: screenshot.expectedMimeType,
+  };
+}
+
+function photoResponse(photo: PhotoLibraryAssetRecord) {
+  return {
+    photo_id: photo.photoId,
+    captured_at: photo.capturedAt.toISOString(),
+    media_type: photo.mediaType,
+    original_filename: photo.originalFilename,
+    mime_type: photo.expectedMimeType,
+    pixel_width: photo.pixelWidth,
+    pixel_height: photo.pixelHeight,
+    duration_seconds: photo.durationSeconds,
+    album_names: [...photo.albumNames],
+    size_bytes: photo.expectedSizeBytes,
   };
 }
 

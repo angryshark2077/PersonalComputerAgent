@@ -23,6 +23,7 @@ import {
   networkLocationLibrary,
   pairingAuthorizationCodes,
   pairingSessions,
+  photoLibraryAssets,
   systemEvents,
   workspaceMembers,
   workspaces,
@@ -249,6 +250,32 @@ export interface PrepareScreenshotInput {
   now: Date;
 }
 
+export interface PhotoLibraryAssetRecord {
+  photoId: string;
+  workspaceId: string;
+  deviceId: string;
+  eventId: string;
+  assetId: string;
+  capturedAt: Date;
+  mediaType: "image" | "video";
+  originalFilename: string;
+  expectedMimeType: string;
+  pixelWidth: number;
+  pixelHeight: number;
+  durationSeconds: number;
+  albumNames: string[];
+  objectKey: string;
+  expectedSha256: string;
+  expectedSizeBytes: number;
+  state: "prepared" | "completed";
+  preparedAt: Date;
+  completedAt: Date | null;
+}
+
+export interface PreparePhotoLibraryAssetInput extends Omit<PhotoLibraryAssetRecord, "workspaceId" | "deviceId" | "state" | "preparedAt" | "completedAt"> {
+  now: Date;
+}
+
 export interface ConfigAuditInput {
   auditId: string;
   actorUserId: string;
@@ -324,12 +351,13 @@ export interface SystemEventRecord {
     | "system.wake"
     | "network.offline"
     | "network.online"
-    | "network.changed";
-  source: "system" | "collector.registry" | "runtime.lifecycle";
+    | "network.changed"
+    | "photos.asset_recorded";
+  source: "system" | "collector.registry" | "runtime.lifecycle" | "photos.library";
   schemaVersion: number;
   occurredAt: Date;
   createdAt: Date;
-  sensitivity: "normal";
+  sensitivity: "normal" | "high";
   payload: Record<string, unknown>;
   idempotencyKey: string | null;
 }
@@ -350,7 +378,7 @@ interface CommunicationEventRecordBase {
   eventId: string;
   workspaceId: string;
   deviceId: string;
-  source: "communication.wechat";
+  source: "communication.wechat" | "communication.messages";
   schemaVersion: 1;
   occurredAt: Date;
   createdAt: Date;
@@ -536,6 +564,11 @@ export interface ControlRepository {
   ): Promise<ScreenshotRecord>;
   listExpiredCompletedScreenshots(capturedBefore: Date, limit: number): Promise<ScreenshotRecord[]>;
   deleteExpiredCompletedScreenshot(screenshotId: string, capturedBefore: Date): Promise<boolean>;
+  preparePhotoLibraryAsset(workspaceId: string, deviceId: string, input: PreparePhotoLibraryAssetInput): Promise<PhotoLibraryAssetRecord>;
+  loadDevicePhotoLibraryAsset(workspaceId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord>;
+  completePhotoLibraryAsset(workspaceId: string, deviceId: string, photoId: string, completedAt: Date): Promise<PhotoLibraryAssetRecord>;
+  listOwnerPhotoLibraryAssets(deviceId: string, workspaceId: string, userId: string, limit: number): Promise<PhotoLibraryAssetRecord[]>;
+  loadOwnerCompletedPhotoLibraryAsset(workspaceId: string, userId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord>;
   listOwnerNetworkLocations(workspaceId: string, userId: string): Promise<NetworkLocationRecord[]>;
   createOwnerNetworkLocation(input: NetworkLocationInput): Promise<NetworkLocationRecord>;
   deleteOwnerNetworkLocation(locationId: string, workspaceId: string, userId: string): Promise<void>;
@@ -656,6 +689,7 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #mediaCleanupRequests = new Map<string, LocalMediaCleanupRecord & { workspaceId: string; deviceId: string }>();
   readonly #screenshotRequests = new Map<string, ScreenshotRequestRecord & { workspaceId: string; deviceId: string }>();
   readonly #screenshots = new Map<string, ScreenshotRecord>();
+  readonly #photoLibraryAssets = new Map<string, PhotoLibraryAssetRecord>();
   readonly #networkLocations = new Map<string, NetworkLocationRecord & { workspaceId: string }>();
   readonly #configAudit: Array<CollectorConfigAuditRecord & { workspaceId: string; deviceId: string }> = [];
   readonly #systemEvents = new Map<string, SystemEventRecord>();
@@ -1102,6 +1136,68 @@ export class MemoryControlRepository implements ControlRepository {
       || screenshot.state !== "completed"
       || screenshot.capturedAt >= capturedBefore) return false;
     return this.#screenshots.delete(screenshotId);
+  }
+
+  async preparePhotoLibraryAsset(
+    workspaceId: string,
+    deviceId: string,
+    input: PreparePhotoLibraryAssetInput,
+  ): Promise<PhotoLibraryAssetRecord> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const existing = this.#photoLibraryAssets.get(input.photoId);
+    if (existing !== undefined) {
+      if (!samePhotoLibraryAsset(existing, workspaceId, deviceId, input)) throw new ControlRepositoryError("CONFLICT");
+      return clonePhotoLibraryAsset(existing);
+    }
+    if ([...this.#photoLibraryAssets.values()].some((record) =>
+      record.workspaceId === workspaceId && record.deviceId === deviceId && record.assetId === input.assetId)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    const event = this.#systemEvents.get(input.eventId);
+    if (event === undefined || event.workspaceId !== workspaceId || event.deviceId !== deviceId || event.eventType !== "photos.asset_recorded") {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    const record: PhotoLibraryAssetRecord = {
+      ...input, workspaceId, deviceId, state: "prepared", preparedAt: input.now, completedAt: null,
+    };
+    this.#photoLibraryAssets.set(input.photoId, record);
+    return clonePhotoLibraryAsset(record);
+  }
+
+  async loadDevicePhotoLibraryAsset(workspaceId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord> {
+    this.#requireDevice(deviceId, workspaceId, false);
+    const record = this.#photoLibraryAssets.get(photoId);
+    if (record === undefined || record.workspaceId !== workspaceId || record.deviceId !== deviceId) {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    return clonePhotoLibraryAsset(record);
+  }
+
+  async completePhotoLibraryAsset(workspaceId: string, deviceId: string, photoId: string, completedAt: Date): Promise<PhotoLibraryAssetRecord> {
+    await this.loadDevicePhotoLibraryAsset(workspaceId, deviceId, photoId);
+    const record = this.#photoLibraryAssets.get(photoId)!;
+    record.state = "completed";
+    record.completedAt = completedAt;
+    return clonePhotoLibraryAsset(record);
+  }
+
+  async listOwnerPhotoLibraryAssets(deviceId: string, workspaceId: string, userId: string, limit: number): Promise<PhotoLibraryAssetRecord[]> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    return [...this.#photoLibraryAssets.values()]
+      .filter((record) => record.workspaceId === workspaceId && record.deviceId === deviceId && record.state === "completed")
+      .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime())
+      .slice(0, limit).map(clonePhotoLibraryAsset);
+  }
+
+  async loadOwnerCompletedPhotoLibraryAsset(workspaceId: string, userId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    const record = this.#photoLibraryAssets.get(photoId);
+    if (record === undefined || record.workspaceId !== workspaceId || record.deviceId !== deviceId || record.state !== "completed") {
+      throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    }
+    return clonePhotoLibraryAsset(record);
   }
 
   async appendConfigAudit(input: ConfigAuditInput): Promise<number> {
@@ -1553,6 +1649,8 @@ export class MemoryControlRepository implements ControlRepository {
       configurationRevision: 0,
       networkEnabled: false,
       wechatEnabled: false,
+      messagesEnabled: false,
+      photosEnabled: false,
     };
     const storedStatus = this.#latestHeartbeats.get(device.id) ?? null;
     const status = storedStatus === null ? null : {
@@ -1863,6 +1961,65 @@ export class DrizzleControlRepository implements ControlRepository {
     } catch (error) {
       throw repositoryError(error);
     }
+  }
+
+  async preparePhotoLibraryAsset(workspaceId: string, deviceId: string, input: PreparePhotoLibraryAssetInput): Promise<PhotoLibraryAssetRecord> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      const [existing] = await this.database.select().from(photoLibraryAssets).where(and(eq(photoLibraryAssets.id, input.photoId), eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId))).limit(1);
+      if (existing !== undefined) {
+        const record = photoLibraryAssetFromRow(existing);
+        if (!samePhotoLibraryAsset(record, workspaceId, deviceId, input)) throw new ControlRepositoryError("CONFLICT");
+        return record;
+      }
+      const [event] = await this.database.select({ id: systemEvents.eventId }).from(systemEvents).where(and(eq(systemEvents.eventId, input.eventId), eq(systemEvents.workspaceId, workspaceId), eq(systemEvents.deviceId, deviceId), eq(systemEvents.eventType, "photos.asset_recorded"))).limit(1);
+      if (event === undefined) throw new ControlRepositoryError("CONFLICT");
+      const [created] = await this.database.insert(photoLibraryAssets).values({
+        id: input.photoId, workspaceId, deviceId, eventId: input.eventId, assetId: input.assetId, capturedAt: input.capturedAt,
+        mediaType: input.mediaType, originalFilename: input.originalFilename, mimeType: input.expectedMimeType,
+        pixelWidth: input.pixelWidth, pixelHeight: input.pixelHeight, durationSeconds: input.durationSeconds,
+        albumNames: input.albumNames, objectKey: input.objectKey, expectedSha256: input.expectedSha256,
+        expectedSizeBytes: input.expectedSizeBytes, state: "prepared", preparedAt: input.now,
+      }).returning();
+      if (created === undefined) throw new ControlRepositoryError("CONFLICT");
+      return photoLibraryAssetFromRow(created);
+    } catch (error) { throw repositoryError(error); }
+  }
+
+  async loadDevicePhotoLibraryAsset(workspaceId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord> {
+    try {
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, false);
+      const [row] = await this.database.select().from(photoLibraryAssets).where(and(eq(photoLibraryAssets.id, photoId), eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId))).limit(1);
+      if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      return photoLibraryAssetFromRow(row);
+    } catch (error) { throw repositoryError(error); }
+  }
+
+  async completePhotoLibraryAsset(workspaceId: string, deviceId: string, photoId: string, completedAt: Date): Promise<PhotoLibraryAssetRecord> {
+    try {
+      const [row] = await this.database.update(photoLibraryAssets).set({ state: "completed", completedAt }).where(and(eq(photoLibraryAssets.id, photoId), eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId))).returning();
+      if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      return photoLibraryAssetFromRow(row);
+    } catch (error) { throw repositoryError(error); }
+  }
+
+  async listOwnerPhotoLibraryAssets(deviceId: string, workspaceId: string, userId: string, limit: number): Promise<PhotoLibraryAssetRecord[]> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const rows = await this.database.select().from(photoLibraryAssets).where(and(eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId), eq(photoLibraryAssets.state, "completed"))).orderBy(desc(photoLibraryAssets.capturedAt)).limit(limit);
+      return rows.map(photoLibraryAssetFromRow);
+    } catch (error) { throw repositoryError(error); }
+  }
+
+  async loadOwnerCompletedPhotoLibraryAsset(workspaceId: string, userId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const [row] = await this.database.select().from(photoLibraryAssets).where(and(eq(photoLibraryAssets.id, photoId), eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId), eq(photoLibraryAssets.state, "completed"))).limit(1);
+      if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      return photoLibraryAssetFromRow(row);
+    } catch (error) { throw repositoryError(error); }
   }
 
   async authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string> {
@@ -3400,6 +3557,58 @@ function communicationObjectRecord(row: {
   };
 }
 
+function clonePhotoLibraryAsset(record: PhotoLibraryAssetRecord): PhotoLibraryAssetRecord {
+  return { ...record, albumNames: [...record.albumNames] };
+}
+
+function samePhotoLibraryAsset(
+  record: PhotoLibraryAssetRecord,
+  workspaceId: string,
+  deviceId: string,
+  input: PreparePhotoLibraryAssetInput,
+): boolean {
+  return record.workspaceId === workspaceId
+    && record.deviceId === deviceId
+    && record.photoId === input.photoId
+    && record.eventId === input.eventId
+    && record.assetId === input.assetId
+    && record.capturedAt.getTime() === input.capturedAt.getTime()
+    && record.mediaType === input.mediaType
+    && record.originalFilename === input.originalFilename
+    && record.expectedMimeType === input.expectedMimeType
+    && record.pixelWidth === input.pixelWidth
+    && record.pixelHeight === input.pixelHeight
+    && record.durationSeconds === input.durationSeconds
+    && JSON.stringify(record.albumNames) === JSON.stringify(input.albumNames)
+    && record.objectKey === input.objectKey
+    && record.expectedSha256 === input.expectedSha256
+    && record.expectedSizeBytes === input.expectedSizeBytes;
+}
+
+function photoLibraryAssetFromRow(row: typeof photoLibraryAssets.$inferSelect): PhotoLibraryAssetRecord {
+  return {
+    photoId: row.id,
+    workspaceId: row.workspaceId,
+    deviceId: row.deviceId,
+    eventId: row.eventId,
+    assetId: row.assetId,
+    capturedAt: row.capturedAt,
+    mediaType: row.mediaType as "image" | "video",
+    originalFilename: row.originalFilename,
+    expectedMimeType: row.mimeType,
+    pixelWidth: row.pixelWidth,
+    pixelHeight: row.pixelHeight,
+    durationSeconds: row.durationSeconds,
+    albumNames: [...row.albumNames],
+    objectKey: row.objectKey,
+    expectedSha256: row.expectedSha256,
+    expectedSizeBytes: row.expectedSizeBytes,
+    state: row.state as "prepared" | "completed",
+    preparedAt: row.preparedAt,
+    completedAt: row.completedAt,
+  };
+}
+
 function secureEqual(left: string, right: string): boolean {
   const leftBuffer = Buffer.from(left);
   const rightBuffer = Buffer.from(right);
@@ -3438,6 +3647,24 @@ function snapshot(
         sync_mode: "full",
         retention_days: 180,
       },
+      "communication.messages": {
+        enabled: config.messagesEnabled,
+        directions: ["incoming", "outgoing"],
+        message_types: ["text"],
+        conversation_scope: "all",
+        initial_lookback_days: 7,
+        sync_mode: "full",
+        attachments_enabled: false,
+        attachment_retention_days: 7,
+      },
+      "photos.library": {
+        enabled: config.photosEnabled,
+        media_types: ["image", "video"],
+        include_originals: true,
+        include_album_names: true,
+        initial_lookback_days: 7,
+        cloud_retention: "permanent",
+      },
     },
   };
 }
@@ -3446,6 +3673,8 @@ function defaultCollectorConfig(): StoredCollectorConfig {
   return {
     networkEnabled: false,
     wechatEnabled: false,
+    messagesEnabled: false,
+    photosEnabled: false,
     screenCaptureEnabled: false,
     screenCaptureScheduledEnabled: true,
     screenCaptureIntervalSeconds: 300,
@@ -3460,6 +3689,8 @@ function storedConfig(config: Partial<StoredCollectorConfig>): StoredCollectorCo
   return {
     networkEnabled: config.networkEnabled ?? defaults.networkEnabled,
     wechatEnabled: config.wechatEnabled ?? defaults.wechatEnabled,
+    messagesEnabled: config.messagesEnabled ?? defaults.messagesEnabled,
+    photosEnabled: config.photosEnabled ?? defaults.photosEnabled,
     screenCaptureEnabled: config.screenCaptureEnabled ?? defaults.screenCaptureEnabled,
     screenCaptureScheduledEnabled: config.screenCaptureScheduledEnabled ?? defaults.screenCaptureScheduledEnabled,
     screenCaptureIntervalSeconds: config.screenCaptureIntervalSeconds ?? defaults.screenCaptureIntervalSeconds,

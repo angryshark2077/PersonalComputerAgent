@@ -29,6 +29,10 @@ const NETWORK_OBSERVE_CAPABILITY: &str = "network.observe";
 const LIFECYCLE_POLL_CAPABILITY: &str = "system.lifecycle.poll";
 const SCREEN_CONTEXT_CAPABILITY: &str = "screen.context";
 const SCREEN_CAPTURE_CAPABILITY: &str = "screen.capture";
+const MESSAGE_DECODE_CAPABILITY: &str = "messages.decode_text";
+const PHOTO_AUTHORIZATION_CAPABILITY: &str = "photos.authorization";
+const PHOTO_LIST_CAPABILITY: &str = "photos.list";
+const PHOTO_EXPORT_CAPABILITY: &str = "photos.export";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -201,6 +205,46 @@ pub struct ScreenCaptureResult {
     pub app_bundle_id: Option<String>,
     pub pixel_width: Option<u32>,
     pub pixel_height: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoAssetRecord {
+    pub local_identifier: String,
+    pub created_at: String,
+    pub media_type: String,
+    pub original_filename: String,
+    pub mime_type: String,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub duration_seconds: f64,
+    pub album_names: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodedMessageBodies {
+    texts: Vec<Option<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhotoAuthorization {
+    status: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhotoAssetBatch {
+    status: String,
+    assets: Vec<PhotoAssetRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhotoExport {
+    status: String,
+    path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for BridgeClient {
@@ -449,6 +493,155 @@ impl BridgeClient {
             .map_err(|_| BridgeClientError::InvalidEnvelope)?;
         validate_screen_capture_result(&result)?;
         Ok(result)
+    }
+
+    /// Decodes bounded Apple attributed message bodies through the native Bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Bridge transport, authentication, timeout, or contract error.
+    pub async fn decode_message_bodies(
+        &mut self,
+        encoded_bodies: &[String],
+    ) -> Result<Vec<Option<String>>, BridgeClientError> {
+        if encoded_bodies.len() > 100 || encoded_bodies.iter().any(String::is_empty) {
+            return Err(BridgeClientError::InvalidConfiguration);
+        }
+        let response = self
+            .request(BridgeEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Uuid::new_v4(),
+                message_kind: BridgeMessageKind::Request,
+                capability: MESSAGE_DECODE_CAPABILITY.to_owned(),
+                deadline_ms: duration_millis(self.operation_timeout)?,
+                payload: object_payload(&serde_json::json!({ "encoded_bodies": encoded_bodies }))?,
+                error: None,
+            })
+            .await?;
+        let decoded: DecodedMessageBodies = serde_json::from_value(Value::Object(response.payload))
+            .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+        if response.error.is_some() || decoded.texts.len() != encoded_bodies.len() {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        Ok(decoded.texts)
+    }
+
+    /// Reads the current Photo Library authorization state without prompting.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Bridge transport, authentication, timeout, or contract error.
+    pub async fn photo_authorization(&mut self) -> Result<String, BridgeClientError> {
+        let response = self
+            .request(BridgeEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Uuid::new_v4(),
+                message_kind: BridgeMessageKind::Request,
+                capability: PHOTO_AUTHORIZATION_CAPABILITY.to_owned(),
+                deadline_ms: duration_millis(self.operation_timeout)?,
+                payload: Map::new(),
+                error: None,
+            })
+            .await?;
+        let value: PhotoAuthorization = serde_json::from_value(Value::Object(response.payload))
+            .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+        if response.error.is_some()
+            || !matches!(
+                value.status.as_str(),
+                "available" | "not_determined" | "permission_required" | "unavailable"
+            )
+        {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        Ok(value.status)
+    }
+
+    /// Lists one cursor-bounded page of Photo Library asset metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Bridge transport, authentication, timeout, or contract error.
+    pub async fn list_photo_assets(
+        &mut self,
+        after_created_at: Option<&str>,
+        after_local_identifier: Option<&str>,
+        cutoff: &str,
+        limit: u8,
+    ) -> Result<(String, Vec<PhotoAssetRecord>), BridgeClientError> {
+        if limit == 0 || limit > 50 || cutoff.is_empty() {
+            return Err(BridgeClientError::InvalidConfiguration);
+        }
+        let response = self
+            .request(BridgeEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Uuid::new_v4(),
+                message_kind: BridgeMessageKind::Request,
+                capability: PHOTO_LIST_CAPABILITY.to_owned(),
+                deadline_ms: duration_millis(self.operation_timeout)?,
+                payload: object_payload(&serde_json::json!({
+                    "after_created_at": after_created_at,
+                    "after_local_identifier": after_local_identifier,
+                    "cutoff": cutoff,
+                    "limit": limit,
+                }))?,
+                error: None,
+            })
+            .await?;
+        let value: PhotoAssetBatch = serde_json::from_value(Value::Object(response.payload))
+            .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+        if response.error.is_some()
+            || !matches!(
+                value.status.as_str(),
+                "available" | "permission_required" | "unavailable"
+            )
+        {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        Ok((value.status, value.assets))
+    }
+
+    /// Exports one original Photo Library asset to the private application spool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Bridge transport, authentication, timeout, or contract error.
+    pub async fn export_photo_asset(
+        &mut self,
+        local_identifier: &str,
+        file_name: Uuid,
+    ) -> Result<Option<PathBuf>, BridgeClientError> {
+        if local_identifier.is_empty() {
+            return Err(BridgeClientError::InvalidConfiguration);
+        }
+        let response = self
+            .request(BridgeEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Uuid::new_v4(),
+                message_kind: BridgeMessageKind::Request,
+                capability: PHOTO_EXPORT_CAPABILITY.to_owned(),
+                deadline_ms: duration_millis(self.operation_timeout)?,
+                payload: object_payload(&serde_json::json!({
+                    "local_identifier": local_identifier,
+                    "file_name": file_name.hyphenated().to_string(),
+                }))?,
+                error: None,
+            })
+            .await?;
+        let value: PhotoExport = serde_json::from_value(Value::Object(response.payload))
+            .map_err(|_| BridgeClientError::InvalidEnvelope)?;
+        if response.error.is_some()
+            || !matches!(
+                value.status.as_str(),
+                "exported" | "permission_required" | "unavailable"
+            )
+        {
+            return Err(BridgeClientError::InvalidEnvelope);
+        }
+        Ok(if value.status == "exported" {
+            value.path
+        } else {
+            None
+        })
     }
 }
 

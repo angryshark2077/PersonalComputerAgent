@@ -530,7 +530,9 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
                 "max_group_members": 15,
                 "sync_mode": "full",
                 "retention_days": 180
-            }
+            },
+            "communication.messages": { "enabled": false, "directions": ["incoming", "outgoing"], "message_types": ["text"], "conversation_scope": "all", "initial_lookback_days": 7, "sync_mode": "full", "attachments_enabled": false, "attachment_retention_days": 7 },
+            "photos.library": { "enabled": false, "media_types": ["image", "video"], "include_originals": true, "include_album_names": true, "initial_lookback_days": 7, "cloud_retention": "permanent" }
         }
     });
     let snapshot: AgentControlSnapshot =
@@ -542,6 +544,23 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
     assert!(applied.communication_wechat_enabled);
     assert_eq!(applied.screen_capture.interval_seconds, 300);
     assert!(apply_snapshot(7, &snapshot).unwrap().is_none());
+
+    let mut legacy = exact.clone();
+    legacy["collectors"]
+        .as_object_mut()
+        .unwrap()
+        .remove("communication.messages");
+    legacy["collectors"]
+        .as_object_mut()
+        .unwrap()
+        .remove("photos.library");
+    let legacy_snapshot: AgentControlSnapshot =
+        serde_json::from_value(legacy).expect("legacy Cloud control remains rollout-compatible");
+    let legacy_applied = apply_snapshot(6, &legacy_snapshot)
+        .expect("legacy Cloud scope validates with disabled additions")
+        .expect("legacy revision applies");
+    assert!(!legacy_applied.communication_messages_enabled);
+    assert!(!legacy_applied.photos_library_enabled);
 
     for (field, invalid) in [
         ("retention_days", serde_json::json!(7)),
@@ -1138,7 +1157,9 @@ fn exact_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
                 "max_group_members": 15,
                 "sync_mode": "full",
                 "retention_days": 180
-            }
+            },
+            "communication.messages": { "enabled": false, "directions": ["incoming", "outgoing"], "message_types": ["text"], "conversation_scope": "all", "initial_lookback_days": 7, "sync_mode": "full", "attachments_enabled": false, "attachment_retention_days": 7 },
+            "photos.library": { "enabled": false, "media_types": ["image", "video"], "include_originals": true, "include_album_names": true, "initial_lookback_days": 7, "cloud_retention": "permanent" }
         }
     }))
     .unwrap()

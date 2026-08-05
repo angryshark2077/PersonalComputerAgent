@@ -550,7 +550,7 @@ impl ConversationScope {
     pub const fn is_allowed(&self) -> bool {
         match self {
             Self::Direct => true,
-            Self::Group { member_count } => *member_count > 0 && *member_count <= 15,
+            Self::Group { member_count } => *member_count > 0,
         }
     }
 }

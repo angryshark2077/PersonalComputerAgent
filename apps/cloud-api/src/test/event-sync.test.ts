@@ -117,6 +117,33 @@ function networkChanged(deviceId: string) {
   };
 }
 
+function photoAsset(deviceId: string) {
+  return {
+    event_id: "01986666-7666-8666-8666-666666666691",
+    workspace_id: owner.workspaceId,
+    device_id: deviceId,
+    event_type: "photos.asset_recorded",
+    source: "photos.library",
+    schema_version: 1,
+    occurred_at: "2026-08-05T12:00:00Z",
+    created_at: "2026-08-05T12:00:00Z",
+    sensitivity: "high",
+    payload: {
+      asset_id: "photo-local-1",
+      captured_at: "2026-08-05T12:00:00Z",
+      media_type: "image",
+      original_filename: "IMG_0001.HEIC",
+      mime_type: "image/heic",
+      pixel_width: 4032,
+      pixel_height: 3024,
+      duration_seconds: 0,
+      album_names: ["Recent"],
+    },
+    attachment_refs: [],
+    idempotency_key: "photos:asset:photo-local-1",
+  };
+}
+
 function communicationText(deviceId: string) {
   return {
     event_id: "01986666-7666-8666-8666-666666666667",
@@ -738,6 +765,62 @@ test("Owner manual screenshot request reaches the device and only a completed pr
   assert.deepEqual(listBody.screenshots.map((item) => [item.screenshot_id, item.trigger]), [[screenshotId, "manual"]]);
   assert.deepEqual(
     await (await api.request(`/v1/devices/${credentials.device_id}/screenshots/${screenshotId}/read`)).json(),
+    { url: "https://private-media.example/read", expires_at: "2026-08-02T00:06:00.000Z" },
+  );
+});
+
+test("Photo originals remain private, become readable only after completion, and have no expiry", async () => {
+  const store = new FakeR2ObjectStore();
+  const repository = new MemoryControlRepository([
+    { workspaceId: owner.workspaceId, userId: owner.userId },
+  ]);
+  const api = createApp({ repository, ownerAuthenticator: async () => owner, objectStore: store });
+  const { credentials } = await pairedApiWith(api);
+  assert.equal((await api.request("/v1/agent/sync/events", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777792",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [photoAsset(credentials.device_id)],
+    }),
+  })).status, 200);
+
+  const photoId = "01986666-7666-8666-8666-666666666692";
+  const prepared = await api.request("/v1/agent/photos/prepare", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      photo_id: photoId,
+      event_id: "01986666-7666-8666-8666-666666666691",
+      asset_id: "photo-local-1",
+      captured_at: "2026-08-05T12:00:00Z",
+      media_type: "image",
+      original_filename: "IMG_0001.HEIC",
+      mime_type: "image/heic",
+      pixel_width: 4032,
+      pixel_height: 3024,
+      duration_seconds: 0,
+      album_names: ["Recent"],
+      sha256: "d".repeat(64),
+      size_bytes: 8192,
+    }),
+  });
+  assert.equal(prepared.status, 200);
+  assert.equal((await prepared.json() as { state: string }).state, "prepared");
+  assert.deepEqual(await (await api.request(`/v1/devices/${credentials.device_id}/photos`)).json(), { photos: [] });
+
+  store.uploaded = true;
+  assert.equal((await api.request("/v1/agent/photos/complete", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({ photo_id: photoId }),
+  })).status, 200);
+  const listed = await (await api.request(`/v1/devices/${credentials.device_id}/photos`)).json() as { photos: Array<{ photo_id: string; original_filename: string }> };
+  assert.deepEqual(listed.photos.map((photo) => [photo.photo_id, photo.original_filename]), [[photoId, "IMG_0001.HEIC"]]);
+  assert.deepEqual(
+    await (await api.request(`/v1/devices/${credentials.device_id}/photos/${photoId}/read`)).json(),
     { url: "https://private-media.example/read", expires_at: "2026-08-02T00:06:00.000Z" },
   );
 });

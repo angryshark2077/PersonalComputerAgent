@@ -30,5 +30,7 @@
 	<string>Personal Computer Agent uses the current Wi-Fi name and BSSID to match this Mac to your saved Dashboard locations.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Personal Computer Agent captures the active display when enabled by its owner in the Dashboard.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Personal Computer Agent uploads the owner's selected photo-library history and future originals to the private Dashboard.</string>
 </dict>
 </plist>

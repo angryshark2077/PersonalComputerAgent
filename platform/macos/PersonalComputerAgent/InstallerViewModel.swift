@@ -8,6 +8,7 @@ enum InstallerState: Equatable, Sendable {
     case waitingFullDiskAccess
     case waitingLocationAccess
     case waitingScreenCaptureAccess
+    case waitingPhotosAccess
     case waitingApproval
     case starting
     case pairing
@@ -33,6 +34,7 @@ final class InstallerViewModel: ObservableObject {
     private let sourceBundle: URL
     private let terminator: any ApplicationTerminating
     private let pairingCoordinator: PairingCoordinator?
+    private let terminateAfterSuccessfulSetup: Bool
     private var automaticStartPending: Bool
     private var activeInstall: (generation: UUID, task: Task<Void, Never>)?
     private var activePairing: Task<Void, Never>?
@@ -51,6 +53,7 @@ final class InstallerViewModel: ObservableObject {
         self.coordinator = coordinator
         self.sourceBundle = sourceBundle
         automaticStartPending = automaticallyStart
+        terminateAfterSuccessfulSetup = automaticallyStart
         self.pairingCoordinator = pairingCoordinator
         self.terminator = terminator
     }
@@ -59,6 +62,7 @@ final class InstallerViewModel: ObservableObject {
         coordinator = nil
         sourceBundle = Bundle.main.bundleURL
         automaticStartPending = false
+        terminateAfterSuccessfulSetup = false
         pairingCoordinator = nil
         terminator = NSApplicationTerminator()
         state = .failed(message: failureMessage, recoveryAction: recoveryAction)
@@ -103,6 +107,8 @@ final class InstallerViewModel: ObservableObject {
                 terminator.terminate()
             } else if pairingCoordinator != nil {
                 startPairing(repair: false)
+            } else if terminateAfterSuccessfulSetup {
+                terminator.terminate()
             }
         } catch let error as InstallError {
             if error.shouldTerminateCurrentProcess {
@@ -143,6 +149,9 @@ final class InstallerViewModel: ObservableObject {
             do {
                 _ = try await (repair ? pairingCoordinator.repair() : pairingCoordinator.startIfUnpaired())
                 self?.state = .success
+                if self?.terminateAfterSuccessfulSetup == true {
+                    self?.terminator.terminate()
+                }
             } catch let error as PairingError {
                 self?.state = .repair(message: error.localizedDescription)
             } catch {

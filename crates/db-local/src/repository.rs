@@ -136,7 +136,10 @@ fn validate_communication_commit(commit: &CommunicationMessageCommit) -> Result<
     if commit.account_id.trim().is_empty()
         || commit.event.event_id.trim().is_empty()
         || commit.event.event_type != "communication.message_recorded"
-        || commit.event.source != "communication.wechat"
+        || !matches!(
+            commit.event.source.as_str(),
+            "communication.wechat" | "communication.messages"
+        )
         || commit.event.schema_version != 1
         || commit.event.sensitivity != Sensitivity::High
         || commit.event.occurred_at != commit.message.occurred_at()
@@ -1117,7 +1120,7 @@ pub(crate) fn load_pending_system_events(
                         ELSE e.source
                     END AS source,
                     e.schema_version, e.occurred_at_ms, e.created_at_ms, e.payload_json,
-                    e.idempotency_key
+                    e.idempotency_key, e.sensitivity
              FROM sync_outbox AS o
              INNER JOIN events_local AS e ON e.event_id = o.event_id
              WHERE o.state = 'pending'
@@ -1133,13 +1136,15 @@ pub(crate) fn load_pending_system_events(
                    'network.offline',
                    'network.online',
                    'network.changed',
+                   'photos.asset_recorded',
                    'AGENT_STARTED',
                    'AGENT_STOPPED',
                    'AGENT_CRASH_RECOVERED',
                    'SYSTEM_SLEEP',
                    'SYSTEM_WAKE'
                )
-               AND e.sensitivity = 'normal'
+               AND ((e.event_type = 'photos.asset_recorded' AND e.source = 'photos.library' AND e.sensitivity = 'high')
+                    OR (e.event_type <> 'photos.asset_recorded' AND e.sensitivity = 'normal'))
                AND e.attachment_refs_json = '[]'
              ORDER BY o.created_at_ms, e.event_id
              LIMIT ?1",
@@ -1158,6 +1163,7 @@ pub(crate) fn load_pending_system_events(
                 row.get::<_, i64>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })
         .map_err(|error| DbError::sqlite("query pending system events", error))?;
@@ -1173,6 +1179,7 @@ pub(crate) fn load_pending_system_events(
             created_at_ms,
             payload_json,
             idempotency_key,
+            sensitivity,
         ) = row.map_err(|error| DbError::sqlite("read pending system event", error))?;
         let payload = serde_json::from_str(&payload_json)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
@@ -1185,13 +1192,21 @@ pub(crate) fn load_pending_system_events(
             schema_version,
             occurred_at: format_timestamp(occurred_at_ms)?,
             created_at: format_timestamp(created_at_ms)?,
-            sensitivity: Sensitivity::Normal,
+            sensitivity: system_event_sensitivity(&sensitivity),
             payload,
             attachment_refs: Vec::new(),
             idempotency_key,
         })
     })
     .collect()
+}
+
+fn system_event_sensitivity(value: &str) -> Sensitivity {
+    if value == "high" {
+        Sensitivity::High
+    } else {
+        Sensitivity::Normal
+    }
 }
 
 pub(crate) fn acknowledge_mismatched_lifecycle_events(
@@ -1295,6 +1310,7 @@ pub(crate) fn acknowledge_system_events(
                              'network.offline',
                              'network.online',
                              'network.changed',
+                             'photos.asset_recorded',
                              'AGENT_STARTED',
                              'AGENT_STOPPED',
                              'AGENT_CRASH_RECOVERED',
@@ -1334,7 +1350,7 @@ pub(crate) fn load_pending_communication_events(
                    'communication.conversation_observed',
                    'communication.message_sender_observed'
                )
-               AND e.source = 'communication.wechat'
+               AND e.source IN ('communication.wechat', 'communication.messages')
                AND e.schema_version = 1
                AND e.sensitivity = 'high'
              ORDER BY o.created_at_ms, e.event_id
@@ -1414,7 +1430,7 @@ pub(crate) fn acknowledge_communication_events(
                              'communication.conversation_observed',
                              'communication.message_sender_observed'
                          )
-                         AND e.source = 'communication.wechat'
+                         AND e.source IN ('communication.wechat', 'communication.messages')
                          AND e.schema_version = 1
                          AND e.sensitivity = 'high'
                    )",

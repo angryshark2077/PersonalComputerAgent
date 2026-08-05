@@ -17,6 +17,24 @@ export interface CollectorConfig {
     sync_mode: "full";
     retention_days: 180;
   };
+  "communication.messages": {
+    enabled: boolean;
+    directions: ["incoming", "outgoing"];
+    message_types: ["text"];
+    conversation_scope: "all";
+    initial_lookback_days: 7;
+    sync_mode: "full";
+    attachments_enabled: false;
+    attachment_retention_days: 7;
+  };
+  "photos.library": {
+    enabled: boolean;
+    media_types: ["image", "video"];
+    include_originals: true;
+    include_album_names: true;
+    initial_lookback_days: 7;
+    cloud_retention: "permanent";
+  };
 }
 
 export interface DashboardScreenshot {
@@ -29,6 +47,19 @@ export interface DashboardScreenshot {
   pixel_height: number;
   size_bytes: number;
   mime_type: "image/jpeg";
+}
+
+export interface DashboardPhoto {
+  photo_id: string;
+  captured_at: string;
+  media_type: "image" | "video";
+  original_filename: string;
+  mime_type: string;
+  pixel_width: number;
+  pixel_height: number;
+  duration_seconds: number;
+  album_names: string[];
+  size_bytes: number;
 }
 
 export interface DashboardDevice {
@@ -182,6 +213,26 @@ const defaultScreenCaptureConfig: CollectorConfig["screen.capture"] = {
   excluded_bundle_ids: [],
 };
 
+const defaultMessagesConfig: CollectorConfig["communication.messages"] = {
+  enabled: false,
+  directions: ["incoming", "outgoing"],
+  message_types: ["text"],
+  conversation_scope: "all",
+  initial_lookback_days: 7,
+  sync_mode: "full",
+  attachments_enabled: false,
+  attachment_retention_days: 7,
+};
+
+const defaultPhotosConfig: CollectorConfig["photos.library"] = {
+  enabled: false,
+  media_types: ["image", "video"],
+  include_originals: true,
+  include_album_names: true,
+  initial_lookback_days: 7,
+  cloud_retention: "permanent",
+};
+
 export function normalizeDashboardDevice(device: DashboardDevice): DashboardDevice {
   const collectors = device.collectors as Partial<CollectorConfig>;
   return {
@@ -189,6 +240,8 @@ export function normalizeDashboardDevice(device: DashboardDevice): DashboardDevi
     collectors: {
       ...device.collectors,
       "screen.capture": collectors["screen.capture"] ?? defaultScreenCaptureConfig,
+      "communication.messages": collectors["communication.messages"] ?? defaultMessagesConfig,
+      "photos.library": collectors["photos.library"] ?? defaultPhotosConfig,
     },
   };
 }
@@ -416,6 +469,32 @@ export async function getScreenshotReadUrl(
       cloudApiOrigin,
       `/v1/devices/${encodeURIComponent(deviceId)}/screenshots/${encodeURIComponent(screenshotId)}/read`,
     ),
+  );
+  return result.url;
+}
+
+export async function getPhotos(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+  limit = 100,
+): Promise<DashboardPhoto[]> {
+  const result = await jsonRequest<{ photos: DashboardPhoto[] }>(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/photos?limit=${limit}`),
+  );
+  return result.photos;
+}
+
+export async function getPhotoReadUrl(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+  photoId: string,
+): Promise<string> {
+  const result = await jsonRequest<{ url: string; expires_at: string }>(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/photos/${encodeURIComponent(photoId)}/read`),
   );
   return result.url;
 }

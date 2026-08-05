@@ -3,6 +3,7 @@ import CoreLocation
 import Darwin
 import Dispatch
 import Foundation
+import Photos
 
 private enum BridgeArgumentsError: Error {
     case invalid
@@ -28,6 +29,7 @@ private func safeFailure(_ message: String) {
 public enum PlatformBridgeExecutable {
     private static let locationAuthorizationArgument = "--authorize-location"
     private static let screenCaptureAuthorizationArgument = "--authorize-screen-capture"
+    private static let photosAuthorizationArgument = "--authorize-photos"
 
     static func run(
         arguments commandLineArguments: [String],
@@ -111,17 +113,40 @@ public enum PlatformBridgeExecutable {
 
     @MainActor
     public static func main() -> Never {
-        if CommandLine.arguments == [CommandLine.arguments[0], locationAuthorizationArgument] {
+        if LaunchServicesBridgeWrapper.shouldRelaunch {
             Task { @MainActor in
-                exit(await requestLocationAuthorization())
+                LaunchServicesBridgeWrapper.terminate(
+                    with: await LaunchServicesBridgeWrapper.run(arguments: CommandLine.arguments)
+                )
             }
             NSApplication.shared.run()
-            exit(3)
+            LaunchServicesBridgeWrapper.terminate(with: 3)
+        }
+        LaunchServicesBridgeWrapper.startWrapperMonitorIfNeeded()
+        if CommandLine.arguments == [CommandLine.arguments[0], locationAuthorizationArgument] {
+            Task { @MainActor in
+                LaunchServicesBridgeWrapper.terminate(with: await requestLocationAuthorization())
+            }
+            NSApplication.shared.run()
+            LaunchServicesBridgeWrapper.terminate(with: 3)
         }
         if CommandLine.arguments == [CommandLine.arguments[0], screenCaptureAuthorizationArgument] {
             NSApplication.shared.setActivationPolicy(.accessory)
             NSApplication.shared.activate(ignoringOtherApps: true)
-            exit(CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() ? 0 : 2)
+            LaunchServicesBridgeWrapper.terminate(
+                with: CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() ? 0 : 2
+            )
+        }
+        if CommandLine.arguments == [CommandLine.arguments[0], photosAuthorizationArgument] {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            Task { @MainActor in
+                LaunchServicesBridgeWrapper.terminate(
+                    with: await PhotoLibrarySource.requestAuthorization() ? 0 : 2
+                )
+            }
+            NSApplication.shared.run()
+            LaunchServicesBridgeWrapper.terminate(with: 3)
         }
 
         NSApplication.shared.setActivationPolicy(.prohibited)
@@ -131,14 +156,16 @@ public enum PlatformBridgeExecutable {
             signalRuntime = try TerminationSignalRuntime.install()
         } catch {
             safeFailure("signal setup failure")
-            exit(1)
+            LaunchServicesBridgeWrapper.terminate(with: 1)
         }
 
         Task {
-            exit(await run(arguments: CommandLine.arguments, signalRuntime: signalRuntime))
+            LaunchServicesBridgeWrapper.terminate(
+                with: await run(arguments: CommandLine.arguments, signalRuntime: signalRuntime)
+            )
         }
         NSApplication.shared.run()
-        exit(3)
+        LaunchServicesBridgeWrapper.terminate(with: 3)
     }
 
     @MainActor

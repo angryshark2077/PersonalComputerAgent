@@ -32,7 +32,7 @@ fn valid_group_message(member_count: u8) -> CommunicationMessageRecordedInput {
 }
 
 #[test]
-fn accepts_direct_text_and_small_group_media_only() {
+fn accepts_direct_text_and_bounded_group_media() {
     let text = CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
         message_id: "message-1".to_owned(),
         conversation_id: "conversation-1".to_owned(),
@@ -49,11 +49,11 @@ fn accepts_direct_text_and_small_group_media_only() {
 
     assert!(text.is_ok());
     assert!(CommunicationMessageRecorded::try_new(valid_group_message(15)).is_ok());
+    assert!(CommunicationMessageRecorded::try_new(valid_group_message(u8::MAX)).is_ok());
 }
 
 #[test]
-fn rejects_group_larger_than_fifteen_and_unknown_attachment_fields() {
-    assert!(CommunicationMessageRecorded::try_new(valid_group_message(16)).is_err());
+fn rejects_unknown_attachment_fields() {
     assert!(serde_json::from_value::<CommunicationAttachment>(json!({
         "attachment_id": "a",
         "kind": "image",

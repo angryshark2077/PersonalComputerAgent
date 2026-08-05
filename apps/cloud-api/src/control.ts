@@ -189,16 +189,20 @@ function parseCleanupResult(value: unknown): HeartbeatRequest["cleanupResult"] |
 export function parseCollectorConfig(value: unknown): StoredCollectorConfig | null {
   if (
     !isRecord(value) ||
-    !hasOnly(value, ["network", "screen.capture", "communication.wechat"]) ||
+    !hasOnly(value, ["network", "screen.capture", "communication.wechat", "communication.messages", "photos.library"]) ||
     !("network" in value) ||
     !("screen.capture" in value) ||
-    !("communication.wechat" in value)
+    !("communication.wechat" in value) ||
+    !("communication.messages" in value) ||
+    !("photos.library" in value)
   ) {
     return null;
   }
   const network = value.network;
   const screen = value["screen.capture"];
   const wechat = value["communication.wechat"];
+  const messages = value["communication.messages"];
+  const photos = value["photos.library"];
   if (!isRecord(network) || !hasOnly(network, ["enabled"]) || typeof network.enabled !== "boolean") {
     return null;
   }
@@ -248,9 +252,39 @@ export function parseCollectorConfig(value: unknown): StoredCollectorConfig | nu
   ) {
     return null;
   }
+  if (
+    !isRecord(messages) ||
+    !hasOnly(messages, [
+      "enabled", "directions", "message_types", "conversation_scope", "initial_lookback_days",
+      "sync_mode", "attachments_enabled", "attachment_retention_days",
+    ]) ||
+    typeof messages.enabled !== "boolean" ||
+    !isExact(messages.directions, ["incoming", "outgoing"]) ||
+    !isExact(messages.message_types, ["text"]) ||
+    messages.conversation_scope !== "all" ||
+    messages.initial_lookback_days !== 7 ||
+    messages.sync_mode !== "full" ||
+    messages.attachments_enabled !== false ||
+    messages.attachment_retention_days !== 7
+  ) return null;
+  if (
+    !isRecord(photos) ||
+    !hasOnly(photos, [
+      "enabled", "media_types", "include_originals", "include_album_names",
+      "initial_lookback_days", "cloud_retention",
+    ]) ||
+    typeof photos.enabled !== "boolean" ||
+    !isExact(photos.media_types, ["image", "video"]) ||
+    photos.include_originals !== true ||
+    photos.include_album_names !== true ||
+    photos.initial_lookback_days !== 7 ||
+    photos.cloud_retention !== "permanent"
+  ) return null;
   return {
     networkEnabled: network.enabled,
     wechatEnabled: wechat.enabled,
+    messagesEnabled: messages.enabled,
+    photosEnabled: photos.enabled,
     screenCaptureEnabled: screen.enabled,
     screenCaptureScheduledEnabled: screen.scheduled_enabled,
     screenCaptureIntervalSeconds: screen.interval_seconds as number,

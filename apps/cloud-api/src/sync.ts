@@ -68,10 +68,14 @@ export function parseCommunicationSyncBatch(value: unknown): CommunicationSyncBa
 }
 
 function parseSystemEvent(event: EventEnvelope): SystemEventRecord | null {
-  if ((event.attachment_refs?.length ?? 0) !== 0 || event.schema_version !== 1 || event.sensitivity !== "normal") {
+  if ((event.attachment_refs?.length ?? 0) !== 0 || event.schema_version !== 1) {
     return null;
   }
-  if (event.event_type === "system.metric_sampled") {
+  if (event.event_type === "photos.asset_recorded") {
+    if (event.source !== "photos.library" || event.sensitivity !== "high" || !validPhotoAssetPayload(event.payload)) return null;
+  } else if (event.sensitivity !== "normal") {
+    return null;
+  } else if (event.event_type === "system.metric_sampled") {
     if (event.source !== "system" || !validateContract("system-metric-sampled", event.payload).valid) return null;
   } else if (event.event_type === "system.health_changed") {
     if (event.source !== "system" || !validateContract("system-health-changed", event.payload).valid) return null;
@@ -104,6 +108,23 @@ function parseSystemEvent(event: EventEnvelope): SystemEventRecord | null {
   };
 }
 
+function validPhotoAssetPayload(value: unknown): boolean {
+  if (!isRecord(value) || !hasOnly(value, [
+    "asset_id", "captured_at", "media_type", "original_filename", "mime_type",
+    "pixel_width", "pixel_height", "duration_seconds", "album_names",
+  ])) return false;
+  return typeof value.asset_id === "string" && value.asset_id.length > 0 && value.asset_id.length <= 1024
+    && typeof value.captured_at === "string" && !Number.isNaN(Date.parse(value.captured_at))
+    && (value.media_type === "image" || value.media_type === "video")
+    && typeof value.original_filename === "string" && value.original_filename.length > 0 && value.original_filename.length <= 1024
+    && typeof value.mime_type === "string" && value.mime_type.length > 0 && value.mime_type.length <= 255
+    && typeof value.pixel_width === "number" && Number.isInteger(value.pixel_width) && value.pixel_width > 0 && value.pixel_width <= 100_000
+    && typeof value.pixel_height === "number" && Number.isInteger(value.pixel_height) && value.pixel_height > 0 && value.pixel_height <= 100_000
+    && typeof value.duration_seconds === "number" && Number.isFinite(value.duration_seconds) && value.duration_seconds >= 0
+    && Array.isArray(value.album_names) && value.album_names.length <= 100
+    && value.album_names.every((name) => typeof name === "string" && name.length > 0 && name.length <= 1024);
+}
+
 function isLifecycleEventType(value: string): value is LifecycleEventType {
   return (lifecycleEventTypes as readonly string[]).includes(value);
 }
@@ -112,7 +133,7 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
   if (
     event.schema_version !== 1
     || event.sensitivity !== "high"
-    || event.source !== "communication.wechat"
+    || (event.source !== "communication.wechat" && event.source !== "communication.messages")
   ) {
     return null;
   }
@@ -125,13 +146,14 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
       || !validateContract("communication-conversation-observed", event.payload).valid
     ) return null;
     const conversation = parseCommunicationConversation(event.payload, occurredAt);
-    if (conversation === null || event.idempotency_key === undefined) return null;
+    if (conversation === null || event.idempotency_key === undefined
+      || (event.source === "communication.wechat" && conversation.scope === "group" && (conversation.memberCount ?? 0) > 15)) return null;
     return {
       eventId: event.event_id,
       workspaceId: event.workspace_id,
       deviceId: event.device_id,
       eventType: "communication.conversation_observed",
-      source: "communication.wechat",
+      source: event.source,
       schemaVersion: 1,
       occurredAt,
       createdAt,
@@ -154,7 +176,7 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
       workspaceId: event.workspace_id,
       deviceId: event.device_id,
       eventType: "communication.message_sender_observed",
-      source: "communication.wechat",
+      source: event.source,
       schemaVersion: 1,
       occurredAt,
       createdAt,
@@ -170,13 +192,15 @@ function parseCommunicationEvent(event: EventEnvelope): CommunicationEventRecord
     || !validateContract("communication-message-recorded", event.payload).valid
   ) return null;
   const message = parseCommunicationMessage(event.payload, occurredAt, event.attachment_refs ?? []);
-  if (message === null || event.idempotency_key !== message.sourceKey) return null;
+  if (message === null || event.idempotency_key !== message.sourceKey
+    || (event.source === "communication.wechat" && message.conversation.scope === "group" && (message.conversation.memberCount ?? 0) > 15)
+    || (event.source === "communication.messages" && (message.kind !== "text" || message.attachments.length !== 0))) return null;
   return {
     eventId: event.event_id,
     workspaceId: event.workspace_id,
     deviceId: event.device_id,
     eventType: "communication.message_recorded",
-    source: "communication.wechat",
+    source: event.source,
     schemaVersion: 1,
     occurredAt,
     createdAt,
@@ -302,4 +326,9 @@ function parseCommunicationMessageSender(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnly(value: Record<string, unknown>, keys: string[]): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).length === keys.length && Object.keys(value).every((key) => allowed.has(key));
 }

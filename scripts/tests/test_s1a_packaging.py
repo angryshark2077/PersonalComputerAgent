@@ -206,7 +206,21 @@ class S1APackagingTests(unittest.TestCase):
             else:
                 os.environ[env_name] = previous
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("location entitlement", result.stdout)
+        self.assertIn("location or Photos entitlement", result.stdout)
+
+    def test_missing_bridge_photos_entitlement_is_rejected(self) -> None:
+        env_name = "PCA_SYNTHETIC_MISSING_PHOTOS_ENTITLEMENT"
+        previous = os.environ.get(env_name)
+        os.environ[env_name] = "PCAPlatformBridge.app"
+        try:
+            result = self.run_verify()
+        finally:
+            if previous is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = previous
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("location or Photos entitlement", result.stdout)
 
     def test_build_fails_before_creating_output_when_identity_is_missing(self) -> None:
         output = self.temp / "must-not-exist.dmg"
@@ -322,6 +336,7 @@ class S1APackagingTests(unittest.TestCase):
                     "LSUIElement": True,
                     "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
                     "NSScreenCaptureUsageDescription": "Capture the active display.",
+                    "NSPhotoLibraryUsageDescription": "Read photo-library originals.",
                 },
                 output,
             )
@@ -335,6 +350,7 @@ class S1APackagingTests(unittest.TestCase):
                     "NSLocationWhenInUseUsageDescription": "Read Wi-Fi identity for location matching.",
                     "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
                     "NSScreenCaptureUsageDescription": "Capture the active display.",
+                    "NSPhotoLibraryUsageDescription": "Read photo-library originals.",
                 },
                 output,
             )
@@ -364,9 +380,11 @@ if [[ "$(basename "$target")" == "${PCA_SYNTHETIC_SIGNATURE_FAILURE:-}" ]]; then
 fi
 if [[ " $* " == *" --entitlements :- "* ]]; then
   if [[ "$(basename "$target")" == "${PCA_SYNTHETIC_MISSING_LOCATION_ENTITLEMENT:-}" ]]; then
-    echo '<?xml version="1.0"?><plist version="1.0"><dict/></plist>'
-  else
+    echo '<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.personal-information.photos-library</key><true/></dict></plist>'
+  elif [[ "$(basename "$target")" == "${PCA_SYNTHETIC_MISSING_PHOTOS_ENTITLEMENT:-}" ]]; then
     echo '<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.personal-information.location</key><true/></dict></plist>'
+  else
+    echo '<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.personal-information.location</key><true/><key>com.apple.security.personal-information.photos-library</key><true/></dict></plist>'
   fi
 elif [[ "$1" == "--verify" ]]; then
   [[ " $* " == *" --strict "* && " $* " == *" --verbose=2 "* ]]

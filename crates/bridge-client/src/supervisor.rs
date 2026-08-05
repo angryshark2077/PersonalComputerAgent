@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::Component,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
+    process::{Command as StdCommand, ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
@@ -21,7 +21,7 @@ use tokio::{
 };
 
 use crate::{
-    BridgeClient, BridgeClientConfig, BridgeClientError, NetworkObservationState,
+    BridgeClient, BridgeClientConfig, BridgeClientError, NetworkObservationState, PhotoAssetRecord,
     PlatformLifecycleEvent, ScreenCaptureResult, ScreenContext,
 };
 
@@ -79,6 +79,96 @@ impl ScreenCaptureCommandHandle {
             .await
             .map_err(|_| BridgeClientError::Disconnected)?
     }
+
+    /// Decodes Apple attributed message bodies using the supervised Bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Disconnected` when supervision stops, otherwise the Bridge error.
+    pub async fn decode_message_bodies(
+        &self,
+        encoded_bodies: Vec<String>,
+    ) -> Result<Vec<Option<String>>, BridgeClientError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(ScreenCaptureCommand::DecodeMessages {
+                encoded_bodies,
+                response,
+            })
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?;
+        receiver
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?
+    }
+
+    /// Reads the Photo Library authorization status using the supervised Bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Disconnected` when supervision stops, otherwise the Bridge error.
+    pub async fn photo_authorization(&self) -> Result<String, BridgeClientError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(ScreenCaptureCommand::PhotoAuthorization { response })
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?;
+        receiver
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?
+    }
+
+    /// Lists Photo Library assets using the supervised Bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Disconnected` when supervision stops, otherwise the Bridge error.
+    pub async fn list_photo_assets(
+        &self,
+        after_created_at: Option<String>,
+        after_local_identifier: Option<String>,
+        cutoff: String,
+        limit: u8,
+    ) -> Result<(String, Vec<PhotoAssetRecord>), BridgeClientError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(ScreenCaptureCommand::ListPhotos {
+                after_created_at,
+                after_local_identifier,
+                cutoff,
+                limit,
+                response,
+            })
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?;
+        receiver
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?
+    }
+
+    /// Exports one original Photo Library asset using the supervised Bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Disconnected` when supervision stops, otherwise the Bridge error.
+    pub async fn export_photo_asset(
+        &self,
+        local_identifier: String,
+        file_name: uuid::Uuid,
+    ) -> Result<Option<PathBuf>, BridgeClientError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(ScreenCaptureCommand::ExportPhoto {
+                local_identifier,
+                file_name,
+                response,
+            })
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?;
+        receiver
+            .await
+            .map_err(|_| BridgeClientError::Disconnected)?
+    }
 }
 
 #[derive(Debug)]
@@ -94,6 +184,25 @@ enum ScreenCaptureCommand {
     Capture {
         excluded_bundle_ids: Vec<String>,
         response: oneshot::Sender<Result<ScreenCaptureResult, BridgeClientError>>,
+    },
+    DecodeMessages {
+        encoded_bodies: Vec<String>,
+        response: oneshot::Sender<Result<Vec<Option<String>>, BridgeClientError>>,
+    },
+    PhotoAuthorization {
+        response: oneshot::Sender<Result<String, BridgeClientError>>,
+    },
+    ListPhotos {
+        after_created_at: Option<String>,
+        after_local_identifier: Option<String>,
+        cutoff: String,
+        limit: u8,
+        response: oneshot::Sender<Result<(String, Vec<PhotoAssetRecord>), BridgeClientError>>,
+    },
+    ExportPhoto {
+        local_identifier: String,
+        file_name: uuid::Uuid,
+        response: oneshot::Sender<Result<Option<PathBuf>, BridgeClientError>>,
     },
 }
 
@@ -257,8 +366,10 @@ impl BridgeSupervisor {
 
     /// Runs the Bridge child lifecycle until cancellation or protocol incompatibility.
     ///
-    /// The child is always executed directly with exactly `--socket <absolute-path>`; no shell,
-    /// command interpolation, secret environment variable, or inherited standard stream is used.
+    /// The signed helper executable is started directly with exactly `--socket <absolute-path>`;
+    /// its production app wrapper relaunches the server through `LaunchServices` so macOS privacy
+    /// permissions are attributed to the signed helper bundle. No shell, command interpolation,
+    /// secret environment variable, or inherited standard stream is used.
     ///
     /// # Errors
     ///
@@ -371,6 +482,20 @@ impl BridgeSupervisor {
                             }
                             ScreenCaptureCommand::Capture { excluded_bundle_ids, response } => {
                                 let _ = response.send(client.capture_screen(&excluded_bundle_ids).await);
+                            }
+                            ScreenCaptureCommand::DecodeMessages { encoded_bodies, response } => {
+                                let _ = response.send(client.decode_message_bodies(&encoded_bodies).await);
+                            }
+                            ScreenCaptureCommand::PhotoAuthorization { response } => {
+                                let _ = response.send(client.photo_authorization().await);
+                            }
+                            ScreenCaptureCommand::ListPhotos { after_created_at, after_local_identifier, cutoff, limit, response } => {
+                                let _ = response.send(client.list_photo_assets(
+                                    after_created_at.as_deref(), after_local_identifier.as_deref(), &cutoff, limit,
+                                ).await);
+                            }
+                            ScreenCaptureCommand::ExportPhoto { local_identifier, file_name, response } => {
+                                let _ = response.send(client.export_photo_asset(&local_identifier, file_name).await);
                             }
                         }
                     }
@@ -508,7 +633,17 @@ impl ReapProcess for Child {
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
-        Child::start_kill(self)
+        let process_id = self
+            .id()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let status = StdCommand::new("/bin/kill")
+            .args(["-TERM", "--", &process_id.to_string()])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("could not terminate Bridge wrapper"))
+        }
     }
 
     fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> {
@@ -517,9 +652,10 @@ impl ReapProcess for Child {
 }
 
 async fn reap_child(child: &mut impl ReapProcess) {
-    // `kill_on_drop` is a last-resort process fallback, never evidence of reap. Once Child is
-    // owned, even pathological start_kill/wait errors keep this loop pending until an explicit
-    // wait observation confirms the child has exited and been reaped.
+    // `kill_on_drop` is a last-resort process fallback, never evidence of reap. The normal
+    // SIGTERM path lets the production wrapper forward termination to its LaunchServices child.
+    // Once Child is owned, even pathological termination/wait errors keep this loop pending until
+    // an explicit wait observation confirms the child has exited and been reaped.
     loop {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;

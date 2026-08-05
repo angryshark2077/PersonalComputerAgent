@@ -12,7 +12,7 @@
     "CollectorConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["network", "screen.capture", "communication.wechat"],
+      "required": ["network", "screen.capture", "communication.wechat", "communication.messages", "photos.library"],
       "properties": {
         "network": {
           "type": "object",
@@ -75,6 +75,34 @@
             "max_group_members": { "const": 15 },
             "sync_mode": { "const": "full" },
             "retention_days": { "const": 180 }
+          }
+        },
+        "communication.messages": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "directions", "message_types", "conversation_scope", "initial_lookback_days", "sync_mode", "attachments_enabled", "attachment_retention_days"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "directions": { "type": "array", "prefixItems": [{ "const": "incoming" }, { "const": "outgoing" }], "items": false, "minItems": 2, "maxItems": 2 },
+            "message_types": { "type": "array", "prefixItems": [{ "const": "text" }], "items": false, "minItems": 1, "maxItems": 1 },
+            "conversation_scope": { "const": "all" },
+            "initial_lookback_days": { "const": 7 },
+            "sync_mode": { "const": "full" },
+            "attachments_enabled": { "const": false },
+            "attachment_retention_days": { "const": 7 }
+          }
+        },
+        "photos.library": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "media_types", "include_originals", "include_album_names", "initial_lookback_days", "cloud_retention"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "media_types": { "type": "array", "prefixItems": [{ "const": "image" }, { "const": "video" }], "items": false, "minItems": 2, "maxItems": 2 },
+            "include_originals": { "const": true },
+            "include_album_names": { "const": true },
+            "initial_lookback_days": { "const": 7 },
+            "cloud_retention": { "const": "permanent" }
           }
         }
       }

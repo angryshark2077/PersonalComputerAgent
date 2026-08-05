@@ -163,6 +163,8 @@ test("control state is Workspace-scoped, monotonic, and audited", async () => {
     config: {
       networkEnabled: true,
       wechatEnabled: false,
+      messagesEnabled: false,
+      photosEnabled: false,
       screenCaptureEnabled: false,
       screenCaptureScheduledEnabled: true,
       screenCaptureIntervalSeconds: 300,
@@ -319,6 +321,8 @@ test("pairing authorization and config audit require Owner membership", async ()
       config: {
         networkEnabled: false,
         wechatEnabled: false,
+        messagesEnabled: false,
+        photosEnabled: false,
         screenCaptureEnabled: false,
         screenCaptureScheduledEnabled: true,
         screenCaptureIntervalSeconds: 300,

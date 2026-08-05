@@ -31,6 +31,24 @@ const snapshotWithWechatEnabled = () => ({
       sync_mode: "full" as const,
       retention_days: 180 as const,
     },
+    "communication.messages": {
+      enabled: true,
+      directions: ["incoming", "outgoing"] as ["incoming", "outgoing"],
+      message_types: ["text"] as ["text"],
+      conversation_scope: "all" as const,
+      initial_lookback_days: 7 as const,
+      sync_mode: "full" as const,
+      attachments_enabled: false as const,
+      attachment_retention_days: 7 as const,
+    },
+    "photos.library": {
+      enabled: true,
+      media_types: ["image", "video"] as ["image", "video"],
+      include_originals: true as const,
+      include_album_names: true as const,
+      initial_lookback_days: 7 as const,
+      cloud_retention: "permanent" as const,
+    },
   },
 });
 

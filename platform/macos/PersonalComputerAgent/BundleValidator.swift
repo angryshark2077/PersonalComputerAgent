@@ -91,6 +91,7 @@ struct BundleValidator: BundleValidating {
               info["CFBundleExecutable"] as? String == "PersonalComputerAgent",
               info["LSUIElement"] as? Bool == true,
               !(info["NSScreenCaptureUsageDescription"] as? String ?? "").isEmpty,
+              !(info["NSPhotoLibraryUsageDescription"] as? String ?? "").isEmpty,
               let candidateVersion = info["CFBundleShortVersionString"] as? String,
               Version(candidateVersion).isValid
         else { throw InstallError.invalidBundle }
@@ -107,7 +108,8 @@ struct BundleValidator: BundleValidating {
               bridgeInfo["CFBundleExecutable"] as? String == "PCAPlatformBridge",
               bridgeInfo["LSUIElement"] as? Bool == true,
               !(bridgeInfo["NSLocationWhenInUseUsageDescription"] as? String ?? "").isEmpty,
-              !(bridgeInfo["NSScreenCaptureUsageDescription"] as? String ?? "").isEmpty
+              !(bridgeInfo["NSScreenCaptureUsageDescription"] as? String ?? "").isEmpty,
+              !(bridgeInfo["NSPhotoLibraryUsageDescription"] as? String ?? "").isEmpty
         else { throw InstallError.invalidBundle }
         let wechatRepair = candidate.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair")
         let ffmpeg = candidate.appendingPathComponent("Contents/Resources/bin/ffmpeg")

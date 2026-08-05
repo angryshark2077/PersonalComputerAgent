@@ -195,6 +195,7 @@ button:disabled { cursor: not-allowed; opacity: 0.58; }
 .screenshot-grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-top: 24px; }
 .screenshot-card { margin: 0; }
 .screenshot-card img { aspect-ratio: 16 / 10; display: block; object-fit: cover; width: 100%; }
+.screenshot-card video { aspect-ratio: 16 / 10; background: #000; display: block; object-fit: contain; width: 100%; }
 .screenshot-card figcaption { display: grid; font-size: 13px; gap: 5px; padding: 14px; }
 .screenshot-card figcaption span { color: #667085; overflow-wrap: anywhere; }
 

@@ -118,6 +118,27 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.health.checkCount, 0)
     }
 
+    func testMissingPhotosAccessStopsBeforeCredentialsServiceAndHealth() async throws {
+        let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
+        fixture.photosAccess.error = .photosAccessRequired
+        var states: [InstallerState] = []
+
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.coordinator.finishInstalledSetup { states.append($0) }
+        ) { error in
+            XCTAssertEqual(error as? InstallError, .photosAccessRequired)
+        }
+
+        XCTAssertEqual(states, [.waitingPhotosAccess])
+        XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
+        XCTAssertEqual(fixture.locationAccess.checkCount, 1)
+        XCTAssertEqual(fixture.screenCaptureAccess.checkCount, 1)
+        XCTAssertEqual(fixture.photosAccess.checkCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
+        XCTAssertEqual(fixture.service.registerCount, 0)
+        XCTAssertEqual(fixture.health.checkCount, 0)
+    }
+
     func testHealthyExistingRuntimeSkipsReregistrationWhenReopeningInstalledSetup() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
         fixture.service.currentState = .enabled
@@ -517,6 +538,7 @@ private final class Fixture {
     let fullDiskAccess = FakeFullDiskAccessController()
     let locationAccess = FakeLocationAccessController()
     let screenCaptureAccess = FakeScreenCaptureAccessController()
+    let photosAccess = FakePhotosAccessController()
     let credentialProvisioner = FakeBridgeCredentialProvisioner()
     let fileSystem: FaultingInstallFileSystem
     let coordinator: InstallCoordinator
@@ -544,6 +566,7 @@ private final class Fixture {
             fullDiskAccess: fullDiskAccess,
             locationAccess: locationAccess,
             screenCaptureAccess: screenCaptureAccess,
+            photosAccess: photosAccess,
             credentialProvisioner: credentialProvisioner,
             fileSystem: fileSystem
         )
@@ -647,6 +670,23 @@ private final class FakeScreenCaptureAccessController: ScreenCaptureAccessContro
     ) async throws {
         checkCount += 1
         helperExecutableURLs.append(helperExecutableURL)
+        if let error {
+            onWaitingForAuthorization()
+            throw error
+        }
+    }
+}
+
+@MainActor
+private final class FakePhotosAccessController: PhotosAccessControlling {
+    var checkCount = 0
+    var error: InstallError?
+
+    func waitForAuthorization(
+        helperExecutableURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        checkCount += 1
         if let error {
             onWaitingForAuthorization()
             throw error
@@ -1108,11 +1148,12 @@ final class InstallerViewModelTests: XCTestCase {
 
     func testInstalledSetupAutomaticallyStartsExactlyOnce() async throws {
         let coordinator = CountingInstallCoordinator()
+        let terminator = FakeTerminator()
         let model = InstallerViewModel(
             coordinator: coordinator,
             sourceBundle: URL(fileURLWithPath: "/tmp/installed.app"),
             automaticallyStart: true,
-            terminator: FakeTerminator()
+            terminator: terminator
         )
 
         model.startIfRequested()
@@ -1121,6 +1162,7 @@ final class InstallerViewModelTests: XCTestCase {
         try await waitUntil { coordinator.callCount == 1 && !model.isInstalling }
         XCTAssertEqual(coordinator.callCount, 1)
         XCTAssertEqual(model.state, .success)
+        XCTAssertEqual(terminator.count, 1)
     }
 
     func testRollbackRelaunchTerminatesCurrentInstallerWithoutShowingConcurrentFailureUI() async {
@@ -1391,6 +1433,7 @@ final class BundleValidatorSigningTests: XCTestCase {
             "CFBundleShortVersionString": "2.0.0",
             "LSUIElement": true,
             "NSScreenCaptureUsageDescription": "Capture the active display.",
+            "NSPhotoLibraryUsageDescription": "Read photo-library originals.",
         ]
         XCTAssertTrue((info as NSDictionary).write(to: bundle.appendingPathComponent("Contents/Info.plist"), atomically: true))
         let bridgeInfo: [String: Any] = [
@@ -1400,6 +1443,7 @@ final class BundleValidatorSigningTests: XCTestCase {
             "LSUIElement": true,
             "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
             "NSScreenCaptureUsageDescription": "Capture the active display.",
+            "NSPhotoLibraryUsageDescription": "Read photo-library originals.",
         ]
         XCTAssertTrue((bridgeInfo as NSDictionary).write(
             to: bridge.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist"),

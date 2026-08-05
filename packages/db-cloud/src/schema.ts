@@ -22,6 +22,8 @@ import {
 export interface StoredCollectorConfig {
   networkEnabled: boolean;
   wechatEnabled: boolean;
+  messagesEnabled: boolean;
+  photosEnabled: boolean;
   screenCaptureEnabled: boolean;
   screenCaptureScheduledEnabled: boolean;
   screenCaptureIntervalSeconds: number;
@@ -252,6 +254,8 @@ export const collectorConfigs = pgTable(
       .default(0),
     networkEnabled: boolean("network_enabled").notNull().default(false),
     wechatEnabled: boolean("wechat_enabled").notNull().default(false),
+    messagesEnabled: boolean("messages_enabled").notNull().default(false),
+    photosEnabled: boolean("photos_enabled").notNull().default(false),
     screenCaptureEnabled: boolean("screen_capture_enabled").notNull().default(false),
     screenCaptureScheduledEnabled: boolean("screen_capture_scheduled_enabled").notNull().default(true),
     screenCaptureIntervalSeconds: integer("screen_capture_interval_seconds").notNull().default(300),
@@ -734,6 +738,48 @@ export const communicationObjects = pgTable(
   ],
 );
 
+export const photoLibraryAssets = pgTable(
+  "photo_library_assets",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    eventId: uuid("event_id").notNull().references(() => systemEvents.eventId, { onDelete: "cascade" }),
+    assetId: text("asset_id").notNull(),
+    capturedAt: timestampColumn("captured_at").notNull(),
+    mediaType: text("media_type").notNull(),
+    originalFilename: text("original_filename").notNull(),
+    mimeType: text("mime_type").notNull(),
+    pixelWidth: integer("pixel_width").notNull(),
+    pixelHeight: integer("pixel_height").notNull(),
+    durationSeconds: doublePrecision("duration_seconds").notNull(),
+    albumNames: jsonb("album_names").$type<string[]>().notNull(),
+    objectKey: text("object_key").notNull(),
+    expectedSha256: char("expected_sha256", { length: 64 }).notNull(),
+    expectedSizeBytes: bigint("expected_size_bytes", { mode: "number" }).notNull(),
+    state: text("state").notNull(),
+    preparedAt: timestampColumn("prepared_at").notNull(),
+    completedAt: timestampColumn("completed_at"),
+  },
+  (table) => [
+    foreignKey({ columns: [table.workspaceId, table.deviceId], foreignColumns: [devices.workspaceId, devices.id] }).onDelete("cascade"),
+    unique("photo_library_assets_event_unique").on(table.eventId),
+    unique("photo_library_assets_source_unique").on(table.workspaceId, table.deviceId, table.assetId),
+    uniqueIndex("photo_library_assets_key_unique").on(table.objectKey),
+    index("idx_photo_library_assets_owner_chronology").on(table.workspaceId, table.deviceId, table.capturedAt.desc()).where(sql`${table.state} = 'completed'`),
+    check("photo_library_assets_media_type", sql`${table.mediaType} IN ('image', 'video')`),
+    check("photo_library_assets_dimensions", sql`${table.pixelWidth} > 0 AND ${table.pixelHeight} > 0`),
+    check("photo_library_assets_duration", sql`${table.durationSeconds} >= 0`),
+    check("photo_library_assets_hash", sql`${table.expectedSha256} ~ '^[a-f0-9]{64}$'`),
+    check("photo_library_assets_size", sql`${table.expectedSizeBytes} > 0`),
+    check("photo_library_assets_state", sql`${table.state} IN ('prepared', 'completed')`),
+    check(
+      "photo_library_assets_completed_at",
+      sql`(${table.state} = 'prepared' AND ${table.completedAt} IS NULL) OR (${table.state} = 'completed' AND ${table.completedAt} IS NOT NULL)`,
+    ),
+  ],
+);
+
 export const cloudSchema = {
   authUsers,
   authSessions,
@@ -755,5 +801,6 @@ export const cloudSchema = {
   communicationMessages,
   communicationMessageAttachments,
   communicationObjects,
+  photoLibraryAssets,
   systemEvents,
 };

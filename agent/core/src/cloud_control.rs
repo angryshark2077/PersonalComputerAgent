@@ -197,6 +197,14 @@ pub trait ControlClient: Send + Sync {
         Box::pin(async { Err(ControlError::Contract) })
     }
 
+    fn sync_photo<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: &'a PendingPhoto,
+    ) -> ControlFuture<'a, ()> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+
     fn fail_screenshot_request<'a>(
         &'a self,
         _: &'a DeviceCredential,
@@ -256,6 +264,26 @@ pub struct PendingScreenshot {
     image_file_name: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingPhoto {
+    pub(crate) photo_id: String,
+    pub(crate) event_id: String,
+    pub(crate) asset_id: String,
+    pub(crate) captured_at: String,
+    pub(crate) media_type: String,
+    pub(crate) original_filename: String,
+    pub(crate) mime_type: String,
+    pub(crate) pixel_width: u32,
+    pub(crate) pixel_height: u32,
+    pub(crate) duration_seconds: f64,
+    pub(crate) album_names: Vec<String>,
+    pub(crate) sha256: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) media_file_name: Option<String>,
+    pub(crate) completed: bool,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ScreenshotTrigger {
@@ -274,6 +302,19 @@ struct PreparedScreenshot {
 #[derive(Deserialize)]
 struct CompletedScreenshot {
     screenshot_id: String,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct PreparedPhoto {
+    photo_id: String,
+    state: String,
+    upload: Option<PreparedCommunicationUpload>,
+}
+
+#[derive(Deserialize)]
+struct CompletedPhoto {
+    photo_id: String,
     state: String,
 }
 
@@ -533,6 +574,62 @@ pub struct CollectorControls {
     pub screen_capture: ScreenCaptureControl,
     #[serde(rename = "communication.wechat")]
     pub communication_wechat: CommunicationScopeV2,
+    #[serde(rename = "communication.messages", default)]
+    pub communication_messages: MessagesControl,
+    #[serde(rename = "photos.library", default)]
+    pub photos_library: PhotosControl,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagesControl {
+    pub enabled: bool,
+    pub directions: [String; 2],
+    pub message_types: [String; 1],
+    pub conversation_scope: String,
+    pub initial_lookback_days: u8,
+    pub sync_mode: String,
+    pub attachments_enabled: bool,
+    pub attachment_retention_days: u16,
+}
+
+impl Default for MessagesControl {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directions: ["incoming".to_owned(), "outgoing".to_owned()],
+            message_types: ["text".to_owned()],
+            conversation_scope: "all".to_owned(),
+            initial_lookback_days: 7,
+            sync_mode: "full".to_owned(),
+            attachments_enabled: false,
+            attachment_retention_days: 7,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotosControl {
+    pub enabled: bool,
+    pub media_types: [String; 2],
+    pub include_originals: bool,
+    pub include_album_names: bool,
+    pub initial_lookback_days: u8,
+    pub cloud_retention: String,
+}
+
+impl Default for PhotosControl {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            media_types: ["image".to_owned(), "video".to_owned()],
+            include_originals: true,
+            include_album_names: true,
+            initial_lookback_days: 7,
+            cloud_retention: "permanent".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -575,6 +672,22 @@ impl AgentControlSnapshot {
             .local_media_cleanup
             .as_ref()
             .is_some_and(|request| Uuid::parse_str(&request.request_id).is_err())
+            || self.collectors.communication_messages.directions != ["incoming", "outgoing"]
+            || self.collectors.communication_messages.message_types != ["text"]
+            || self.collectors.communication_messages.conversation_scope != "all"
+            || self.collectors.communication_messages.initial_lookback_days != 7
+            || self.collectors.communication_messages.sync_mode != "full"
+            || self.collectors.communication_messages.attachments_enabled
+            || self
+                .collectors
+                .communication_messages
+                .attachment_retention_days
+                != 7
+            || self.collectors.photos_library.media_types != ["image", "video"]
+            || !self.collectors.photos_library.include_originals
+            || !self.collectors.photos_library.include_album_names
+            || self.collectors.photos_library.initial_lookback_days != 7
+            || self.collectors.photos_library.cloud_retention != "permanent"
         {
             return Err(ControlError::Contract);
         }
@@ -600,10 +713,16 @@ impl AgentControlSnapshot {
 
 /// Complete, durable desired configuration. S1B intentionally does not start either source.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "fixed independent collector enable flags"
+)]
 pub struct AppliedControl {
     pub configuration_revision: u64,
     pub network_enabled: bool,
     pub communication_wechat_enabled: bool,
+    pub communication_messages_enabled: bool,
+    pub photos_library_enabled: bool,
     pub screen_capture: ScreenCaptureControl,
     pub screenshot_request_id: Option<String>,
 }
@@ -626,6 +745,8 @@ pub fn apply_snapshot(
         configuration_revision: snapshot.configuration_revision,
         network_enabled: snapshot.collectors.network.enabled,
         communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+        communication_messages_enabled: snapshot.collectors.communication_messages.enabled,
+        photos_library_enabled: snapshot.collectors.photos_library.enabled,
         screen_capture: snapshot.collectors.screen_capture.clone(),
         screenshot_request_id: snapshot
             .screenshot_request
@@ -943,6 +1064,26 @@ async fn run_cloud_workers(
         Arc::clone(&client),
         media_shutdown_receiver,
     ));
+    let apple_worker = screen_capture.as_ref().map(|bridge| {
+        tokio::spawn(crate::apple_messages::run(
+            Arc::clone(&database),
+            bridge.clone(),
+            credentials.credential().workspace_id().to_owned(),
+            credentials.credential().device_id().to_owned(),
+            screen_controls.clone(),
+            media_shutdown.subscribe(),
+        ))
+    });
+    let photo_worker = screen_capture.as_ref().map(|bridge| {
+        tokio::spawn(crate::apple_photos::run(
+            Arc::clone(&database),
+            bridge.clone(),
+            credentials.credential().workspace_id().to_owned(),
+            credentials.credential().device_id().to_owned(),
+            screen_controls.clone(),
+            media_shutdown.subscribe(),
+        ))
+    });
     let screen_worker = screen_capture.map(|bridge| {
         tokio::spawn(run_screenshot_loop(
             screen_controls,
@@ -970,6 +1111,12 @@ async fn run_cloud_workers(
     if let Some(worker) = &screen_worker {
         worker.abort();
     }
+    if let Some(worker) = &apple_worker {
+        worker.abort();
+    }
+    if let Some(worker) = &photo_worker {
+        worker.abort();
+    }
     let media_result = match media_worker.await {
         Ok(result) => result,
         Err(error) if error.is_cancelled() => Ok(()),
@@ -977,7 +1124,7 @@ async fn run_cloud_workers(
     };
     control_result?;
     media_result?;
-    if let Some(worker) = screen_worker {
+    let screen_result = if let Some(worker) = screen_worker {
         match worker.await {
             Ok(result) => result,
             Err(error) if error.is_cancelled() => Ok(()),
@@ -985,7 +1132,14 @@ async fn run_cloud_workers(
         }
     } else {
         Ok(())
+    };
+    if let Some(worker) = apple_worker {
+        let _ = worker.await;
     }
+    if let Some(worker) = photo_worker {
+        let _ = worker.await;
+    }
+    screen_result
 }
 
 impl CloudControlOwner {
@@ -1634,6 +1788,8 @@ async fn apply_control_snapshot(
         configuration_revision: snapshot.configuration_revision,
         network_enabled: snapshot.collectors.network.enabled,
         communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+        communication_messages_enabled: snapshot.collectors.communication_messages.enabled,
+        photos_library_enabled: snapshot.collectors.photos_library.enabled,
         screen_capture: snapshot.collectors.screen_capture.clone(),
         screenshot_request_id: snapshot
             .screenshot_request
@@ -1653,6 +1809,8 @@ async fn apply_control_snapshot(
             configuration_revision: snapshot.configuration_revision,
             network_enabled: snapshot.collectors.network.enabled,
             communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+            communication_messages_enabled: snapshot.collectors.communication_messages.enabled,
+            photos_library_enabled: snapshot.collectors.photos_library.enabled,
             screen_capture: snapshot.collectors.screen_capture.clone(),
             screenshot_request_id: snapshot
                 .screenshot_request
@@ -1779,6 +1937,7 @@ async fn run_media_loop(
             sync_pending_communication_attachments(&database, &credential, client.as_ref())
                 .await
                 .unwrap_or(0);
+        let _ = upload_pending_photos(client.as_ref(), &credential).await;
         wait = next_media_wait(completed_media);
     }
 }
@@ -2073,6 +2232,102 @@ fn screenshot_spool_root() -> Result<PathBuf, ControlError> {
         return Err(ControlError::Contract);
     }
     Ok(root)
+}
+
+pub(crate) fn photo_spool_root() -> Result<PathBuf, ControlError> {
+    let home = std::env::var_os("HOME").ok_or(ControlError::Contract)?;
+    let root = PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("PersonalComputerAgent")
+        .join("PhotoSpool");
+    if !root.is_absolute() {
+        return Err(ControlError::Contract);
+    }
+    Ok(root)
+}
+
+pub(crate) async fn persist_photo_manifest(photo: &PendingPhoto) -> Result<(), ControlError> {
+    let root = photo_spool_root()?;
+    tokio::fs::create_dir_all(&root)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    let bytes = serde_json::to_vec(photo).map_err(|_| ControlError::Contract)?;
+    let final_path = root.join(format!("{}.json", photo.photo_id));
+    let temporary_path = root.join(format!(".{}.tmp", photo.photo_id));
+    tokio::fs::write(&temporary_path, bytes)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::rename(temporary_path, final_path)
+        .await
+        .map_err(|_| ControlError::Transient)
+}
+
+async fn upload_pending_photos(
+    client: &dyn ControlClient,
+    credentials: &DeviceCredential,
+) -> Result<(), ControlError> {
+    let root = photo_spool_root()?;
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ControlError::Transient),
+    };
+    let mut processed = 0_u8;
+    while processed < 4 {
+        let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|_| ControlError::Transient)?
+        else {
+            break;
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|value| value != "json") {
+            continue;
+        }
+        let mut photo: PendingPhoto = serde_json::from_slice(
+            &tokio::fs::read(&path)
+                .await
+                .map_err(|_| ControlError::Transient)?,
+        )
+        .map_err(|_| ControlError::Contract)?;
+        if photo.completed {
+            continue;
+        }
+        if Uuid::parse_str(&photo.photo_id).is_err()
+            || Uuid::parse_str(&photo.event_id).is_err()
+            || photo.media_file_name.as_deref() != Some(photo.photo_id.as_str())
+        {
+            return Err(ControlError::Contract);
+        }
+        if client.sync_photo(credentials, &photo).await.is_err() {
+            continue;
+        }
+        let media_path = root.join(
+            photo
+                .media_file_name
+                .as_deref()
+                .ok_or(ControlError::Contract)?,
+        );
+        if media_path.parent() != Some(root.as_path()) {
+            return Err(ControlError::Contract);
+        }
+        tokio::fs::remove_file(media_path)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        photo.media_file_name = None;
+        photo.completed = true;
+        persist_photo_manifest(&photo).await?;
+        processed = processed.saturating_add(1);
+    }
+    Ok(())
 }
 
 async fn sync_pending_system_events(
@@ -2407,6 +2662,66 @@ async fn upload_screenshot(
     }
 }
 
+async fn upload_photo(
+    client: &Client,
+    upload_url: Url,
+    headers: &BTreeMap<String, String>,
+    photo: &PendingPhoto,
+    spool_root: &Path,
+) -> Result<(), ControlError> {
+    let file_name = photo
+        .media_file_name
+        .as_deref()
+        .ok_or(ControlError::Contract)?;
+    let path = spool_root.join(file_name);
+    if path.parent() != Some(spool_root) || file_name != photo.photo_id {
+        return Err(ControlError::Contract);
+    }
+    let (actual_sha256, actual_size) = hash_spool_file(&path).await?;
+    if actual_size != photo.size_bytes || actual_sha256 != photo.sha256 {
+        return Err(ControlError::Contract);
+    }
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    let request = client
+        .put(upload_url)
+        .timeout(MEDIA_UPLOAD_TIMEOUT)
+        .body(reqwest::Body::wrap_stream(ReaderStream::new(file)));
+    let request = apply_communication_upload_headers(request, headers, photo.size_bytes)?;
+    let response = request.send().await.map_err(|_| ControlError::Transient)?;
+    if response.status().is_success() {
+        Ok(())
+    } else if response.status().is_server_error() {
+        Err(ControlError::Transient)
+    } else {
+        Err(ControlError::Contract)
+    }
+}
+
+async fn hash_spool_file(path: &Path) -> Result<(String, u64), ControlError> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    let mut digest = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        size = size
+            .checked_add(u64::try_from(count).map_err(|_| ControlError::Contract)?)
+            .ok_or(ControlError::Contract)?;
+    }
+    Ok((format!("{:x}", digest.finalize()), size))
+}
+
 fn apply_communication_upload_headers(
     mut request: reqwest::RequestBuilder,
     headers: &BTreeMap<String, String>,
@@ -2724,6 +3039,79 @@ impl ControlClient for HttpControlClient {
             .await?;
             if completed.screenshot_id != screenshot.screenshot_id || completed.state != "completed"
             {
+                return Err(ControlError::Contract);
+            }
+            Ok(())
+        })
+    }
+
+    fn sync_photo<'a>(
+        &'a self,
+        credentials: &'a DeviceCredential,
+        photo: &'a PendingPhoto,
+    ) -> ControlFuture<'a, ()> {
+        Box::pin(async move {
+            let client = Self::client()?;
+            let response = client
+                .post(self.endpoint("v1/agent/photos/prepare")?)
+                .bearer_auth(credentials.access_credential())
+                .json(&serde_json::json!({
+                    "photo_id": photo.photo_id,
+                    "event_id": photo.event_id,
+                    "asset_id": photo.asset_id,
+                    "captured_at": photo.captured_at,
+                    "media_type": photo.media_type,
+                    "original_filename": photo.original_filename,
+                    "mime_type": photo.mime_type,
+                    "pixel_width": photo.pixel_width,
+                    "pixel_height": photo.pixel_height,
+                    "duration_seconds": photo.duration_seconds,
+                    "album_names": photo.album_names,
+                    "sha256": photo.sha256,
+                    "size_bytes": photo.size_bytes,
+                }))
+                .send()
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            let prepared = parse_response::<PreparedPhoto>(response).await?;
+            if prepared.photo_id != photo.photo_id {
+                return Err(ControlError::Contract);
+            }
+            if prepared.state != "completed" {
+                if prepared.state != "prepared" {
+                    return Err(ControlError::Contract);
+                }
+                let upload = prepared.upload.ok_or(ControlError::Contract)?;
+                let upload_url = Url::parse(&upload.url).map_err(|_| ControlError::Contract)?;
+                if upload_url.scheme() != "https" {
+                    return Err(ControlError::Contract);
+                }
+                let root = photo_spool_root()?;
+                if upload_photo(&client, upload_url.clone(), &upload.headers, photo, &root)
+                    .await
+                    .is_err()
+                {
+                    upload_photo(
+                        &Self::direct_client()?,
+                        upload_url,
+                        &upload.headers,
+                        photo,
+                        &root,
+                    )
+                    .await?;
+                }
+            }
+            let completed = parse_response::<CompletedPhoto>(
+                Self::client()?
+                    .post(self.endpoint("v1/agent/photos/complete")?)
+                    .bearer_auth(credentials.access_credential())
+                    .json(&serde_json::json!({ "photo_id": photo.photo_id }))
+                    .send()
+                    .await
+                    .map_err(|_| ControlError::Transient)?,
+            )
+            .await?;
+            if completed.photo_id != photo.photo_id || completed.state != "completed" {
                 return Err(ControlError::Contract);
             }
             Ok(())

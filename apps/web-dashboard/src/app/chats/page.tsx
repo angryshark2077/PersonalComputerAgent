@@ -31,9 +31,9 @@ export default function ChatsPage() {
   return (
     <DashboardShell>
       <section className="page-heading">
-        <p className="workspace-name">WeChat collection</p>
+        <p className="workspace-name">Communication collection</p>
         <h1>Chats</h1>
-        <p>Select the Mac whose WeChat account you want to inspect.</p>
+        <p>Select the Mac whose WeChat or Messages conversations you want to inspect.</p>
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
       {devices === null ? <p className="status-note">Loading devices…</p> : (

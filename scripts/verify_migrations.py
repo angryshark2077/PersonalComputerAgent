@@ -49,6 +49,9 @@ EXPECTED_MIGRATIONS = {
         "0018_network_lifecycle_events.sql",
         "0019_network_changed_events.sql",
         "0020_prefer_complete_media_projections.sql",
+        "0021_screen_capture.sql",
+        "0022_apple_photos_messages_collectors.sql",
+        "0023_photo_library_assets.sql",
     ],
 }
 
@@ -194,7 +197,10 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "communication_message_attachments",
         "communication_objects",
         "device_media_cleanup_requests",
+        "device_screenshot_requests",
+        "device_screenshots",
         "network_location_library",
+        "photo_library_assets",
     }
     actual_tables = set(
         re.findall(

@@ -98,25 +98,31 @@ plist_mode=$(stat -f '%Lp' "$launch_agent")
 [[ "$(plutil -extract CFBundleIdentifier raw -o - "$bridge_app/Contents/Info.plist")" == "com.pca.PersonalComputerAgent.PlatformBridge" ]] || fail "wrong Bridge helper bundle identifier"
 [[ -n "$(plutil -extract NSLocationWhenInUseUsageDescription raw -o - "$bridge_app/Contents/Info.plist")" ]] || fail "missing Bridge helper location usage description"
 [[ -n "$(plutil -extract NSScreenCaptureUsageDescription raw -o - "$bridge_app/Contents/Info.plist")" ]] || fail "missing Bridge helper screen capture usage description"
+[[ -n "$(plutil -extract NSPhotoLibraryUsageDescription raw -o - "$bridge_app/Contents/Info.plist")" ]] || fail "missing Bridge helper Photos usage description"
 [[ -n "$(plutil -extract NSLocationUsageDescription raw -o - "$info")" ]] || fail "missing macOS location usage description"
+[[ -n "$(plutil -extract NSPhotoLibraryUsageDescription raw -o - "$info")" ]] || fail "missing macOS Photos usage description"
 [[ "$(plutil -extract CFBundleExecutable raw -o - "$info")" == "PersonalComputerAgent" ]] || fail "wrong bundle executable"
 [[ "$(plutil -extract LSUIElement raw -o - "$info")" == "true" ]] || fail "LSUIElement must be true"
 version=$(plutil -extract CFBundleShortVersionString raw -o - "$info")
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "bundle version must be three numeric components"
 
-for location_target in "$app" "$bridge_app"; do
-  location_entitlements=$(codesign -d --entitlements :- "$location_target" 2>/dev/null) \
-    || fail "could not inspect signature location entitlement for $(basename "$location_target")"
-  location_allowed=$(python3 -c '
+for permission_target in "$app" "$bridge_app"; do
+  permission_entitlements=$(codesign -d --entitlements :- "$permission_target" 2>/dev/null) \
+    || fail "could not inspect signature privacy entitlements for $(basename "$permission_target")"
+  permissions_allowed=$(python3 -c '
 import plistlib, sys
-value = plistlib.load(sys.stdin.buffer).get("com.apple.security.personal-information.location")
-if value is not True:
-    raise SystemExit(1)
+values = plistlib.load(sys.stdin.buffer)
+for key in (
+    "com.apple.security.personal-information.location",
+    "com.apple.security.personal-information.photos-library",
+):
+    if values.get(key) is not True:
+        raise SystemExit(1)
 print("true")
-' <<<"$location_entitlements" 2>/dev/null) \
-    || fail "missing location entitlement for $(basename "$location_target")"
-  [[ "$location_allowed" == "true" ]] \
-    || fail "location entitlement must be enabled for $(basename "$location_target")"
+' <<<"$permission_entitlements" 2>/dev/null) \
+    || fail "missing location or Photos entitlement for $(basename "$permission_target")"
+  [[ "$permissions_allowed" == "true" ]] \
+    || fail "privacy entitlements must be enabled for $(basename "$permission_target")"
 done
 
 [[ "$(plutil -extract Label raw -o - "$launch_agent")" == "com.pca.agentd" ]] || fail "wrong LaunchAgent label"

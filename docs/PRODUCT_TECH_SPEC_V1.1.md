@@ -983,6 +983,10 @@ AND extension_reports_active_tab</th>
 | file                 | OFF        | Swift FSEvents Bridge + Rust Scope           | file.created, file.updated, file.deleted, file.renamed               |
 | location             | OFF        | Swift Core Location Bridge                   | location.updated                                                     |
 | communication.wechat | 授权后静默 | Rust WeChatProvider + Keychain + SQLCipher   | communication.message_received, communication.provider_ready         |
+| communication.messages | OFF（Owner 开启） | Rust 只读 Messages DB + Swift typedstream 解码 | communication.conversation_observed, communication.message_sender_observed, communication.message_recorded |
+| photos.library       | OFF（Owner 开启） | Rust Collector + Swift PhotoKit Bridge       | photos.asset_recorded                                                 |
+
+Apple Messages 固定采集全部会话的文本，不读取或上传附件；首次回看 7 天，之后使用本地持久化游标补传离线期间新增文本。Photos 固定采集原始图片和视频、拍摄时间及相册名；首次回看 7 天，之后持续增量。Photos 原件存入私有 R2 并永久保留，短期签名 URL 只用于 Owner 读取。
 
 # 14. Screenshot、Activity 与 System Collector
 
@@ -1519,6 +1523,7 @@ Agent BrowserCollector<br />
 | Screenshots      | GET /v1/screenshots; GET /v1/screenshots/:id; DELETE /v1/screenshots                               |
 | Activity         | GET /v1/activity/summary; GET /v1/activity/sessions; GET /v1/applications                          |
 | Communication    | GET /v1/conversations; GET /v1/messages                                                            |
+| Photos            | POST /v1/agent/photos/prepare; POST /v1/agent/photos/complete; GET /v1/devices/:deviceId/photos; GET /v1/devices/:deviceId/photos/:photoId/read |
 | Devices/Commands | GET /v1/devices; GET /v1/devices/:id; POST /v1/devices/:id/commands                                |
 | Settings         | GET/PUT collector-configs; retention-policies; exclusion-rules                                     |
 | Updates          | GET /v1/agent-update/policy; POST /v1/agent-update/events                                          |
@@ -1568,6 +1573,7 @@ Agent BrowserCollector<br />
 <tr class="header">
 <th>workspace/{workspace_id}/device/{device_id}/<br />
 screenshots/{yyyy}/{mm}/{dd}/{screenshot_id}.{ext}<br />
+photos/{device_id}/{photo_id}<br />
 diagnostics/{yyyy}/{mm}/{diagnostic_id}.zip<br />
 exports/{export_id}/manifest.json</th>
 </tr>

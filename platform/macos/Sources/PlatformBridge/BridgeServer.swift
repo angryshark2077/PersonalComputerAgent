@@ -177,6 +177,7 @@ actor BridgeServer {
     private let networkSource: NetworkObservationSource
     private let lifecycleSource: PlatformLifecycleEventBuffer
     private let screenSource: ScreenCaptureSource
+    private let photoSource: PhotoLibrarySource
     private let handshakeTimeoutMilliseconds: UInt64
     private let credentialTimeoutMilliseconds: UInt64
     private let idleTimeoutMilliseconds: UInt64
@@ -194,6 +195,7 @@ actor BridgeServer {
         networkSource: NetworkObservationSource? = nil,
         lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer(),
         screenSource: ScreenCaptureSource = ScreenCaptureSource(),
+        photoSource: PhotoLibrarySource = PhotoLibrarySource(),
         handshakeTimeoutMilliseconds: UInt64 = 1_000,
         credentialTimeoutMilliseconds: UInt64 = 1_000,
         idleTimeoutMilliseconds: UInt64 = BridgeServer.defaultIdleTimeoutMilliseconds
@@ -204,6 +206,7 @@ actor BridgeServer {
         self.credentialProvider = credentialProvider
         self.lifecycleSource = lifecycleSource
         self.screenSource = screenSource
+        self.photoSource = photoSource
         self.networkSource = networkSource ?? NetworkObservationSource(lifecycleSource: lifecycleSource)
         self.handshakeTimeoutMilliseconds = max(handshakeTimeoutMilliseconds, 1)
         self.credentialTimeoutMilliseconds = max(credentialTimeoutMilliseconds, 1)
@@ -368,7 +371,8 @@ actor BridgeServer {
                 to: request,
                 networkSource: networkSource,
                 lifecycleSource: lifecycleSource,
-                screenSource: screenSource
+                screenSource: screenSource,
+                photoSource: photoSource
             )
             try await writeFrame(
                 descriptor,
@@ -501,6 +505,10 @@ enum CapabilityRequestHandler {
     private static let lifecyclePayloadKeys: Set<String> = ["after_sequence"]
     private static let screenContextPayloadKeys: Set<String> = []
     private static let screenCapturePayloadKeys: Set<String> = ["excluded_bundle_ids"]
+    private static let messageDecodePayloadKeys: Set<String> = ["encoded_bodies"]
+    private static let photoAuthorizationPayloadKeys: Set<String> = []
+    private static let photoListPayloadKeys: Set<String> = ["after_created_at", "after_local_identifier", "cutoff", "limit"]
+    private static let photoExportPayloadKeys: Set<String> = ["local_identifier", "file_name"]
 
     struct Response {
         let payload: Data
@@ -511,7 +519,8 @@ enum CapabilityRequestHandler {
         to requestJSON: Data,
         networkSource: NetworkObservationSource = NetworkObservationSource(),
         lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer(),
-        screenSource: ScreenCaptureSource = ScreenCaptureSource()
+        screenSource: ScreenCaptureSource = ScreenCaptureSource(),
+        photoSource: PhotoLibrarySource = PhotoLibrarySource()
     ) throws -> Response {
         let object = try StrictJSON.object(requestJSON)
         try StrictJSON.requireOnlyKeys(object, allowed: envelopeKeys)
@@ -531,6 +540,14 @@ enum CapabilityRequestHandler {
             try StrictJSON.requireExactKeys(payloadObject, expected: screenContextPayloadKeys)
         } else if capability == "screen.capture" {
             try StrictJSON.requireExactKeys(payloadObject, expected: screenCapturePayloadKeys)
+        } else if capability == "messages.decode_text" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: messageDecodePayloadKeys)
+        } else if capability == "photos.authorization" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: photoAuthorizationPayloadKeys)
+        } else if capability == "photos.list" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: photoListPayloadKeys)
+        } else if capability == "photos.export" {
+            try StrictJSON.requireExactKeys(payloadObject, expected: photoExportPayloadKeys)
         } else {
             throw BridgeServerError.invalidRequest
         }
@@ -571,6 +588,42 @@ enum CapabilityRequestHandler {
                 throw BridgeServerError.invalidRequest
             }
             responsePayload = screenSource.capture(excludedBundleIDs: Set(excludedBundleIDs)).payload
+        } else if capability == "messages.decode_text" {
+            guard let encodedBodies = request.payload.encodedBodies,
+                  encodedBodies.count <= 100,
+                  encodedBodies.allSatisfy({ !$0.isEmpty && $0.count <= 6 * 1024 * 1024 }) else {
+                throw BridgeServerError.invalidRequest
+            }
+            responsePayload = [
+                "texts": .array(MessageBodyDecoder.decode(encodedBodies).map { value in
+                    value.map(JSONValue.string) ?? .null
+                }),
+            ]
+        } else if capability == "photos.authorization" {
+            responsePayload = photoSource.authorizationPayload()
+        } else if capability == "photos.list" {
+            guard let cutoffValue = request.payload.cutoff,
+                  let cutoff = PhotoLibrarySource.parseDate(cutoffValue),
+                  let limit = request.payload.limit,
+                  (1...PhotoLibrarySource.maximumBatchSize).contains(limit),
+                  request.payload.afterCreatedAt == nil
+                    || PhotoLibrarySource.parseDate(request.payload.afterCreatedAt!) != nil else {
+                throw BridgeServerError.invalidRequest
+            }
+            responsePayload = photoSource.list(
+                afterDate: request.payload.afterCreatedAt.flatMap(PhotoLibrarySource.parseDate),
+                afterIdentifier: request.payload.afterLocalIdentifier,
+                cutoff: cutoff,
+                limit: limit
+            )
+        } else if capability == "photos.export" {
+            guard let localIdentifier = request.payload.localIdentifier,
+                  !localIdentifier.isEmpty,
+                  localIdentifier.count <= 1024,
+                  let fileName = request.payload.fileName else {
+                throw BridgeServerError.invalidRequest
+            }
+            responsePayload = photoSource.export(localIdentifier: localIdentifier, fileName: fileName)
         } else {
             responsePayload = ["screen_capture": .string("available")]
         }
@@ -614,11 +667,25 @@ private struct StrictCapabilityPayload: Decodable {
     let includeWifiIdentity: Bool?
     let afterSequence: UInt64?
     let excludedBundleIDs: [String]?
+    let encodedBodies: [String]?
+    let afterCreatedAt: String?
+    let afterLocalIdentifier: String?
+    let cutoff: String?
+    let limit: Int?
+    let localIdentifier: String?
+    let fileName: String?
 
     private enum CodingKeys: String, CodingKey {
         case includePermissions = "include_permissions"
         case includeWifiIdentity = "include_wifi_identity"
         case afterSequence = "after_sequence"
         case excludedBundleIDs = "excluded_bundle_ids"
+        case encodedBodies = "encoded_bodies"
+        case afterCreatedAt = "after_created_at"
+        case afterLocalIdentifier = "after_local_identifier"
+        case cutoff
+        case limit
+        case localIdentifier = "local_identifier"
+        case fileName = "file_name"
     }
 }

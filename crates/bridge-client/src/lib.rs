@@ -16,8 +16,8 @@ pub use supervisor::{
 
 pub use client::{
     BridgeClient, BridgeClientConfig, BridgeClientError, DeviceLocationObservation,
-    NetworkObservation, PlatformLifecycleEvent, ScreenCaptureResult, ScreenCaptureStatus,
-    ScreenContext, PROTOCOL_VERSION,
+    NetworkObservation, PhotoAssetRecord, PlatformLifecycleEvent, ScreenCaptureResult,
+    ScreenCaptureStatus, ScreenContext, PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Default)]

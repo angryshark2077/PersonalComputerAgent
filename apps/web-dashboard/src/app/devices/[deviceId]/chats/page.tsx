@@ -84,7 +84,7 @@ export default function DeviceChatsPage() {
       <section className="page-heading">
         <p className="workspace-name">Device {params.deviceId}</p>
         <h1>Chats</h1>
-        <p>Conversations from the WeChat account collected on this Mac.</p>
+        <p>Conversations from WeChat and Apple Messages collected on this Mac.</p>
       </section>
       {error !== null ? <p role="alert">{error}</p> : null}
       {conversations === null ? <p className="status-note">Loading chats…</p> : (

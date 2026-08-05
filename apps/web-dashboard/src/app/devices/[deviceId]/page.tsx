@@ -198,6 +198,7 @@ export default function DevicePage() {
       <div className="device-links">
         <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/chats`}>View chats</Link>
         <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/screenshots`}>View screenshots</Link>
+        <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/photos`}>View photos</Link>
       </div>
       {error !== null ? <p role="alert">{error}</p> : null}
       <CollectorScopeCard
@@ -220,6 +221,32 @@ export default function DevicePage() {
             "communication.wechat": {
               ...screen.device.collectors["communication.wechat"],
             enabled: !screen.device.collectors["communication.wechat"].enabled,
+            },
+          })}
+        />
+        <CollectorScopeCard
+          name="Messages"
+          detail="All iMessage and SMS conversations; text only; initial 7-day history and future messages"
+          enabled={screen.device.collectors["communication.messages"].enabled}
+          disabled={disabled}
+          onToggle={() => void save({
+            ...screen.device.collectors,
+            "communication.messages": {
+              ...screen.device.collectors["communication.messages"],
+              enabled: !screen.device.collectors["communication.messages"].enabled,
+            },
+          })}
+        />
+        <CollectorScopeCard
+          name="Photos"
+          detail="Original photos and videos with capture time and album names; initial 7-day history and future items; permanent Cloud retention"
+          enabled={screen.device.collectors["photos.library"].enabled}
+          disabled={disabled}
+          onToggle={() => void save({
+            ...screen.device.collectors,
+            "photos.library": {
+              ...screen.device.collectors["photos.library"],
+              enabled: !screen.device.collectors["photos.library"].enabled,
             },
           })}
         />

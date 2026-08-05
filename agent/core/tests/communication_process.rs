@@ -1970,7 +1970,9 @@ fn control_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
                 "max_group_members": 15,
                 "sync_mode": "full",
                 "retention_days": 180
-            }
+            },
+            "communication.messages": { "enabled": false, "directions": ["incoming", "outgoing"], "message_types": ["text"], "conversation_scope": "all", "initial_lookback_days": 7, "sync_mode": "full", "attachments_enabled": false, "attachment_retention_days": 7 },
+            "photos.library": { "enabled": false, "media_types": ["image", "video"], "include_originals": true, "include_album_names": true, "initial_lookback_days": 7, "cloud_retention": "permanent" }
         }
     }))
     .unwrap()

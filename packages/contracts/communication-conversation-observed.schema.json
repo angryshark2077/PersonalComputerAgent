@@ -24,7 +24,7 @@
           "required": ["scope", "member_count"],
           "properties": {
             "scope": { "const": "group" },
-            "member_count": { "type": "integer", "minimum": 1, "maximum": 15 }
+            "member_count": { "type": "integer", "minimum": 1, "maximum": 255 }
           }
         }
       ]

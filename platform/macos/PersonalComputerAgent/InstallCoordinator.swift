@@ -34,6 +34,7 @@ enum InstallError: Error, Equatable {
     case fullDiskAccessRequired
     case locationAccessRequired
     case screenCaptureAccessRequired
+    case photosAccessRequired
     case approvalTimedOut
     case healthCheckFailed
     case uninstallConfirmationRequired
@@ -59,6 +60,7 @@ extension InstallError: LocalizedError {
         case .fullDiskAccessRequired: "Full Disk Access was not granted, so the background Agent was not started."
         case .locationAccessRequired: "Location access was not granted, so Wi-Fi SSID and BSSID cannot be collected."
         case .screenCaptureAccessRequired: "Screen Recording access was not granted, so screenshots cannot be collected."
+        case .photosAccessRequired: "Photos access was not granted, so photo-library originals cannot be collected."
         case .approvalTimedOut: "Background-item approval was not completed in time."
         case .healthCheckFailed: "The local runtime did not become healthy."
         case .uninstallConfirmationRequired: "Complete uninstall cancelled because the confirmation token did not match."
@@ -79,6 +81,8 @@ extension InstallError: LocalizedError {
             "Open System Settings > Privacy & Security > Location Services, enable PersonalComputerAgent, then retry."
         case .screenCaptureAccessRequired:
             "Open System Settings > Privacy & Security > Screen & System Audio Recording, enable PersonalComputerAgent, then retry."
+        case .photosAccessRequired:
+            "Open System Settings > Privacy & Security > Photos, allow PersonalComputerAgent full access, then retry."
         case .approvalTimedOut, .serviceRegistrationFailed:
             "Open System Settings > General > Login Items and allow Personal Computer Agent, then retry."
         case .keychainDeletionFailed:
@@ -553,6 +557,40 @@ protocol ScreenCaptureAccessControlling: AnyObject {
 }
 
 @MainActor
+protocol PhotosAccessControlling: AnyObject {
+    func waitForAuthorization(
+        helperExecutableURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws
+}
+
+@MainActor
+final class PhotosAccessController: PhotosAccessControlling {
+    func waitForAuthorization(
+        helperExecutableURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        guard FileManager.default.isExecutableFile(atPath: helperExecutableURL.path) else {
+            throw InstallError.invalidBundle
+        }
+        onWaitingForAuthorization()
+        let process = Process()
+        process.executableURL = helperExecutableURL
+        process.arguments = ["--authorize-photos"]
+        let status = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { process in continuation.resume(returning: process.terminationStatus) }
+            do { try process.run() } catch { continuation.resume(throwing: error) }
+        }
+        guard status == 0 else {
+            if let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
+                NSWorkspace.shared.open(settings)
+            }
+            throw InstallError.photosAccessRequired
+        }
+    }
+}
+
+@MainActor
 final class ScreenCaptureAccessController: ScreenCaptureAccessControlling {
     func waitForAuthorization(
         helperExecutableURL: URL,
@@ -740,6 +778,7 @@ final class InstallCoordinator: InstallCoordinating {
     private let fullDiskAccess: any FullDiskAccessControlling
     private let locationAccess: any LocationAccessControlling
     private let screenCaptureAccess: any ScreenCaptureAccessControlling
+    private let photosAccess: any PhotosAccessControlling
     private let credentialProvisioner: any BridgeCredentialProvisioning
     private let fileSystem: any InstallFileOperating
 
@@ -752,6 +791,7 @@ final class InstallCoordinator: InstallCoordinating {
         fullDiskAccess: any FullDiskAccessControlling = FullDiskAccessController(),
         locationAccess: any LocationAccessControlling = LocationAccessController(),
         screenCaptureAccess: any ScreenCaptureAccessControlling = ScreenCaptureAccessController(),
+        photosAccess: any PhotosAccessControlling = PhotosAccessController(),
         credentialProvisioner: any BridgeCredentialProvisioning = KeychainBridgeCredentialProvisioner(),
         fileSystem: any InstallFileOperating = LocalInstallFileSystem()
     ) {
@@ -763,6 +803,7 @@ final class InstallCoordinator: InstallCoordinating {
         self.fullDiskAccess = fullDiskAccess
         self.locationAccess = locationAccess
         self.screenCaptureAccess = screenCaptureAccess
+        self.photosAccess = photosAccess
         self.credentialProvisioner = credentialProvisioner
         self.fileSystem = fileSystem
     }
@@ -918,6 +959,9 @@ final class InstallCoordinator: InstallCoordinating {
         }
         try await screenCaptureAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
             onState(.waitingScreenCaptureAccess)
+        }
+        try await photosAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
+            onState(.waitingPhotosAccess)
         }
         do {
             let trustedApplicationURLs = [

@@ -82,6 +82,8 @@ test("owner config is scoped, strict, and reaches device control", async () => {
           sync_mode: "full",
           retention_days: 180,
         },
+        "communication.messages": { enabled: true, directions: ["incoming", "outgoing"], message_types: ["text"], conversation_scope: "all", initial_lookback_days: 7, sync_mode: "full", attachments_enabled: false, attachment_retention_days: 7 },
+        "photos.library": { enabled: true, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 7, cloud_retention: "permanent" },
       }),
     },
   );
@@ -356,6 +358,8 @@ test("Owner reads only its device control state and configuration audit", async 
       sync_mode: "full",
       retention_days: 180,
     },
+    "communication.messages": { enabled: true, directions: ["incoming", "outgoing"], message_types: ["text"], conversation_scope: "all", initial_lookback_days: 7, sync_mode: "full", attachments_enabled: false, attachment_retention_days: 7 },
+    "photos.library": { enabled: true, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 7, cloud_retention: "permanent" },
   };
   assert.equal(
     (
@@ -429,7 +433,8 @@ test("Owner reads only its device control state and configuration audit", async 
   const audit = await api.request(`/v1/devices/${credentials.device_id}/collector-config/audit`);
   assert.equal(audit.status, 200);
   const auditBody = await audit.json();
-  assert.equal(validateContract("dashboard-control", auditBody).valid, true);
+  const auditValidation = validateContract("dashboard-control", auditBody);
+  assert.equal(auditValidation.valid, true, JSON.stringify(auditValidation.errors));
   assert.deepEqual(auditBody, {
     audit: [
       {
@@ -446,6 +451,8 @@ test("Owner reads only its device control state and configuration audit", async 
             excluded_bundle_ids: [],
           },
           "communication.wechat": { ...config["communication.wechat"], enabled: false },
+          "communication.messages": { ...config["communication.messages"], enabled: false },
+          "photos.library": { ...config["photos.library"], enabled: false },
         },
         new_config: config,
         created_at: (await repository.listCollectorConfigAudit(credentials.device_id, owner.workspaceId, owner.userId))[0]?.createdAt.toISOString(),
@@ -496,6 +503,8 @@ test("owner endpoints cannot cross Workspace boundaries", async () => {
           sync_mode: "full",
           retention_days: 180,
         },
+        "communication.messages": { enabled: false, directions: ["incoming", "outgoing"], message_types: ["text"], conversation_scope: "all", initial_lookback_days: 7, sync_mode: "full", attachments_enabled: false, attachment_retention_days: 7 },
+        "photos.library": { enabled: false, media_types: ["image", "video"], include_originals: true, include_album_names: true, initial_lookback_days: 7, cloud_retention: "permanent" },
       }),
     },
   );
