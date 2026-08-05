@@ -2319,15 +2319,21 @@ async fn upload_pending_photos(
         if media_path.parent() != Some(root.as_path()) {
             return Err(ControlError::Contract);
         }
-        tokio::fs::remove_file(media_path)
-            .await
-            .map_err(|_| ControlError::Transient)?;
+        remove_uploaded_photo_file(&media_path).await?;
         photo.media_file_name = None;
         photo.completed = true;
         persist_photo_manifest(&photo).await?;
         processed = processed.saturating_add(1);
     }
     Ok(())
+}
+
+async fn remove_uploaded_photo_file(path: &Path) -> Result<(), ControlError> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(ControlError::Transient),
+    }
 }
 
 async fn sync_pending_system_events(
@@ -3302,11 +3308,12 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 mod tests {
     use super::{
         apply_communication_upload_headers, next_media_wait, remember_screenshot_request,
-        retry_delay, screenshot_prepare_payload, sync_pending_communication_events,
-        sync_pending_system_events, AgentControlSnapshot, ControlClient, ControlError,
-        ControlFuture, DeviceCredential, HttpControlClient, PendingScreenshot, ScreenshotTrigger,
-        SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF,
-        MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
+        remove_uploaded_photo_file, retry_delay, screenshot_prepare_payload,
+        sync_pending_communication_events, sync_pending_system_events, AgentControlSnapshot,
+        ControlClient, ControlError, ControlFuture, DeviceCredential, HttpControlClient,
+        PendingScreenshot, ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL,
+        CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT,
+        PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
     use pca_domain::{
@@ -3424,6 +3431,31 @@ mod tests {
             next_media_wait(usize::from(MEDIA_BATCH_SIZE - 1)),
             CONTROL_INTERVAL
         );
+    }
+
+    #[tokio::test]
+    async fn uploaded_photo_cleanup_accepts_an_already_missing_file() {
+        let directory = tempfile::tempdir().expect("temporary photo spool");
+        let path = directory.path().join("already-removed-photo");
+
+        remove_uploaded_photo_file(&path)
+            .await
+            .expect("cloud-completed photo can recover after a crash following local removal");
+    }
+
+    #[tokio::test]
+    async fn uploaded_photo_cleanup_removes_an_existing_file() {
+        let directory = tempfile::tempdir().expect("temporary photo spool");
+        let path = directory.path().join("uploaded-photo");
+        tokio::fs::write(&path, b"photo")
+            .await
+            .expect("write photo spool file");
+
+        remove_uploaded_photo_file(&path)
+            .await
+            .expect("remove cloud-completed photo");
+
+        assert!(!path.exists());
     }
 
     #[test]
