@@ -24,6 +24,7 @@ EXPECTED_TABLES = [
     "device_credential_generations",
     "device_heartbeats",
     "device_media_cleanup_requests",
+    "device_network_history",
     "device_revocation_audit",
     "device_screenshot_requests",
     "device_screenshots",

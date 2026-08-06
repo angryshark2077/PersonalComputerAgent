@@ -55,6 +55,7 @@ EXPECTED_MIGRATIONS = {
         "0022_apple_photos_messages_collectors.sql",
         "0023_photo_library_assets.sql",
         "0024_photo_system_event_constraints.sql",
+        "0025_device_network_history.sql",
     ],
 }
 
@@ -203,6 +204,7 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "device_screenshot_requests",
         "device_screenshots",
         "network_location_library",
+        "device_network_history",
         "photo_library_assets",
     }
     actual_tables = set(
