@@ -1,9 +1,9 @@
-//! Explicit developer repair utility for a locally running `WeChat` process.
+//! Explicit one-time repair utility for the reviewed official `WeChat` process.
 //!
-//! This binary is never called by `agentd`. When an owner runs it directly, it captures one
-//! reviewed WCDB key call from an ephemeral debug copy, validates the result against private
-//! `SQLCipher` snapshots, and stores only a validated result in the PCA Keychain item. The official
-//! `/Applications/WeChat.app` bundle is never modified.
+//! This binary is never called by `agentd`. Setup can authorize a detached one-time worker while
+//! `WeChat` is closed; the worker waits for the next official launch, captures one reviewed WCDB
+//! key call, validates it against private `SQLCipher` snapshots, and stores only a validated result
+//! in the PCA Keychain item. The official process is never quit and its bundle is never modified.
 #![deny(unsafe_code)]
 
 mod lldb_capture;
@@ -13,16 +13,18 @@ use std::{
     env,
     ffi::OsStr,
     fs::{self, File},
-    io::Read,
+    io::{BufRead, BufReader, Read, Write},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use pca_domain::MessageKind;
 use pca_keychain::{
-    load_wechat_key_material, MacOSKeychainStore, WechatDatabaseKeyMaterial, WechatKeyMaterial,
+    load_wechat_key_material, CredentialError, MacOSKeychainStore, WechatDatabaseKeyMaterial,
+    WechatKeyMaterial,
 };
 use pca_provider_contracts::CommunicationProviderFactory;
 use pca_wechat_provider::sqlcipher_source::{inspect_recovered_schema, validate_recovered_key};
@@ -42,15 +44,20 @@ fn main() -> std::process::ExitCode {
     let command = env::args_os().nth(1);
     let is_schema_probe = command.as_deref() == Some(OsStr::new("probe-schema"));
     let is_message_probe = command.as_deref() == Some(OsStr::new("probe-messages"));
+    let is_automatic_worker = command.as_deref() == Some(OsStr::new("automatic-worker"));
     let result = match command {
         None => run(),
+        Some(command) if command == "prepare-automatic" => prepare_automatic(),
+        Some(command) if command == "automatic-worker" => run_automatic_worker(),
         Some(command) if command == "probe-schema" => probe_schema(),
         Some(command) if command == "probe-messages" => probe_messages(),
         Some(_) => Err(RepairError::Usage),
     };
     match result {
         Ok(()) => {
-            if is_message_probe {
+            if is_automatic_worker {
+                // The detached worker has no interactive output after its authorization handshake.
+            } else if is_message_probe {
                 println!("WeChat message probe completed.");
             } else if is_schema_probe {
                 println!("WeChat schema probe completed.");
@@ -175,10 +182,10 @@ fn run() -> Result<(), RepairError> {
         return Ok(());
     }
     let candidates = collect_candidates()?;
-    println!(
-        "Found {} bounded WCDB key candidates; validating required databases.",
-        candidates.len()
-    );
+    validate_and_store(&source, &candidates)
+}
+
+fn validate_and_store(source: &Source, candidates: &[Candidate]) -> Result<(), RepairError> {
     let account_id = account_id_for_root(&source.account_root);
     let mut database_keys = Vec::with_capacity(source.databases.len());
     for database in &source.databases {
@@ -213,6 +220,105 @@ fn run() -> Result<(), RepairError> {
         .store_validated_wechat_key_material(&material)
         .map_err(|_| RepairError::Keychain)?;
     Ok(())
+}
+
+fn prepare_automatic() -> Result<(), RepairError> {
+    if !automatic_recovery_required(&load_wechat_key_material(&MacOSKeychainStore))? {
+        return Ok(());
+    }
+    reviewed_capture_profile()?;
+    lldb_capture::preflight().map_err(map_capture_error)?;
+
+    let executable = env::current_exe().map_err(|_| RepairError::CaptureFailed)?;
+    let mut child = Command::new(executable)
+        .arg("automatic-worker")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| RepairError::CaptureFailed)?;
+    let stdout = child.stdout.take().ok_or(RepairError::CaptureFailed)?;
+    let mut line = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut line)
+        .map_err(|_| RepairError::CaptureFailed)?;
+    if line.trim() != "AUTHORIZED" {
+        let _ = child.wait();
+        return Err(RepairError::CaptureFailed);
+    }
+    // `Child` does not terminate the process on drop. Setup can now exit while the one-time worker
+    // remains under launchd and waits for the first official WeChat launch.
+    drop(child);
+    Ok(())
+}
+
+fn run_automatic_worker() -> Result<(), RepairError> {
+    if !automatic_recovery_required(&load_wechat_key_material(&MacOSKeychainStore))? {
+        return Err(RepairError::Keychain);
+    }
+    let profile = reviewed_capture_profile()?;
+    let raw_key = lldb_capture::capture_key_on_next_launch(profile, || {
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "AUTHORIZED");
+        let _ = stdout.flush();
+    })
+    .map_err(map_capture_error)?;
+    let source = wait_for_source(Duration::from_mins(5))?;
+    validate_and_store(
+        &source,
+        &[Candidate {
+            raw_key,
+            salt: None,
+        }],
+    )?;
+    restart_agent_after_automatic_recovery();
+    Ok(())
+}
+
+fn restart_agent_after_automatic_recovery() {
+    let Ok(output) = Command::new("/usr/bin/id").arg("-u").output() else {
+        return;
+    };
+    let Some(target) = current_user_launch_agent_target(&output.stdout) else {
+        return;
+    };
+    let _ = Command::new("/bin/launchctl")
+        .args(["kickstart", "-k", &target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn current_user_launch_agent_target(uid_output: &[u8]) -> Option<String> {
+    let uid = std::str::from_utf8(uid_output).ok()?.trim();
+    (!uid.is_empty() && uid.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| format!("gui/{uid}/com.pca.agentd"))
+}
+
+fn automatic_recovery_required(
+    credential: &Result<Option<WechatKeyMaterial>, CredentialError>,
+) -> Result<bool, RepairError> {
+    match credential {
+        Ok(Some(_)) => Ok(false),
+        Err(CredentialError::CorruptSecret | CredentialError::InvalidCredential) => Ok(true),
+        Ok(None) | Err(_) => Err(RepairError::Keychain),
+    }
+}
+
+fn wait_for_source(timeout: Duration) -> Result<Source, RepairError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(RepairError::SourceUnavailable)?;
+    loop {
+        match discover_source() {
+            Ok(source) => return Ok(source),
+            Err(RepairError::SourceUnavailable) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn reuse_existing_key_for_hardlink(source: &Source) -> Result<bool, RepairError> {
@@ -262,23 +368,27 @@ struct SourceDatabase {
 }
 
 fn collect_candidates() -> Result<Vec<Candidate>, RepairError> {
+    let profile = reviewed_capture_profile()?;
+    let pid = running_wechat_pid()?;
+    println!(
+        "Capturing the reviewed WeChat {} WCDB key call from the running official app.",
+        profile.version
+    );
+    let raw_key = lldb_capture::capture_key(pid, profile).map_err(map_capture_error)?;
+    Ok(vec![Candidate {
+        raw_key,
+        salt: None,
+    }])
+}
+
+fn reviewed_capture_profile() -> Result<lldb_capture::CaptureProfile, RepairError> {
     let version = wechat_version()?;
     if !version.starts_with("4.") {
         return Err(RepairError::UnsupportedBuild);
     }
-    let dylib_path = Path::new(WECHAT_DYLIB_PATH);
-    if let Some(profile) =
-        lldb_capture::profile_for_build(&version, dylib_path).map_err(map_capture_error)?
-    {
-        let pid = running_wechat_pid()?;
-        println!("Capturing the reviewed WeChat {version} WCDB key call from a temporary copy.");
-        let raw_key = lldb_capture::capture_key(pid, profile).map_err(map_capture_error)?;
-        return Ok(vec![Candidate {
-            raw_key,
-            salt: None,
-        }]);
-    }
-    Err(RepairError::UnsupportedBuild)
+    lldb_capture::profile_for_build(&version, Path::new(WECHAT_DYLIB_PATH))
+        .map_err(map_capture_error)?
+        .ok_or(RepairError::UnsupportedBuild)
 }
 
 fn wechat_version() -> Result<String, RepairError> {
@@ -322,6 +432,8 @@ fn running_wechat_pid() -> Result<libc::pid_t, RepairError> {
 const fn map_capture_error(error: lldb_capture::CaptureError) -> RepairError {
     match error {
         lldb_capture::CaptureError::BuildUnavailable => RepairError::SourceUnavailable,
+        lldb_capture::CaptureError::SipEnabled => RepairError::SipEnabled,
+        lldb_capture::CaptureError::SipStatusUnavailable => RepairError::SipStatusUnavailable,
         lldb_capture::CaptureError::DebuggerUnavailable => RepairError::DebuggerUnavailable,
         lldb_capture::CaptureError::DebuggerFailed => RepairError::CaptureFailed,
         lldb_capture::CaptureError::TimedOut => RepairError::CaptureTimedOut,
@@ -407,6 +519,8 @@ enum RepairError {
     SourceUnavailable,
     MultipleAccounts,
     WeChatUnavailable,
+    SipEnabled,
+    SipStatusUnavailable,
     DebuggerUnavailable,
     CaptureFailed,
     CaptureTimedOut,
@@ -422,6 +536,7 @@ impl RepairError {
         match self {
             Self::Usage => 2,
             Self::SourceUnavailable | Self::MultipleAccounts | Self::WeChatUnavailable => 3,
+            Self::SipEnabled | Self::SipStatusUnavailable => 9,
             Self::DebuggerUnavailable => 4,
             Self::CaptureFailed | Self::CaptureTimedOut | Self::NoValidatedCandidate => 5,
             Self::Keychain => 1,
@@ -433,12 +548,18 @@ impl RepairError {
 
     const fn message(&self) -> &'static str {
         match self {
-            Self::Usage => "usage: pca-wechat-repair [probe-schema|probe-messages]",
+            Self::Usage => {
+                "usage: pca-wechat-repair [prepare-automatic|probe-schema|probe-messages]"
+            }
             Self::SourceUnavailable => "WeChat source databases are unavailable",
             Self::MultipleAccounts => {
                 "multiple local WeChat accounts require explicit repair support"
             }
             Self::WeChatUnavailable => "WeChat is not running",
+            Self::SipEnabled => {
+                "System Integrity Protection must be temporarily disabled before WeChat key recovery"
+            }
+            Self::SipStatusUnavailable => "System Integrity Protection status could not be verified",
             Self::DebuggerUnavailable => "LLDB is unavailable for this reviewed WeChat build",
             Self::CaptureFailed => "the reviewed WeChat key capture could not start",
             Self::CaptureTimedOut => {
@@ -450,5 +571,58 @@ impl RepairError {
             Self::SchemaProbeFailed => "the validated WeChat schema could not be inspected",
             Self::MessageProbeFailed => "eligible WeChat messages could not be read",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_recovery_accepts_the_installer_invalid_placeholder() {
+        assert!(matches!(
+            automatic_recovery_required(&Err(CredentialError::InvalidCredential)),
+            Ok(true)
+        ));
+    }
+
+    #[test]
+    fn automatic_recovery_accepts_legacy_corrupt_placeholders() {
+        assert!(matches!(
+            automatic_recovery_required(&Err(CredentialError::CorruptSecret)),
+            Ok(true)
+        ));
+    }
+
+    #[test]
+    fn automatic_recovery_skips_an_existing_validated_key() {
+        let material =
+            WechatKeyMaterial::new("local-account-proof", [0x42; 32]).expect("valid fixture");
+
+        assert!(matches!(
+            automatic_recovery_required(&Ok(Some(material))),
+            Ok(false)
+        ));
+    }
+
+    #[test]
+    fn automatic_recovery_rejects_missing_or_unavailable_keychain_items() {
+        assert!(matches!(
+            automatic_recovery_required(&Ok(None)),
+            Err(RepairError::Keychain)
+        ));
+        assert!(matches!(
+            automatic_recovery_required(&Err(CredentialError::OperationFailed)),
+            Err(RepairError::Keychain)
+        ));
+    }
+
+    #[test]
+    fn recovered_key_targets_the_current_users_agent() {
+        assert_eq!(
+            current_user_launch_agent_target(b"501\n").as_deref(),
+            Some("gui/501/com.pca.agentd")
+        );
+        assert_eq!(current_user_launch_agent_target(b"root\n"), None);
     }
 }

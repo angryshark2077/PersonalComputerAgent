@@ -89,6 +89,7 @@ pub struct MediaUploadFailure {
     stage: MediaUploadFailureStage,
     error: ControlError,
     fallback_from: Option<MediaUploadFailureStage>,
+    superseded: bool,
 }
 
 impl MediaUploadFailure {
@@ -99,6 +100,16 @@ impl MediaUploadFailure {
             stage,
             error,
             fallback_from: None,
+            superseded: false,
+        }
+    }
+
+    const fn superseded() -> Self {
+        Self {
+            stage: MediaUploadFailureStage::Prepare,
+            error: ControlError::Contract,
+            fallback_from: None,
+            superseded: true,
         }
     }
 
@@ -111,8 +122,13 @@ impl MediaUploadFailure {
             stage,
             error,
             fallback_from: Some(fallback_from),
+            superseded: false,
         }
     }
+}
+
+fn attachment_was_superseded(failure: MediaUploadFailure) -> bool {
+    failure.superseded
 }
 
 /// Failures a Cloud-control adapter can return without exposing response bodies or credentials.
@@ -282,6 +298,21 @@ pub struct PendingPhoto {
     pub(crate) size_bytes: u64,
     pub(crate) media_file_name: Option<String>,
     pub(crate) completed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PhotoMarker {
+    Completed,
+    Oversized,
+}
+
+impl PhotoMarker {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Oversized => "oversized",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -2160,11 +2191,16 @@ async fn upload_pending_screenshots(
         if path.extension().is_none_or(|value| value != "json") {
             continue;
         }
+        processed = processed.saturating_add(1);
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|_| ControlError::Transient)?;
-        let screenshot: PendingScreenshot =
-            serde_json::from_slice(&bytes).map_err(|_| ControlError::Contract)?;
+        let screenshot: PendingScreenshot = if let Ok(screenshot) = serde_json::from_slice(&bytes) {
+            screenshot
+        } else {
+            quarantine_manifest(&path).await?;
+            continue;
+        };
         if screenshot.mime_type != "image/jpeg"
             || Uuid::parse_str(&screenshot.screenshot_id).is_err()
             || screenshot
@@ -2172,7 +2208,13 @@ async fn upload_pending_screenshots(
                 .as_ref()
                 .is_some_and(|value| Uuid::parse_str(value).is_err())
         {
-            return Err(ControlError::Contract);
+            quarantine_manifest(&path).await?;
+            continue;
+        }
+        let image_path = spool_root.join(&screenshot.image_file_name);
+        if image_path.parent() != Some(spool_root.as_path()) {
+            quarantine_manifest(&path).await?;
+            continue;
         }
         remember_screenshot_request(&screenshot, handled_requests);
         if client
@@ -2182,19 +2224,19 @@ async fn upload_pending_screenshots(
         {
             continue;
         }
-        let image_path = spool_root.join(&screenshot.image_file_name);
-        if image_path.parent() != Some(spool_root.as_path()) {
-            return Err(ControlError::Contract);
-        }
-        tokio::fs::remove_file(&image_path)
-            .await
-            .map_err(|_| ControlError::Transient)?;
+        remove_uploaded_media_file(&image_path).await?;
         tokio::fs::remove_file(&path)
             .await
             .map_err(|_| ControlError::Transient)?;
-        processed = processed.saturating_add(1);
     }
     Ok(())
+}
+
+async fn quarantine_manifest(path: &Path) -> Result<(), ControlError> {
+    let quarantined = path.with_extension(format!("invalid-{}", Uuid::new_v4()));
+    tokio::fs::rename(path, quarantined)
+        .await
+        .map_err(|_| ControlError::Transient)
 }
 
 fn remember_screenshot_request(
@@ -2247,6 +2289,63 @@ pub(crate) fn photo_spool_root() -> Result<PathBuf, ControlError> {
     Ok(root)
 }
 
+fn photo_handled_root(root: &Path) -> PathBuf {
+    root.join("Handled")
+}
+
+fn photo_marker_path(root: &Path, photo_id: &str, marker: PhotoMarker) -> PathBuf {
+    photo_handled_root(root).join(format!("{photo_id}.{}", marker.extension()))
+}
+
+pub(crate) async fn photo_asset_is_handled(photo_id: &str) -> Result<bool, ControlError> {
+    if Uuid::parse_str(photo_id).is_err() {
+        return Err(ControlError::Contract);
+    }
+    let root = photo_spool_root()?;
+    for path in [
+        root.join(format!("{photo_id}.json")),
+        root.join(format!("{photo_id}.oversized")),
+        photo_marker_path(&root, photo_id, PhotoMarker::Completed),
+        photo_marker_path(&root, photo_id, PhotoMarker::Oversized),
+    ] {
+        if tokio::fs::try_exists(path)
+            .await
+            .map_err(|_| ControlError::Transient)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) async fn persist_photo_marker(
+    photo_id: &str,
+    marker: PhotoMarker,
+) -> Result<(), ControlError> {
+    if Uuid::parse_str(photo_id).is_err() {
+        return Err(ControlError::Contract);
+    }
+    let root = photo_spool_root()?;
+    let handled = photo_handled_root(&root);
+    tokio::fs::create_dir_all(&handled)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::set_permissions(&handled, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    let final_path = photo_marker_path(&root, photo_id, marker);
+    let temporary_path = handled.join(format!(".{photo_id}.{}.tmp", marker.extension()));
+    tokio::fs::write(&temporary_path, [])
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::rename(temporary_path, final_path)
+        .await
+        .map_err(|_| ControlError::Transient)
+}
+
 pub(crate) async fn persist_photo_manifest(photo: &PendingPhoto) -> Result<(), ControlError> {
     let root = photo_spool_root()?;
     tokio::fs::create_dir_all(&root)
@@ -2292,13 +2391,28 @@ async fn upload_pending_photos(
         if path.extension().is_none_or(|value| value != "json") {
             continue;
         }
-        let mut photo: PendingPhoto = serde_json::from_slice(
-            &tokio::fs::read(&path)
-                .await
-                .map_err(|_| ControlError::Transient)?,
-        )
-        .map_err(|_| ControlError::Contract)?;
+        processed = processed.saturating_add(1);
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        let photo: PendingPhoto = if let Ok(photo) = serde_json::from_slice(&bytes) {
+            photo
+        } else {
+            quarantine_manifest(&path).await?;
+            continue;
+        };
         if photo.completed {
+            persist_photo_marker(&photo.photo_id, PhotoMarker::Completed).await?;
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            continue;
+        }
+        if Uuid::parse_str(&photo.photo_id).is_err()
+            || Uuid::parse_str(&photo.event_id).is_err()
+            || photo.media_file_name.as_deref() != Some(photo.photo_id.as_str())
+        {
+            quarantine_manifest(&path).await?;
             continue;
         }
         if photo.size_bytes > 500 * 1024 * 1024 {
@@ -2308,18 +2422,12 @@ async fn upload_pending_photos(
                     .as_deref()
                     .ok_or(ControlError::Contract)?,
             );
-            remove_uploaded_photo_file(&media_path).await?;
+            remove_uploaded_media_file(&media_path).await?;
+            persist_photo_marker(&photo.photo_id, PhotoMarker::Oversized).await?;
             tokio::fs::remove_file(&path)
                 .await
                 .map_err(|_| ControlError::Transient)?;
-            processed = processed.saturating_add(1);
             continue;
-        }
-        if Uuid::parse_str(&photo.photo_id).is_err()
-            || Uuid::parse_str(&photo.event_id).is_err()
-            || photo.media_file_name.as_deref() != Some(photo.photo_id.as_str())
-        {
-            return Err(ControlError::Contract);
         }
         if client.sync_photo(credentials, &photo).await.is_err() {
             continue;
@@ -2333,16 +2441,16 @@ async fn upload_pending_photos(
         if media_path.parent() != Some(root.as_path()) {
             return Err(ControlError::Contract);
         }
-        remove_uploaded_photo_file(&media_path).await?;
-        photo.media_file_name = None;
-        photo.completed = true;
-        persist_photo_manifest(&photo).await?;
-        processed = processed.saturating_add(1);
+        remove_uploaded_media_file(&media_path).await?;
+        persist_photo_marker(&photo.photo_id, PhotoMarker::Completed).await?;
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|_| ControlError::Transient)?;
     }
     Ok(())
 }
 
-async fn remove_uploaded_photo_file(path: &Path) -> Result<(), ControlError> {
+async fn remove_uploaded_media_file(path: &Path) -> Result<(), ControlError> {
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2449,6 +2557,14 @@ async fn sync_pending_communication_attachments(
             .sync_communication_attachment(credentials, &attachment)
             .await
         {
+            if attachment_was_superseded(failure) {
+                database
+                    .complete_communication_attachment(&attachment.attachment_id)
+                    .await
+                    .map_err(|_| ControlError::Transient)?;
+                completed = completed.saturating_add(1);
+                continue;
+            }
             database
                 .defer_communication_attachment(
                     &attachment.attachment_id,
@@ -2914,23 +3030,25 @@ impl ControlClient for HttpControlClient {
             let prepare_failure =
                 |error| MediaUploadFailure::new(MediaUploadFailureStage::Prepare, error);
             let client = Self::client().map_err(prepare_failure)?;
-            let prepared = parse_response::<PreparedCommunicationObject>(
-                client
-                    .post(
-                        self.endpoint("v1/agent/communication/objects/prepare")
-                            .map_err(prepare_failure)?,
-                    )
-                    .bearer_auth(credentials.access_credential())
-                    .json(&serde_json::json!({
-                        "event_id": attachment.event_id,
-                        "attachment_id": attachment.attachment_id,
-                    }))
-                    .send()
-                    .await
-                    .map_err(|_| prepare_failure(ControlError::Transient))?,
-            )
-            .await
-            .map_err(prepare_failure)?;
+            let prepare_response = client
+                .post(
+                    self.endpoint("v1/agent/communication/objects/prepare")
+                        .map_err(prepare_failure)?,
+                )
+                .bearer_auth(credentials.access_credential())
+                .json(&serde_json::json!({
+                    "event_id": attachment.event_id,
+                    "attachment_id": attachment.attachment_id,
+                }))
+                .send()
+                .await
+                .map_err(|_| prepare_failure(ControlError::Transient))?;
+            if prepare_response.status() == StatusCode::NOT_FOUND {
+                return Err(MediaUploadFailure::superseded());
+            }
+            let prepared = parse_response::<PreparedCommunicationObject>(prepare_response)
+                .await
+                .map_err(prepare_failure)?;
             if prepared.state == "completed" {
                 return Ok(());
             }
@@ -3321,13 +3439,14 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_communication_upload_headers, next_media_wait, remember_screenshot_request,
-        remove_uploaded_photo_file, retry_delay, screenshot_prepare_payload,
+        apply_communication_upload_headers, attachment_was_superseded, next_media_wait,
+        photo_marker_path, quarantine_manifest, remember_screenshot_request,
+        remove_uploaded_media_file, retry_delay, screenshot_prepare_payload,
         sync_pending_communication_events, sync_pending_system_events, AgentControlSnapshot,
         ControlClient, ControlError, ControlFuture, DeviceCredential, HttpControlClient,
-        PendingScreenshot, ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL,
-        CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT,
-        PRODUCTION_CLOUD_API_ORIGIN,
+        MediaUploadFailure, MediaUploadFailureStage, PendingScreenshot, PhotoMarker,
+        ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT,
+        MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
     use pca_domain::{
@@ -3447,12 +3566,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_a_missing_prepare_projection_marks_old_media_superseded() {
+        assert!(attachment_was_superseded(MediaUploadFailure::superseded()));
+        assert!(!attachment_was_superseded(MediaUploadFailure::new(
+            MediaUploadFailureStage::Prepare,
+            ControlError::Contract,
+        )));
+        assert!(!attachment_was_superseded(MediaUploadFailure::new(
+            MediaUploadFailureStage::Complete,
+            ControlError::Contract,
+        )));
+    }
+
     #[tokio::test]
     async fn uploaded_photo_cleanup_accepts_an_already_missing_file() {
         let directory = tempfile::tempdir().expect("temporary photo spool");
         let path = directory.path().join("already-removed-photo");
 
-        remove_uploaded_photo_file(&path)
+        remove_uploaded_media_file(&path)
             .await
             .expect("cloud-completed photo can recover after a crash following local removal");
     }
@@ -3465,11 +3597,50 @@ mod tests {
             .await
             .expect("write photo spool file");
 
-        remove_uploaded_photo_file(&path)
+        remove_uploaded_media_file(&path)
             .await
             .expect("remove cloud-completed photo");
 
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_manifest_is_quarantined_out_of_the_upload_queue() {
+        let directory = tempfile::tempdir().expect("temporary spool");
+        let path = directory.path().join("broken.json");
+        tokio::fs::write(&path, b"not-json")
+            .await
+            .expect("write corrupt manifest");
+
+        quarantine_manifest(&path)
+            .await
+            .expect("quarantine corrupt manifest");
+
+        assert!(!path.exists());
+        let entries = std::fs::read_dir(directory.path())
+            .expect("read quarantine directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read quarantine entries");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with("broken.invalid-"));
+    }
+
+    #[test]
+    fn photo_completion_markers_live_outside_the_hot_upload_directory() {
+        let root = std::path::Path::new("/private/photo-spool");
+        let photo_id = "01985555-7555-8555-8555-555555555555";
+
+        assert_eq!(
+            photo_marker_path(root, photo_id, PhotoMarker::Completed),
+            root.join("Handled").join(format!("{photo_id}.completed"))
+        );
+        assert_eq!(
+            photo_marker_path(root, photo_id, PhotoMarker::Oversized),
+            root.join("Handled").join(format!("{photo_id}.oversized"))
+        );
     }
 
     #[test]

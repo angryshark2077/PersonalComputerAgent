@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 protocol SignatureChecking: Sendable {
     func verifyAndReadTeamIdentifier(of target: URL) throws -> String
@@ -10,48 +11,51 @@ protocol ArchitectureChecking: Sendable {
 
 struct ProductionSignatureChecker: SignatureChecking {
     func verifyAndReadTeamIdentifier(of target: URL) throws -> String {
-        let verify = Process()
-        verify.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        verify.arguments = ["--verify", "--strict", "--verbose=2", target.path]
-        verify.standardOutput = FileHandle.nullDevice
-        verify.standardError = FileHandle.nullDevice
-        try verify.run()
-        verify.waitUntilExit()
-        guard verify.terminationStatus == 0 else { throw InstallError.invalidBundle }
-
-        let details = Pipe()
-        let inspect = Process()
-        inspect.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        inspect.arguments = ["-d", "--verbose=4", target.path]
-        inspect.standardOutput = FileHandle.nullDevice
-        inspect.standardError = details
-        try inspect.run()
-        inspect.waitUntilExit()
-        guard inspect.terminationStatus == 0 else { throw InstallError.invalidBundle }
-        let output = String(decoding: details.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard let line = output.split(whereSeparator: \ .isNewline)
-            .first(where: { $0.hasPrefix("TeamIdentifier=") })
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(target as CFURL, [], &code) == errSecSuccess,
+              let code
         else { throw InstallError.invalidBundle }
-        let team = line.dropFirst("TeamIdentifier=".count)
-        guard !team.isEmpty, team != "not set" else { throw InstallError.invalidBundle }
-        return String(team)
+        let validationFlags = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures)
+        guard SecStaticCodeCheckValidity(code, validationFlags, nil) == errSecSuccess else {
+            throw InstallError.invalidBundle
+        }
+        var signingInformation: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            code,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &signingInformation
+        ) == errSecSuccess,
+            let information = signingInformation as? [String: Any],
+            let team = information[kSecCodeInfoTeamIdentifier as String] as? String,
+            !team.isEmpty
+        else { throw InstallError.invalidBundle }
+        return team
     }
 }
 
 struct ProductionArchitectureChecker: ArchitectureChecking {
     func architectures(of executable: URL) throws -> [String] {
-        let output = Pipe()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/lipo")
-        process.arguments = ["-archs", executable.path]
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { throw InstallError.invalidBundle }
-        return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            .split(whereSeparator: \ .isWhitespace)
-            .map(String.init)
+        let handle = try FileHandle(forReadingFrom: executable)
+        defer { try? handle.close() }
+        guard let header = try handle.read(upToCount: 8), header.count == 8 else {
+            throw InstallError.invalidBundle
+        }
+        let bytes = [UInt8](header)
+        let magic = littleEndianUInt32(bytes, offset: 0)
+        guard magic == 0xFEED_FACF else { throw InstallError.invalidBundle }
+        let cpuType = littleEndianUInt32(bytes, offset: 4)
+        switch cpuType {
+        case 0x0100_000C: return ["arm64"]
+        case 0x0100_0007: return ["x86_64"]
+        default: throw InstallError.invalidBundle
+        }
+    }
+
+    private func littleEndianUInt32(_ bytes: [UInt8], offset: Int) -> UInt32 {
+        UInt32(bytes[offset])
+            | UInt32(bytes[offset + 1]) << 8
+            | UInt32(bytes[offset + 2]) << 16
+            | UInt32(bytes[offset + 3]) << 24
     }
 }
 

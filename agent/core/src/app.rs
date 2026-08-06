@@ -36,6 +36,8 @@ use pca_keychain::{
 };
 #[cfg(all(target_os = "macos", not(feature = "process-test-hooks")))]
 use pca_wechat_provider::MacOSWechatProviderFactory;
+#[cfg(target_os = "macos")]
+use pca_wechat_provider::{probe_wechat_app_data_access, WechatAppDataAccess};
 use reqwest::Url;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::{
@@ -98,6 +100,35 @@ pub(crate) async fn execute(command: CommandConfig) -> u8 {
             );
             EXIT_UNSUPPORTED
         }
+        CommandConfig::ProbeWechatAppData => probe_wechat_app_data(),
+    }
+}
+
+fn probe_wechat_app_data() -> u8 {
+    #[cfg(target_os = "macos")]
+    {
+        match probe_wechat_app_data_access() {
+            Ok(WechatAppDataAccess::Authorized) => {
+                println!("authorized");
+                0
+            }
+            Ok(WechatAppDataAccess::NotInitialized) => {
+                println!("not_initialized");
+                0
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("permission_required");
+                77
+            }
+            Err(_) => {
+                eprintln!("probe_failed");
+                EXIT_RUNTIME_FAILURE
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        EXIT_UNSUPPORTED
     }
 }
 
@@ -321,6 +352,7 @@ impl RuntimeResources {
                 ),
                 credential_store,
                 control_commands,
+                Arc::clone(&network_observations),
                 pairing_shutdown_receiver,
             )
             .await?,
@@ -782,12 +814,19 @@ async fn start_pairing_server(
     database: Arc<DbActorHandle>,
     credential_store: Arc<dyn CredentialStore>,
     control_commands: CloudControlCommands,
+    network_observations: Arc<NetworkObservationState>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<JoinHandle<Result<(), PairingIpcServerError>>, FailureStage> {
     let socket = PairingSocket::bind(&config.paths.pairing_socket_file)
         .await
         .map_err(|_| FailureStage::PairingConfiguration)?;
-    let server = PairingIpcServer::new(socket, database, credential_store, control_commands);
+    let server = PairingIpcServer::new(
+        socket,
+        database,
+        credential_store,
+        control_commands,
+        network_observations,
+    );
     Ok(tokio::spawn(server.serve(shutdown)))
 }
 

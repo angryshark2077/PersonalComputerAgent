@@ -4,14 +4,14 @@ use std::{
     fmt::Write as _,
     fs,
     fs::OpenOptions,
-    io::{Read, Write},
+    io::{self, Read, Write},
     os::unix::ffi::OsStrExt,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aes::Aes128;
@@ -46,9 +46,10 @@ const MAX_PENDING_IMAGE_RETRIES_PER_CONVERSATION: usize = 256;
 const MAX_PENDING_FILE_RETRIES_PER_CONVERSATION: usize = 256;
 const MAX_PENDING_VIDEO_RETRIES_PER_CONVERSATION: usize = 256;
 const KIND_BATCH_QUOTA: usize = MAX_BATCH / 5;
-const MEDIA_CURSOR_LOOKBACK: i64 = 200;
 const INITIAL_HISTORY_SECONDS: u64 = 60 * 24 * 60 * 60;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
+const MESSAGE_DATABASE_TIMEOUT: Duration = Duration::from_mins(1);
+const PENDING_MEDIA_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -57,6 +58,60 @@ const FILE_TIMESTAMP_FALLBACK_SECONDS: u64 = 5 * 60;
 const VOICE_SAMPLE_RATE: u32 = 24_000;
 const IMAGE_CODE_CACHE: &str =
     "Library/Application Support/PersonalComputerAgent/Data/wechat-image-codes-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WechatAppDataAccess {
+    Authorized,
+    NotInitialized,
+}
+
+/// Performs a content-free open of an existing `WeChat` database.
+///
+/// This is intentionally independent of `WeChat` key recovery. On macOS, opening a file inside
+/// another developer's app container is the install-time trigger for the Other App Data consent
+/// prompt; enumerating the container directory alone is not sufficient.
+///
+/// # Errors
+///
+/// Returns the underlying filesystem error when the home directory or data container cannot be
+/// read.
+pub fn probe_wechat_app_data_access() -> io::Result<WechatAppDataAccess> {
+    let home = env::var_os("HOME")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory unavailable"))?;
+    probe_wechat_app_data_root(&PathBuf::from(home).join(SOURCE_ROOT))
+}
+
+fn probe_wechat_app_data_root(root: &Path) -> io::Result<WechatAppDataAccess> {
+    let accounts = match fs::read_dir(root) {
+        Ok(accounts) => accounts,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(WechatAppDataAccess::NotInitialized);
+        }
+        Err(error) => return Err(error),
+    };
+    for account in accounts {
+        let account = account?;
+        if !account.file_type()?.is_dir()
+            || account
+                .file_name()
+                .to_str()
+                .and_then(clean_account_directory_name)
+                .is_none()
+        {
+            continue;
+        }
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(account.path().join(SESSION_DATABASE))
+        {
+            Ok(_) => return Ok(WechatAppDataAccess::Authorized),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(WechatAppDataAccess::NotInitialized)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct MacOSWechatProviderFactory {
@@ -74,17 +129,10 @@ impl MacOSWechatProviderFactory {
 
 impl CommunicationProviderFactory for MacOSWechatProviderFactory {
     fn create(&self) -> Result<Box<dyn CommunicationProvider>, DomainError> {
-        require_full_disk_access()?;
         Ok(Box::new(WechatProvider::new(MacOSWechatSource::discover(
             self.local_database.as_deref(),
         )?)))
     }
-}
-
-fn require_full_disk_access() -> Result<(), DomainError> {
-    fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db")
-        .map(|_| ())
-        .map_err(|_| full_disk_access_required())
 }
 
 struct SourcePaths {
@@ -108,6 +156,8 @@ struct MacOSWechatSource {
     paths: Arc<SourcePaths>,
     cursors: Arc<Mutex<BTreeMap<String, i64>>>,
     verified: Arc<Mutex<bool>>,
+    last_pending_media_retry_at: Arc<Mutex<Option<Instant>>>,
+    last_message_snapshot: Arc<Mutex<Option<MessageSourceSnapshot>>>,
 }
 
 impl MacOSWechatSource {
@@ -115,7 +165,7 @@ impl MacOSWechatSource {
         let home = env::var_os("HOME").ok_or_else(source_unavailable)?;
         let root = PathBuf::from(home).join(SOURCE_ROOT);
         let mut accounts = fs::read_dir(root)
-            .map_err(|_| source_unavailable())?
+            .map_err(|error| source_access_error(&error))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
@@ -138,7 +188,7 @@ impl MacOSWechatSource {
             .and_then(clean_account_directory_name)
             .ok_or_else(source_unavailable)?;
         let mut message_databases = fs::read_dir(account_root.join(MESSAGE_DIRECTORY))
-            .map_err(|_| source_unavailable())?
+            .map_err(|error| source_access_error(&error))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| is_message_database(path))
@@ -148,7 +198,7 @@ impl MacOSWechatSource {
             return Err(source_unavailable());
         }
         let mut media_databases = fs::read_dir(account_root.join(MESSAGE_DIRECTORY))
-            .map_err(|_| source_unavailable())?
+            .map_err(|error| source_access_error(&error))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| is_media_database(path))
@@ -174,6 +224,8 @@ impl MacOSWechatSource {
             }),
             cursors: Arc::new(Mutex::new(cursors)),
             verified: Arc::new(Mutex::new(false)),
+            last_pending_media_retry_at: Arc::new(Mutex::new(None)),
+            last_message_snapshot: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -195,15 +247,105 @@ impl WechatSource for MacOSWechatSource {
         let paths = Arc::clone(&self.paths);
         let cursors = Arc::clone(&self.cursors);
         let verified = Arc::clone(&self.verified);
+        let last_pending_media_retry_at = Arc::clone(&self.last_pending_media_retry_at);
+        let last_message_snapshot = Arc::clone(&self.last_message_snapshot);
         Box::pin(async move {
             if !verified.lock().is_ok_and(|state| *state) {
                 return Err(waiting_source());
             }
-            tokio::task::spawn_blocking(move || read_message_batch(&paths, &cursors))
-                .await
-                .map_err(|_| capability_unavailable())?
+            let retry_pending_media = {
+                let mut last_retry_at = last_pending_media_retry_at
+                    .lock()
+                    .map_err(|_| capability_unavailable())?;
+                claim_pending_media_retry(&mut last_retry_at, Instant::now())
+            };
+            tokio::task::spawn_blocking(move || {
+                read_message_batch(
+                    &paths,
+                    &cursors,
+                    &last_message_snapshot,
+                    retry_pending_media,
+                )
+            })
+            .await
+            .map_err(|_| capability_unavailable())?
         })
     }
+}
+
+fn claim_pending_media_retry(last_retry_at: &mut Option<Instant>, now: Instant) -> bool {
+    let due = last_retry_at.is_none_or(|last_retry_at| {
+        now.checked_duration_since(last_retry_at)
+            .is_some_and(|elapsed| elapsed >= PENDING_MEDIA_RETRY_INTERVAL)
+    });
+    if due {
+        *last_retry_at = Some(now);
+    }
+    due
+}
+
+fn pending_retry_rows(
+    cursors: &BTreeMap<String, i64>,
+    retry_prefix: &str,
+    retry_pending_media: bool,
+) -> Vec<(String, i64, i64)> {
+    if !retry_pending_media {
+        return Vec::new();
+    }
+    cursors
+        .iter()
+        .filter_map(|(key, create_time)| {
+            key.strip_prefix(retry_prefix)
+                .and_then(|local_id| local_id.parse::<i64>().ok())
+                .map(|local_id| (key.clone(), local_id, *create_time))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceFileStamp {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MessageSourceSnapshot(Vec<(SourceFileStamp, SourceFileStamp)>);
+
+fn message_source_snapshot(databases: &[PathBuf]) -> MessageSourceSnapshot {
+    MessageSourceSnapshot(
+        databases
+            .iter()
+            .map(|database| {
+                let mut wal = database.as_os_str().to_os_string();
+                wal.push("-wal");
+                (
+                    source_file_stamp(database),
+                    source_file_stamp(Path::new(&wal)),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn source_file_stamp(path: &Path) -> SourceFileStamp {
+    path.metadata().map_or(
+        SourceFileStamp {
+            length: 0,
+            modified: None,
+        },
+        |metadata| SourceFileStamp {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        },
+    )
+}
+
+fn should_scan_message_source(
+    previous: Option<&MessageSourceSnapshot>,
+    current: &MessageSourceSnapshot,
+    retry_pending_media: bool,
+) -> bool {
+    retry_pending_media || previous != Some(current)
 }
 
 fn probe_source(paths: &SourcePaths) -> Result<SourceCapabilities, DomainError> {
@@ -254,7 +396,19 @@ fn probe_source(paths: &SourcePaths) -> Result<SourceCapabilities, DomainError> 
 fn read_message_batch(
     paths: &SourcePaths,
     cursors: &Mutex<BTreeMap<String, i64>>,
+    last_message_snapshot: &Mutex<Option<MessageSourceSnapshot>>,
+    retry_pending_media: bool,
 ) -> Result<Vec<SourceRecord>, DomainError> {
+    let current_snapshot = message_source_snapshot(&paths.message_databases);
+    let should_scan = {
+        let previous = last_message_snapshot
+            .lock()
+            .map_err(|_| capability_unavailable())?;
+        should_scan_message_source(previous.as_ref(), &current_snapshot, retry_pending_media)
+    };
+    if !should_scan {
+        return Ok(Vec::new());
+    }
     let material = extend_message_database_routes(paths, load_material(paths)?)?;
     let sessions = with_database(&paths.session_database, &material, read_sessions)
         .map_err(|_| read_stage_error("WECHAT_SESSION_READ_FAILED"))?;
@@ -326,65 +480,67 @@ fn read_message_batch(
             cursors: &cursor_snapshot,
             cutoff,
         };
-        if std::env::var_os("PCA_WECHAT_ROW_DIAGNOSTIC").is_some() {
-            with_database(database, &material, |connection| {
+        with_message_database(database, &material, |connection| {
+            if std::env::var_os("PCA_WECHAT_ROW_DIAGNOSTIC").is_some() {
                 diagnostic_recent_rows(
                     connection,
                     &sessions,
                     &video_hardlinks,
                     &video_files,
                     &emoticon_files,
-                )
-            })
-            .map_err(|_| read_stage_error("WECHAT_MESSAGE_READ_FAILED"))?;
-        }
-        let text_limit = remaining.min(KIND_BATCH_QUOTA);
-        let text_batch = with_database(database, &material, |connection| {
-            read_database_text(connection, &context, &sessions, text_limit)
-        })
-        .map_err(|_| read_stage_error("WECHAT_MESSAGE_READ_FAILED"))?;
-        for (cursor_key, sequence, record) in text_batch {
-            cursor_guard
-                .entry(cursor_key)
-                .and_modify(|current| *current = (*current).max(sequence))
-                .or_insert(sequence);
-            if let Some(record) = record {
+                )?;
+            }
+
+            let text_limit = remaining.min(KIND_BATCH_QUOTA);
+            let text_batch = read_database_text(connection, &context, &sessions, text_limit)?;
+            for (cursor_key, sequence, record) in text_batch {
+                cursor_guard
+                    .entry(cursor_key)
+                    .and_modify(|current| *current = (*current).max(sequence))
+                    .or_insert(sequence);
+                if let Some(record) = record {
+                    records.push(SourceRecord::Message(Box::new(record)));
+                }
+            }
+            if records.len() >= MAX_BATCH {
+                return Ok(());
+            }
+
+            let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
+            let file_batch = read_database_files(
+                connection,
+                &context,
+                &sessions,
+                &message_files,
+                remaining,
+                retry_pending_media,
+            );
+            let file_batch = file_batch.unwrap_or_else(|_| {
+                eprintln!("WeChat media stage deferred: WECHAT_FILE_READ_FAILED");
+                FileReadBatch {
+                    records: Vec::new(),
+                    cursor_updates: Vec::new(),
+                    cursor_removals: Vec::new(),
+                }
+            });
+            for cursor_key in file_batch.cursor_removals {
+                cursor_guard.remove(&cursor_key);
+            }
+            for (cursor_key, sequence) in file_batch.cursor_updates {
+                cursor_guard
+                    .entry(cursor_key)
+                    .and_modify(|current| *current = (*current).max(sequence))
+                    .or_insert(sequence);
+            }
+            for record in file_batch.records {
                 records.push(SourceRecord::Message(Box::new(record)));
             }
-        }
-        if records.len() >= MAX_BATCH {
-            break;
-        }
-        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
-        let file_batch = with_database(database, &material, |connection| {
-            read_database_files(connection, &context, &sessions, &message_files, remaining)
-        });
-        let file_batch = file_batch.unwrap_or_else(|_| {
-            eprintln!("WeChat media stage deferred: WECHAT_FILE_READ_FAILED");
-            FileReadBatch {
-                records: Vec::new(),
-                cursor_updates: Vec::new(),
-                cursor_removals: Vec::new(),
+            if records.len() >= MAX_BATCH {
+                return Ok(());
             }
-        });
-        for cursor_key in file_batch.cursor_removals {
-            cursor_guard.remove(&cursor_key);
-        }
-        for (cursor_key, sequence) in file_batch.cursor_updates {
-            cursor_guard
-                .entry(cursor_key)
-                .and_modify(|current| *current = (*current).max(sequence))
-                .or_insert(sequence);
-        }
-        for record in file_batch.records {
-            records.push(SourceRecord::Message(Box::new(record)));
-        }
-        if records.len() >= MAX_BATCH {
-            break;
-        }
-        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
-        let image_batch = with_database(database, &material, |connection| {
-            read_database_images(
+
+            let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
+            let image_batch = read_database_images(
                 connection,
                 &context,
                 &sessions,
@@ -394,136 +550,138 @@ fn read_message_batch(
                 &image_keys,
                 &paths.account_root,
                 remaining,
-            )
-        });
-        let image_batch = image_batch.unwrap_or_else(|_| {
-            eprintln!("WeChat media stage deferred: WECHAT_IMAGE_READ_FAILED");
-            ImageReadBatch {
-                records: Vec::new(),
-                cursor_updates: Vec::new(),
-                cursor_removals: Vec::new(),
-                rows_scanned: 0,
-                cache_matches: 0,
-                metadata_matches: 0,
-                dat_matches: 0,
-                index_matches: 0,
-                hardlink_matches: 0,
+                retry_pending_media,
+            );
+            let image_batch = image_batch.unwrap_or_else(|_| {
+                eprintln!("WeChat media stage deferred: WECHAT_IMAGE_READ_FAILED");
+                ImageReadBatch {
+                    records: Vec::new(),
+                    cursor_updates: Vec::new(),
+                    cursor_removals: Vec::new(),
+                    rows_scanned: 0,
+                    cache_matches: 0,
+                    metadata_matches: 0,
+                    dat_matches: 0,
+                    index_matches: 0,
+                    hardlink_matches: 0,
+                }
+            });
+            image_rows_scanned += image_batch.rows_scanned;
+            image_cache_matches += image_batch.cache_matches;
+            image_metadata_matches += image_batch.metadata_matches;
+            image_dat_matches += image_batch.dat_matches;
+            image_index_matches += image_batch.index_matches;
+            image_hardlink_matches += image_batch.hardlink_matches;
+            image_records += image_batch.records.len();
+            for cursor_key in image_batch.cursor_removals {
+                cursor_guard.remove(&cursor_key);
             }
-        });
-        image_rows_scanned += image_batch.rows_scanned;
-        image_cache_matches += image_batch.cache_matches;
-        image_metadata_matches += image_batch.metadata_matches;
-        image_dat_matches += image_batch.dat_matches;
-        image_index_matches += image_batch.index_matches;
-        image_hardlink_matches += image_batch.hardlink_matches;
-        image_records += image_batch.records.len();
-        for cursor_key in image_batch.cursor_removals {
-            cursor_guard.remove(&cursor_key);
-        }
-        for (cursor_key, sequence) in image_batch.cursor_updates {
-            cursor_guard
-                .entry(cursor_key)
-                .and_modify(|current| *current = (*current).max(sequence))
-                .or_insert(sequence);
-        }
-        for record in image_batch.records {
-            records.push(SourceRecord::Message(Box::new(record)));
-        }
-        if records.len() >= MAX_BATCH {
-            break;
-        }
-        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
-        let emoticon_batch = with_database(database, &material, |connection| {
-            read_database_emoticons(
+            for (cursor_key, sequence) in image_batch.cursor_updates {
+                cursor_guard
+                    .entry(cursor_key)
+                    .and_modify(|current| *current = (*current).max(sequence))
+                    .or_insert(sequence);
+            }
+            for record in image_batch.records {
+                records.push(SourceRecord::Message(Box::new(record)));
+            }
+            if records.len() >= MAX_BATCH {
+                return Ok(());
+            }
+
+            let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
+            let emoticon_batch = read_database_emoticons(
                 connection,
                 &context,
                 &sessions,
                 &emoticon_files,
                 &emoticon_keys,
                 remaining,
-            )
-        });
-        let emoticon_batch = emoticon_batch.unwrap_or_else(|_| {
-            eprintln!("WeChat media stage deferred: WECHAT_EMOTICON_READ_FAILED");
-            EmoticonReadBatch {
-                records: Vec::new(),
-                cursor_updates: Vec::new(),
-                cursor_removals: Vec::new(),
+                retry_pending_media,
+            );
+            let emoticon_batch = emoticon_batch.unwrap_or_else(|_| {
+                eprintln!("WeChat media stage deferred: WECHAT_EMOTICON_READ_FAILED");
+                EmoticonReadBatch {
+                    records: Vec::new(),
+                    cursor_updates: Vec::new(),
+                    cursor_removals: Vec::new(),
+                }
+            });
+            for cursor_key in emoticon_batch.cursor_removals {
+                cursor_guard.remove(&cursor_key);
             }
-        });
-        for cursor_key in emoticon_batch.cursor_removals {
-            cursor_guard.remove(&cursor_key);
-        }
-        for (cursor_key, sequence) in emoticon_batch.cursor_updates {
-            cursor_guard
-                .entry(cursor_key)
-                .and_modify(|current| *current = (*current).max(sequence))
-                .or_insert(sequence);
-        }
-        for record in emoticon_batch.records {
-            records.push(SourceRecord::Message(Box::new(record)));
-        }
-        if records.len() >= MAX_BATCH {
-            break;
-        }
-        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
-        let audio_batch = with_database(database, &material, |connection| {
-            read_database_audio(
+            for (cursor_key, sequence) in emoticon_batch.cursor_updates {
+                cursor_guard
+                    .entry(cursor_key)
+                    .and_modify(|current| *current = (*current).max(sequence))
+                    .or_insert(sequence);
+            }
+            for record in emoticon_batch.records {
+                records.push(SourceRecord::Message(Box::new(record)));
+            }
+            if records.len() >= MAX_BATCH {
+                return Ok(());
+            }
+
+            let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
+            let audio_batch = read_database_audio(
                 connection,
                 &context,
                 &sessions,
                 &paths.media_databases,
                 &material,
                 remaining,
-            )
-        });
-        if let Ok(audio_batch) = audio_batch {
-            for (cursor_key, sequence) in audio_batch.cursor_updates {
-                cursor_guard
-                    .entry(cursor_key)
-                    .and_modify(|current| *current = (*current).max(sequence))
-                    .or_insert(sequence);
+            );
+            if let Ok(audio_batch) = audio_batch {
+                for (cursor_key, sequence) in audio_batch.cursor_updates {
+                    cursor_guard
+                        .entry(cursor_key)
+                        .and_modify(|current| *current = (*current).max(sequence))
+                        .or_insert(sequence);
+                }
+                for record in audio_batch.records {
+                    records.push(SourceRecord::Message(Box::new(record)));
+                }
+            } else {
+                eprintln!("WeChat media stage deferred: WECHAT_AUDIO_READ_FAILED");
             }
-            for record in audio_batch.records {
-                records.push(SourceRecord::Message(Box::new(record)));
+            if records.len() >= MAX_BATCH {
+                return Ok(());
             }
-        } else {
-            eprintln!("WeChat media stage deferred: WECHAT_AUDIO_READ_FAILED");
-        }
-        if records.len() >= MAX_BATCH {
-            break;
-        }
-        let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
-        let video_batch = with_database(database, &material, |connection| {
-            read_database_videos(
+
+            let remaining = (MAX_BATCH - records.len()).min(KIND_BATCH_QUOTA);
+            let video_batch = read_database_videos(
                 connection,
                 &context,
                 &sessions,
                 &video_hardlinks,
                 &video_files,
                 remaining,
-            )
-        });
-        let video_batch = video_batch.unwrap_or_else(|_| {
-            eprintln!("WeChat media stage deferred: WECHAT_VIDEO_READ_FAILED");
-            VideoReadBatch {
-                records: Vec::new(),
-                cursor_updates: Vec::new(),
-                cursor_removals: Vec::new(),
+                retry_pending_media,
+            );
+            let video_batch = video_batch.unwrap_or_else(|_| {
+                eprintln!("WeChat media stage deferred: WECHAT_VIDEO_READ_FAILED");
+                VideoReadBatch {
+                    records: Vec::new(),
+                    cursor_updates: Vec::new(),
+                    cursor_removals: Vec::new(),
+                }
+            });
+            for cursor_key in video_batch.cursor_removals {
+                cursor_guard.remove(&cursor_key);
             }
-        });
-        for cursor_key in video_batch.cursor_removals {
-            cursor_guard.remove(&cursor_key);
-        }
-        for (cursor_key, sequence) in video_batch.cursor_updates {
-            cursor_guard
-                .entry(cursor_key)
-                .and_modify(|current| *current = (*current).max(sequence))
-                .or_insert(sequence);
-        }
-        for record in video_batch.records {
-            records.push(SourceRecord::Message(Box::new(record)));
-        }
+            for (cursor_key, sequence) in video_batch.cursor_updates {
+                cursor_guard
+                    .entry(cursor_key)
+                    .and_modify(|current| *current = (*current).max(sequence))
+                    .or_insert(sequence);
+            }
+            for record in video_batch.records {
+                records.push(SourceRecord::Message(Box::new(record)));
+            }
+            Ok(())
+        })
+        .map_err(|_| read_stage_error("WECHAT_MESSAGE_READ_FAILED"))?;
     }
     if std::env::var_os("PCA_WECHAT_MEDIA_DIAGNOSTIC").is_some() {
         eprintln!(
@@ -545,6 +703,9 @@ fn read_message_batch(
             image_records
         );
     }
+    *last_message_snapshot
+        .lock()
+        .map_err(|_| capability_unavailable())? = Some(current_snapshot);
     Ok(records)
 }
 
@@ -901,6 +1062,7 @@ fn read_database_images(
     image_keys: &[ImageKeys],
     account_root: &Path,
     limit: usize,
+    retry_pending_media: bool,
 ) -> Result<ImageReadBatch, SqlcipherProbeFailure> {
     let my_rowid = local_sender_rowid(connection, context.local_username)?
         .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
@@ -961,15 +1123,7 @@ fn read_database_images(
         let cursor_key = format!("{}:{}:image", context.database_name, session.username);
         let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
         let retry_prefix = format!("{cursor_key}:full-pending:");
-        let retry_rows = context
-            .cursors
-            .iter()
-            .filter_map(|(key, create_time)| {
-                key.strip_prefix(&retry_prefix)
-                    .and_then(|local_id| local_id.parse::<i64>().ok())
-                    .map(|local_id| (key.clone(), local_id, *create_time))
-            })
-            .collect::<Vec<_>>();
+        let retry_rows = pending_retry_rows(context.cursors, &retry_prefix, retry_pending_media);
         cursor_removals.extend(
             retry_rows
                 .iter()
@@ -1105,6 +1259,8 @@ fn read_database_images(
                 .iter()
                 .find_map(|md5| image_hardlinks.get(md5))
                 .and_then(|source| resolve_full_image_variant(source));
+            let full_source_present =
+                full_direct_dat_path.is_some() || full_hardlink_path.is_some();
             let completed_full_image = full_direct_dat_path
                 .as_ref()
                 .and_then(|source| {
@@ -1129,24 +1285,10 @@ fn read_database_images(
                         )
                     })
                 });
-            let is_full_image = completed_full_image.is_some();
-            let completed_image = completed_full_image
-                .or_else(|| {
-                    direct_dat_path.as_ref().and_then(|source| {
-                        decrypted_image_attachment(
-                            source,
-                            image_keys,
-                            context.database_name,
-                            &table_name,
-                            row.local_id,
-                            false,
-                        )
-                    })
-                })
-                .or_else(|| {
-                    image_md5s
-                        .iter()
-                        .find_map(|md5| image_hardlinks.get(md5))
+            let (completed_image, is_full_image) =
+                select_image_candidate(is_retry, completed_full_image, || {
+                    direct_dat_path
+                        .as_ref()
                         .and_then(|source| {
                             decrypted_image_attachment(
                                 source,
@@ -1157,17 +1299,40 @@ fn read_database_images(
                                 false,
                             )
                         })
-                })
-                .or_else(|| {
-                    decoded_image_attachment(
-                        decoded_images,
-                        context.database_name,
-                        &table_name,
-                        row.local_id,
-                        row.create_time,
-                    )
+                        .or_else(|| {
+                            image_md5s
+                                .iter()
+                                .find_map(|md5| image_hardlinks.get(md5))
+                                .and_then(|source| {
+                                    decrypted_image_attachment(
+                                        source,
+                                        image_keys,
+                                        context.database_name,
+                                        &table_name,
+                                        row.local_id,
+                                        false,
+                                    )
+                                })
+                        })
+                        .or_else(|| {
+                            decoded_image_attachment(
+                                decoded_images,
+                                context.database_name,
+                                &table_name,
+                                row.local_id,
+                                row.create_time,
+                            )
+                        })
                 });
             let Some((attachment, source_path)) = completed_image else {
+                if should_retire_failed_full_image_retry(
+                    is_retry,
+                    full_source_present,
+                    row.create_time,
+                    media_ready_cutoff,
+                ) {
+                    cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
+                }
                 if !is_retry && row.create_time > media_ready_cutoff {
                     break;
                 }
@@ -1297,6 +1462,27 @@ fn read_database_images(
     })
 }
 
+fn select_image_candidate<T>(
+    is_retry: bool,
+    completed_full_image: Option<T>,
+    thumbnail: impl FnOnce() -> Option<T>,
+) -> (Option<T>, bool) {
+    match completed_full_image {
+        Some(full_image) => (Some(full_image), true),
+        None if is_retry => (None, false),
+        None => (thumbnail(), false),
+    }
+}
+
+fn should_retire_failed_full_image_retry(
+    is_retry: bool,
+    full_source_present: bool,
+    create_time: i64,
+    media_ready_cutoff: i64,
+) -> bool {
+    is_retry && full_source_present && create_time <= media_ready_cutoff
+}
+
 struct ImageReadBatch {
     records: Vec<SourceMessageRecord>,
     cursor_updates: Vec<(String, i64)>,
@@ -1326,6 +1512,7 @@ fn read_database_emoticons(
     emoticon_files: &BTreeMap<String, PathBuf>,
     emoticon_keys: &BTreeMap<String, String>,
     limit: usize,
+    retry_pending_media: bool,
 ) -> Result<EmoticonReadBatch, SqlcipherProbeFailure> {
     let my_rowid = local_sender_rowid(connection, context.local_username)?
         .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
@@ -1381,15 +1568,7 @@ fn read_database_emoticons(
         let cursor_key = format!("{}:{}:emoticon-v2", context.database_name, session.username);
         let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
         let retry_prefix = format!("{cursor_key}:pending:");
-        let retry_rows = context
-            .cursors
-            .iter()
-            .filter_map(|(key, create_time)| {
-                key.strip_prefix(&retry_prefix)
-                    .and_then(|local_id| local_id.parse::<i64>().ok())
-                    .map(|local_id| (key.clone(), local_id, *create_time))
-            })
-            .collect::<Vec<_>>();
+        let retry_rows = pending_retry_rows(context.cursors, &retry_prefix, retry_pending_media);
         cursor_removals.extend(
             retry_rows
                 .iter()
@@ -1625,6 +1804,7 @@ fn read_database_files(
     sessions: &[Session],
     message_files: &BTreeMap<String, Vec<PathBuf>>,
     limit: usize,
+    retry_pending_media: bool,
 ) -> Result<FileReadBatch, SqlcipherProbeFailure> {
     let my_rowid = local_sender_rowid(connection, read_context.local_username)?
         .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
@@ -1674,15 +1854,8 @@ fn read_database_files(
         );
         let after = read_context.cursors.get(&cursor_key).copied().unwrap_or(0);
         let retry_prefix = format!("{cursor_key}:pending:");
-        let retry_rows = read_context
-            .cursors
-            .iter()
-            .filter_map(|(key, create_time)| {
-                key.strip_prefix(&retry_prefix)
-                    .and_then(|local_id| local_id.parse::<i64>().ok())
-                    .map(|local_id| (key.clone(), local_id, *create_time))
-            })
-            .collect::<Vec<_>>();
+        let retry_rows =
+            pending_retry_rows(read_context.cursors, &retry_prefix, retry_pending_media);
         cursor_removals.extend(
             retry_rows
                 .iter()
@@ -1910,6 +2083,7 @@ fn read_database_videos(
     video_hardlinks: &BTreeMap<String, String>,
     video_files: &BTreeMap<String, PathBuf>,
     limit: usize,
+    retry_pending_media: bool,
 ) -> Result<VideoReadBatch, SqlcipherProbeFailure> {
     let my_rowid = local_sender_rowid(connection, context.local_username)?
         .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
@@ -1956,15 +2130,7 @@ fn read_database_videos(
         let cursor_key = format!("{}:{}:video", context.database_name, session.username);
         let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
         let retry_prefix = format!("{cursor_key}:pending:");
-        let retry_rows = context
-            .cursors
-            .iter()
-            .filter_map(|(key, create_time)| {
-                key.strip_prefix(&retry_prefix)
-                    .and_then(|local_id| local_id.parse::<i64>().ok())
-                    .map(|local_id| (key.clone(), local_id, *create_time))
-            })
-            .collect::<Vec<_>>();
+        let retry_rows = pending_retry_rows(context.cursors, &retry_prefix, retry_pending_media);
         cursor_removals.extend(
             retry_rows
                 .iter()
@@ -4476,7 +4642,7 @@ fn extend_message_database_routes(
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(database)
             .and_then(|mut file| file.read_exact(&mut salt))
-            .map_err(|_| source_unavailable())?;
+            .map_err(|error| source_access_error(&error))?;
         material = material
             .with_database_route_from(&source_database, relative, salt)
             .map_err(|_| capability_unavailable())?;
@@ -4490,6 +4656,15 @@ fn with_database<T>(
     operation: impl FnOnce(&Connection) -> Result<T, SqlcipherProbeFailure>,
 ) -> Result<T, DomainError> {
     with_recovered_database(path, material, DATABASE_TIMEOUT, operation).map_err(map_failure)
+}
+
+fn with_message_database<T>(
+    path: &Path,
+    material: &WechatKeyMaterial,
+    operation: impl FnOnce(&Connection) -> Result<T, SqlcipherProbeFailure>,
+) -> Result<T, DomainError> {
+    with_recovered_database(path, material, MESSAGE_DATABASE_TIMEOUT, operation)
+        .map_err(map_failure)
 }
 
 fn require_columns(
@@ -5132,6 +5307,9 @@ fn account_id_for_root(root: &Path) -> String {
     format!("wechat-db-v1:{fingerprint:x}")
 }
 
+type PendingSourceCursor = (String, i64, Option<String>);
+type BootstrappedSourceCursor = (String, i64, Option<PendingSourceCursor>);
+
 fn bootstrap_source_cursors(
     local_database: &Path,
     account_id: &str,
@@ -5143,41 +5321,112 @@ fn bootstrap_source_cursors(
     ) else {
         return BTreeMap::new();
     };
+    let database_names = message_databases
+        .iter()
+        .filter_map(|database| database.file_name()?.to_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
     let Ok(mut statement) = connection.prepare(
-        "SELECT external_conversation_id, last_source_sequence \
-         FROM communication_cursors WHERE account_id = ?1",
+        "SELECT message.external_conversation_id, message.source_sequence, \
+                message.source_key, message.occurred_at_ms \
+         FROM communication_messages AS message \
+         WHERE message.account_id = ?1",
     ) else {
         return BTreeMap::new();
     };
     let Ok(rows) = statement.query_map([account_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
     }) else {
         return BTreeMap::new();
     };
-    let saved = rows
-        .filter_map(Result::ok)
-        .filter(|(conversation_id, sequence)| !conversation_id.is_empty() && *sequence > 0)
-        .collect::<Vec<_>>();
-    let mut cursors = BTreeMap::new();
-    for database in message_databases {
-        let Some(database_name) = database.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        for (conversation_id, sequence) in &saved {
-            cursors.insert(
-                format!("{database_name}:{conversation_id}:display-text-v2"),
-                *sequence,
-            );
-            let media_sequence = sequence.saturating_sub(MEDIA_CURSOR_LOOKBACK);
-            for kind in ["file-v2", "image", "emoticon-v1", "audio", "video"] {
-                cursors.insert(
-                    format!("{database_name}:{conversation_id}:{kind}"),
-                    media_sequence,
-                );
+    let mut cursors: BTreeMap<String, i64> = BTreeMap::new();
+    let mut pending_images = Vec::new();
+    let mut completed_images = BTreeSet::new();
+    for row in rows.filter_map(Result::ok) {
+        if row.2.ends_with(":image:full") {
+            completed_images.insert(row.2.clone());
+        }
+        if let Some((cursor_key, sequence, pending)) =
+            cursors_from_local_message(row, &database_names)
+        {
+            cursors
+                .entry(cursor_key)
+                .and_modify(|current| *current = (*current).max(sequence))
+                .or_insert(sequence);
+            if let Some((key, create_time, completed_source_key)) = pending {
+                if let Some(completed_source_key) = completed_source_key {
+                    pending_images.push((key, create_time, completed_source_key));
+                } else {
+                    cursors.insert(key, create_time);
+                }
             }
         }
     }
+    for (key, create_time, completed_source_key) in pending_images {
+        if !completed_images.contains(&completed_source_key) {
+            cursors.insert(key, create_time);
+        }
+    }
     cursors
+}
+
+fn cursors_from_local_message(
+    (conversation_id, source_sequence, source_key, occurred_at_ms): (String, i64, String, i64),
+    database_names: &BTreeSet<String>,
+) -> Option<BootstrappedSourceCursor> {
+    if conversation_id.is_empty() || source_sequence <= 0 || occurred_at_ms <= 0 {
+        return None;
+    }
+    let mut parts = source_key.split(':');
+    if parts.next()? != "wechat" {
+        return None;
+    }
+    let database_name = parts.next()?;
+    if !database_names.contains(database_name) {
+        return None;
+    }
+    let table_name = parts.next()?;
+    if !valid_sql_identifier(table_name) {
+        return None;
+    }
+    let local_id = parts.next()?.parse::<i64>().ok()?;
+    if local_id != source_sequence {
+        return None;
+    }
+    let suffix = parts.collect::<Vec<_>>();
+    let (kind, pending_kind, completed_source_key) = match suffix.as_slice() {
+        [] => ("display-text-v2", None, None),
+        ["audio"] => ("audio", None, None),
+        ["file"] => ("file-v2", None, None),
+        ["file-pending"] => ("file-v2", Some("file-v2:pending"), None),
+        ["image", "full"] => ("image", None, None),
+        ["image"] => (
+            "image",
+            Some("image:full-pending"),
+            Some(format!("{source_key}:full")),
+        ),
+        ["emoticon"] => ("emoticon-v2", None, None),
+        ["emoticon-placeholder"] => ("emoticon-v2", Some("emoticon-v2:pending"), None),
+        ["video"] => ("video", None, None),
+        ["video-pending"] => ("video", Some("video:pending"), None),
+        _ => return None,
+    };
+    let pending = pending_kind.map(|pending_kind| {
+        (
+            format!("{database_name}:{conversation_id}:{pending_kind}:{local_id}"),
+            occurred_at_ms / 1_000,
+            completed_source_key,
+        )
+    });
+    Some((
+        format!("{database_name}:{conversation_id}:{kind}"),
+        source_sequence,
+        pending,
+    ))
 }
 
 fn map_failure(failure: SqlcipherProbeFailure) -> DomainError {
@@ -5228,12 +5477,16 @@ fn source_unavailable() -> DomainError {
     )
 }
 
-fn full_disk_access_required() -> DomainError {
-    DomainError::new(
-        "WECHAT_PERMISSION_REQUIRED",
-        "Full Disk Access is required before reading WeChat data",
-        true,
-    )
+fn source_access_error(error: &std::io::Error) -> DomainError {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        DomainError::new(
+            "WECHAT_PERMISSION_REQUIRED",
+            "Access to WeChat app data is required",
+            true,
+        )
+    } else {
+        source_unavailable()
+    }
 }
 
 fn capability_unavailable() -> DomainError {
@@ -5247,25 +5500,113 @@ fn capability_unavailable() -> DomainError {
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_source_cursors, clean_account_directory_name, decode_value,
-        decode_voice_attachment, decoded_image_attachment, decrypt_emoticon, decrypt_v4_image,
-        derive_image_keys, display_text_message, extend_message_database_routes,
+        bootstrap_source_cursors, claim_pending_media_retry, clean_account_directory_name,
+        decode_value, decode_voice_attachment, decoded_image_attachment, decrypt_emoticon,
+        decrypt_v4_image, derive_image_keys, display_text_message, extend_message_database_routes,
         extract_hevc_nalu_units, file_attachment, image_attachment_id, image_mime_type,
         index_decoded_images, index_message_files, index_video_files, is_direct_conversation,
         is_message_database, kvcomm_codes_from_filename, message_table_name,
         normalize_decrypted_image, parse_group_nicknames, parse_image_dat_name,
         parse_image_md5_candidates, parse_video_file_key, parse_video_length,
-        parse_video_md5_candidates, read_contact_cards, read_conversation_metadata,
-        read_database_emoticons, read_database_files, read_database_images, read_database_text,
-        read_database_videos, read_voice_blob, resolve_full_image_dat_path, resolve_group_sender,
-        resolve_image_dat_path, resolve_message_file, resolve_video_path, retention_cutoff_from,
+        parse_video_md5_candidates, probe_wechat_app_data_root, read_contact_cards,
+        read_conversation_metadata, read_database_emoticons, read_database_files,
+        read_database_images, read_database_text, read_database_videos, read_voice_blob,
+        resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
+        resolve_message_file, resolve_video_path, retention_cutoff_from, select_image_candidate,
+        should_retire_failed_full_image_retry, should_scan_message_source, source_access_error,
         stage_decrypted_image, video_attachment, voice_same_time_index, ContactCardProfile,
-        ConversationMetadata, ImageKeys, Session, SourcePaths, SourcePayload, TextReadContext,
+        ConversationMetadata, ImageKeys, MessageSourceSnapshot, Session, SourceFileStamp,
+        SourcePaths, SourcePayload, TextReadContext, WechatAppDataAccess, SESSION_DATABASE,
     };
     use pca_keychain::{WechatDatabaseKeyMaterial, WechatKeyMaterial};
 
     #[test]
-    fn production_bootstraps_recent_source_cursors_from_local_progress() {
+    fn pending_media_retry_is_claimed_at_most_once_per_interval() {
+        let start = std::time::Instant::now();
+        let mut last_retry_at = None;
+
+        assert!(claim_pending_media_retry(&mut last_retry_at, start));
+        assert!(!claim_pending_media_retry(
+            &mut last_retry_at,
+            start + std::time::Duration::from_secs(299)
+        ));
+        assert!(claim_pending_media_retry(
+            &mut last_retry_at,
+            start + std::time::Duration::from_mins(5)
+        ));
+    }
+
+    #[test]
+    fn unchanged_message_source_skips_normal_poll_but_not_pending_retry() {
+        let snapshot = MessageSourceSnapshot(vec![(
+            SourceFileStamp {
+                length: 100,
+                modified: None,
+            },
+            SourceFileStamp {
+                length: 200,
+                modified: None,
+            },
+        )]);
+        let changed = MessageSourceSnapshot(vec![(
+            SourceFileStamp {
+                length: 100,
+                modified: None,
+            },
+            SourceFileStamp {
+                length: 201,
+                modified: None,
+            },
+        )]);
+
+        assert!(should_scan_message_source(None, &snapshot, false));
+        assert!(!should_scan_message_source(
+            Some(&snapshot),
+            &snapshot,
+            false
+        ));
+        assert!(should_scan_message_source(Some(&snapshot), &changed, false));
+        assert!(should_scan_message_source(Some(&snapshot), &snapshot, true));
+    }
+
+    #[test]
+    fn permission_denied_is_reported_as_app_data_authorization_required() {
+        let permission_error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let permission = source_access_error(&permission_error);
+        assert_eq!(permission.code, "WECHAT_PERMISSION_REQUIRED");
+
+        let missing_error = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let missing = source_access_error(&missing_error);
+        assert_eq!(missing.code, "WECHAT_DATABASE_UNAVAILABLE");
+    }
+
+    #[test]
+    fn app_data_probe_accepts_an_existing_wechat_directory() {
+        let fixture = tempfile::tempdir().expect("create app data fixture");
+        let account = fixture.path().join("wxid_test_suffix");
+        std::fs::create_dir_all(account.join("db_storage/session"))
+            .expect("create app data fixture");
+        std::fs::write(account.join(SESSION_DATABASE), b"").expect("seed app data fixture");
+
+        assert_eq!(
+            probe_wechat_app_data_root(fixture.path()).expect("probe existing app data"),
+            WechatAppDataAccess::Authorized
+        );
+    }
+
+    #[test]
+    fn app_data_probe_reports_a_missing_wechat_directory() {
+        let fixture = tempfile::tempdir().expect("create app data parent");
+
+        assert_eq!(
+            probe_wechat_app_data_root(&fixture.path().join("missing"))
+                .expect("probe missing app data"),
+            WechatAppDataAccess::NotInitialized
+        );
+    }
+
+    #[test]
+    fn production_bootstraps_exact_progress_and_pending_media() {
         let fixture = tempfile::tempdir().expect("create cursor fixture");
         let database = fixture.path().join("agent.sqlite3");
         let connection = rusqlite::Connection::open(&database).expect("open cursor fixture");
@@ -5277,9 +5618,35 @@ mod tests {
                     last_source_sequence INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL
                  );
+                 CREATE TABLE communication_messages (
+                    account_id TEXT NOT NULL,
+                    external_conversation_id TEXT NOT NULL,
+                    source_sequence INTEGER NOT NULL,
+                    source_key TEXT NOT NULL,
+                    occurred_at_ms INTEGER NOT NULL
+                 );
                  INSERT INTO communication_cursors VALUES
                     ('account-1', 'wxid_friend', 9876, 1),
-                    ('other-account', 'wxid_other', 9999, 1);",
+                    ('other-account', 'wxid_other', 9999, 1);
+                 INSERT INTO communication_messages VALUES
+                    ('account-1', 'wxid_friend', 6,
+                     'wechat:message_0.db:Msg_abc:6', 6000),
+                    ('account-1', 'wxid_friend', 7,
+                     'wechat:message_0.db:Msg_abc:7:image', 7000),
+                    ('account-1', 'wxid_friend', 8,
+                     'wechat:message_0.db:Msg_abc:8:image', 8000),
+                    ('account-1', 'wxid_friend', 8,
+                     'wechat:message_0.db:Msg_abc:8:image:full', 8000),
+                    ('account-1', 'wxid_friend', 9,
+                     'wechat:message_0.db:Msg_abc:9:emoticon-placeholder', 9000),
+                    ('account-1', 'wxid_friend', 10,
+                     'wechat:message_0.db:Msg_abc:10:file-pending', 10000),
+                    ('account-1', 'wxid_friend', 11,
+                     'wechat:message_0.db:Msg_abc:11:video-pending', 11000),
+                    ('account-1', 'wxid_friend', 12,
+                     'wechat:message_0.db:Msg_abc:12:audio', 12000),
+                    ('other-account', 'wxid_other', 12,
+                     'wechat:message_0.db:Msg_other:12:file-pending', 12000);",
             )
             .expect("seed cursor fixture");
         drop(connection);
@@ -5289,10 +5656,17 @@ mod tests {
             "account-1",
             &[fixture.path().join("message_0.db")],
         );
-        assert_eq!(cursors["message_0.db:wxid_friend:display-text-v2"], 9_876);
-        for kind in ["file-v2", "image", "emoticon-v1", "audio", "video"] {
-            assert_eq!(cursors[&format!("message_0.db:wxid_friend:{kind}")], 9_676);
-        }
+        assert_eq!(cursors["message_0.db:wxid_friend:display-text-v2"], 6);
+        assert_eq!(cursors["message_0.db:wxid_friend:image"], 8);
+        assert_eq!(cursors["message_0.db:wxid_friend:emoticon-v2"], 9);
+        assert_eq!(cursors["message_0.db:wxid_friend:file-v2"], 10);
+        assert_eq!(cursors["message_0.db:wxid_friend:video"], 11);
+        assert_eq!(cursors["message_0.db:wxid_friend:audio"], 12);
+        assert_eq!(cursors["message_0.db:wxid_friend:image:full-pending:7"], 7);
+        assert_eq!(cursors["message_0.db:wxid_friend:emoticon-v2:pending:9"], 9);
+        assert_eq!(cursors["message_0.db:wxid_friend:file-v2:pending:10"], 10);
+        assert_eq!(cursors["message_0.db:wxid_friend:video:pending:11"], 11);
+        assert!(!cursors.contains_key("message_0.db:wxid_friend:image:full-pending:8"));
         assert!(!cursors.keys().any(|key| key.contains("wxid_other")));
     }
 
@@ -5713,6 +6087,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &files,
             20,
+            false,
         )
         .expect("read video message");
         assert_eq!(batch.records.len(), 1);
@@ -5774,6 +6149,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             20,
+            true,
         )
         .expect("record delayed video retry");
         assert_eq!(first.records.len(), 1);
@@ -5809,6 +6185,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &index_video_files(account.path()),
             20,
+            true,
         )
         .expect("read materialized delayed video");
         assert_eq!(second.records.len(), 1);
@@ -5866,6 +6243,7 @@ mod tests {
             }],
             &std::collections::BTreeMap::new(),
             20,
+            true,
         )
         .expect("record delayed file retry");
         assert_eq!(first.records.len(), 1);
@@ -5884,6 +6262,20 @@ mod tests {
             cursors: &retry_cursors,
             ..context
         };
+        let suppressed = read_database_files(
+            &connection,
+            &retry_context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            &index_message_files(account.path(), 0),
+            20,
+            false,
+        )
+        .expect("defer materialized file until the retry interval");
+        assert!(suppressed.records.is_empty());
+        assert!(suppressed.cursor_removals.is_empty());
+
         let second = read_database_files(
             &connection,
             &retry_context,
@@ -5892,6 +6284,7 @@ mod tests {
             }],
             &index_message_files(account.path(), 0),
             20,
+            true,
         )
         .expect("read materialized delayed file");
         assert_eq!(second.records.len(), 1);
@@ -6146,6 +6539,7 @@ mod tests {
                 "00112233445566778899aabbccddeeff".to_owned(),
             )]),
             20,
+            true,
         )
         .expect("read emoticon message");
 
@@ -6221,6 +6615,7 @@ mod tests {
             &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
             20,
+            true,
         )
         .expect("read unreadable emoticon");
 
@@ -6273,6 +6668,7 @@ mod tests {
                 "30313233343536373839616263646566".to_owned(),
             )]),
             20,
+            true,
         )
         .expect("upgrade recovered emoticon");
         assert_eq!(recovered.records.len(), 1);
@@ -6609,6 +7005,43 @@ mod tests {
     }
 
     #[test]
+    fn production_full_image_retry_does_not_reprocess_the_existing_thumbnail() {
+        let thumbnail_called = std::cell::Cell::new(false);
+        let (candidate, is_full) = select_image_candidate(false, None, || {
+            thumbnail_called.set(true);
+            Some("thumbnail")
+        });
+        assert_eq!(candidate, Some("thumbnail"));
+        assert!(!is_full);
+        assert!(thumbnail_called.get());
+
+        thumbnail_called.set(false);
+        let (candidate, is_full) = select_image_candidate(true, None, || {
+            thumbnail_called.set(true);
+            Some("thumbnail")
+        });
+        assert_eq!(candidate, None);
+        assert!(!is_full);
+        assert!(!thumbnail_called.get());
+
+        let (candidate, is_full) = select_image_candidate(true, Some("full"), || Some("thumbnail"));
+        assert_eq!(candidate, Some("full"));
+        assert!(is_full);
+    }
+
+    #[test]
+    fn production_full_image_retry_stops_repeating_a_stable_failed_source() {
+        assert!(should_retire_failed_full_image_retry(true, true, 100, 100));
+        assert!(!should_retire_failed_full_image_retry(
+            false, true, 100, 100
+        ));
+        assert!(!should_retire_failed_full_image_retry(
+            true, false, 100, 100
+        ));
+        assert!(!should_retire_failed_full_image_retry(true, true, 101, 100));
+    }
+
+    #[test]
     fn production_decrypted_image_stage_returns_a_canonical_source_path() {
         let bytes = [0xff, 0xd8, 0xff, 0x00];
         let sha256 = format!("{:x}", Sha256::digest(bytes));
@@ -6703,6 +7136,7 @@ mod tests {
             &[],
             account.path(),
             20,
+            true,
         )
         .expect("scan image rows");
         assert_eq!(batch.records.len(), 1);

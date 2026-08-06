@@ -8,7 +8,9 @@ pub mod source;
 pub mod sqlcipher_source;
 
 #[cfg(target_os = "macos")]
-pub use production::MacOSWechatProviderFactory;
+pub use production::{
+    probe_wechat_app_data_access, MacOSWechatProviderFactory, WechatAppDataAccess,
+};
 
 use pca_domain::DomainError;
 use pca_provider_contracts::{

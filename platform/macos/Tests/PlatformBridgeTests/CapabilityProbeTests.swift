@@ -45,6 +45,17 @@ final class CapabilityProbeTests: XCTestCase {
         ))
     }
 
+    func testWiFiIdentityNormalizationRejectsValuesThatWouldInvalidateObservation() {
+        XCTAssertEqual(normalizedWiFiSSID("ChinaNet-G4NS-5G"), "ChinaNet-G4NS-5G")
+        XCTAssertNil(normalizedWiFiSSID(""))
+        XCTAssertNil(normalizedWiFiSSID(String(repeating: "网", count: 43)))
+
+        XCTAssertEqual(normalizedWiFiBSSID("aa:bb:0c:01:02:ff"), "AA:BB:0C:01:02:FF")
+        XCTAssertNil(normalizedWiFiBSSID("AA:BB:CC:DD:EE"))
+        XCTAssertNil(normalizedWiFiBSSID("AA:BB:CC:DD:EE:GG"))
+        XCTAssertNil(normalizedWiFiBSSID("0:0:0:0:0:0"))
+    }
+
     func testWiFiLocationGateAcceptsOnlyTheGrantedMacOSCoreLocationStatus() {
         XCTAssertTrue(locationAccessGranted(.authorizedAlways))
         XCTAssertFalse(locationAccessGranted(.notDetermined))

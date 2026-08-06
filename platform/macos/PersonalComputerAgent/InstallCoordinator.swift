@@ -31,7 +31,9 @@ enum InstallError: Error, Equatable {
     case relaunchFailed
     case serviceRegistrationFailed
     case credentialProvisioningFailed
-    case fullDiskAccessRequired
+    case wechatAppDataAccessRequired
+    case wechatAppDataUnavailable
+    case wechatAppDataProbeFailed
     case locationAccessRequired
     case screenCaptureAccessRequired
     case photosAccessRequired
@@ -57,7 +59,9 @@ extension InstallError: LocalizedError {
         case .relaunchFailed: "The installed app could not be opened."
         case .serviceRegistrationFailed: "The background service could not be registered."
         case .credentialProvisioningFailed: "The Bridge credential could not be created in Keychain."
-        case .fullDiskAccessRequired: "Full Disk Access was not granted, so the background Agent was not started."
+        case .wechatAppDataAccessRequired: "Access to WeChat app data was not granted."
+        case .wechatAppDataUnavailable: "The existing WeChat data directory could not be found."
+        case .wechatAppDataProbeFailed: "WeChat app data access could not be verified safely."
         case .locationAccessRequired: "Location access was not granted, so Wi-Fi SSID and BSSID cannot be collected."
         case .screenCaptureAccessRequired: "Screen Recording access was not granted, so screenshots cannot be collected."
         case .photosAccessRequired: "Photos access was not granted, so photo-library originals cannot be collected."
@@ -75,8 +79,12 @@ extension InstallError: LocalizedError {
 
     var recoveryAction: String {
         switch self {
-        case .fullDiskAccessRequired:
-            "Open System Settings > Privacy & Security > Full Disk Access, add and enable PersonalComputerAgent, then retry."
+        case .wechatAppDataAccessRequired:
+            "Allow PersonalComputerAgent to access data from other apps, then retry installation."
+        case .wechatAppDataUnavailable:
+            "Open and log in to the official WeChat once to create its data directory, quit WeChat, then retry installation."
+        case .wechatAppDataProbeFailed:
+            "Keep WeChat closed and retry with a fresh signed installer."
         case .locationAccessRequired:
             "Open System Settings > Privacy & Security > Location Services, enable PersonalComputerAgent, then retry."
         case .screenCaptureAccessRequired:
@@ -533,11 +541,53 @@ protocol InstallCoordinating: AnyObject {
 }
 
 @MainActor
-protocol FullDiskAccessControlling: AnyObject {
+protocol WechatAppDataAccessControlling: AnyObject {
     func waitForAuthorization(
-        installedBundleURL: URL,
+        agentExecutableURL: URL,
         onWaitingForAuthorization: @escaping @MainActor () -> Void
     ) async throws
+}
+
+@MainActor
+final class WechatAppDataAccessController: WechatAppDataAccessControlling {
+    func waitForAuthorization(
+        agentExecutableURL: URL,
+        onWaitingForAuthorization: @escaping @MainActor () -> Void
+    ) async throws {
+        guard FileManager.default.isExecutableFile(atPath: agentExecutableURL.path) else {
+            throw InstallError.invalidBundle
+        }
+        onWaitingForAuthorization()
+        try Task.checkCancellation()
+        let output = Pipe()
+        let process = Process()
+        process.executableURL = agentExecutableURL
+        process.arguments = ["probe-wechat-app-data"]
+        process.standardOutput = output
+        process.standardError = output
+        let status = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { process in
+                    continuation.resume(returning: process.terminationStatus)
+                }
+                do { try process.run() } catch { continuation.resume(throwing: error) }
+            }
+        } onCancel: {
+            if process.isRunning { process.terminate() }
+        }
+        try Task.checkCancellation()
+        let response = String(decoding: try output.fileHandleForReading.readToEnd() ?? Data(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try validateProbeResult(status: status, response: response)
+    }
+
+    func validateProbeResult(status: Int32, response: String) throws {
+        if status == 0, response == "authorized" || response == "not_initialized" { return }
+        if status == 77, response == "permission_required" {
+            throw InstallError.wechatAppDataAccessRequired
+        }
+        throw InstallError.wechatAppDataProbeFailed
+    }
 }
 
 @MainActor
@@ -659,66 +709,6 @@ final class LocationAccessController: LocationAccessControlling {
 }
 
 @MainActor
-final class FullDiskAccessController: FullDiskAccessControlling {
-    private let protectedDatabaseURL: URL
-    private let approvalTimeout: Duration
-    private let pollInterval: Duration
-
-    convenience init(
-        approvalTimeout: Duration = .seconds(300),
-        pollInterval: Duration = .milliseconds(500)
-    ) {
-        self.init(
-            protectedDatabaseURL: URL(
-                fileURLWithPath: "/Library/Application Support/com.apple.TCC/TCC.db"
-            ),
-            approvalTimeout: approvalTimeout,
-            pollInterval: pollInterval
-        )
-    }
-
-    init(protectedDatabaseURL: URL, approvalTimeout: Duration, pollInterval: Duration) {
-        self.protectedDatabaseURL = protectedDatabaseURL
-        self.approvalTimeout = approvalTimeout
-        self.pollInterval = pollInterval
-    }
-
-    func waitForAuthorization(
-        installedBundleURL: URL,
-        onWaitingForAuthorization: @escaping @MainActor () -> Void
-    ) async throws {
-        guard FileManager.default.fileExists(atPath: installedBundleURL.path) else {
-            throw InstallError.invalidBundle
-        }
-        if canReadProtectedDatabase() { return }
-        onWaitingForAuthorization()
-        openFullDiskAccessSettings()
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: approvalTimeout)
-        while clock.now < deadline {
-            try Task.checkCancellation()
-            if canReadProtectedDatabase() { return }
-            try await Task.sleep(for: pollInterval)
-        }
-        throw InstallError.fullDiskAccessRequired
-    }
-
-    private func canReadProtectedDatabase() -> Bool {
-        let descriptor = open(protectedDatabaseURL.path, O_RDONLY | O_CLOEXEC)
-        guard descriptor >= 0 else { return false }
-        close(descriptor)
-        return true
-    }
-
-    private func openFullDiskAccessSettings() {
-        guard let settings = URL(
-            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
-        ) else { return }
-        NSWorkspace.shared.open(settings)
-    }
-}
-
-@MainActor
 protocol BridgeCredentialProvisioning {
     func ensureCredential(trustedApplicationURLs: [URL]) throws
     func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws
@@ -775,7 +765,7 @@ final class InstallCoordinator: InstallCoordinating {
     private let service: any ServiceControlling
     private let health: any HealthChecking
     private let relauncher: any Relaunching
-    private let fullDiskAccess: any FullDiskAccessControlling
+    private let wechatAppDataAccess: any WechatAppDataAccessControlling
     private let locationAccess: any LocationAccessControlling
     private let screenCaptureAccess: any ScreenCaptureAccessControlling
     private let photosAccess: any PhotosAccessControlling
@@ -788,7 +778,7 @@ final class InstallCoordinator: InstallCoordinating {
         service: any ServiceControlling,
         health: any HealthChecking,
         relauncher: any Relaunching,
-        fullDiskAccess: any FullDiskAccessControlling = FullDiskAccessController(),
+        wechatAppDataAccess: any WechatAppDataAccessControlling = WechatAppDataAccessController(),
         locationAccess: any LocationAccessControlling = LocationAccessController(),
         screenCaptureAccess: any ScreenCaptureAccessControlling = ScreenCaptureAccessController(),
         photosAccess: any PhotosAccessControlling = PhotosAccessController(),
@@ -800,7 +790,7 @@ final class InstallCoordinator: InstallCoordinating {
         self.service = service
         self.health = health
         self.relauncher = relauncher
-        self.fullDiskAccess = fullDiskAccess
+        self.wechatAppDataAccess = wechatAppDataAccess
         self.locationAccess = locationAccess
         self.screenCaptureAccess = screenCaptureAccess
         self.photosAccess = photosAccess
@@ -950,9 +940,9 @@ final class InstallCoordinator: InstallCoordinating {
         }
 
         let installedVersion = try validator.version(at: paths.installedBundleURL)
-        try await fullDiskAccess.waitForAuthorization(
-            installedBundleURL: paths.installedBundleURL,
-            onWaitingForAuthorization: { onState(.waitingFullDiskAccess) }
+        try await wechatAppDataAccess.waitForAuthorization(
+            agentExecutableURL: paths.installedAgentExecutableURL,
+            onWaitingForAuthorization: { onState(.waitingWechatAppDataAccess) }
         )
         try await locationAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
             onState(.waitingLocationAccess)

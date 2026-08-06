@@ -10,7 +10,8 @@ use tokio::{io::AsyncReadExt, sync::watch, time};
 use uuid::Uuid;
 
 use crate::cloud_control::{
-    persist_photo_manifest, photo_spool_root, AppliedControl, PendingPhoto,
+    persist_photo_manifest, persist_photo_marker, photo_asset_is_handled, photo_spool_root,
+    AppliedControl, PendingPhoto, PhotoMarker,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_mins(1);
@@ -97,11 +98,7 @@ async fn queue_asset(
     let photo_id = stable_uuid(workspace_id, device_id, "photo", &asset.local_identifier);
     let event_id = stable_uuid(workspace_id, device_id, "event", &asset.local_identifier);
     let spool_root = photo_spool_root().map_err(|_| ())?;
-    let manifest_path = spool_root.join(format!("{photo_id}.json"));
-    if tokio::fs::try_exists(&manifest_path)
-        .await
-        .map_err(|_| ())?
-    {
+    if photo_asset_is_handled(&photo_id).await.map_err(|_| ())? {
         return Ok(());
     }
     let file_uuid = Uuid::parse_str(&photo_id).map_err(|_| ())?;
@@ -111,12 +108,23 @@ async fn queue_asset(
         .map_err(|_| ())?
         .ok_or(())?;
     validate_export_path(&exported, &spool_root, &photo_id)?;
+    let exported_size = tokio::fs::metadata(&exported).await.map_err(|_| ())?.len();
+    if exceeds_upload_limit(exported_size) {
+        tokio::fs::remove_file(&exported).await.map_err(|_| ())?;
+        persist_photo_marker(&photo_id, PhotoMarker::Oversized)
+            .await
+            .map_err(|_| ())?;
+        return Ok(());
+    }
     let (sha256, size_bytes) = hash_file(&exported).await?;
     if size_bytes == 0 {
         return Err(());
     }
     if size_bytes > MAX_UPLOAD_BYTES {
-        let _ = tokio::fs::remove_file(&exported).await;
+        tokio::fs::remove_file(&exported).await.map_err(|_| ())?;
+        persist_photo_marker(&photo_id, PhotoMarker::Oversized)
+            .await
+            .map_err(|_| ())?;
         return Ok(());
     }
     let payload = serde_json::json!({
@@ -196,6 +204,10 @@ async fn hash_file(path: &Path) -> Result<(String, u64), ()> {
     Ok((format!("{:x}", digest.finalize()), size))
 }
 
+fn exceeds_upload_limit(size_bytes: u64) -> bool {
+    size_bytes > MAX_UPLOAD_BYTES
+}
+
 fn stable_uuid(workspace_id: &str, device_id: &str, kind: &str, key: &str) -> String {
     let digest = Sha256::digest(format!("{workspace_id}\0{device_id}\0{kind}\0{key}").as_bytes());
     let mut bytes = [0_u8; 16];
@@ -211,7 +223,7 @@ fn object(value: &Value) -> Result<Map<String, Value>, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{stable_uuid, LOOKBACK_DAYS};
+    use super::{exceeds_upload_limit, stable_uuid, LOOKBACK_DAYS, MAX_UPLOAD_BYTES};
 
     #[test]
     fn photo_library_initial_history_is_sixty_days() {
@@ -224,5 +236,12 @@ mod tests {
         assert_eq!(photo, stable_uuid("workspace", "device", "photo", "asset"));
         assert_ne!(photo, stable_uuid("workspace", "device", "event", "asset"));
         assert!(uuid::Uuid::parse_str(&photo).is_ok());
+    }
+
+    #[test]
+    fn photo_upload_limit_allows_exactly_five_hundred_mebibytes() {
+        assert_eq!(MAX_UPLOAD_BYTES, 500 * 1024 * 1024);
+        assert!(!exceeds_upload_limit(MAX_UPLOAD_BYTES));
+        assert!(exceeds_upload_limit(MAX_UPLOAD_BYTES + 1));
     }
 }

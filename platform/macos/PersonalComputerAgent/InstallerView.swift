@@ -27,6 +27,13 @@ struct InstallerView: View {
                 Button("Cancel Pairing") { model.cancelPairing() }
                     .buttonStyle(.bordered)
             }
+            if canRetryWechatAuthorization {
+                Button("Retry Administrator Authorization") {
+                    model.retryAutomaticWechatRecoveryAuthorization()
+                }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+            }
         }
         .padding(28)
         .frame(width: 520, height: 310)
@@ -42,10 +49,10 @@ struct InstallerView: View {
             progress("Copying the signed app…")
         case .validating:
             progress("Validating bundle, architecture, and signatures…")
-        case .waitingFullDiskAccess:
+        case .waitingWechatAppDataAccess:
             VStack(alignment: .leading, spacing: 8) {
-                Label("Full Disk Access is required before the Agent can start.", systemImage: "externaldrive.badge.checkmark")
-                Text("In System Settings, add and enable PersonalComputerAgent. Installation continues automatically after access is verified.")
+                progress("Allow access to WeChat data when macOS asks…")
+                Text("This read-only check completes Other App Data authorization before WeChat is opened again.")
                     .foregroundStyle(.secondary)
             }
         case .waitingLocationAccess:
@@ -60,6 +67,26 @@ struct InstallerView: View {
             progress("Starting the local runtime…")
         case .pairing:
             progress("Complete the secure pairing flow in your browser…")
+        case .preparingAutomaticWechatRecovery:
+            VStack(alignment: .leading, spacing: 8) {
+                progress("Approve one administrator request while WeChat remains closed…")
+                Text("This prepares a one-time background recovery. Opening WeChat later will not show another prompt.")
+                    .foregroundStyle(.secondary)
+            }
+        case .automaticWechatRecoveryPrepared:
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Automatic WeChat recovery is ready", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text("Open and log in to the official WeChat normally. PCA will capture and validate the key in the background without another prompt.")
+                    .foregroundStyle(.secondary)
+            }
+        case let .automaticWechatRecoveryFailed(message):
+            VStack(alignment: .leading, spacing: 8) {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                Text("Keep WeChat closed, verify SIP is disabled, then retry the one-time administrator authorization.")
+                    .foregroundStyle(.secondary)
+            }
         case let .repair(message):
             VStack(alignment: .leading, spacing: 8) {
                 Label(message, systemImage: "exclamationmark.triangle.fill")
@@ -90,6 +117,14 @@ struct InstallerView: View {
     private var canRepairPairing: Bool {
         if case .repair = model.state { return !model.isPairing }
         return false
+    }
+
+    private var canRetryWechatAuthorization: Bool {
+        guard model.wechatRepairAvailable,
+              !model.isPreparingAutomaticWechatRecovery,
+              case .automaticWechatRecoveryFailed = model.state
+        else { return false }
+        return true
     }
 
     private func progress(_ text: String) -> some View {

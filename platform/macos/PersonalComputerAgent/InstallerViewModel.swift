@@ -5,13 +5,16 @@ enum InstallerState: Equatable, Sendable {
     case ready
     case copying
     case validating
-    case waitingFullDiskAccess
+    case waitingWechatAppDataAccess
     case waitingLocationAccess
     case waitingScreenCaptureAccess
     case waitingPhotosAccess
     case waitingApproval
     case starting
     case pairing
+    case preparingAutomaticWechatRecovery
+    case automaticWechatRecoveryPrepared
+    case automaticWechatRecoveryFailed(message: String)
     case repair(message: String)
     case success
     case failed(message: String, recoveryAction: String)
@@ -28,26 +31,89 @@ final class NSApplicationTerminator: ApplicationTerminating {
 }
 
 @MainActor
+protocol WechatRepairRunning: AnyObject {
+    var isAvailable: Bool { get }
+    func prepareAutomaticRecovery() async throws
+}
+
+enum WechatRepairRunnerError: LocalizedError, Equatable {
+    case unavailable
+    case failed(message: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            "The installed WeChat recovery tool is unavailable."
+        case let .failed(message):
+            message
+        }
+    }
+}
+
+@MainActor
+final class ProcessWechatRepairRunner: WechatRepairRunning {
+    private let executableURL: URL
+
+    init(executableURL: URL) {
+        self.executableURL = executableURL
+    }
+
+    var isAvailable: Bool {
+        FileManager.default.isExecutableFile(atPath: executableURL.path)
+    }
+
+    func prepareAutomaticRecovery() async throws {
+        guard isAvailable else { throw WechatRepairRunnerError.unavailable }
+        let output = Pipe()
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = ["prepare-automatic"]
+        process.standardOutput = output
+        process.standardError = output
+        let status = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { process in
+                continuation.resume(returning: process.terminationStatus)
+            }
+            do { try process.run() } catch { continuation.resume(throwing: error) }
+        }
+        let data = try output.fileHandleForReading.readToEnd() ?? Data()
+        guard status == 0 else {
+            let message = String(decoding: data, as: UTF8.self)
+                .split(whereSeparator: \.isNewline)
+                .last
+                .map(String.init)
+                ?? "WeChat key recovery failed safely."
+            throw WechatRepairRunnerError.failed(message: message)
+        }
+    }
+}
+
+@MainActor
 final class InstallerViewModel: ObservableObject {
     @Published private(set) var state: InstallerState = .ready
     private let coordinator: (any InstallCoordinating)?
     private let sourceBundle: URL
     private let terminator: any ApplicationTerminating
     private let pairingCoordinator: PairingCoordinator?
+    private let wechatRepairRunner: (any WechatRepairRunning)?
     private let terminateAfterSuccessfulSetup: Bool
     private var automaticStartPending: Bool
     private var activeInstall: (generation: UUID, task: Task<Void, Never>)?
     private var activePairing: Task<Void, Never>?
+    private var activeWechatRepair: Task<Void, Never>?
 
     var installationAvailable: Bool { coordinator != nil }
     var isInstalling: Bool { activeInstall != nil }
     var isPairing: Bool { activePairing != nil }
+    var isPreparingAutomaticWechatRecovery: Bool { activeWechatRepair != nil }
+    var wechatRepairAvailable: Bool { wechatRepairRunner?.isAvailable == true }
 
     init(
         coordinator: any InstallCoordinating,
         sourceBundle: URL,
         automaticallyStart: Bool = false,
         pairingCoordinator: PairingCoordinator? = nil,
+        wechatRepairRunner: (any WechatRepairRunning)? = nil,
         terminator: any ApplicationTerminating = NSApplicationTerminator()
     ) {
         self.coordinator = coordinator
@@ -55,6 +121,7 @@ final class InstallerViewModel: ObservableObject {
         automaticStartPending = automaticallyStart
         terminateAfterSuccessfulSetup = automaticallyStart
         self.pairingCoordinator = pairingCoordinator
+        self.wechatRepairRunner = wechatRepairRunner
         self.terminator = terminator
     }
 
@@ -64,6 +131,7 @@ final class InstallerViewModel: ObservableObject {
         automaticStartPending = false
         terminateAfterSuccessfulSetup = false
         pairingCoordinator = nil
+        wechatRepairRunner = nil
         terminator = NSApplicationTerminator()
         state = .failed(message: failureMessage, recoveryAction: recoveryAction)
     }
@@ -107,8 +175,11 @@ final class InstallerViewModel: ObservableObject {
                 terminator.terminate()
             } else if pairingCoordinator != nil {
                 startPairing(repair: false)
-            } else if terminateAfterSuccessfulSetup {
-                terminator.terminate()
+            } else if wechatRepairAvailable {
+                startAutomaticWechatRecoveryPreparation()
+            } else {
+                state = .success
+                if terminateAfterSuccessfulSetup { terminator.terminate() }
             }
         } catch let error as InstallError {
             if error.shouldTerminateCurrentProcess {
@@ -141,6 +212,30 @@ final class InstallerViewModel: ObservableObject {
         Task { await pairingCoordinator.cancel() }
     }
 
+    func retryAutomaticWechatRecoveryAuthorization() {
+        startAutomaticWechatRecoveryPreparation()
+    }
+
+    private func startAutomaticWechatRecoveryPreparation() {
+        guard activeWechatRepair == nil, let wechatRepairRunner else { return }
+        state = .preparingAutomaticWechatRecovery
+        activeWechatRepair = Task { [weak self] in
+            defer { self?.activeWechatRepair = nil }
+            do {
+                try await wechatRepairRunner.prepareAutomaticRecovery()
+                self?.state = .automaticWechatRecoveryPrepared
+                if self?.terminateAfterSuccessfulSetup == true {
+                    self?.terminator.terminate()
+                }
+            } catch {
+                self?.state = .automaticWechatRecoveryFailed(
+                    message: (error as? LocalizedError)?.errorDescription
+                        ?? "Automatic WeChat recovery could not be prepared safely."
+                )
+            }
+        }
+    }
+
     private func startPairing(repair: Bool) {
         guard activePairing == nil, let pairingCoordinator else { return }
         state = .pairing
@@ -148,8 +243,13 @@ final class InstallerViewModel: ObservableObject {
             defer { self?.activePairing = nil }
             do {
                 _ = try await (repair ? pairingCoordinator.repair() : pairingCoordinator.startIfUnpaired())
-                self?.state = .success
-                if self?.terminateAfterSuccessfulSetup == true {
+                if !repair, self?.wechatRepairAvailable == true {
+                    self?.startAutomaticWechatRecoveryPreparation()
+                } else {
+                    self?.state = .success
+                }
+                if self?.terminateAfterSuccessfulSetup == true,
+                   (repair || self?.wechatRepairAvailable != true) {
                     self?.terminator.terminate()
                 }
             } catch let error as PairingError {

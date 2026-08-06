@@ -83,26 +83,65 @@ struct PhotoLibrarySource: Sendable {
                 guard values.isRegularFile == true, values.isSymbolicLink != true else {
                     return ["status": .string("unavailable")]
                 }
-                return ["status": .string("exported"), "path": .string(destination.path)]
+                try FileManager.default.removeItem(at: destination)
             }
+            let temporary = root.appendingPathComponent(
+                ".\(fileName).\(UUID().uuidString).partial",
+                isDirectory: false
+            )
             let semaphore = DispatchSemaphore(value: 0)
-            final class ResultBox: @unchecked Sendable { var error: Error? }
+            final class ResultBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var error: Error?
+                private var completed = false
+                private var timedOut = false
+
+                func finish(error: Error?) -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    self.error = error
+                    completed = true
+                    return timedOut
+                }
+
+                func markTimedOut() -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    timedOut = true
+                    return completed
+                }
+
+                func capturedError() -> Error? {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    return error
+                }
+            }
             let result = ResultBox()
             let requestOptions = PHAssetResourceRequestOptions()
             requestOptions.isNetworkAccessAllowed = true
             PHAssetResourceManager.default().writeData(
                 for: resource,
-                toFile: destination,
+                toFile: temporary,
                 options: requestOptions
             ) { error in
-                result.error = error
+                if result.finish(error: error) {
+                    try? FileManager.default.removeItem(at: temporary)
+                }
                 semaphore.signal()
             }
-            guard semaphore.wait(timeout: .now() + 25) == .success, result.error == nil else {
-                try? FileManager.default.removeItem(at: destination)
+            guard semaphore.wait(timeout: .now() + 25) == .success else {
+                if result.markTimedOut() {
+                    try? FileManager.default.removeItem(at: temporary)
+                }
                 return ["status": .string("unavailable")]
             }
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+            guard result.capturedError() == nil else {
+                try? FileManager.default.removeItem(at: temporary)
+                return ["status": .string("unavailable")]
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+            try FileManager.default.moveItem(at: temporary, to: destination)
             return ["status": .string("exported"), "path": .string(destination.path)]
         } catch {
             return ["status": .string("unavailable")]

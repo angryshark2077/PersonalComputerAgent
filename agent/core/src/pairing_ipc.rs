@@ -9,6 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use pca_bridge_client::{
     auth::verify_proof,
     framing::{read_frame_bytes, write_frame},
+    NetworkObservationState,
 };
 use pca_db_local::DbActorHandle;
 use pca_keychain::{load_bridge_shared_secret, load_device_credential, CredentialStore};
@@ -50,6 +51,7 @@ pub struct PairingIpcServer {
     store: Arc<dyn CredentialStore>,
     pending: Mutex<Option<PendingPairing>>,
     control_commands: CloudControlCommands,
+    network_observations: Arc<NetworkObservationState>,
 }
 
 struct PendingPairing {
@@ -261,6 +263,7 @@ impl PairingIpcServer {
         database: Arc<DbActorHandle>,
         store: Arc<dyn CredentialStore>,
         control_commands: CloudControlCommands,
+        network_observations: Arc<NetworkObservationState>,
     ) -> Self {
         Self {
             socket,
@@ -268,6 +271,7 @@ impl PairingIpcServer {
             store,
             pending: Mutex::new(None),
             control_commands,
+            network_observations,
         }
     }
 
@@ -328,8 +332,11 @@ impl PairingIpcServer {
                 } else {
                     let client = Url::parse(&payload.cloud_api_origin)
                         .ok()
-                        .and_then(|origin| HttpControlClient::new(origin).ok())
-                        .map(Arc::new);
+                        .and_then(|origin| {
+                            pairing_control_client(origin, Arc::clone(&self.network_observations))
+                                .ok()
+                                .map(Arc::new)
+                        });
                     let Some(client) = client else {
                         return Err(());
                     };
@@ -416,4 +423,32 @@ impl PairingIpcServer {
 
 fn error_response(code: &str) -> Value {
     json!({ "error": { "code": code } })
+}
+
+fn pairing_control_client(
+    origin: Url,
+    network_observations: Arc<NetworkObservationState>,
+) -> Result<HttpControlClient, crate::cloud_control::ControlError> {
+    HttpControlClient::new(origin)
+        .map(|client| client.with_network_observations(network_observations))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pairing_control_client, ControlClient, NetworkObservationState, Url};
+    use std::sync::Arc;
+
+    #[test]
+    fn pairing_control_client_uses_the_process_network_state() {
+        let network_observations = Arc::new(NetworkObservationState::default());
+        let client = pairing_control_client(
+            Url::parse("https://pca-cloud-api-production.up.railway.app").expect("valid origin"),
+            Arc::clone(&network_observations),
+        )
+        .expect("control client");
+
+        client.set_network_enabled(true);
+
+        assert!(network_observations.is_enabled());
+    }
 }

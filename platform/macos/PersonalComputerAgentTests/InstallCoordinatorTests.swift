@@ -53,6 +53,11 @@ final class InstallCoordinatorTests: XCTestCase {
             ]]
         )
         XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.wechatAppDataAccess.checkCount, 1)
+        XCTAssertEqual(
+            fixture.wechatAppDataAccess.agentExecutableURLs,
+            [fixture.paths.installedAgentExecutableURL]
+        )
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
         XCTAssertEqual(fixture.locationAccess.helperExecutableURLs, [fixture.paths.installedBridgeExecutableURL])
         XCTAssertEqual(fixture.screenCaptureAccess.checkCount, 1)
@@ -61,19 +66,20 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertTrue(fixture.relauncher.urls.isEmpty)
     }
 
-    func testMissingFullDiskAccessStopsBeforeCredentialsServiceAndHealth() async throws {
+    func testMissingWechatAppDataAccessStopsBeforeOtherPermissionsAndRuntime() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
-        fixture.fullDiskAccess.error = .fullDiskAccessRequired
+        fixture.wechatAppDataAccess.error = .wechatAppDataAccessRequired
         var states: [InstallerState] = []
 
         await XCTAssertThrowsErrorAsync(
             try await fixture.coordinator.finishInstalledSetup { states.append($0) }
         ) { error in
-            XCTAssertEqual(error as? InstallError, .fullDiskAccessRequired)
+            XCTAssertEqual(error as? InstallError, .wechatAppDataAccessRequired)
         }
 
-        XCTAssertEqual(states, [.waitingFullDiskAccess])
-        XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
+        XCTAssertEqual(states, [.waitingWechatAppDataAccess])
+        XCTAssertEqual(fixture.wechatAppDataAccess.checkCount, 1)
+        XCTAssertEqual(fixture.locationAccess.checkCount, 0)
         XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
         XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertEqual(fixture.health.checkCount, 0)
@@ -91,7 +97,6 @@ final class InstallCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(states, [.waitingLocationAccess])
-        XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
         XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
         XCTAssertEqual(fixture.service.registerCount, 0)
@@ -110,7 +115,6 @@ final class InstallCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(states, [.waitingScreenCaptureAccess])
-        XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
         XCTAssertEqual(fixture.screenCaptureAccess.checkCount, 1)
         XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
@@ -130,7 +134,6 @@ final class InstallCoordinatorTests: XCTestCase {
         }
 
         XCTAssertEqual(states, [.waitingPhotosAccess])
-        XCTAssertEqual(fixture.fullDiskAccess.checkCount, 1)
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
         XCTAssertEqual(fixture.screenCaptureAccess.checkCount, 1)
         XCTAssertEqual(fixture.photosAccess.checkCount, 1)
@@ -535,7 +538,7 @@ private final class Fixture {
     let service = FakeServiceController()
     let health = FakeHealthChecker()
     let relauncher = FakeRelauncher()
-    let fullDiskAccess = FakeFullDiskAccessController()
+    let wechatAppDataAccess = FakeWechatAppDataAccessController()
     let locationAccess = FakeLocationAccessController()
     let screenCaptureAccess = FakeScreenCaptureAccessController()
     let photosAccess = FakePhotosAccessController()
@@ -563,7 +566,7 @@ private final class Fixture {
             service: service,
             health: health,
             relauncher: relauncher,
-            fullDiskAccess: fullDiskAccess,
+            wechatAppDataAccess: wechatAppDataAccess,
             locationAccess: locationAccess,
             screenCaptureAccess: screenCaptureAccess,
             photosAccess: photosAccess,
@@ -623,15 +626,17 @@ private final class Fixture {
 }
 
 @MainActor
-private final class FakeFullDiskAccessController: FullDiskAccessControlling {
+private final class FakeWechatAppDataAccessController: WechatAppDataAccessControlling {
     var checkCount = 0
+    var agentExecutableURLs: [URL] = []
     var error: InstallError?
 
     func waitForAuthorization(
-        installedBundleURL: URL,
+        agentExecutableURL: URL,
         onWaitingForAuthorization: @escaping @MainActor () -> Void
     ) async throws {
         checkCount += 1
+        agentExecutableURLs.append(agentExecutableURL)
         if let error {
             onWaitingForAuthorization()
             throw error
@@ -1165,6 +1170,52 @@ final class InstallerViewModelTests: XCTestCase {
         XCTAssertEqual(terminator.count, 1)
     }
 
+    func testInstalledSetupAutomaticallyPreparesWechatRecoveryBeforeClosing() async throws {
+        let coordinator = CountingInstallCoordinator()
+        let terminator = FakeTerminator()
+        let repair = FakeWechatRepairRunner()
+        let model = InstallerViewModel(
+            coordinator: coordinator,
+            sourceBundle: URL(fileURLWithPath: "/tmp/installed.app"),
+            automaticallyStart: true,
+            wechatRepairRunner: repair,
+            terminator: terminator
+        )
+
+        model.startIfRequested()
+
+        try await waitUntil {
+            coordinator.callCount == 1
+                && repair.callCount == 1
+                && !model.isInstalling
+                && !model.isPreparingAutomaticWechatRecovery
+        }
+        XCTAssertEqual(model.state, .automaticWechatRecoveryPrepared)
+        XCTAssertEqual(terminator.count, 1)
+        XCTAssertTrue(model.wechatRepairAvailable)
+    }
+
+    func testAlreadyPairedSetupStillPreparesAutomaticWechatRecovery() async throws {
+        let repair = FakeWechatRepairRunner()
+        let terminator = FakeTerminator()
+        let model = InstallerViewModel(
+            coordinator: CountingInstallCoordinator(),
+            sourceBundle: URL(fileURLWithPath: "/tmp/installed.app"),
+            automaticallyStart: true,
+            pairingCoordinator: PairingCoordinator(agent: AlreadyPairedAgent()),
+            wechatRepairRunner: repair,
+            terminator: terminator
+        )
+
+        model.startIfRequested()
+
+        try await waitUntil {
+            repair.callCount == 1 && !model.isPairing && !model.isPreparingAutomaticWechatRecovery
+        }
+        XCTAssertEqual(model.state, .automaticWechatRecoveryPrepared)
+        XCTAssertEqual(terminator.count, 1)
+    }
+
     func testRollbackRelaunchTerminatesCurrentInstallerWithoutShowingConcurrentFailureUI() async {
         let terminator = FakeTerminator()
         let model = InstallerViewModel(
@@ -1199,6 +1250,34 @@ final class InstallerViewModelTests: XCTestCase {
         model.installAndStart()
         try await waitUntil { coordinator.callCount == 2 }
         XCTAssertEqual(coordinator.callCount, 2)
+    }
+
+    func testWechatRecoveryDoesNotStartBeforeSetupCompletes() {
+        let repair = FakeWechatRepairRunner()
+        _ = InstallerViewModel(
+            coordinator: CountingInstallCoordinator(),
+            sourceBundle: URL(fileURLWithPath: "/tmp/source.app"),
+            wechatRepairRunner: repair,
+            terminator: FakeTerminator()
+        )
+
+        XCTAssertEqual(repair.callCount, 0)
+    }
+
+    func testAutomaticWechatAuthorizationFailureRemainsRetryable() async throws {
+        let repair = FakeWechatRepairRunner(error: .failed(message: "SIP must be disabled"))
+        let model = InstallerViewModel(
+            coordinator: CountingInstallCoordinator(),
+            sourceBundle: URL(fileURLWithPath: "/tmp/source.app"),
+            wechatRepairRunner: repair,
+            terminator: FakeTerminator()
+        )
+
+        model.retryAutomaticWechatRecoveryAuthorization()
+        try await waitUntil { !model.isPreparingAutomaticWechatRecovery }
+
+        XCTAssertEqual(model.state, .automaticWechatRecoveryFailed(message: "SIP must be disabled"))
+        XCTAssertTrue(model.wechatRepairAvailable)
     }
 }
 
@@ -1259,6 +1338,37 @@ private final class FailingInstallCoordinator: InstallCoordinating {
 private final class FakeTerminator: ApplicationTerminating {
     var count = 0
     func terminate() { count += 1 }
+}
+
+@MainActor
+private final class FakeWechatRepairRunner: WechatRepairRunning {
+    let isAvailable = true
+    private let error: WechatRepairRunnerError?
+    private(set) var callCount = 0
+
+    init(error: WechatRepairRunnerError? = nil) {
+        self.error = error
+    }
+
+    func prepareAutomaticRecovery() async throws {
+        callCount += 1
+        if let error { throw error }
+    }
+}
+
+@MainActor
+private final class AlreadyPairedAgent: PairingAgentHandingOff {
+    func isPaired() async throws -> Bool { true }
+
+    func beginPairing(_: PairingStartHandoff) async throws -> PairingSessionHandoff {
+        throw PairingError.unavailable
+    }
+
+    func completePairing(_: PairingCallbackHandoff) async throws -> PairingResult {
+        throw PairingError.unavailable
+    }
+
+    func cancelPairing(sessionID _: String) async {}
 }
 
 @MainActor
@@ -1458,6 +1568,80 @@ final class BundleValidatorSigningTests: XCTestCase {
         ]
         XCTAssertTrue((plist as NSDictionary).write(to: launchAgent, atomically: true))
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: launchAgent.path)
+    }
+}
+
+final class ProductionArchitectureCheckerTests: XCTestCase {
+    func testReadsThinArm64MachOWithoutDeveloperTools() throws {
+        let executable = try writeMachOHeader([
+            0xCF, 0xFA, 0xED, 0xFE,
+            0x0C, 0x00, 0x00, 0x01,
+        ])
+        defer { try? FileManager.default.removeItem(at: executable) }
+
+        XCTAssertEqual(
+            try ProductionArchitectureChecker().architectures(of: executable),
+            ["arm64"]
+        )
+    }
+
+    func testReportsThinX8664AsUnsupportedArchitecture() throws {
+        let executable = try writeMachOHeader([
+            0xCF, 0xFA, 0xED, 0xFE,
+            0x07, 0x00, 0x00, 0x01,
+        ])
+        defer { try? FileManager.default.removeItem(at: executable) }
+
+        XCTAssertEqual(
+            try ProductionArchitectureChecker().architectures(of: executable),
+            ["x86_64"]
+        )
+    }
+
+    func testRejectsFatOrTruncatedMachOHeaders() throws {
+        let invalidHeaders: [[UInt8]] = [
+            [0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x01],
+            [0xCF, 0xFA, 0xED, 0xFE],
+        ]
+        for header in invalidHeaders {
+            let executable = try writeMachOHeader(header)
+            defer { try? FileManager.default.removeItem(at: executable) }
+            XCTAssertThrowsError(
+                try ProductionArchitectureChecker().architectures(of: executable)
+            ) { error in
+                XCTAssertEqual(error as? InstallError, .invalidBundle)
+            }
+        }
+    }
+
+    private func writeMachOHeader(_ bytes: [UInt8]) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try Data(bytes).write(to: url)
+        return url
+    }
+}
+
+@MainActor
+final class WechatAppDataAccessControllerTests: XCTestCase {
+    func testAllowsInstallationBeforeWechatCreatesItsDataDirectory() throws {
+        XCTAssertNoThrow(
+            try WechatAppDataAccessController().validateProbeResult(
+                status: 0,
+                response: "not_initialized"
+            )
+        )
+    }
+
+    func testStillRequiresPermissionWhenWechatDataExistsButIsDenied() {
+        XCTAssertThrowsError(
+            try WechatAppDataAccessController().validateProbeResult(
+                status: 77,
+                response: "permission_required"
+            )
+        ) { error in
+            XCTAssertEqual(error as? InstallError, .wechatAppDataAccessRequired)
+        }
     }
 }
 

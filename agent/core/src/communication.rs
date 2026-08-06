@@ -1964,7 +1964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_disk_access_error_is_persisted_as_permission_required() {
+    async fn app_data_access_error_is_persisted_as_permission_required() {
         let directory = tempfile::tempdir().expect("create database fixture");
         let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.1.0")
             .await
@@ -1980,7 +1980,7 @@ mod tests {
         .expect("valid control");
         let error = DomainError::new(
             "WECHAT_PERMISSION_REQUIRED",
-            "Full Disk Access is required",
+            "Access to WeChat app data is required",
             true,
         );
 

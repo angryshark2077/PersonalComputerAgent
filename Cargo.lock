@@ -936,7 +936,6 @@ dependencies = [
  "pca-provider-contracts",
  "pca-wechat-provider",
  "sha2",
- "tempfile",
  "tokio",
 ]
 

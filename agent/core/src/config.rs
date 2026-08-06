@@ -179,6 +179,7 @@ pub(crate) enum CommandConfig {
     Run(Box<RunConfig>),
     Health(Box<RuntimePaths>),
     PrepareSleep,
+    ProbeWechatAppData,
 }
 
 impl CommandConfig {
@@ -277,6 +278,11 @@ impl CommandConfig {
                 process_test.reject_if_present()?;
                 let _ = paths;
                 Ok(Self::PrepareSleep)
+            }
+            "probe-wechat-app-data" if !explicit_root => {
+                #[cfg(feature = "process-test-hooks")]
+                process_test.reject_if_present()?;
+                Ok(Self::ProbeWechatAppData)
             }
             _ => Err(usage()),
         }
@@ -453,7 +459,7 @@ fn all_paths_are_distinct(paths: &[&Path]) -> bool {
 }
 
 fn usage() -> String {
-    "usage: pca-agentd <run|health|prepare-sleep> [--runtime-root <absolute-path>]".to_owned()
+    "usage: pca-agentd <run|health|prepare-sleep|probe-wechat-app-data> [--runtime-root <absolute-path>]".to_owned()
 }
 
 #[cfg(test)]
@@ -470,6 +476,24 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn wechat_app_data_probe_is_production_only_and_takes_no_options() {
+        assert!(matches!(
+            CommandConfig::parse([
+                OsString::from("pca-agentd"),
+                OsString::from("probe-wechat-app-data"),
+            ]),
+            Ok(CommandConfig::ProbeWechatAppData)
+        ));
+        assert!(CommandConfig::parse([
+            OsString::from("pca-agentd"),
+            OsString::from("probe-wechat-app-data"),
+            OsString::from("--runtime-root"),
+            OsString::from("/tmp/not-allowed"),
+        ])
+        .is_err());
     }
 
     #[test]

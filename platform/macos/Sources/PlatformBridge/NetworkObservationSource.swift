@@ -87,6 +87,26 @@ func validDeviceLocation(
         && (0 ... 100_000).contains(horizontalAccuracyMeters)
 }
 
+func normalizedWiFiSSID(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let normalized = value.precomposedStringWithCanonicalMapping
+    guard !normalized.isEmpty, normalized.utf8.count <= 128 else { return nil }
+    return normalized
+}
+
+func normalizedWiFiBSSID(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let normalized = value.uppercased()
+    let octets = normalized.split(separator: ":", omittingEmptySubsequences: false)
+    guard octets.count == 6,
+          octets.allSatisfy({ octet in
+              octet.count == 2 && octet.utf8.allSatisfy { byte in
+                  (48 ... 57).contains(byte) || (65 ... 70).contains(byte)
+              }
+          }) else { return nil }
+    return normalized
+}
+
 final class DeviceLocationSource: NSObject, CLLocationManagerDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var manager: CLLocationManager?
@@ -236,8 +256,8 @@ final class NetworkObservationSource: @unchecked Sendable {
         let wifi = interfaceType == "wifi" && locationAccessGranted(locationManager.authorizationStatus)
             ? CWWiFiClient.shared().interface()
             : nil
-        let ssid = wifi?.ssid()?.precomposedStringWithCanonicalMapping
-        let bssid = wifi?.bssid()?.uppercased()
+        let ssid = normalizedWiFiSSID(wifi?.ssid())
+        let bssid = normalizedWiFiBSSID(wifi?.bssid())
         return NetworkObservation(
             interfaceType: interfaceType,
             wifiIdentityAvailable: interfaceType == "wifi" && ssid != nil && bssid != nil,
@@ -276,8 +296,8 @@ final class NetworkObservationSource: @unchecked Sendable {
             : nil
         return NetworkPathIdentity(
             interfaceName: interfaceName,
-            ssid: wifi?.ssid()?.precomposedStringWithCanonicalMapping,
-            bssid: wifi?.bssid()?.uppercased(),
+            ssid: normalizedWiFiSSID(wifi?.ssid()),
+            bssid: normalizedWiFiBSSID(wifi?.bssid()),
             localIPv4: addresses.0,
             localIPv6: addresses.1
         )

@@ -68,7 +68,10 @@ private struct PCAInstallerApplication: App {
                     automaticallyStart: CommandLine.arguments.dropFirst().first == "--setup-installed",
                     pairingCoordinator: PairingCoordinator(agent: InstalledPairingAgentBridge(
                         configuration: pairingConfiguration
-                    ))
+                    )),
+                    wechatRepairRunner: ProcessWechatRepairRunner(
+                        executableURL: paths.installedWechatRepairExecutableURL
+                    )
                 )
             )
         } catch {
