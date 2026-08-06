@@ -58,6 +58,9 @@ export default function HomePage() {
                       Device {device.device_id}{device.revoked ? " (revoked)" : ""}
                     </Link>
                     <p className="status-note">{deviceStatusLabel(device)}</p>
+                    <Link href={`/devices/${encodeURIComponent(device.device_id)}#network-history`}>
+                      Network history
+                    </Link>
                   </li>
                 ))}
               </ul>

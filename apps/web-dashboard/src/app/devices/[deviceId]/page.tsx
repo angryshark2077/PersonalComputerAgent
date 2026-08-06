@@ -355,7 +355,7 @@ export default function DevicePage() {
             <p>Waiting for an enabled Network Collector observation.</p>
           ) : (
             <>
-              <h3>Recent network and location changes</h3>
+              <h3 id="network-history">Recent network and location changes</h3>
               {(screen.device.status.network_history ?? []).length === 0 ? (
                 <p>No network or location changes recorded yet.</p>
               ) : (
