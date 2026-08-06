@@ -1,6 +1,7 @@
 name: S0 and S1A Engineering Gates
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
