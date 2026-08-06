@@ -110,14 +110,14 @@
     "DeviceStatus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "previous_network", "observed_at"],
+      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "network_history", "observed_at"],
       "properties": {
         "presence": { "enum": ["online", "stale", "offline", "sleeping"] },
         "agent_version": { "type": "string", "minLength": 1 },
         "outbox_depth": { "type": "integer", "minimum": 0 },
         "local_media": { "$ref": "#/$defs/LocalMedia" },
         "network": { "anyOf": [{ "$ref": "#/$defs/NetworkStatus" }, { "type": "null" }] },
-        "previous_network": { "anyOf": [{ "$ref": "#/$defs/PreviousNetworkStatus" }, { "type": "null" }] },
+        "network_history": { "type": "array", "maxItems": 5, "items": { "$ref": "#/$defs/PreviousNetworkStatus" } },
         "observed_at": { "type": "string", "format": "date-time" }
       }
     },

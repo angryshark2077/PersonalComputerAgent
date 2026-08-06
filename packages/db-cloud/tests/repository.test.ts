@@ -246,6 +246,67 @@ test("heartbeats are append-only and Workspace-scoped", async () => {
   );
 });
 
+test("device presence becomes stale and offline when its Agent stops checking in", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const receivedAt = new Date(Date.now() - 181_000);
+  await repository.recordHeartbeat({
+    heartbeatId: "01986666-7666-8666-8666-666666666667",
+    workspaceId,
+    deviceId: "01981111-7111-8111-8111-111111111111",
+    receivedAt,
+    agentVersion: "0.3.0",
+    presence: "online",
+    outboxDepth: 0,
+    localMedia: { completedFileCount: 0, completedBytes: 0, protectedFileCount: 0, protectedBytes: 0 },
+    cleanupResult: null,
+    network: null,
+  });
+
+  const [device] = await repository.listOwnerDevices(workspaceId, ownerUserId);
+  assert.equal(device?.status?.presence, "offline");
+});
+
+test("network history records identity changes only and retains the latest five", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  const network = (ssid: string, bssid: string) => ({
+    interfaceType: "wifi" as const,
+    wifiIdentityAvailable: true,
+    ssid,
+    bssid,
+    localIpv4: "192.168.1.20",
+    localIpv6: null,
+    observedExitIp: "203.0.113.25",
+    ipLocation: { country: "SG", region: "Singapore", city: "Singapore", accuracy: "ip_city" as const },
+    location: null,
+  });
+  const record = async (index: number, currentNetwork: ReturnType<typeof network>) => repository.recordHeartbeat({
+    heartbeatId: `01986666-7666-8666-8666-${String(index).padStart(12, "0")}`,
+    workspaceId,
+    deviceId,
+    receivedAt: new Date(now.getTime() + index * 1_000),
+    agentVersion: "0.3.0",
+    presence: "online",
+    outboxDepth: 0,
+    localMedia: { completedFileCount: 0, completedBytes: 0, protectedFileCount: 0, protectedBytes: 0 },
+    cleanupResult: null,
+    network: currentNetwork,
+  });
+
+  await record(0, network("WiFi 0", "00:00:00:00:00:00"));
+  await record(1, network("WiFi 0", "00:00:00:00:00:00"));
+  for (let index = 1; index <= 6; index += 1) {
+    await record(index + 1, network(`WiFi ${index}`, `00:00:00:00:00:0${index}`));
+  }
+
+  const [device] = await repository.listOwnerDevices(workspaceId, ownerUserId);
+  assert.equal(device?.status?.networkHistory.length, 5);
+  assert.equal(device?.status?.networkHistory[0]?.network.ssid, "WiFi 6");
+  assert.equal(device?.status?.networkHistory[4]?.network.ssid, "WiFi 2");
+});
+
 test("screenshot retention selects and deletes only expired completed captures", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);

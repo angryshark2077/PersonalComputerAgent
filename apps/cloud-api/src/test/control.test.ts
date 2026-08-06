@@ -359,16 +359,17 @@ test("network heartbeat is IP-enriched and matched against the Owner location li
       matched_location: { name: string };
       exit_ip_location: { city: string };
       device_location: { latitude: number; horizontal_accuracy_meters: number };
-    }; previous_network: { ssid: string; local_ipv4: string; observed_at: string } };
+    }; network_history: Array<{ ssid: string; local_ipv4: string; observed_at: string }> };
   };
   assert.equal(body.status.network.observed_exit_ip, "203.0.113.25");
   assert.equal(body.status.network.matched_location.name, "Home");
   assert.equal(body.status.network.exit_ip_location.city, "Singapore");
   assert.equal(body.status.network.device_location.latitude, 1.352083);
   assert.equal(body.status.network.device_location.horizontal_accuracy_meters, 24.5);
-  assert.equal(body.status.previous_network.ssid, "Previous WiFi");
-  assert.equal(body.status.previous_network.local_ipv4, "192.168.1.20");
-  assert.equal(Number.isNaN(Date.parse(body.status.previous_network.observed_at)), false);
+  assert.equal(body.status.network_history.length, 2);
+  assert.equal(body.status.network_history[1]?.ssid, "Previous WiFi");
+  assert.equal(body.status.network_history[1]?.local_ipv4, "192.168.1.20");
+  assert.equal(Number.isNaN(Date.parse(body.status.network_history[1]?.observed_at ?? "")), false);
 });
 
 test("Owner reads only its device control state and configuration audit", async () => {

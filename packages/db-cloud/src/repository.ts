@@ -1,5 +1,5 @@
 import type { AgentControlSnapshot, SystemMetricPayload } from "@pca/contracts/src/types.js";
-import { and, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -15,6 +15,7 @@ import {
   collectorConfigs,
   deviceCredentialGenerations,
   deviceHeartbeats,
+  deviceNetworkHistory,
   deviceMediaCleanupRequests,
   deviceScreenshotRequests,
   deviceScreenshots,
@@ -310,11 +311,11 @@ export interface DeviceStatus {
   localMedia: LocalMediaStorageStatus;
   network: NetworkHeartbeat | null;
   matchedLocation: NetworkLocationRecord | null;
-  previousNetwork: {
+  networkHistory: Array<{
     network: NetworkHeartbeat;
     matchedLocation: NetworkLocationRecord | null;
     observedAt: Date;
-  } | null;
+  }>;
   observedAt: Date;
 }
 
@@ -716,6 +717,7 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #revocationAuditIds = new Set<string>();
   readonly #workspaceNames = new Map<string, string>();
   readonly #latestHeartbeats = new Map<string, DeviceStatus>();
+  readonly #networkHistory = new Map<string, Array<{ network: NetworkHeartbeat; observedAt: Date }>>();
   readonly #mediaCleanupRequests = new Map<string, LocalMediaCleanupRecord & { workspaceId: string; deviceId: string }>();
   readonly #screenshotRequests = new Map<string, ScreenshotRequestRecord & { workspaceId: string; deviceId: string }>();
   readonly #screenshots = new Map<string, ScreenshotRecord>();
@@ -917,26 +919,21 @@ export class MemoryControlRepository implements ControlRepository {
         request.errorCode = input.cleanupResult.errorCode;
       }
     }
-    const current = this.#latestHeartbeats.get(input.deviceId);
-    const previousNetwork = current?.network === null || current?.network === undefined
-      ? current?.previousNetwork ?? null
-      : {
-          network: current.network,
-          matchedLocation: current.matchedLocation,
-          observedAt: current.observedAt,
-        };
+    if (input.network !== null) {
+      const history = this.#networkHistory.get(input.deviceId) ?? [];
+      if (!networkIdentityMatches(history[0]?.network ?? null, input.network)) {
+        history.unshift({ network: cloneNetwork(input.network), observedAt: input.receivedAt });
+        this.#networkHistory.set(input.deviceId, history.slice(0, 5));
+      }
+    }
     this.#latestHeartbeats.set(input.deviceId, {
       presence: input.presence,
       agentVersion: input.agentVersion,
       outboxDepth: input.outboxDepth,
       localMedia: { ...input.localMedia },
-      network: input.network === null ? null : {
-        ...input.network,
-        ipLocation: input.network.ipLocation === null ? null : { ...input.network.ipLocation },
-        location: input.network.location === null ? null : { ...input.network.location },
-      },
+      network: input.network === null ? null : cloneNetwork(input.network),
       matchedLocation: null,
-      previousNetwork,
+      networkHistory: [],
       observedAt: input.receivedAt,
     });
   }
@@ -1782,17 +1779,19 @@ export class MemoryControlRepository implements ControlRepository {
     const storedStatus = this.#latestHeartbeats.get(device.id) ?? null;
     const status = storedStatus === null ? null : {
       ...storedStatus,
+      presence: currentPresence(storedStatus.presence, storedStatus.observedAt, new Date()),
       matchedLocation: matchNetworkLocation(
         storedStatus.network,
         [...this.#networkLocations.values()].filter((location) => location.workspaceId === device.workspaceId),
       ),
-      previousNetwork: storedStatus.previousNetwork === null ? null : {
-        ...storedStatus.previousNetwork,
+      networkHistory: (this.#networkHistory.get(device.id) ?? []).map((record) => ({
+        network: cloneNetwork(record.network),
         matchedLocation: matchNetworkLocation(
-          storedStatus.previousNetwork.network,
+          record.network,
           [...this.#networkLocations.values()].filter((location) => location.workspaceId === device.workspaceId),
         ),
-      },
+        observedAt: record.observedAt,
+      })),
     };
     return {
       deviceId: device.id,
@@ -2462,6 +2461,32 @@ export class DrizzleControlRepository implements ControlRepository {
           networkLocationHorizontalAccuracyMeters: input.network?.location?.horizontalAccuracyMeters ?? null,
           networkLocationObservedAt: input.network?.location?.observedAt ?? null,
         });
+        if (input.network !== null) {
+          const [latest] = await transaction
+            .select()
+            .from(deviceNetworkHistory)
+            .where(and(
+              eq(deviceNetworkHistory.workspaceId, input.workspaceId),
+              eq(deviceNetworkHistory.deviceId, input.deviceId),
+            ))
+            .orderBy(desc(deviceNetworkHistory.observedAt))
+            .limit(1);
+          if (latest === undefined || !networkIdentityMatches(networkFromHistoryRow(latest), input.network)) {
+            await transaction.insert(deviceNetworkHistory).values(networkHistoryValues(input));
+            const excess = await transaction
+              .select({ id: deviceNetworkHistory.id })
+              .from(deviceNetworkHistory)
+              .where(and(
+                eq(deviceNetworkHistory.workspaceId, input.workspaceId),
+                eq(deviceNetworkHistory.deviceId, input.deviceId),
+              ))
+              .orderBy(desc(deviceNetworkHistory.observedAt))
+              .offset(5);
+            if (excess.length > 0) {
+              await transaction.delete(deviceNetworkHistory).where(inArray(deviceNetworkHistory.id, excess.map((row) => row.id)));
+            }
+          }
+        }
         await transaction
           .update(deviceHeartbeats)
           .set({
@@ -2854,8 +2879,17 @@ export class DrizzleControlRepository implements ControlRepository {
           ),
         )
         .orderBy(desc(deviceHeartbeats.receivedAt))
-        .limit(2);
-      const [heartbeat, previousHeartbeat] = heartbeats;
+        .limit(1);
+      const [heartbeat] = heartbeats;
+      const networkHistoryRows = await this.database
+        .select()
+        .from(deviceNetworkHistory)
+        .where(and(
+          eq(deviceNetworkHistory.workspaceId, workspaceId),
+          eq(deviceNetworkHistory.deviceId, deviceId),
+        ))
+        .orderBy(desc(deviceNetworkHistory.observedAt))
+        .limit(5);
       const configRecord: ConfigRecord = {
         configurationRevision: config?.configurationRevision ?? 0,
         ...storedConfig(config ?? defaultCollectorConfig()),
@@ -2892,38 +2926,6 @@ export class DrizzleControlRepository implements ControlRepository {
           };
       const networkLocations = await this.listOwnerNetworkLocations(workspaceId, userId);
       const matchedLocation = matchNetworkLocation(network, networkLocations);
-      const previousNetwork: NetworkHeartbeat | null = previousHeartbeat?.networkInterfaceType === null
-        || previousHeartbeat?.networkInterfaceType === undefined
-        ? null
-        : {
-            interfaceType: previousHeartbeat.networkInterfaceType as NetworkHeartbeat["interfaceType"],
-            wifiIdentityAvailable: previousHeartbeat.networkWifiIdentityAvailable ?? false,
-            ssid: previousHeartbeat.networkSsid,
-            bssid: previousHeartbeat.networkBssid,
-            localIpv4: previousHeartbeat.networkLocalIpv4,
-            localIpv6: previousHeartbeat.networkLocalIpv6,
-            observedExitIp: previousHeartbeat.networkPublicIp,
-            ipLocation: previousHeartbeat.networkIpAccuracy === "ip_city"
-              ? {
-                  country: previousHeartbeat.networkIpCountry,
-                  region: previousHeartbeat.networkIpRegion,
-                  city: previousHeartbeat.networkIpCity,
-                  accuracy: "ip_city",
-                }
-              : null,
-            location: previousHeartbeat.networkLocationLatitude === null
-              || previousHeartbeat.networkLocationLongitude === null
-              || previousHeartbeat.networkLocationHorizontalAccuracyMeters === null
-              || previousHeartbeat.networkLocationObservedAt === null
-              ? null
-              : {
-                  latitude: previousHeartbeat.networkLocationLatitude,
-                  longitude: previousHeartbeat.networkLocationLongitude,
-                  horizontalAccuracyMeters: previousHeartbeat.networkLocationHorizontalAccuracyMeters,
-                  observedAt: previousHeartbeat.networkLocationObservedAt,
-                },
-          };
-      const previousMatchedLocation = matchNetworkLocation(previousNetwork, networkLocations);
       return {
         deviceId: device.id,
         workspaceId: device.workspaceId,
@@ -2935,7 +2937,7 @@ export class DrizzleControlRepository implements ControlRepository {
           heartbeat === undefined
             ? null
             : {
-                presence: heartbeat.presence as HeartbeatInput["presence"],
+                presence: currentPresence(heartbeat.presence as HeartbeatInput["presence"], heartbeat.observedAt, new Date()),
                 agentVersion: heartbeat.agentVersion,
                 outboxDepth: heartbeat.outboxDepth,
                 localMedia: {
@@ -2946,13 +2948,14 @@ export class DrizzleControlRepository implements ControlRepository {
                 },
                 network,
                 matchedLocation,
-                previousNetwork: previousNetwork === null || previousHeartbeat === undefined
-                  ? null
-                  : {
-                      network: previousNetwork,
-                      matchedLocation: previousMatchedLocation,
-                      observedAt: previousHeartbeat.observedAt,
-                    },
+                networkHistory: networkHistoryRows.map((row) => {
+                  const historicalNetwork = networkFromHistoryRow(row);
+                  return {
+                    network: historicalNetwork,
+                    matchedLocation: matchNetworkLocation(historicalNetwork, networkLocations),
+                    observedAt: row.observedAt,
+                  };
+                }),
                 observedAt: heartbeat.observedAt,
               },
         snapshot: await this.loadControlSnapshot(deviceId, workspaceId),
@@ -3797,6 +3800,92 @@ function configKey(workspaceId: string, deviceId: string): string {
 
 function membershipKey(workspaceId: string, userId: string): string {
   return `${workspaceId}:${userId}`;
+}
+
+function cloneNetwork(network: NetworkHeartbeat): NetworkHeartbeat {
+  return {
+    ...network,
+    ipLocation: network.ipLocation === null ? null : { ...network.ipLocation },
+    location: network.location === null ? null : { ...network.location },
+  };
+}
+
+function networkIdentityMatches(left: NetworkHeartbeat | null, right: NetworkHeartbeat): boolean {
+  return left !== null
+    && left.interfaceType === right.interfaceType
+    && left.wifiIdentityAvailable === right.wifiIdentityAvailable
+    && left.ssid === right.ssid
+    && left.bssid === right.bssid
+    && left.observedExitIp === right.observedExitIp
+    && left.ipLocation?.country === right.ipLocation?.country
+    && left.ipLocation?.region === right.ipLocation?.region
+    && left.ipLocation?.city === right.ipLocation?.city;
+}
+
+function currentPresence(
+  reported: HeartbeatInput["presence"],
+  observedAt: Date,
+  now: Date,
+): HeartbeatInput["presence"] {
+  const ageMilliseconds = Math.max(0, now.getTime() - observedAt.getTime());
+  if (ageMilliseconds > 180_000) return "offline";
+  if (ageMilliseconds > 45_000) return "stale";
+  return reported === "sleeping" ? "sleeping" : "online";
+}
+
+function networkHistoryValues(input: HeartbeatInput) {
+  const network = input.network;
+  if (network === null) throw new ControlRepositoryError("CONFLICT");
+  return {
+    id: randomUUID(),
+    workspaceId: input.workspaceId,
+    deviceId: input.deviceId,
+    observedAt: input.receivedAt,
+    interfaceType: network.interfaceType,
+    wifiIdentityAvailable: network.wifiIdentityAvailable,
+    ssid: network.ssid,
+    bssid: network.bssid,
+    localIpv4: network.localIpv4,
+    localIpv6: network.localIpv6,
+    publicIp: network.observedExitIp,
+    ipCountry: network.ipLocation?.country ?? null,
+    ipRegion: network.ipLocation?.region ?? null,
+    ipCity: network.ipLocation?.city ?? null,
+    ipAccuracy: network.ipLocation?.accuracy ?? null,
+    locationLatitude: network.location?.latitude ?? null,
+    locationLongitude: network.location?.longitude ?? null,
+    locationHorizontalAccuracyMeters: network.location?.horizontalAccuracyMeters ?? null,
+    locationObservedAt: network.location?.observedAt ?? null,
+  };
+}
+
+function networkFromHistoryRow(row: typeof deviceNetworkHistory.$inferSelect): NetworkHeartbeat {
+  return {
+    interfaceType: row.interfaceType as NetworkHeartbeat["interfaceType"],
+    wifiIdentityAvailable: row.wifiIdentityAvailable,
+    ssid: row.ssid,
+    bssid: row.bssid,
+    localIpv4: row.localIpv4,
+    localIpv6: row.localIpv6,
+    observedExitIp: row.publicIp,
+    ipLocation: row.ipAccuracy === "ip_city" ? {
+      country: row.ipCountry,
+      region: row.ipRegion,
+      city: row.ipCity,
+      accuracy: "ip_city",
+    } : null,
+    location: row.locationLatitude === null
+      || row.locationLongitude === null
+      || row.locationHorizontalAccuracyMeters === null
+      || row.locationObservedAt === null
+      ? null
+      : {
+          latitude: row.locationLatitude,
+          longitude: row.locationLongitude,
+          horizontalAccuracyMeters: row.locationHorizontalAccuracyMeters,
+          observedAt: row.locationObservedAt,
+        },
+  };
 }
 
 function matchNetworkLocation(

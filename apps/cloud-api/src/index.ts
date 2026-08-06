@@ -1480,7 +1480,7 @@ function ownerDeviceSummaryResponse(device: {
       createdAt: Date;
       updatedAt: Date;
     } | null;
-    previousNetwork: {
+    networkHistory: Array<{
       network: {
         interfaceType: string;
         wifiIdentityAvailable: boolean;
@@ -1509,7 +1509,7 @@ function ownerDeviceSummaryResponse(device: {
         updatedAt: Date;
       } | null;
       observedAt: Date;
-    } | null;
+    }>;
     observedAt: Date;
   } | null;
 }) {
@@ -1552,26 +1552,24 @@ function ownerDeviceSummaryResponse(device: {
                 ? null
                 : networkLocationResponse(device.status.matchedLocation),
             },
-            previous_network: device.status.previousNetwork === null ? null : {
-              interface_type: device.status.previousNetwork.network.interfaceType,
-              wifi_identity_available: device.status.previousNetwork.network.wifiIdentityAvailable,
-              ssid: device.status.previousNetwork.network.ssid,
-              bssid: device.status.previousNetwork.network.bssid,
-              local_ipv4: device.status.previousNetwork.network.localIpv4,
-              local_ipv6: device.status.previousNetwork.network.localIpv6,
-              observed_exit_ip: device.status.previousNetwork.network.observedExitIp,
-              exit_ip_location: device.status.previousNetwork.network.ipLocation,
-              device_location: device.status.previousNetwork.network.location === null ? null : {
-                latitude: device.status.previousNetwork.network.location.latitude,
-                longitude: device.status.previousNetwork.network.location.longitude,
-                horizontal_accuracy_meters: device.status.previousNetwork.network.location.horizontalAccuracyMeters,
-                observed_at: device.status.previousNetwork.network.location.observedAt.toISOString(),
+            network_history: device.status.networkHistory.map((record) => ({
+              interface_type: record.network.interfaceType,
+              wifi_identity_available: record.network.wifiIdentityAvailable,
+              ssid: record.network.ssid,
+              bssid: record.network.bssid,
+              local_ipv4: record.network.localIpv4,
+              local_ipv6: record.network.localIpv6,
+              observed_exit_ip: record.network.observedExitIp,
+              exit_ip_location: record.network.ipLocation,
+              device_location: record.network.location === null ? null : {
+                latitude: record.network.location.latitude,
+                longitude: record.network.location.longitude,
+                horizontal_accuracy_meters: record.network.location.horizontalAccuracyMeters,
+                observed_at: record.network.location.observedAt.toISOString(),
               },
-              matched_location: device.status.previousNetwork.matchedLocation === null
-                ? null
-                : networkLocationResponse(device.status.previousNetwork.matchedLocation),
-              observed_at: device.status.previousNetwork.observedAt.toISOString(),
-            },
+              matched_location: record.matchedLocation === null ? null : networkLocationResponse(record.matchedLocation),
+              observed_at: record.observedAt.toISOString(),
+            })),
             observed_at: device.status.observedAt.toISOString(),
           },
   };

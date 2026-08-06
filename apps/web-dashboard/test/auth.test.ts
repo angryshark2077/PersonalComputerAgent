@@ -40,7 +40,7 @@ test("sign up creates a Better Auth email session without putting credentials in
   );
 });
 
-test("sign out sends only an authenticated request to the Better Auth sign-out endpoint", async () => {
+test("sign out sends the JSON request required by the Better Auth sign-out endpoint", async () => {
   let request: Request | undefined;
   await signOut(async (input, init) => {
     request = new Request(input, init);
@@ -49,7 +49,8 @@ test("sign out sends only an authenticated request to the Better Auth sign-out e
 
   assert.equal(request?.url, "https://cloud.example.test/api/auth/sign-out");
   assert.equal(request?.method, "POST");
-  assert.equal(request?.headers.get("content-type"), null);
+  assert.equal(request?.headers.get("content-type"), "application/json");
+  assert.equal(await request?.text(), "{}");
   assert.equal(request?.headers.get("cookie"), null);
   assert.equal(request?.credentials, "include");
 });

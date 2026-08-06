@@ -355,17 +355,18 @@ export default function DevicePage() {
             <p>Waiting for an enabled Network Collector observation.</p>
           ) : (
             <>
-              <h3>Current record</h3>
-              <p>Recorded {new Date(screen.device.status.observed_at).toLocaleString()}</p>
-              <NetworkObservationDetails network={screen.device.status.network} />
-              <h3>Previous record</h3>
-              {screen.device.status.previous_network === null || screen.device.status.previous_network === undefined ? (
-                <p>No previous Network Collector observation.</p>
+              <h3>Recent network and location changes</h3>
+              {(screen.device.status.network_history ?? []).length === 0 ? (
+                <p>No network or location changes recorded yet.</p>
               ) : (
-                <>
-                  <p>Recorded {new Date(screen.device.status.previous_network.observed_at).toLocaleString()}</p>
-                  <NetworkObservationDetails network={screen.device.status.previous_network} />
-                </>
+                <ol>
+                  {(screen.device.status.network_history ?? []).map((record) => (
+                    <li key={`${record.observed_at}:${record.interface_type}:${record.bssid ?? record.observed_exit_ip ?? "none"}`}>
+                      <p>Recorded {new Date(record.observed_at).toLocaleString()}</p>
+                      <NetworkObservationDetails network={record} />
+                    </li>
+                  ))}
+                </ol>
               )}
             </>
           )}

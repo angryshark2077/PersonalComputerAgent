@@ -32,7 +32,7 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const CHILD_REAP_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STABLE_READY: Duration = Duration::from_secs(30);
-const NETWORK_OBSERVATION_INTERVAL: Duration = Duration::from_mins(1);
+const NETWORK_OBSERVATION_INTERVAL: Duration = Duration::from_mins(30);
 const NETWORK_ENABLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 

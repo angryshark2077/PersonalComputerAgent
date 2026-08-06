@@ -363,6 +363,38 @@ export const deviceHeartbeats = pgTable(
   ],
 );
 
+export const deviceNetworkHistory = pgTable(
+  "device_network_history",
+  {
+    id: uuid("id").primaryKey(),
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    observedAt: timestampColumn("observed_at").notNull(),
+    interfaceType: text("interface_type").notNull(),
+    wifiIdentityAvailable: boolean("wifi_identity_available").notNull(),
+    ssid: text("ssid"),
+    bssid: text("bssid"),
+    localIpv4: inet("local_ipv4"),
+    localIpv6: inet("local_ipv6"),
+    publicIp: inet("public_ip"),
+    ipCountry: text("ip_country"),
+    ipRegion: text("ip_region"),
+    ipCity: text("ip_city"),
+    ipAccuracy: text("ip_accuracy"),
+    locationLatitude: doublePrecision("location_latitude"),
+    locationLongitude: doublePrecision("location_longitude"),
+    locationHorizontalAccuracyMeters: doublePrecision("location_horizontal_accuracy_meters"),
+    locationObservedAt: timestampColumn("location_observed_at"),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    index("idx_device_network_history_recent").on(table.workspaceId, table.deviceId, table.observedAt.desc()),
+  ],
+);
+
 export const networkLocationLibrary = pgTable(
   "network_location_library",
   {
@@ -793,6 +825,7 @@ export const cloudSchema = {
   collectorConfigs,
   collectorConfigAudit,
   deviceHeartbeats,
+  deviceNetworkHistory,
   deviceMediaCleanupRequests,
   networkLocationLibrary,
   deviceRevocationAudit,

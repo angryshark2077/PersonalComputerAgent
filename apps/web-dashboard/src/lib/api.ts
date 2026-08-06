@@ -104,7 +104,7 @@ export interface DashboardDevice {
       protected_bytes: number;
     };
     network: DashboardNetworkObservation | null;
-    previous_network?: (DashboardNetworkObservation & { observed_at: string }) | null;
+    network_history?: Array<DashboardNetworkObservation & { observed_at: string }>;
     observed_at: string;
   } | null;
   local_media_cleanup: {

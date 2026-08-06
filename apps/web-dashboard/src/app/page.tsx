@@ -57,6 +57,7 @@ export default function HomePage() {
                     <Link href={`/devices/${encodeURIComponent(device.device_id)}`}>
                       Device {device.device_id}{device.revoked ? " (revoked)" : ""}
                     </Link>
+                    <p className="status-note">{deviceStatusLabel(device)}</p>
                   </li>
                 ))}
               </ul>
@@ -66,6 +67,12 @@ export default function HomePage() {
       )}
     </DashboardShell>
   );
+}
+
+function deviceStatusLabel(device: Awaited<ReturnType<typeof getDevices>>[number]): string {
+  if (device.revoked) return "Revoked";
+  if (device.status === null) return "Agent has not checked in yet";
+  return `${device.status.presence[0]?.toUpperCase()}${device.status.presence.slice(1)} · Agent ${device.status.agent_version} · Last check-in ${new Date(device.status.observed_at).toLocaleString()}`;
 }
 
 function messageFor(cause: unknown): string {

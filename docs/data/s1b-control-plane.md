@@ -3,9 +3,9 @@
 **Status:** implemented local/control contracts; production deployment and the
 Swift-to-Agent handoff transport are intentionally not configured.
 
-S1B contains device pairing, identity, desired Collector configuration and
-presence only. It does not contain business Events, Network observations,
-WeChat message bodies, attachments, public-IP data, or geo projections.
+S1B contains device pairing, identity, desired Collector configuration,
+presence, and the bounded network/location change projection. It does not
+contain business Events, WeChat message bodies, or attachments.
 
 ## Local SQLite: `pairing_state`
 
@@ -64,6 +64,7 @@ Migrations are ordered and immutable:
 | `collector_configs` | workspace/device, non-negative revision, `network_enabled`, `wechat_enabled`, update time | one complete desired configuration per device; S1B transports it but starts neither source |
 | `collector_config_audit` | ID, workspace/device, actor, positive revision, old/new JSON configuration, time | append-only Owner audit; records only the two approved boolean scope settings |
 | `device_heartbeats` | ID, workspace/device, received time, Agent version, presence, non-negative Outbox depth | authenticated presence history; S1B has no Event upload |
+| `device_network_history` | ID, workspace/device, observation time, network identity, exit-IP city projection and optional Core Location estimate | only a changed network identity is recorded; each device retains its five newest records; no GPS source is assumed |
 | `device_revocation_audit` | ID, workspace/device, Owner actor, revoked time | append-only device revocation audit |
 
 ### Indexes and integrity boundaries
@@ -73,6 +74,7 @@ Migrations are ordered and immutable:
 - `idx_collector_config_audit_chronology` and
   `idx_device_revocation_audit_chronology` support Owner audit timelines.
 - `idx_device_heartbeats_last` supports recent presence lookup.
+- `idx_device_network_history_recent` supports the Owner Dashboard's five-record network/location change list.
 - Composite `(workspace_id, user_id)` membership foreign keys protect pairing
   authorization, device ownership and configuration/revocation audit actors.
 - Device credentials and pairing values are global unique SHA-256 values;
@@ -86,7 +88,6 @@ Migrations are ordered and immutable:
   Event, fixture, diagnostic, JSON status, or ordinary log data.
 - Better Auth password/session secrets remain inside Better Auth's own
   authentication boundary and are not exposed through Dashboard device APIs.
-- S1B does not create raw Network or WeChat data. The future retention rules
-  are 30 days for raw Network identifiers and 90 days for WeChat body/display
-  names; those rules require their separate S2B/S3 implementation before any
-  such data is collected.
+- `device_network_history` is a bounded Owner projection: it retains no more
+  than five changed network/location records per device. It is not an Event
+  log and repeated heartbeat observations do not create rows.

@@ -13,7 +13,8 @@ export function DashboardShell({ children }: { children: ReactNode }) {
   const chatsActive = pathname === "/chats" || pathname.includes("/chats/");
   const messagesActive = pathname === "/messages" || pathname.includes("/messages/");
   const photosActive = pathname === "/photos" || pathname.includes("/photos/") || pathname.endsWith("/photos");
-  const devicesActive = !chatsActive && !messagesActive && !photosActive && (pathname.startsWith("/devices") || pathname === "/");
+  const screenshotsActive = pathname === "/screenshots" || pathname.includes("/screenshots/") || pathname.endsWith("/screenshots");
+  const devicesActive = !chatsActive && !messagesActive && !photosActive && !screenshotsActive && (pathname.startsWith("/devices") || pathname === "/");
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
 
@@ -22,7 +23,7 @@ export function DashboardShell({ children }: { children: ReactNode }) {
     setSignOutError(null);
     try {
       await signOut(window.fetch, cloudApiOrigin());
-      window.location.assign("/sign-in");
+      window.location.replace("/sign-in");
     } catch {
       setSignOutError("Unable to sign out. Please try again.");
       setSigningOut(false);
@@ -45,6 +46,9 @@ export function DashboardShell({ children }: { children: ReactNode }) {
           </Link>
           <Link className={photosActive ? "is-active" : undefined} href="/photos">
             Photos
+          </Link>
+          <Link className={screenshotsActive ? "is-active" : undefined} href="/screenshots">
+            Screenshots
           </Link>
         </nav>
         <div className="dashboard-account">
