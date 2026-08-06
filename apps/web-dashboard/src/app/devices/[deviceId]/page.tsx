@@ -355,10 +355,10 @@ export default function DevicePage() {
             <p>Waiting for an enabled Network Collector observation.</p>
           ) : (
             <>
+              <h3>Current network and location</h3>
+              <NetworkObservationDetails network={screen.device.status.network} />
               <h3 id="network-history">Recent network and location changes</h3>
-              {(screen.device.status.network_history ?? []).length === 0 ? (
-                <p>No network or location changes recorded yet.</p>
-              ) : (
+              {hasNetworkChanges(screen.device.status.network_history ?? [], screen.device.status.network) ? (
                 <ol>
                   {(screen.device.status.network_history ?? []).map((record) => (
                     <li key={`${record.observed_at}:${record.interface_type}:${record.bssid ?? record.observed_exit_ip ?? "none"}`}>
@@ -367,6 +367,8 @@ export default function DevicePage() {
                     </li>
                   ))}
                 </ol>
+              ) : (
+                <p>No network or location changes recorded yet.</p>
               )}
             </>
           )}
@@ -534,6 +536,20 @@ function NetworkObservationDetails({
       <div><dt>Saved location match</dt><dd>{networkLocationLabel(network)}</dd></div>
     </dl>
   );
+}
+
+function hasNetworkChanges(
+  history: Array<NonNullable<NonNullable<DashboardDevice["status"]>["network"]> & { observed_at: string }>,
+  current: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>,
+): boolean {
+  return history.length > 1
+    || history.some((record) => record.interface_type !== current.interface_type
+      || record.ssid !== current.ssid
+      || record.bssid !== current.bssid
+      || record.observed_exit_ip !== current.observed_exit_ip
+      || record.exit_ip_location?.country !== current.exit_ip_location?.country
+      || record.exit_ip_location?.region !== current.exit_ip_location?.region
+      || record.exit_ip_location?.city !== current.exit_ip_location?.city);
 }
 
 function networkLocationLabel(network: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>): string {

@@ -721,21 +721,18 @@ struct KeychainBridgeCredentialProvisioner: BridgeCredentialProvisioning {
 
     func ensureCredential(trustedApplicationURLs: [URL]) throws {
         do {
-            let secret: Data
-            if let existingSecret = try store.load() {
-                secret = existingSecret
-            } else {
-                var generatedSecret = Data(count: KeychainCredentialStore.sharedSecretLength)
-                let status = generatedSecret.withUnsafeMutableBytes { buffer -> OSStatus in
-                    guard let baseAddress = buffer.baseAddress else { return errSecParam }
-                    return SecRandomCopyBytes(kSecRandomDefault, buffer.count, baseAddress)
-                }
-                guard status == errSecSuccess else {
-                    throw InstallError.credentialProvisioningFailed
-                }
-                secret = generatedSecret
+            if try store.bridgeCredentialExists() {
+                return
             }
-            try store.store(secret, trustedApplicationURLs: trustedApplicationURLs)
+            var generatedSecret = Data(count: KeychainCredentialStore.sharedSecretLength)
+            let status = generatedSecret.withUnsafeMutableBytes { buffer -> OSStatus in
+                guard let baseAddress = buffer.baseAddress else { return errSecParam }
+                return SecRandomCopyBytes(kSecRandomDefault, buffer.count, baseAddress)
+            }
+            guard status == errSecSuccess else {
+                throw InstallError.credentialProvisioningFailed
+            }
+            try store.store(generatedSecret, trustedApplicationURLs: trustedApplicationURLs)
         } catch {
             throw (error as? InstallError) ?? InstallError.credentialProvisioningFailed
         }

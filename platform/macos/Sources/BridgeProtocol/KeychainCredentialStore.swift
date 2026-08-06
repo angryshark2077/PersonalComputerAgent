@@ -42,6 +42,15 @@ public struct KeychainCredentialStore: Sendable {
         return secret
     }
 
+    /// Checks whether an existing Bridge credential can be preserved during an update without
+    /// asking the installer to read or replace its secret.
+    public func bridgeCredentialExists() throws -> Bool {
+        let status = SecItemCopyMatching(Self.bridgeCredentialExistenceQuery() as CFDictionary, nil)
+        if status == errSecSuccess { return true }
+        if status == errSecItemNotFound { return false }
+        throw Self.error(for: status)
+    }
+
     public func store(_ secret: Data, trustedApplicationURLs: [URL]) throws {
         guard secret.count == Self.sharedSecretLength else {
             throw KeychainCredentialStoreError.invalidSecretLength
@@ -119,6 +128,10 @@ public struct KeychainCredentialStore: Sendable {
 
     static func wechatCredentialExistenceQuery() -> [String: Any] {
         Self.baseQuery(service: Self.wechatService, account: Self.wechatAccount)
+    }
+
+    static func bridgeCredentialExistenceQuery() -> [String: Any] {
+        Self.baseQuery()
     }
 
     private static func baseQuery(

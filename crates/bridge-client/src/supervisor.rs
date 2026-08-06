@@ -453,7 +453,21 @@ impl BridgeSupervisor {
                             continue;
                         };
                         match poll_and_forward_lifecycle(&mut client, sender, last_lifecycle_sequence).await {
-                            Ok(latest_sequence) => last_lifecycle_sequence = latest_sequence,
+                            Ok((latest_sequence, observe_network)) => {
+                                last_lifecycle_sequence = latest_sequence;
+                                if observe_network && self.network_observations.is_enabled() {
+                                    match client.observe_network().await {
+                                        Ok(observation) => {
+                                            self.network_observations.replace(observation);
+                                            last_network_observation = Some(Instant::now());
+                                        }
+                                        Err(error) if !network_observation_error_requires_reconnect(&error) => {
+                                            last_network_observation = Some(Instant::now());
+                                        }
+                                        Err(_) => break false,
+                                    }
+                                }
+                            }
                             Err(()) => break false,
                         }
                     }
@@ -533,15 +547,25 @@ async fn poll_and_forward_lifecycle(
     client: &mut BridgeClient,
     sender: &mpsc::Sender<PlatformLifecycleEvent>,
     after_sequence: u64,
-) -> Result<u64, ()> {
+) -> Result<(u64, bool), ()> {
     let (events, latest_sequence) = client
         .poll_lifecycle(after_sequence)
         .await
         .map_err(|_| ())?;
+    let observe_network = lifecycle_events_require_network_observation(&events);
     for event in events {
         sender.send(event).await.map_err(|_| ())?;
     }
-    Ok(latest_sequence)
+    Ok((latest_sequence, observe_network))
+}
+
+fn lifecycle_events_require_network_observation(events: &[PlatformLifecycleEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "network.offline" | "network.online" | "network.changed"
+        )
+    })
 }
 
 fn network_observation_error_requires_reconnect(error: &BridgeClientError) -> bool {
@@ -754,11 +778,11 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::{
-        network_observation_error_requires_reconnect, reap_child, remove_confirmed_socket, Backoff,
-        BridgeSupervisorConfig, ReapProcess, StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT,
-        MAX_STABLE_READY,
+        lifecycle_events_require_network_observation, network_observation_error_requires_reconnect,
+        reap_child, remove_confirmed_socket, Backoff, BridgeSupervisorConfig, ReapProcess,
+        StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT, MAX_STABLE_READY,
     };
-    use crate::BridgeClientError;
+    use crate::{BridgeClientError, PlatformLifecycleEvent};
     use pca_domain::BridgeStatus;
     use std::{
         collections::VecDeque,
@@ -771,6 +795,7 @@ mod tests {
         time::Duration,
     };
     use tokio::sync::watch;
+    use uuid::Uuid;
 
     #[test]
     fn backoff_is_jittered_bounded_and_resettable() {
@@ -817,6 +842,29 @@ mod tests {
         assert!(network_observation_error_requires_reconnect(
             &BridgeClientError::Timeout
         ));
+    }
+
+    #[test]
+    fn network_lifecycle_events_trigger_an_immediate_observation() {
+        let event = |event_type: &str| PlatformLifecycleEvent {
+            sequence: 1,
+            event_id: Uuid::nil(),
+            event_type: event_type.to_owned(),
+            occurred_at: "2026-08-07T00:00:00Z".to_owned(),
+        };
+
+        assert!(lifecycle_events_require_network_observation(&[event(
+            "network.changed"
+        )]));
+        assert!(lifecycle_events_require_network_observation(&[event(
+            "network.online"
+        )]));
+        assert!(lifecycle_events_require_network_observation(&[event(
+            "network.offline"
+        )]));
+        assert!(!lifecycle_events_require_network_observation(&[event(
+            "system.wake"
+        )]));
     }
 
     #[test]
