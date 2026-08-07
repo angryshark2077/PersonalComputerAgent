@@ -328,10 +328,11 @@ async function assertCommunicationProjectionBackfill(pool: Pool) {
     userId,
     "communication.wechat",
     100,
+    0,
   );
-  assert.equal(conversations.length, 1);
-  assert.ok(conversations[0]?.lastMessageAt instanceof Date);
-  assert.equal(conversations[0]?.lastMessageAt.toISOString(), "2026-08-02T00:01:00.000Z");
+  assert.equal(conversations.conversations.length, 1);
+  assert.ok(conversations.conversations[0]?.lastMessageAt instanceof Date);
+  assert.equal(conversations.conversations[0]?.lastMessageAt.toISOString(), "2026-08-02T00:01:00.000Z");
 
   const missing = await repository.listUnlinkedCommunicationAttachments(100);
   const missingFile = missing.find((attachment) => attachment.eventId === fileEventId);

@@ -22,7 +22,7 @@ async function pairedApi() {
     { workspaceId: owner.workspaceId, userId: owner.userId },
   ]);
   const api = createApp({ repository, ownerAuthenticator: async () => owner });
-  return pairedApiWith(api);
+  return { ...await pairedApiWith(api), repository };
 }
 
 async function pairedApiWith(api: ReturnType<typeof createApp>) {
@@ -471,6 +471,7 @@ test("only the device owner can read projected communication conversations and m
       message_count: 1,
       last_message_at: "2026-08-02T00:00:00.000Z",
     }],
+    pagination: { page: 1, page_size: 50, total_count: 1, total_pages: 1 },
   });
 
   const messages = await api.request(
@@ -497,6 +498,64 @@ test("only the device owner can read projected communication conversations and m
     (await otherApi.request(`/v1/devices/${credentials.device_id}/communication/conversations`)).status,
     403,
   );
+});
+
+test("owner pages through every projected communication conversation", async () => {
+  const { api, credentials } = await pairedApi();
+  const events = Array.from({ length: 101 }, (_, index) => {
+    const event = communicationText(credentials.device_id);
+    const occurredAt = new Date(Date.UTC(2026, 7, 2, 0, index)).toISOString();
+    const conversationId = `conversation-${String(index).padStart(3, "0")}`;
+    return {
+      ...event,
+      event_id: `01986666-7666-8666-8666-${String(666_666_666_700 + index)}`,
+      occurred_at: occurredAt,
+      created_at: occurredAt,
+      payload: {
+        ...event.payload,
+        message_id: `message-${index}`,
+        conversation_id: conversationId,
+        source_key: `source-key-${index}`,
+        occurred_at: occurredAt,
+      },
+      idempotency_key: `source-key-${index}`,
+    };
+  });
+  const sync = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777781",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events,
+    }),
+  });
+  assert.equal(sync.status, 200);
+
+  const first = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations?limit=100&page=1`,
+  );
+  const second = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations?limit=100&page=2`,
+  );
+  const firstBody = await first.json() as {
+    conversations: Array<{ conversation_id: string }>;
+    pagination: { page: number; page_size: number; total_count: number; total_pages: number };
+  };
+  const secondBody = await second.json() as {
+    conversations: Array<{ conversation_id: string }>;
+    pagination: { page: number; page_size: number; total_count: number; total_pages: number };
+  };
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.deepEqual(firstBody.pagination, { page: 1, page_size: 100, total_count: 101, total_pages: 2 });
+  assert.deepEqual(secondBody.pagination, { page: 2, page_size: 100, total_count: 101, total_pages: 2 });
+  assert.equal(firstBody.conversations.length, 100);
+  assert.deepEqual(secondBody.conversations.map((conversation) => conversation.conversation_id), ["conversation-000"]);
 });
 
 test("WeChat and Apple Messages are isolated by communication source", async () => {
@@ -847,7 +906,10 @@ test("Owner manual screenshot request reaches the device and only a completed pr
   assert.equal(prepared.status, 200);
   assert.equal((await prepared.json() as { state: string }).state, "prepared");
   assert.equal((await api.request(`/v1/devices/${credentials.device_id}/screenshots`)).status, 200);
-  assert.deepEqual(await (await api.request(`/v1/devices/${credentials.device_id}/screenshots`)).json(), { screenshots: [] });
+  assert.deepEqual(await (await api.request(`/v1/devices/${credentials.device_id}/screenshots`)).json(), {
+    screenshots: [],
+    pagination: { page: 1, page_size: 50, total_count: 0, total_pages: 0 },
+  });
 
   store.uploaded = true;
   assert.equal((await api.request("/v1/agent/screenshots/complete", {
@@ -860,12 +922,63 @@ test("Owner manual screenshot request reaches the device and only a completed pr
   })).status, 200);
 
   const list = await api.request(`/v1/devices/${credentials.device_id}/screenshots`);
-  const listBody = await list.json() as { screenshots: Array<{ screenshot_id: string; trigger: string }> };
+  const listBody = await list.json() as {
+    screenshots: Array<{ screenshot_id: string; trigger: string }>;
+    pagination: { page: number; total_count: number; total_pages: number };
+  };
   assert.deepEqual(listBody.screenshots.map((item) => [item.screenshot_id, item.trigger]), [[screenshotId, "manual"]]);
+  assert.deepEqual(listBody.pagination, { page: 1, page_size: 50, total_count: 1, total_pages: 1 });
   assert.deepEqual(
     await (await api.request(`/v1/devices/${credentials.device_id}/screenshots/${screenshotId}/read`)).json(),
     { url: "https://private-media.example/read", expires_at: "2026-08-02T00:06:00.000Z" },
   );
+});
+
+test("Owner paginates every completed screenshot by page number", async () => {
+  const { api, credentials, repository } = await pairedApi();
+  const createCompleted = async (screenshotId: string, capturedAt: string) => {
+    await repository.prepareScreenshot(owner.workspaceId, credentials.device_id, {
+      screenshotId,
+      objectKey: `screenshots/${screenshotId}`,
+      requestId: null,
+      trigger: "activity",
+      capturedAt: new Date(capturedAt),
+      appBundleId: null,
+      pixelWidth: 1728,
+      pixelHeight: 1117,
+      expectedSha256: "d".repeat(64),
+      expectedSizeBytes: 4096,
+      expectedMimeType: "image/jpeg",
+      now: new Date(capturedAt),
+    });
+    await repository.completeScreenshot(owner.workspaceId, credentials.device_id, screenshotId, new Date(capturedAt));
+  };
+
+  await createCompleted("01986666-7666-8666-8666-666666666691", "2026-08-05T12:01:00.000Z");
+  await createCompleted("01986666-7666-8666-8666-666666666692", "2026-08-05T12:02:00.000Z");
+  await createCompleted("01986666-7666-8666-8666-666666666693", "2026-08-05T12:03:00.000Z");
+
+  const first = await api.request(`/v1/devices/${credentials.device_id}/screenshots?limit=2&page=1`);
+  assert.equal(first.status, 200);
+  const firstBody = await first.json() as {
+    screenshots: Array<{ screenshot_id: string }>;
+    pagination: { page: number; page_size: number; total_count: number; total_pages: number };
+  };
+  assert.deepEqual(firstBody.screenshots.map((item) => item.screenshot_id), [
+    "01986666-7666-8666-8666-666666666693",
+    "01986666-7666-8666-8666-666666666692",
+  ]);
+  assert.deepEqual(firstBody.pagination, { page: 1, page_size: 2, total_count: 3, total_pages: 2 });
+
+  const second = await api.request(`/v1/devices/${credentials.device_id}/screenshots?limit=2&page=2`);
+  const secondBody = await second.json() as {
+    screenshots: Array<{ screenshot_id: string }>;
+    pagination: { page: number; page_size: number; total_count: number; total_pages: number };
+  };
+  assert.deepEqual(secondBody.screenshots.map((item) => item.screenshot_id), [
+    "01986666-7666-8666-8666-666666666691",
+  ]);
+  assert.deepEqual(secondBody.pagination, { page: 2, page_size: 2, total_count: 3, total_pages: 2 });
 });
 
 test("Photo originals remain private, become readable only after completion, and have no expiry", async () => {

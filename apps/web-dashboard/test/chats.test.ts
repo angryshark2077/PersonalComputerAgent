@@ -56,13 +56,16 @@ test("loads owner-scoped conversations for one device", async () => {
   let requested = "";
   const conversations = await getCommunicationConversations(async (input) => {
     requested = String(input);
-    return new Response(JSON.stringify({ conversations: [] }), { status: 200 });
-  }, "https://cloud.example", "device/id", "communication.wechat", 25);
+    return new Response(JSON.stringify({
+      conversations: [],
+      pagination: { page: 3, page_size: 25, total_count: 0, total_pages: 0 },
+    }), { status: 200 });
+  }, "https://cloud.example", "device/id", "communication.wechat", 25, 3);
 
-  assert.deepEqual(conversations, []);
+  assert.deepEqual(conversations.conversations, []);
   assert.equal(
     requested,
-    "https://cloud.example/v1/devices/device%2Fid/communication/conversations?source=communication.wechat&limit=25",
+    "https://cloud.example/v1/devices/device%2Fid/communication/conversations?source=communication.wechat&limit=25&page=3",
   );
 });
 

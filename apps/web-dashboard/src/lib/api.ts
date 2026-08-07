@@ -68,6 +68,18 @@ export function nextPhotoPage<T>(records: readonly T[], loaded: number): T[] {
   return records.slice(loaded, loaded + PHOTO_PAGE_SIZE);
 }
 
+export const SCREENSHOT_PAGE_SIZE = 20;
+
+export interface DashboardScreenshotPage {
+  screenshots: DashboardScreenshot[];
+  pagination: {
+    page: number;
+    page_size: number;
+    total_count: number;
+    total_pages: number;
+  };
+}
+
 export interface DashboardNetworkObservation {
   interface_type: "wifi" | "wired" | "other" | "none";
   wifi_identity_available: boolean;
@@ -151,6 +163,16 @@ export interface DashboardConversation {
   member_count: number | null;
   message_count: number;
   last_message_at: string;
+}
+
+export interface DashboardConversationPage {
+  conversations: DashboardConversation[];
+  pagination: {
+    page: number;
+    page_size: number;
+    total_count: number;
+    total_pages: number;
+  };
 }
 
 export type CommunicationSource = "communication.wechat" | "communication.messages";
@@ -361,15 +383,15 @@ export async function getCommunicationConversations(
   deviceId: string,
   source: CommunicationSource,
   limit = 100,
-): Promise<DashboardConversation[]> {
-  const result = await jsonRequest<{ conversations: DashboardConversation[] }>(
+  page = 1,
+): Promise<DashboardConversationPage> {
+  return jsonRequest<DashboardConversationPage>(
     fetcher,
     apiUrl(
       cloudApiOrigin,
-      `/v1/devices/${encodeURIComponent(deviceId)}/communication/conversations?source=${encodeURIComponent(source)}&limit=${limit}`,
+      `/v1/devices/${encodeURIComponent(deviceId)}/communication/conversations?source=${encodeURIComponent(source)}&limit=${limit}&page=${page}`,
     ),
   );
-  return result.conversations;
 }
 
 export async function getCommunicationMessages(
@@ -482,13 +504,14 @@ export async function getScreenshots(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,
   deviceId: string,
-  limit = 100,
-): Promise<DashboardScreenshot[]> {
-  const result = await jsonRequest<{ screenshots: DashboardScreenshot[] }>(
+  limit = SCREENSHOT_PAGE_SIZE,
+  page = 1,
+): Promise<DashboardScreenshotPage> {
+  const query = new URLSearchParams({ limit: String(limit), page: String(page) });
+  return jsonRequest<DashboardScreenshotPage>(
     fetcher,
-    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/screenshots?limit=${limit}`),
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/screenshots?${query}`),
   );
-  return result.screenshots;
 }
 
 export async function getScreenshotReadUrl(

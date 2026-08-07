@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { DashboardShell } from "../../../../../components/dashboard-shell";
@@ -32,8 +32,10 @@ export function CommunicationMessagesPage({
   rootPath: "chats" | "messages";
 }) {
   const params = useParams<{ deviceId: string; conversationId: string }>();
+  const searchParams = useSearchParams();
   const deviceId = decodeDashboardRouteParam(params.deviceId);
   const conversationId = decodeDashboardRouteParam(params.conversationId);
+  const conversationPage = Math.max(1, Number.parseInt(searchParams.get("page") ?? "1", 10) || 1);
   const [messages, setMessages] = useState<DashboardMessage[] | null>(null);
   const [displayName, setDisplayName] = useState(conversationId);
   const [conversationAvatarUrl, setConversationAvatarUrl] = useState<string | null>(null);
@@ -56,10 +58,10 @@ export function CommunicationMessagesPage({
       try {
         const [latest, conversations] = await Promise.all([
           getCommunicationMessages(window.fetch, origin, deviceId, conversationId, source),
-          getCommunicationConversations(window.fetch, origin, deviceId, source),
+          getCommunicationConversations(window.fetch, origin, deviceId, source, 100, conversationPage),
         ]);
         if (!active) return;
-        const conversation = conversations.find(
+        const conversation = conversations.conversations.find(
           (candidate) => candidate.conversation_id === conversationId,
         );
         setDisplayName(conversation?.display_name ?? conversationId);
@@ -95,7 +97,7 @@ export function CommunicationMessagesPage({
       window.removeEventListener("focus", refreshLatest);
       window.removeEventListener("pageshow", refreshLatest);
     };
-  }, [conversationId, deviceId, source]);
+  }, [conversationId, conversationPage, deviceId, source]);
 
   useEffect(() => {
     if (messages !== null && !didInitialScroll.current) {

@@ -1,5 +1,5 @@
 import type { AgentControlSnapshot, SystemMetricPayload } from "@pca/contracts/src/types.js";
-import { and, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, count, countDistinct, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -234,6 +234,16 @@ export interface ScreenshotRecord {
   state: "prepared" | "completed";
   preparedAt: Date;
   completedAt: Date | null;
+}
+
+export interface ScreenshotPage {
+  screenshots: ScreenshotRecord[];
+  total: number;
+}
+
+export interface CommunicationConversationPage {
+  conversations: CommunicationConversationRecord[];
+  total: number;
 }
 
 export interface PrepareScreenshotInput {
@@ -579,7 +589,8 @@ export interface ControlRepository {
     workspaceId: string,
     userId: string,
     limit: number,
-  ): Promise<ScreenshotRecord[]>;
+    offset: number,
+  ): Promise<ScreenshotPage>;
   loadOwnerCompletedScreenshot(
     workspaceId: string,
     userId: string,
@@ -636,7 +647,8 @@ export interface ControlRepository {
     userId: string,
     source: CommunicationSource,
     limit: number,
-  ): Promise<CommunicationConversationRecord[]>;
+    offset: number,
+  ): Promise<CommunicationConversationPage>;
   listOwnerCommunicationMessages(
     deviceId: string,
     conversationId: string,
@@ -1127,14 +1139,18 @@ export class MemoryControlRepository implements ControlRepository {
     workspaceId: string,
     userId: string,
     limit: number,
-  ): Promise<ScreenshotRecord[]> {
+    offset: number,
+  ): Promise<ScreenshotPage> {
     this.#requireOwnerMembership(workspaceId, userId);
     this.#requireDevice(deviceId, workspaceId, true);
-    return [...this.#screenshots.values()]
-      .filter((record) => record.workspaceId === workspaceId && record.deviceId === deviceId && record.state === "completed")
-      .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime())
-      .slice(0, limit)
+    const screenshots = [...this.#screenshots.values()]
+      .filter((record) => record.workspaceId === workspaceId
+        && record.deviceId === deviceId
+        && record.state === "completed")
+      .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime()
+        || right.screenshotId.localeCompare(left.screenshotId))
       .map((record) => ({ ...record }));
+    return { screenshots: screenshots.slice(offset, offset + limit), total: screenshots.length };
   }
 
   async loadOwnerCompletedScreenshot(
@@ -1535,7 +1551,8 @@ export class MemoryControlRepository implements ControlRepository {
     userId: string,
     source: CommunicationSource,
     limit: number,
-  ): Promise<CommunicationConversationRecord[]> {
+    offset: number,
+  ): Promise<CommunicationConversationPage> {
     this.#requireOwnerMembership(workspaceId, userId);
     this.#requireDevice(deviceId, workspaceId, true);
     const conversations = new Map<string, CommunicationConversationRecord>();
@@ -1568,9 +1585,10 @@ export class MemoryControlRepository implements ControlRepository {
         }
       }
     }
-    return [...conversations.values()]
-      .sort((left, right) => right.lastMessageAt.getTime() - left.lastMessageAt.getTime())
-      .slice(0, limit);
+    const records = [...conversations.values()]
+      .sort((left, right) => right.lastMessageAt.getTime() - left.lastMessageAt.getTime()
+        || right.conversationId.localeCompare(left.conversationId));
+    return { conversations: records.slice(offset, offset + limit), total: records.length };
   }
 
   async listOwnerCommunicationMessages(
@@ -2028,16 +2046,24 @@ export class DrizzleControlRepository implements ControlRepository {
     workspaceId: string,
     userId: string,
     limit: number,
-  ): Promise<ScreenshotRecord[]> {
+    offset: number,
+  ): Promise<ScreenshotPage> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
       await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
-      const rows = await this.database.select().from(deviceScreenshots).where(and(
+      const where = and(
         eq(deviceScreenshots.workspaceId, workspaceId),
         eq(deviceScreenshots.deviceId, deviceId),
         eq(deviceScreenshots.state, "completed"),
-      )).orderBy(desc(deviceScreenshots.capturedAt)).limit(limit);
-      return rows.map(screenshotFromRow);
+      );
+      const [rows, totals] = await Promise.all([
+        this.database.select().from(deviceScreenshots).where(where)
+          .orderBy(desc(deviceScreenshots.capturedAt), desc(deviceScreenshots.id))
+          .limit(limit)
+          .offset(offset),
+        this.database.select({ total: count() }).from(deviceScreenshots).where(where),
+      ]);
+      return { screenshots: rows.map(screenshotFromRow), total: Number(totals[0]?.total ?? 0) };
     } catch (error) {
       throw repositoryError(error);
     }
@@ -3263,11 +3289,18 @@ export class DrizzleControlRepository implements ControlRepository {
     userId: string,
     source: CommunicationSource,
     limit: number,
-  ): Promise<CommunicationConversationRecord[]> {
+    offset: number,
+  ): Promise<CommunicationConversationPage> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
       await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
-      const rows = await this.database
+      const where = and(
+        eq(communicationConversations.workspaceId, workspaceId),
+        eq(communicationConversations.deviceId, deviceId),
+        eq(communicationEvents.source, source),
+      );
+      const [rows, totals] = await Promise.all([
+        this.database
         .select({
           conversationId: communicationConversations.conversationId,
           displayName: communicationConversations.displayName,
@@ -3292,13 +3325,7 @@ export class DrizzleControlRepository implements ControlRepository {
           communicationEvents,
           eq(communicationEvents.eventId, communicationMessages.eventId),
         )
-        .where(
-          and(
-            eq(communicationConversations.workspaceId, workspaceId),
-            eq(communicationConversations.deviceId, deviceId),
-            eq(communicationEvents.source, source),
-          ),
-        )
+        .where(where)
         .groupBy(
           communicationConversations.conversationId,
           communicationConversations.displayName,
@@ -3307,9 +3334,27 @@ export class DrizzleControlRepository implements ControlRepository {
           communicationConversations.memberCount,
           communicationConversations.lastMessageAt,
         )
-        .orderBy(desc(sql`max(${communicationMessages.occurredAt})`))
-        .limit(limit);
-      return rows.map((row) => ({
+        .orderBy(
+          desc(sql`max(${communicationMessages.occurredAt})`),
+          desc(communicationConversations.conversationId),
+        )
+        .limit(limit)
+        .offset(offset),
+        this.database
+          .select({ total: countDistinct(communicationConversations.conversationId) })
+          .from(communicationConversations)
+          .innerJoin(
+            communicationMessages,
+            and(
+              eq(communicationMessages.workspaceId, communicationConversations.workspaceId),
+              eq(communicationMessages.deviceId, communicationConversations.deviceId),
+              eq(communicationMessages.conversationId, communicationConversations.conversationId),
+            ),
+          )
+          .innerJoin(communicationEvents, eq(communicationEvents.eventId, communicationMessages.eventId))
+          .where(where),
+      ]);
+      return { conversations: rows.map((row) => ({
         conversationId: row.conversationId,
         displayName: row.displayName || row.conversationId,
         avatarUrl: row.avatarUrl,
@@ -3317,7 +3362,7 @@ export class DrizzleControlRepository implements ControlRepository {
         memberCount: row.memberCount,
         messageCount: row.messageCount,
         lastMessageAt: row.sourceLastMessageAt,
-      }));
+      })), total: Number(totals[0]?.total ?? 0) };
     } catch (error) {
       throw repositoryError(error);
     }

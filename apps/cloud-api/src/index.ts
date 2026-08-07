@@ -683,20 +683,22 @@ export function createApp(options: CreateAppOptions): Hono {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
     const limit = parseCommunicationLimit(context.req.query("limit"));
+    const page = parsePage(context.req.query("page"));
     const source = parseCommunicationSource(context.req.query("source"));
-    if (limit === null || source === null) {
+    if (limit === null || page === null || source === null) {
       return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication limit.");
     }
     try {
-      const conversations = await options.repository.listOwnerCommunicationConversations(
+      const result = await options.repository.listOwnerCommunicationConversations(
         context.req.param("deviceId"),
         principal.workspaceId,
         principal.userId,
         source,
         limit,
+        (page - 1) * limit,
       );
       return context.json({
-        conversations: conversations.map((conversation) => ({
+        conversations: result.conversations.map((conversation) => ({
           conversation_id: conversation.conversationId,
           display_name: conversation.displayName,
           avatar_url: conversation.avatarUrl,
@@ -705,6 +707,12 @@ export function createApp(options: CreateAppOptions): Hono {
           message_count: conversation.messageCount,
           last_message_at: conversation.lastMessageAt.toISOString(),
         })),
+        pagination: {
+          page,
+          page_size: limit,
+          total_count: result.total,
+          total_pages: Math.ceil(result.total / limit),
+        },
       });
     } catch (error) {
       return repositoryErrorResponse(context, error);
@@ -909,15 +917,25 @@ export function createApp(options: CreateAppOptions): Hono {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
     const limit = parseScreenshotLimit(context.req.query("limit"));
-    if (limit === null) return errorResponse(context, 400, "REQUEST_INVALID", "Invalid screenshot limit.");
+    const page = parsePage(context.req.query("page"));
+    if (limit === null || page === null) return errorResponse(context, 400, "REQUEST_INVALID", "Invalid screenshot pagination.");
     try {
-      const screenshots = await options.repository.listOwnerScreenshots(
+      const result = await options.repository.listOwnerScreenshots(
         context.req.param("deviceId"),
         principal.workspaceId,
         principal.userId,
         limit,
+        (page - 1) * limit,
       );
-      return context.json({ screenshots: screenshots.map(screenshotResponse) });
+      return context.json({
+        screenshots: result.screenshots.map(screenshotResponse),
+        pagination: {
+          page,
+          page_size: limit,
+          total_count: result.total,
+          total_pages: Math.ceil(result.total / limit),
+        },
+      });
     } catch (error) {
       return repositoryErrorResponse(context, error);
     }
@@ -1000,6 +1018,12 @@ function parseScreenshotLimit(value: string | undefined): number | null {
   if (value === undefined) return 50;
   const limit = Number(value);
   return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
+}
+
+function parsePage(value: string | undefined): number | null {
+  if (value === undefined) return 1;
+  const page = Number(value);
+  return Number.isInteger(page) && page >= 1 && page <= 10_000 ? page : null;
 }
 
 function parseCommunicationMessageCursor(
