@@ -3043,12 +3043,11 @@ impl ControlClient for HttpControlClient {
                 .send()
                 .await
                 .map_err(|_| prepare_failure(ControlError::Transient))?;
-            if prepare_response.status() == StatusCode::NOT_FOUND {
-                return Err(MediaUploadFailure::superseded());
-            }
-            let prepared = parse_response::<PreparedCommunicationObject>(prepare_response)
-                .await
-                .map_err(prepare_failure)?;
+            let prepared = match parse_communication_prepare_response(prepare_response).await {
+                Ok(Some(prepared)) => prepared,
+                Ok(None) => return Err(MediaUploadFailure::superseded()),
+                Err(error) => return Err(prepare_failure(error)),
+            };
             if prepared.state == "completed" {
                 return Ok(());
             }
@@ -3400,8 +3399,15 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
         .bytes()
         .await
         .map_err(|_| ControlError::Transient)?;
+    parse_response_bytes(status, &bytes)
+}
+
+fn parse_response_bytes<T: for<'de> Deserialize<'de>>(
+    status: StatusCode,
+    bytes: &[u8],
+) -> Result<T, ControlError> {
     if status.is_success() {
-        return serde_json::from_slice(&bytes).map_err(|_| ControlError::Contract);
+        return serde_json::from_slice(bytes).map_err(|_| ControlError::Contract);
     }
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         return Err(ControlError::Transient);
@@ -3410,12 +3416,34 @@ async fn parse_response<T: for<'de> Deserialize<'de>>(
         status,
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE
     ) {
-        return match serde_json::from_slice::<ErrorResponse>(&bytes) {
+        return match serde_json::from_slice::<ErrorResponse>(bytes) {
             Ok(error) if error.error.error_code == "DEVICE_REVOKED" => Err(ControlError::Revoked),
             _ => Err(ControlError::InvalidCredential),
         };
     }
     Err(ControlError::Contract)
+}
+
+async fn parse_communication_prepare_response(
+    response: reqwest::Response,
+) -> Result<Option<PreparedCommunicationObject>, ControlError> {
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    if communication_attachment_is_missing(status, &bytes) {
+        return Ok(None);
+    }
+    parse_response_bytes(status, &bytes).map(Some)
+}
+
+fn communication_attachment_is_missing(status: StatusCode, bytes: &[u8]) -> bool {
+    status == StatusCode::NOT_FOUND
+        && matches!(
+            serde_json::from_slice::<ErrorResponse>(bytes),
+            Ok(error) if error.error.error_code == "COMMUNICATION_ATTACHMENT_NOT_FOUND"
+        )
 }
 
 fn classify_status(status: StatusCode) -> ControlError {
@@ -3439,14 +3467,15 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_communication_upload_headers, attachment_was_superseded, next_media_wait,
-        photo_marker_path, quarantine_manifest, remember_screenshot_request,
-        remove_uploaded_media_file, retry_delay, screenshot_prepare_payload,
-        sync_pending_communication_events, sync_pending_system_events, AgentControlSnapshot,
-        ControlClient, ControlError, ControlFuture, DeviceCredential, HttpControlClient,
-        MediaUploadFailure, MediaUploadFailureStage, PendingScreenshot, PhotoMarker,
-        ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT,
-        MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
+        apply_communication_upload_headers, attachment_was_superseded,
+        communication_attachment_is_missing, next_media_wait, photo_marker_path,
+        quarantine_manifest, remember_screenshot_request, remove_uploaded_media_file, retry_delay,
+        screenshot_prepare_payload, sync_pending_communication_events, sync_pending_system_events,
+        AgentControlSnapshot, ControlClient, ControlError, ControlFuture, DeviceCredential,
+        HttpControlClient, MediaUploadFailure, MediaUploadFailureStage, PendingScreenshot,
+        PhotoMarker, ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL,
+        CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT,
+        PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
     use pca_domain::{
@@ -3577,6 +3606,25 @@ mod tests {
             MediaUploadFailureStage::Complete,
             ControlError::Contract,
         )));
+    }
+
+    #[test]
+    fn only_the_dedicated_attachment_not_found_error_supersedes_media() {
+        let missing = br#"{"error":{"error_code":"COMMUNICATION_ATTACHMENT_NOT_FOUND","message":"missing","retryable":false}}"#;
+        let invalid_credential = br#"{"error":{"error_code":"CREDENTIAL_INVALID","message":"invalid","retryable":false}}"#;
+
+        assert!(communication_attachment_is_missing(
+            reqwest::StatusCode::NOT_FOUND,
+            missing,
+        ));
+        assert!(!communication_attachment_is_missing(
+            reqwest::StatusCode::NOT_FOUND,
+            invalid_credential,
+        ));
+        assert!(!communication_attachment_is_missing(
+            reqwest::StatusCode::UNAUTHORIZED,
+            missing,
+        ));
     }
 
     #[tokio::test]

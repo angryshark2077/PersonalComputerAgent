@@ -707,6 +707,52 @@ test("communication attachment manifests are projected without exposing object a
   });
 });
 
+test("a missing communication attachment has a dedicated prepare error", async () => {
+  const store = new FakeR2ObjectStore();
+  const { api, credentials } = await pairedApiWith(createApp({
+    repository: new MemoryControlRepository([
+      { workspaceId: owner.workspaceId, userId: owner.userId },
+    ]),
+    ownerAuthenticator: async () => owner,
+    objectStore: store,
+  }));
+  const sync = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777784",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationImage(credentials.device_id)],
+    }),
+  });
+  assert.equal(sync.status, 200);
+
+  const prepare = await api.request("/v1/agent/communication/objects/prepare", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      event_id: "01986666-7666-8666-8666-666666666668",
+      attachment_id: "attachment-that-does-not-exist",
+    }),
+  });
+
+  assert.equal(prepare.status, 404);
+  assert.deepEqual(await prepare.json(), {
+    error: {
+      error_code: "COMMUNICATION_ATTACHMENT_NOT_FOUND",
+      message: "The communication attachment no longer exists.",
+      retryable: false,
+    },
+  });
+});
+
 test("communication sync rejects an idempotency key that is not the opaque source key", async () => {
   const { api, credentials } = await pairedApi();
   const event = communicationText(credentials.device_id);

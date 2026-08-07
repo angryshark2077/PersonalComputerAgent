@@ -63,6 +63,9 @@ export async function requireDevice(
       ? await repository.authenticateDeviceAccess(tokenHash, new Date())
       : await repository.authenticateDeviceRefresh(tokenHash, new Date());
   } catch (error) {
+    if (error instanceof ControlRepositoryError && error.code === "DEVICE_NOT_FOUND") {
+      return errorResponse(context, 401, "CREDENTIAL_INVALID", "The device credential is invalid.");
+    }
     return repositoryErrorResponse(context, error);
   }
 }
@@ -72,10 +75,10 @@ export function repositoryErrorResponse(context: Context, error: unknown): Respo
     throw error;
   }
   const status =
-    error.code === "WORKSPACE_FORBIDDEN"
+    error.code === "COMMUNICATION_ATTACHMENT_NOT_FOUND" || error.code === "DEVICE_NOT_FOUND"
+      ? 404
+      : error.code === "WORKSPACE_FORBIDDEN"
       ? 403
-      : error.code === "DEVICE_NOT_FOUND"
-        ? 404
       : error.code === "PAIRING_EXPIRED"
         ? 410
         : error.code === "PAIRING_REPLAYED" || error.code === "CONFLICT"
@@ -88,6 +91,8 @@ export function repositoryErrorResponse(context: Context, error: unknown): Respo
 
 function messageFor(code: ControlRepositoryError["code"]): string {
   switch (code) {
+    case "COMMUNICATION_ATTACHMENT_NOT_FOUND":
+      return "The communication attachment no longer exists.";
     case "DEVICE_REVOKED":
       return "The device has been revoked.";
     case "PAIRING_EXPIRED":

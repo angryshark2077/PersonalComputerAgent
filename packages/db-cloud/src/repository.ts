@@ -32,6 +32,7 @@ import {
 } from "./schema.js";
 
 export type ControlRepositoryErrorCode =
+  | "COMMUNICATION_ATTACHMENT_NOT_FOUND"
   | "CONFLICT"
   | "CREDENTIAL_INVALID"
   | "DEVICE_NOT_FOUND"
@@ -1634,7 +1635,9 @@ export class MemoryControlRepository implements ControlRepository {
       && event.eventType === "communication.message_recorded"
       ? event.message.attachments.find((candidate) => candidate.attachmentId === input.attachmentId)
       : undefined;
-    if (attachment === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    if (attachment === undefined) {
+      throw new ControlRepositoryError("COMMUNICATION_ATTACHMENT_NOT_FOUND");
+    }
     const existing = [...this.#communicationObjects.values()].find((object) =>
       object.eventId === input.eventId && object.attachmentId === input.attachmentId,
     );
@@ -3500,7 +3503,9 @@ export class DrizzleControlRepository implements ControlRepository {
             ),
           )
           .limit(1);
-        if (attachment === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+        if (attachment === undefined) {
+          throw new ControlRepositoryError("COMMUNICATION_ATTACHMENT_NOT_FOUND");
+        }
 
         const [created] = await transaction
           .insert(communicationObjects)
