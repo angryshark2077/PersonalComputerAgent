@@ -2997,6 +2997,18 @@ export class DrizzleControlRepository implements ControlRepository {
           };
       const networkLocations = await this.listOwnerNetworkLocations(workspaceId, userId);
       const matchedLocation = matchNetworkLocation(network, networkLocations);
+      const networkHistory: DeviceStatus["networkHistory"] = [];
+      for (const row of networkHistoryRows) {
+        const historicalNetwork = networkFromHistoryRow(row);
+        if (networkIdentityMatches(networkHistory.at(-1)?.network ?? null, historicalNetwork)) {
+          continue;
+        }
+        networkHistory.push({
+          network: historicalNetwork,
+          matchedLocation: matchNetworkLocation(historicalNetwork, networkLocations),
+          observedAt: row.observedAt,
+        });
+      }
       return {
         deviceId: device.id,
         workspaceId: device.workspaceId,
@@ -3019,14 +3031,7 @@ export class DrizzleControlRepository implements ControlRepository {
                 },
                 network,
                 matchedLocation,
-                networkHistory: networkHistoryRows.map((row) => {
-                  const historicalNetwork = networkFromHistoryRow(row);
-                  return {
-                    network: historicalNetwork,
-                    matchedLocation: matchNetworkLocation(historicalNetwork, networkLocations),
-                    observedAt: row.observedAt,
-                  };
-                }),
+                networkHistory,
                 observedAt: heartbeat.observedAt,
               },
         snapshot: await this.loadControlSnapshot(deviceId, workspaceId),
@@ -3908,10 +3913,8 @@ function networkIdentityMatches(left: NetworkHeartbeat | null, right: NetworkHea
     && left.wifiIdentityAvailable === right.wifiIdentityAvailable
     && left.ssid === right.ssid
     && left.bssid === right.bssid
-    && left.observedExitIp === right.observedExitIp
-    && left.ipLocation?.country === right.ipLocation?.country
-    && left.ipLocation?.region === right.ipLocation?.region
-    && left.ipLocation?.city === right.ipLocation?.city
+    && left.localIpv4 === right.localIpv4
+    && left.localIpv6 === right.localIpv6
     && deviceLocationsMatch(left.location, right.location);
 }
 

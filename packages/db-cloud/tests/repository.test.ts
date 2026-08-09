@@ -307,6 +307,49 @@ test("network history records identity changes only and retains the latest five"
   assert.equal(device?.status?.networkHistory[4]?.network.ssid, "WiFi 2");
 });
 
+test("network history ignores rotating exit IPs but records local address changes", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  const record = (index: number, localIpv4: string, observedExitIp: string) => repository.recordHeartbeat({
+    heartbeatId: `01989999-7999-8999-8999-${String(index).padStart(12, "0")}`,
+    workspaceId,
+    deviceId,
+    receivedAt: new Date(now.getTime() + index * 1_000),
+    agentVersion: "0.3.0",
+    presence: "online" as const,
+    outboxDepth: 0,
+    localMedia: { completedFileCount: 0, completedBytes: 0, protectedFileCount: 0, protectedBytes: 0 },
+    cleanupResult: null,
+    network: {
+      interfaceType: "wifi" as const,
+      wifiIdentityAvailable: true,
+      ssid: "Stable WiFi",
+      bssid: "00:00:00:00:00:01",
+      localIpv4,
+      localIpv6: null,
+      observedExitIp,
+      ipLocation: {
+        country: observedExitIp.endsWith("1") ? "SG" : "US",
+        region: null,
+        city: null,
+        accuracy: "ip_city" as const,
+      },
+      location: null,
+    },
+  });
+
+  await record(0, "192.168.1.20", "203.0.113.1");
+  await record(1, "192.168.1.20", "203.0.113.2");
+  await record(2, "192.168.1.21", "203.0.113.2");
+
+  const [device] = await repository.listOwnerDevices(workspaceId, ownerUserId);
+  assert.equal(device?.status?.network?.observedExitIp, "203.0.113.2");
+  assert.equal(device?.status?.networkHistory.length, 2);
+  assert.equal(device?.status?.networkHistory[0]?.network.localIpv4, "192.168.1.21");
+  assert.equal(device?.status?.networkHistory[1]?.network.localIpv4, "192.168.1.20");
+});
+
 test("network history records a device location change beyond both accuracy radii", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);

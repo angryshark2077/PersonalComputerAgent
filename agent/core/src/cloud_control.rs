@@ -19,7 +19,7 @@ use pca_db_local::{
     CommunicationMediaStorageStats, DbActorHandle, DbError, PairingState,
     PendingCommunicationAttachment,
 };
-use pca_domain::{CommunicationScopeV2, EventEnvelope};
+use pca_domain::{CollectorState, CollectorStatus, CommunicationScopeV2, EventEnvelope};
 use pca_keychain::{
     delete_device_credential, load_device_credential, store_device_credential, CredentialError,
     CredentialStore, DeviceCredential,
@@ -1870,6 +1870,7 @@ async fn apply_control_snapshot(
     sync_pending_system_events(database, &credentials.credential, client).await?;
     sync_pending_communication_events(database, &credentials.credential, client).await?;
     if let Some(applied) = applied {
+        persist_network_collector_state(database, &applied).await?;
         client.set_network_enabled(applied.network_enabled);
         if applied.configuration_revision > current {
             database
@@ -1903,6 +1904,41 @@ async fn apply_control_snapshot(
         .publish(owner_epoch, Some(observed_control))
         .await;
     Ok(())
+}
+
+async fn persist_network_collector_state(
+    database: &DbActorHandle,
+    applied: &AppliedControl,
+) -> Result<(), ControlError> {
+    let now_ms = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| ControlError::Transient)?;
+    let prior = database
+        .load_collector_states()
+        .await
+        .map_err(|_| ControlError::Transient)?
+        .into_iter()
+        .find(|state| state.collector_key == "network");
+    database
+        .upsert_collector_state(&CollectorState {
+            collector_key: "network".to_owned(),
+            collector_version: option_env!("PCA_APP_VERSION")
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .to_owned(),
+            status: if applied.network_enabled {
+                CollectorStatus::Running
+            } else {
+                CollectorStatus::Disabled
+            },
+            desired_config_revision: applied.configuration_revision,
+            applied_config_revision: applied.configuration_revision,
+            last_event_at_ms: prior.as_ref().and_then(|state| state.last_event_at_ms),
+            last_health_at_ms: Some(now_ms),
+            last_error_code: None,
+            created_at_ms: prior.map_or(now_ms, |state| state.created_at_ms),
+            updated_at_ms: now_ms,
+        })
+        .await
+        .map_err(|_| ControlError::Transient)
 }
 
 async fn handle_local_media_cleanup(

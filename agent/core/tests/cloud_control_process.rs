@@ -694,9 +694,26 @@ async fn persisted_enabled_revision_is_restored_even_when_published_before_subsc
         .await
         .unwrap();
     database.save_control_revision(7).await.unwrap();
+    database
+        .upsert_collector_state(&CollectorState {
+            collector_key: "network".to_owned(),
+            collector_version: "old".to_owned(),
+            status: CollectorStatus::Disabled,
+            desired_config_revision: 0,
+            applied_config_revision: 0,
+            last_event_at_ms: None,
+            last_health_at_ms: None,
+            last_error_code: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    let mut snapshot = exact_snapshot(7, true);
+    snapshot.collectors.network.enabled = true;
     let client = Arc::new(SequenceClient {
         calls: AtomicUsize::new(0),
-        snapshots: Mutex::new(VecDeque::from([Ok(exact_snapshot(7, true))])),
+        snapshots: Mutex::new(VecDeque::from([Ok(snapshot)])),
     });
     let runtime = CloudControlRuntime::start(
         Arc::clone(&database),
@@ -724,6 +741,16 @@ async fn persisted_enabled_revision_is_restored_even_when_published_before_subsc
         .expect("equal persisted revision is published for restart hydration");
     assert_eq!(restored.configuration_revision, 7);
     assert!(restored.communication_wechat_enabled);
+    let network = database
+        .load_collector_states()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|state| state.collector_key == "network")
+        .expect("network state is persisted");
+    assert_eq!(network.status, CollectorStatus::Running);
+    assert_eq!(network.desired_config_revision, 7);
+    assert_eq!(network.applied_config_revision, 7);
 
     runtime.shutdown().await.unwrap();
     match Arc::try_unwrap(database) {
