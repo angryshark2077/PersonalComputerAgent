@@ -1067,7 +1067,10 @@ test("Photo originals remain private, become readable only after completion, and
   });
   assert.equal(prepared.status, 200);
   assert.equal((await prepared.json() as { state: string }).state, "prepared");
-  assert.deepEqual(await (await api.request(`/v1/devices/${credentials.device_id}/photos`)).json(), { photos: [] });
+  assert.deepEqual(await (await api.request(`/v1/devices/${credentials.device_id}/photos`)).json(), {
+    photos: [],
+    pagination: { page: 1, page_size: 50, total_count: 0, total_pages: 0 },
+  });
 
   store.uploaded = true;
   assert.equal((await api.request("/v1/agent/photos/complete", {
@@ -1075,8 +1078,12 @@ test("Photo originals remain private, become readable only after completion, and
     headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
     body: JSON.stringify({ photo_id: photoId }),
   })).status, 200);
-  const listed = await (await api.request(`/v1/devices/${credentials.device_id}/photos`)).json() as { photos: Array<{ photo_id: string; original_filename: string }> };
+  const listed = await (await api.request(`/v1/devices/${credentials.device_id}/photos`)).json() as {
+    photos: Array<{ photo_id: string; original_filename: string }>;
+    pagination: { page: number; page_size: number; total_count: number; total_pages: number };
+  };
   assert.deepEqual(listed.photos.map((photo) => [photo.photo_id, photo.original_filename]), [[photoId, "IMG_0001.HEIC"]]);
+  assert.deepEqual(listed.pagination, { page: 1, page_size: 50, total_count: 1, total_pages: 1 });
   assert.deepEqual(
     await (await api.request(`/v1/devices/${credentials.device_id}/photos/${photoId}/read`)).json(),
     { url: "https://private-media.example/read", expires_at: "2026-08-02T00:06:00.000Z" },

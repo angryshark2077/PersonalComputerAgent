@@ -171,7 +171,14 @@ final class InstallCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(result, .success(version: "2.0.0"))
         XCTAssertTrue(states.contains(.migratingKeychainAccess))
-        XCTAssertEqual(fixture.credentialProvisioner.migrationCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.migrationCount, 2)
+        XCTAssertTrue(fixture.credentialProvisioner.bridgeMigrationURLs[0].contains(fixture.paths.rollbackBundleURL))
+        XCTAssertFalse(fixture.credentialProvisioner.bridgeMigrationURLs[1].contains(fixture.paths.rollbackBundleURL))
+        XCTAssertEqual(fixture.credentialProvisioner.bridgeMigrationURLs[1], [
+            fixture.paths.installedBundleURL,
+            fixture.paths.installedAgentExecutableURL,
+            fixture.paths.installedBridgeExecutableURL,
+        ])
         XCTAssertEqual(fixture.service.registerCount, 1)
     }
 
@@ -194,6 +201,27 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.credentialProvisioner.migrationCount, 1)
         XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
+    }
+
+    func testCommittedSigningIdentityCleanupRetriesWithoutRollingBackHealthyVersion() async throws {
+        let fixture = try Fixture(
+            installedVersion: "1.0.0",
+            candidateVersion: "2.0.0",
+            signingIdentityChanged: true
+        )
+        _ = try await fixture.coordinator.prepareInstallation(from: fixture.candidate)
+        fixture.credentialProvisioner.migrationFailures[2] = .credentialProvisioningFailed
+
+        await XCTAssertThrowsErrorAsync(try await fixture.coordinator.finishInstalledSetup()) { error in
+            XCTAssertEqual(error as? InstallError, .committedCleanupFailed)
+        }
+
+        XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "2.0.0")
+        XCTAssertTrue(fixture.fileSystem.exists(fixture.paths.rollbackBundleURL))
+        let retry = try await fixture.coordinator.finishInstalledSetup()
+        XCTAssertEqual(retry, .success(version: "2.0.0"))
+        XCTAssertEqual(fixture.credentialProvisioner.migrationCount, 3)
+        XCTAssertFalse(fixture.fileSystem.exists(fixture.paths.rollbackBundleURL))
     }
 
     func testRepeatInstallOfSameVersionUsesReplacementFlow() async throws {
@@ -733,6 +761,9 @@ private final class FakePhotosAccessController: PhotosAccessControlling {
 @MainActor
 private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisioning {
     var migrationCount = 0
+    var bridgeMigrationURLs: [[URL]] = []
+    var deviceMigrationURLs: [[URL]] = []
+    var wechatMigrationURLs: [[URL]] = []
     var provisionCount = 0
     var trustedApplicationURLs: [[URL]] = []
     var deviceCredentialProvisionCount = 0
@@ -740,13 +771,20 @@ private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisionin
     var wechatCredentialProvisionCount = 0
     var wechatCredentialTrustedApplicationURLs: [[URL]] = []
     var error: InstallError?
+    var migrationFailures: [Int: InstallError] = [:]
 
     func migrateExistingCredentials(
-        bridgeTrustedApplicationURLs _: [URL],
-        deviceTrustedApplicationURLs _: [URL],
-        wechatTrustedApplicationURLs _: [URL]
+        bridgeTrustedApplicationURLs: [URL],
+        deviceTrustedApplicationURLs: [URL],
+        wechatTrustedApplicationURLs: [URL]
     ) throws {
         migrationCount += 1
+        bridgeMigrationURLs.append(bridgeTrustedApplicationURLs)
+        deviceMigrationURLs.append(deviceTrustedApplicationURLs)
+        wechatMigrationURLs.append(wechatTrustedApplicationURLs)
+        if let migrationError = migrationFailures[migrationCount] {
+            throw migrationError
+        }
         if let error {
             self.error = nil
             throw error
@@ -1716,6 +1754,33 @@ final class BundleValidatorSigningTests: XCTestCase {
         XCTAssertTrue(result.signingIdentityChanged)
     }
 
+    func testDifferentNestedSigningRequirementRequestsKeychainAccessMigration() throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let installed = temporary.appendingPathComponent("PersonalComputerAgent.app", isDirectory: true)
+        let candidate = temporary.appendingPathComponent(".staging-candidate", isDirectory: true)
+        try makeValidBundle(at: installed)
+        try makeValidBundle(at: candidate)
+        let productionTeam = BundleValidator.productionTeamIdentifier
+        let installedAgent = installed.appendingPathComponent("Contents/Resources/bin/pca-agentd")
+        let candidateAgent = candidate.appendingPathComponent("Contents/Resources/bin/pca-agentd")
+        let validator = BundleValidator(
+            signatureChecker: FakeSignatureChecker(
+                teams: [:],
+                requirements: [
+                    installedAgent.path: "identifier pca-agentd and certificate old",
+                    candidateAgent.path: "identifier pca-agentd and certificate new",
+                ],
+                defaultTeam: productionTeam
+            ),
+            architectureChecker: FakeArchitectureChecker()
+        )
+
+        let result = try validator.validate(candidate: candidate, replacing: installed)
+
+        XCTAssertTrue(result.signingIdentityChanged)
+    }
+
     private func makeValidBundle(at bundle: URL) throws {
         let executable = bundle.appendingPathComponent("Contents/MacOS/PersonalComputerAgent")
         let agent = bundle.appendingPathComponent("Contents/Resources/bin/pca-agentd")
@@ -1844,12 +1909,18 @@ final class WechatAppDataAccessControllerTests: XCTestCase {
 private struct FakeSignatureChecker: SignatureChecking {
     let teams: [String: String]
     var requirements: [String: String] = [:]
+    var defaultTeam = "TEAM123456"
 
     func verifyAndReadIdentity(of target: URL) throws -> CodeSigningIdentity {
-        let team = teams[target.lastPathComponent] ?? "TEAM123456"
+        let team = teams[target.path] ?? teams[target.lastPathComponent] ?? defaultTeam
+        let defaultIdentifier = target.pathExtension == "app" || target.lastPathComponent.hasPrefix(".staging-")
+            ? "PersonalComputerAgent"
+            : target.lastPathComponent
         return CodeSigningIdentity(
             teamIdentifier: team,
-            designatedRequirement: requirements[target.lastPathComponent] ?? "requirement:\(team)"
+            designatedRequirement: requirements[target.path]
+                ?? requirements[target.lastPathComponent]
+                ?? "requirement:\(team):\(defaultIdentifier)"
         )
     }
 }

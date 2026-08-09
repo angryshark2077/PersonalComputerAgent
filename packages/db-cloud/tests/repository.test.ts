@@ -348,6 +348,56 @@ test("network history records a device location change beyond both accuracy radi
   assert.equal(device?.status?.networkHistory[0]?.network.location?.latitude, 1.3531);
 });
 
+test("photo library pages expose every completed asset", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  for (let index = 1; index <= 3; index += 1) {
+    const eventId = `01988888-8888-8888-8888-${String(index).padStart(12, "0")}`;
+    const photoId = `01989999-9999-8999-8999-${String(index).padStart(12, "0")}`;
+    const capturedAt = new Date(now.getTime() + index * 1_000);
+    await repository.appendSystemEvents(workspaceId, deviceId, [{
+      eventId,
+      workspaceId,
+      deviceId,
+      eventType: "photos.asset_recorded",
+      source: "photos.library",
+      schemaVersion: 1,
+      occurredAt: capturedAt,
+      createdAt: capturedAt,
+      sensitivity: "high",
+      payload: {},
+      idempotencyKey: `photos:asset:${index}`,
+    }]);
+    await repository.preparePhotoLibraryAsset(workspaceId, deviceId, {
+      photoId,
+      eventId,
+      assetId: `asset-${index}`,
+      capturedAt,
+      mediaType: "image",
+      originalFilename: `IMG_${index}.HEIC`,
+      expectedMimeType: "image/heic",
+      pixelWidth: 100,
+      pixelHeight: 100,
+      durationSeconds: 0,
+      albumNames: [],
+      objectKey: `photos/${photoId}`,
+      expectedSha256: hash(String(index)),
+      expectedSizeBytes: 100,
+      now: capturedAt,
+    });
+    await repository.completePhotoLibraryAsset(workspaceId, deviceId, photoId, capturedAt);
+  }
+
+  const first = await repository.listOwnerPhotoLibraryAssets(deviceId, workspaceId, ownerUserId, 2, 0);
+  const second = await repository.listOwnerPhotoLibraryAssets(deviceId, workspaceId, ownerUserId, 2, 2);
+
+  assert.equal(first.total, 3);
+  assert.deepEqual(first.photos.map((photo) => photo.assetId), ["asset-3", "asset-2"]);
+  assert.equal(second.total, 3);
+  assert.deepEqual(second.photos.map((photo) => photo.assetId), ["asset-1"]);
+});
+
 test("screenshot retention selects and deletes only expired completed captures", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);

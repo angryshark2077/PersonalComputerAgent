@@ -152,21 +152,38 @@ struct BundleValidator: BundleValidating {
         guard let expectedTeamIdentifier, !expectedTeamIdentifier.isEmpty else {
             throw InstallError.invalidBundle
         }
-        let candidateSigningIdentity = try signatureChecker.verifyAndReadIdentity(of: candidate)
-        guard candidateSigningIdentity.teamIdentifier == expectedTeamIdentifier else { throw InstallError.invalidBundle }
-        for signedTarget in [candidate, agent, bridge, wechatRepair, ffmpeg] {
-            guard try signatureChecker.verifyAndReadIdentity(of: signedTarget).teamIdentifier == expectedTeamIdentifier else {
-                throw InstallError.invalidBundle
+        let candidateSignedTargets = [candidate, agent, bridge, wechatRepair, ffmpeg]
+        let candidateSigningIdentities = try candidateSignedTargets.map { target in
+            try signatureChecker.verifyAndReadIdentity(of: target)
+        }
+        guard candidateSigningIdentities.allSatisfy({ $0.teamIdentifier == expectedTeamIdentifier }) else {
+            throw InstallError.invalidBundle
+        }
+        let previousSigningIdentities = try installed.map { installed in
+            let installedSignedTargets = [
+                installed,
+                installed.appendingPathComponent("Contents/Resources/bin/pca-agentd"),
+                installed.appendingPathComponent(
+                    "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
+                ),
+                installed.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair"),
+                installed.appendingPathComponent("Contents/Resources/bin/ffmpeg"),
+            ]
+            return try installedSignedTargets.map { target in
+                try signatureChecker.verifyAndReadIdentity(of: target)
             }
         }
-        let previousSigningIdentity = try installed.map {
-            try signatureChecker.verifyAndReadIdentity(of: $0)
+        if let previousSigningIdentities,
+           previousSigningIdentities.count != candidateSigningIdentities.count {
+                throw InstallError.invalidBundle
         }
         return ValidatedBundle(
             version: candidateVersion,
             previousVersion: previousVersion,
-            signingIdentityChanged: previousSigningIdentity.map {
-                $0.designatedRequirement != candidateSigningIdentity.designatedRequirement
+            signingIdentityChanged: previousSigningIdentities.map { previousIdentities in
+                zip(previousIdentities, candidateSigningIdentities).contains { previous, candidate in
+                    previous.designatedRequirement != candidate.designatedRequirement
+                }
             } ?? false
         )
     }

@@ -974,7 +974,7 @@ final class InstallCoordinator: InstallCoordinating {
         if let existing = transaction {
             switch existing.phase {
             case .committed:
-                try cleanupCommitted(existing, layoutIdentity: layoutIdentity)
+                try finalizeCommitted(existing, layoutIdentity: layoutIdentity)
                 return .success(version: existing.candidateVersion)
             case .rolledBack:
                 try cleanupRolledBack(existing, layoutIdentity: layoutIdentity)
@@ -1020,37 +1020,7 @@ final class InstallCoordinator: InstallCoordinating {
         do {
             if transaction?.signingIdentityChanged == true {
                 onState(.migratingKeychainAccess)
-                let rollbackAgent = paths.rollbackBundleURL.appendingPathComponent("Contents/Resources/bin/pca-agentd")
-                let rollbackBridge = paths.rollbackBundleURL.appendingPathComponent(
-                    "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
-                )
-                let rollbackRepair = paths.rollbackBundleURL.appendingPathComponent(
-                    "Contents/Resources/bin/pca-wechat-repair"
-                )
-                try credentialProvisioner.migrateExistingCredentials(
-                    bridgeTrustedApplicationURLs: [
-                        paths.installedBundleURL,
-                        paths.installedAgentExecutableURL,
-                        paths.installedBridgeExecutableURL,
-                        paths.rollbackBundleURL,
-                        rollbackAgent,
-                        rollbackBridge,
-                    ],
-                    deviceTrustedApplicationURLs: [
-                        paths.installedBundleURL,
-                        paths.installedAgentExecutableURL,
-                        paths.installedBridgeExecutableURL,
-                        paths.rollbackBundleURL,
-                        rollbackAgent,
-                        rollbackBridge,
-                    ],
-                    wechatTrustedApplicationURLs: [
-                        paths.installedAgentExecutableURL,
-                        paths.installedWechatRepairExecutableURL,
-                        rollbackAgent,
-                        rollbackRepair,
-                    ]
-                )
+                try migrateExistingCredentials(includeRollbackApplications: true)
             }
             let trustedApplicationURLs = [
                 paths.installedBundleURL,
@@ -1118,7 +1088,7 @@ final class InstallCoordinator: InstallCoordinating {
                 let recovery = await recoverFailure(existing, layoutIdentity: layoutIdentity)
                 throw InstallError.transactionFailed(primary: .health, recovery: recovery)
             }
-            try cleanupCommitted(committed, layoutIdentity: layoutIdentity)
+            try finalizeCommitted(committed, layoutIdentity: layoutIdentity)
         }
         onState(.success)
         return .success(version: installedVersion)
@@ -1318,6 +1288,49 @@ final class InstallCoordinator: InstallCoordinating {
         } catch {
             throw InstallError.committedCleanupFailed
         }
+    }
+
+    private func finalizeCommitted(
+        _ transaction: InstallTransaction,
+        layoutIdentity: InstallLayoutIdentity
+    ) throws {
+        if transaction.signingIdentityChanged == true {
+            do { try migrateExistingCredentials(includeRollbackApplications: false) }
+            catch { throw InstallError.committedCleanupFailed }
+        }
+        try cleanupCommitted(transaction, layoutIdentity: layoutIdentity)
+    }
+
+    private func migrateExistingCredentials(includeRollbackApplications: Bool) throws {
+        var bridgeApplications = [
+            paths.installedBundleURL,
+            paths.installedAgentExecutableURL,
+            paths.installedBridgeExecutableURL,
+        ]
+        var wechatApplications = [
+            paths.installedAgentExecutableURL,
+            paths.installedWechatRepairExecutableURL,
+        ]
+        if includeRollbackApplications {
+            let rollbackAgent = paths.rollbackBundleURL.appendingPathComponent("Contents/Resources/bin/pca-agentd")
+            let rollbackBridge = paths.rollbackBundleURL.appendingPathComponent(
+                "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
+            )
+            bridgeApplications.append(contentsOf: [
+                paths.rollbackBundleURL,
+                rollbackAgent,
+                rollbackBridge,
+            ])
+            wechatApplications.append(contentsOf: [
+                rollbackAgent,
+                paths.rollbackBundleURL.appendingPathComponent("Contents/Resources/bin/pca-wechat-repair"),
+            ])
+        }
+        try credentialProvisioner.migrateExistingCredentials(
+            bridgeTrustedApplicationURLs: bridgeApplications,
+            deviceTrustedApplicationURLs: bridgeApplications,
+            wechatTrustedApplicationURLs: wechatApplications
+        )
     }
 
     private func cleanupRolledBack(

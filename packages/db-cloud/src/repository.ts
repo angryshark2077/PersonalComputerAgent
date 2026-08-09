@@ -242,6 +242,11 @@ export interface ScreenshotPage {
   total: number;
 }
 
+export interface PhotoLibraryAssetPage {
+  photos: PhotoLibraryAssetRecord[];
+  total: number;
+}
+
 export interface CommunicationConversationPage {
   conversations: CommunicationConversationRecord[];
   total: number;
@@ -603,7 +608,13 @@ export interface ControlRepository {
   preparePhotoLibraryAsset(workspaceId: string, deviceId: string, input: PreparePhotoLibraryAssetInput): Promise<PhotoLibraryAssetRecord>;
   loadDevicePhotoLibraryAsset(workspaceId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord>;
   completePhotoLibraryAsset(workspaceId: string, deviceId: string, photoId: string, completedAt: Date): Promise<PhotoLibraryAssetRecord>;
-  listOwnerPhotoLibraryAssets(deviceId: string, workspaceId: string, userId: string, limit: number): Promise<PhotoLibraryAssetRecord[]>;
+  listOwnerPhotoLibraryAssets(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+    offset: number,
+  ): Promise<PhotoLibraryAssetPage>;
   loadOwnerCompletedPhotoLibraryAsset(workspaceId: string, userId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord>;
   listOwnerNetworkLocations(workspaceId: string, userId: string): Promise<NetworkLocationRecord[]>;
   createOwnerNetworkLocation(input: NetworkLocationInput): Promise<NetworkLocationRecord>;
@@ -1234,13 +1245,22 @@ export class MemoryControlRepository implements ControlRepository {
     return clonePhotoLibraryAsset(record);
   }
 
-  async listOwnerPhotoLibraryAssets(deviceId: string, workspaceId: string, userId: string, limit: number): Promise<PhotoLibraryAssetRecord[]> {
+  async listOwnerPhotoLibraryAssets(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+    offset: number,
+  ): Promise<PhotoLibraryAssetPage> {
     this.#requireOwnerMembership(workspaceId, userId);
     this.#requireDevice(deviceId, workspaceId, true);
-    return [...this.#photoLibraryAssets.values()]
+    const photos = [...this.#photoLibraryAssets.values()]
       .filter((record) => record.workspaceId === workspaceId && record.deviceId === deviceId && record.state === "completed")
-      .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime())
-      .slice(0, limit).map(clonePhotoLibraryAsset);
+      .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime());
+    return {
+      photos: photos.slice(offset, offset + limit).map(clonePhotoLibraryAsset),
+      total: photos.length,
+    };
   }
 
   async loadOwnerCompletedPhotoLibraryAsset(workspaceId: string, userId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord> {
@@ -2165,12 +2185,28 @@ export class DrizzleControlRepository implements ControlRepository {
     } catch (error) { throw repositoryError(error); }
   }
 
-  async listOwnerPhotoLibraryAssets(deviceId: string, workspaceId: string, userId: string, limit: number): Promise<PhotoLibraryAssetRecord[]> {
+  async listOwnerPhotoLibraryAssets(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+    offset: number,
+  ): Promise<PhotoLibraryAssetPage> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
       await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
-      const rows = await this.database.select().from(photoLibraryAssets).where(and(eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId), eq(photoLibraryAssets.state, "completed"))).orderBy(desc(photoLibraryAssets.capturedAt)).limit(limit);
-      return rows.map(photoLibraryAssetFromRow);
+      const where = and(
+        eq(photoLibraryAssets.workspaceId, workspaceId),
+        eq(photoLibraryAssets.deviceId, deviceId),
+        eq(photoLibraryAssets.state, "completed"),
+      );
+      const [rows, totals] = await Promise.all([
+        this.database.select().from(photoLibraryAssets).where(where)
+          .orderBy(desc(photoLibraryAssets.capturedAt), desc(photoLibraryAssets.id))
+          .limit(limit).offset(offset),
+        this.database.select({ total: count() }).from(photoLibraryAssets).where(where),
+      ]);
+      return { photos: rows.map(photoLibraryAssetFromRow), total: totals[0]?.total ?? 0 };
     } catch (error) { throw repositoryError(error); }
   }
 

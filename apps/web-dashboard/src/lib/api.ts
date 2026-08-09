@@ -64,8 +64,14 @@ export interface DashboardPhoto {
 
 export const PHOTO_PAGE_SIZE = 20;
 
-export function nextPhotoPage<T>(records: readonly T[], loaded: number): T[] {
-  return records.slice(loaded, loaded + PHOTO_PAGE_SIZE);
+export interface DashboardPhotoPage {
+  photos: DashboardPhoto[];
+  pagination: {
+    page: number;
+    page_size: number;
+    total_count: number;
+    total_pages: number;
+  };
 }
 
 export const SCREENSHOT_PAGE_SIZE = 20;
@@ -534,13 +540,13 @@ export async function getPhotos(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,
   deviceId: string,
-  limit = 100,
-): Promise<DashboardPhoto[]> {
-  const result = await jsonRequest<{ photos: DashboardPhoto[] }>(
+  limit = PHOTO_PAGE_SIZE,
+  page = 1,
+): Promise<DashboardPhotoPage> {
+  return jsonRequest<DashboardPhotoPage>(
     fetcher,
-    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/photos?limit=${limit}`),
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/photos?limit=${limit}&page=${page}`),
   );
-  return result.photos;
 }
 
 export async function getPhotoReadUrl(

@@ -970,10 +970,25 @@ export function createApp(options: CreateAppOptions): Hono {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
     const limit = parseScreenshotLimit(context.req.query("limit"));
-    if (limit === null) return errorResponse(context, 400, "REQUEST_INVALID", "Invalid photo limit.");
+    const page = parsePage(context.req.query("page"));
+    if (limit === null || page === null) return errorResponse(context, 400, "REQUEST_INVALID", "Invalid photo pagination.");
     try {
-      const photos = await options.repository.listOwnerPhotoLibraryAssets(context.req.param("deviceId"), principal.workspaceId, principal.userId, limit);
-      return context.json({ photos: photos.map(photoResponse) });
+      const result = await options.repository.listOwnerPhotoLibraryAssets(
+        context.req.param("deviceId"),
+        principal.workspaceId,
+        principal.userId,
+        limit,
+        (page - 1) * limit,
+      );
+      return context.json({
+        photos: result.photos.map(photoResponse),
+        pagination: {
+          page,
+          page_size: limit,
+          total_count: result.total,
+          total_pages: Math.ceil(result.total / limit),
+        },
+      });
     } catch (error) { return repositoryErrorResponse(context, error); }
   });
 
