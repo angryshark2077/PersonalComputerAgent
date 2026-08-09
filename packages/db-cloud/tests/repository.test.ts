@@ -203,19 +203,39 @@ test("credential rotation revokes the prior refresh hash", async () => {
     newRefreshTokenHash: hash("b"),
     accessExpiresAt: later,
     refreshExpiresAt: new Date("2026-09-30T12:00:00.000Z"),
+    replayPayload: "sealed-rotation-result",
+    replayExpiresAt: new Date(now.getTime() + 5 * 60 * 1000),
     now,
   };
 
   const grant = await repository.rotateDeviceCredentials(rotation);
   assert.equal(grant.credentialGeneration, 2);
+  assert.equal(grant.replayPayload, rotation.replayPayload);
+  assert.deepEqual(await repository.authenticateDeviceRefresh(hash("6"), now), {
+    workspaceId,
+    deviceId: rotation.deviceId,
+  });
+  assert.deepEqual(await repository.rotateDeviceCredentials(rotation), grant);
   await assert.rejects(
     repository.rotateDeviceCredentials({
       ...rotation,
-      newAccessTokenHash: hash("c"),
-      newRefreshTokenHash: hash("d"),
+      now: rotation.replayExpiresAt,
     }),
     (error) =>
       error instanceof ControlRepositoryError && error.code === "CREDENTIAL_INVALID",
+  );
+  assert.deepEqual(
+    await repository.rotateDeviceCredentials({
+      ...rotation,
+      newAccessTokenHash: hash("c"),
+      newRefreshTokenHash: hash("d"),
+      replayPayload: "different-sealed-result",
+    }),
+    grant,
+  );
+  await assert.rejects(
+    repository.authenticateDeviceRefresh(hash("6"), rotation.replayExpiresAt),
+    (error) => error instanceof ControlRepositoryError && error.code === "CREDENTIAL_INVALID",
   );
 });
 
@@ -618,6 +638,8 @@ test("device and credential hashes are globally unique", async () => {
     currentRefreshTokenHash: hash("6"),
     accessExpiresAt: later,
     refreshExpiresAt: later,
+    replayPayload: "sealed-rotation-result",
+    replayExpiresAt: new Date(now.getTime() + 5 * 60 * 1000),
     now,
   };
   await assert.rejects(

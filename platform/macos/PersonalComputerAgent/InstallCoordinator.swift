@@ -1134,6 +1134,9 @@ final class InstallCoordinator: InstallCoordinating {
             if let previousVersion = transaction.previousVersion {
                 try await service.stopAndUnregister()
                 try restorePreviousBundle(previousVersion, layoutIdentity: layoutIdentity)
+                if transaction.signingIdentityChanged == true {
+                    try migrateExistingCredentials(includeRollbackApplications: false)
+                }
                 if transaction.rollbackPhase == nil {
                     transaction = transaction.advancingRollback(to: .oldBundleRestored)
                     try fileSystem.writeTransaction(

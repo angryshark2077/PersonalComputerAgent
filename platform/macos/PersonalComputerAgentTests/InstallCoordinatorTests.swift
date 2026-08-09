@@ -198,7 +198,13 @@ final class InstallCoordinatorTests: XCTestCase {
             }
         }
 
-        XCTAssertEqual(fixture.credentialProvisioner.migrationCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.migrationCount, 2)
+        XCTAssertTrue(fixture.credentialProvisioner.bridgeMigrationURLs[0].contains(fixture.paths.rollbackBundleURL))
+        XCTAssertEqual(fixture.credentialProvisioner.bridgeMigrationURLs[1], [
+            fixture.paths.installedBundleURL,
+            fixture.paths.installedAgentExecutableURL,
+            fixture.paths.installedBridgeExecutableURL,
+        ])
         XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
     }

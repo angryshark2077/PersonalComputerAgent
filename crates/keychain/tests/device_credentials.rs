@@ -83,3 +83,18 @@ fn device_credential_errors_do_not_include_secret_material() {
     assert!(!error.to_string().contains("access-secret"));
     assert!(!format!("{error:?}").contains("access-secret"));
 }
+
+#[test]
+fn device_credential_debug_redacts_both_bearer_tokens() {
+    let credential = DeviceCredential::new(
+        device_id(),
+        workspace_id(),
+        "access-must-not-appear",
+        "refresh-must-not-appear",
+    )
+    .expect("valid device credential");
+    let debug = format!("{credential:?}");
+    assert!(!debug.contains("access-must-not-appear"));
+    assert!(!debug.contains("refresh-must-not-appear"));
+    assert!(debug.contains("redacted"));
+}

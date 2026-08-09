@@ -482,7 +482,7 @@ pub fn load_wechat_key_material(
 /// The value is intentionally opaque to `SQLite`, Events, and logs. Task 6 must add the Agent
 /// local-IPC Keychain adapter that creates this item with an ACL for the installed Setup app and
 /// `agentd`; this crate deliberately supplies only the versioned codec and fixed identity.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceCredential {
     version: u8,
@@ -493,6 +493,22 @@ pub struct DeviceCredential {
     refresh_expires_at_ms: i64,
     access_credential: String,
     refresh_credential: String,
+}
+
+impl std::fmt::Debug for DeviceCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCredential")
+            .field("version", &self.version)
+            .field("device_id", &self.device_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("credential_generation", &self.credential_generation)
+            .field("access_expires_at_ms", &self.access_expires_at_ms)
+            .field("refresh_expires_at_ms", &self.refresh_expires_at_ms)
+            .field("access_credential", &"[redacted]")
+            .field("refresh_credential", &"[redacted]")
+            .finish()
+    }
 }
 
 impl DeviceCredential {

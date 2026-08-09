@@ -93,6 +93,8 @@ export interface CredentialRotationInput {
   newRefreshTokenHash: string;
   accessExpiresAt: Date;
   refreshExpiresAt: Date;
+  replayPayload: string;
+  replayExpiresAt: Date;
   now: Date;
 }
 
@@ -102,6 +104,10 @@ export interface DeviceCredentialGrant {
   credentialGeneration: number;
   accessExpiresAt: Date;
   refreshExpiresAt: Date;
+}
+
+export interface DeviceCredentialRotationGrant extends DeviceCredentialGrant {
+  replayPayload: string;
 }
 
 export interface HeartbeatInput {
@@ -553,7 +559,7 @@ export interface ControlRepository {
   createPairingSession(input: PairingSessionInput): Promise<PairingSession>;
   authorizePairingSession(input: AuthorizePairingSessionInput): Promise<string>;
   consumeAuthorizationCode(input: CodeExchangeInput): Promise<DeviceCredentialGrant>;
-  rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialGrant>;
+  rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialRotationGrant>;
   authenticateDeviceAccess(
     accessTokenHash: string,
     now: Date,
@@ -719,7 +725,10 @@ interface DeviceRecord {
 interface CredentialRecord extends DeviceCredentialGrant {
   accessTokenHash: string;
   refreshTokenHash: string;
+  createdAt: Date;
   revokedAt: Date | null;
+  rotationReplayPayload: string | null;
+  rotationReplayExpiresAt: Date | null;
 }
 
 interface ConfigRecord extends StoredCollectorConfig {
@@ -844,7 +853,10 @@ export class MemoryControlRepository implements ControlRepository {
         ...grant,
         accessTokenHash: input.accessTokenHash,
         refreshTokenHash: input.refreshTokenHash,
+        createdAt: input.now,
         revokedAt: null,
+        rotationReplayPayload: null,
+        rotationReplayExpiresAt: null,
       },
     ]);
     this.#configs.set(configKey(code.workspaceId, input.deviceId), {
@@ -854,7 +866,7 @@ export class MemoryControlRepository implements ControlRepository {
     return grant;
   }
 
-  async rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialGrant> {
+  async rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialRotationGrant> {
     const device = this.#requireDevice(input.deviceId, input.workspaceId, false);
     if (device.revokedAt !== null) {
       throw new ControlRepositoryError("DEVICE_REVOKED");
@@ -863,11 +875,33 @@ export class MemoryControlRepository implements ControlRepository {
     const current = records.find(
       (record) =>
         record.refreshTokenHash === input.currentRefreshTokenHash &&
-        record.revokedAt === null &&
         record.refreshExpiresAt > input.now,
     );
     if (current === undefined) {
       throw new ControlRepositoryError("CREDENTIAL_INVALID");
+    }
+    if (current.revokedAt !== null) {
+      const replay = records.find(
+        (record) =>
+          record.credentialGeneration === current.credentialGeneration + 1 &&
+          record.revokedAt === null,
+      );
+      if (
+        replay === undefined ||
+        current.rotationReplayPayload === null ||
+        current.rotationReplayExpiresAt === null ||
+        current.rotationReplayExpiresAt <= input.now
+      ) {
+        throw new ControlRepositoryError("CREDENTIAL_INVALID");
+      }
+      return {
+        workspaceId: replay.workspaceId,
+        deviceId: replay.deviceId,
+        credentialGeneration: replay.credentialGeneration,
+        accessExpiresAt: replay.accessExpiresAt,
+        refreshExpiresAt: replay.refreshExpiresAt,
+        replayPayload: current.rotationReplayPayload,
+      };
     }
     if (
       this.#accessTokenHashes.has(input.newAccessTokenHash) ||
@@ -876,6 +910,8 @@ export class MemoryControlRepository implements ControlRepository {
       throw new ControlRepositoryError("CONFLICT");
     }
     current.revokedAt = input.now;
+    current.rotationReplayPayload = input.replayPayload;
+    current.rotationReplayExpiresAt = input.replayExpiresAt;
     const grant: DeviceCredentialGrant = {
       workspaceId: input.workspaceId,
       deviceId: input.deviceId,
@@ -887,11 +923,14 @@ export class MemoryControlRepository implements ControlRepository {
       ...grant,
       accessTokenHash: input.newAccessTokenHash,
       refreshTokenHash: input.newRefreshTokenHash,
+      createdAt: input.now,
       revokedAt: null,
+      rotationReplayPayload: null,
+      rotationReplayExpiresAt: null,
     });
     this.#accessTokenHashes.add(input.newAccessTokenHash);
     this.#refreshTokenHashes.add(input.newRefreshTokenHash);
-    return grant;
+    return { ...grant, replayPayload: input.replayPayload };
   }
 
   async authenticateDeviceAccess(
@@ -905,7 +944,13 @@ export class MemoryControlRepository implements ControlRepository {
     refreshTokenHash: string,
     now: Date,
   ): Promise<DeviceCredentialAuthentication> {
-    return this.#authenticateCredential(refreshTokenHash, now, "refreshTokenHash", "refreshExpiresAt");
+    return this.#authenticateCredential(
+      refreshTokenHash,
+      now,
+      "refreshTokenHash",
+      "refreshExpiresAt",
+      true,
+    );
   }
 
   async loadControlSnapshot(
@@ -1850,6 +1895,7 @@ export class MemoryControlRepository implements ControlRepository {
     now: Date,
     hashField: "accessTokenHash" | "refreshTokenHash",
     expiresField: "accessExpiresAt" | "refreshExpiresAt",
+    allowRotationReplay = false,
   ): DeviceCredentialAuthentication {
     for (const [deviceId, credentials] of this.#credentials) {
       const credential = credentials.find((record) => record[hashField] === credentialHash);
@@ -1864,7 +1910,14 @@ export class MemoryControlRepository implements ControlRepository {
         throw new ControlRepositoryError("DEVICE_REVOKED");
       }
       if (credential.revokedAt !== null) {
-        throw new ControlRepositoryError("CREDENTIAL_INVALID");
+        const replayable = allowRotationReplay
+          && credential.rotationReplayPayload !== null
+          && credential.rotationReplayExpiresAt !== null
+          && credential.rotationReplayExpiresAt > now
+          && credentials.some((record) =>
+            record.credentialGeneration === credential.credentialGeneration + 1
+              && record.revokedAt === null);
+        if (!replayable) throw new ControlRepositoryError("CREDENTIAL_INVALID");
       }
       return { workspaceId: device.workspaceId, deviceId: device.id };
     }
@@ -2353,19 +2406,23 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
-  async rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialGrant> {
+  async rotateDeviceCredentials(input: CredentialRotationInput): Promise<DeviceCredentialRotationGrant> {
     try {
       return await this.database.transaction(async (transaction) => {
         await requireDatabaseDevice(transaction, input.deviceId, input.workspaceId, false);
         const [current] = await transaction
-          .select({ generation: deviceCredentialGenerations.generation })
+          .select({
+            generation: deviceCredentialGenerations.generation,
+            revokedAt: deviceCredentialGenerations.revokedAt,
+            rotationReplayPayload: deviceCredentialGenerations.rotationReplayPayload,
+            rotationReplayExpiresAt: deviceCredentialGenerations.rotationReplayExpiresAt,
+          })
           .from(deviceCredentialGenerations)
           .where(
             and(
               eq(deviceCredentialGenerations.workspaceId, input.workspaceId),
               eq(deviceCredentialGenerations.deviceId, input.deviceId),
               eq(deviceCredentialGenerations.refreshTokenHash, input.currentRefreshTokenHash),
-              isNull(deviceCredentialGenerations.revokedAt),
               gt(deviceCredentialGenerations.refreshExpiresAt, input.now),
             ),
           )
@@ -2373,9 +2430,55 @@ export class DrizzleControlRepository implements ControlRepository {
         if (current === undefined) {
           throw new ControlRepositoryError("CREDENTIAL_INVALID");
         }
+        const loadReplay = async (): Promise<DeviceCredentialRotationGrant | null> => {
+          const [source] = await transaction
+            .select({
+              replayPayload: deviceCredentialGenerations.rotationReplayPayload,
+              replayExpiresAt: deviceCredentialGenerations.rotationReplayExpiresAt,
+            })
+            .from(deviceCredentialGenerations)
+            .where(and(
+              eq(deviceCredentialGenerations.workspaceId, input.workspaceId),
+              eq(deviceCredentialGenerations.deviceId, input.deviceId),
+              eq(deviceCredentialGenerations.generation, current.generation),
+            ))
+            .limit(1);
+          if (
+            source?.replayPayload === null ||
+            source?.replayPayload === undefined ||
+            source.replayExpiresAt === null ||
+            source.replayExpiresAt <= input.now
+          ) return null;
+          const [replay] = await transaction
+            .select({
+              workspaceId: deviceCredentialGenerations.workspaceId,
+              deviceId: deviceCredentialGenerations.deviceId,
+              credentialGeneration: deviceCredentialGenerations.generation,
+              accessExpiresAt: deviceCredentialGenerations.accessExpiresAt,
+              refreshExpiresAt: deviceCredentialGenerations.refreshExpiresAt,
+            })
+            .from(deviceCredentialGenerations)
+            .where(and(
+              eq(deviceCredentialGenerations.workspaceId, input.workspaceId),
+              eq(deviceCredentialGenerations.deviceId, input.deviceId),
+              eq(deviceCredentialGenerations.generation, current.generation + 1),
+              isNull(deviceCredentialGenerations.revokedAt),
+            ))
+            .limit(1);
+          return replay === undefined ? null : { ...replay, replayPayload: source.replayPayload };
+        };
+        if (current.revokedAt !== null) {
+          const replay = await loadReplay();
+          if (replay === null) throw new ControlRepositoryError("CREDENTIAL_INVALID");
+          return replay;
+        }
         const [revoked] = await transaction
           .update(deviceCredentialGenerations)
-          .set({ revokedAt: input.now })
+          .set({
+            revokedAt: input.now,
+            rotationReplayPayload: input.replayPayload,
+            rotationReplayExpiresAt: input.replayExpiresAt,
+          })
           .where(
             and(
               eq(deviceCredentialGenerations.deviceId, input.deviceId),
@@ -2385,7 +2488,9 @@ export class DrizzleControlRepository implements ControlRepository {
           )
           .returning({ generation: deviceCredentialGenerations.generation });
         if (revoked === undefined) {
-          throw new ControlRepositoryError("CREDENTIAL_INVALID");
+          const replay = await loadReplay();
+          if (replay === null) throw new ControlRepositoryError("CREDENTIAL_INVALID");
+          return replay;
         }
         const generation = current.generation + 1;
         await transaction.insert(deviceCredentialGenerations).values({
@@ -2405,6 +2510,7 @@ export class DrizzleControlRepository implements ControlRepository {
           credentialGeneration: generation,
           accessExpiresAt: input.accessExpiresAt,
           refreshExpiresAt: input.refreshExpiresAt,
+          replayPayload: input.replayPayload,
         };
       });
     } catch (error) {
@@ -2423,7 +2529,7 @@ export class DrizzleControlRepository implements ControlRepository {
     refreshTokenHash: string,
     now: Date,
   ): Promise<DeviceCredentialAuthentication> {
-    return this.#authenticateDatabaseCredential(refreshTokenHash, now, "refresh");
+    return this.#authenticateDatabaseCredential(refreshTokenHash, now, "refresh", true);
   }
 
   async loadControlSnapshot(
@@ -3800,6 +3906,7 @@ export class DrizzleControlRepository implements ControlRepository {
     credentialHash: string,
     now: Date,
     kind: "access" | "refresh",
+    allowRotationReplay = false,
   ): Promise<DeviceCredentialAuthentication> {
     const hashColumn =
       kind === "access"
@@ -3814,7 +3921,10 @@ export class DrizzleControlRepository implements ControlRepository {
         .select({
           workspaceId: deviceCredentialGenerations.workspaceId,
           deviceId: deviceCredentialGenerations.deviceId,
+          generation: deviceCredentialGenerations.generation,
           credentialRevokedAt: deviceCredentialGenerations.revokedAt,
+          rotationReplayPayload: deviceCredentialGenerations.rotationReplayPayload,
+          rotationReplayExpiresAt: deviceCredentialGenerations.rotationReplayExpiresAt,
           deviceRevokedAt: devices.revokedAt,
         })
         .from(deviceCredentialGenerations)
@@ -3828,7 +3938,25 @@ export class DrizzleControlRepository implements ControlRepository {
         throw new ControlRepositoryError("DEVICE_REVOKED");
       }
       if (credential.credentialRevokedAt !== null) {
-        throw new ControlRepositoryError("CREDENTIAL_INVALID");
+        if (
+          !allowRotationReplay ||
+          credential.rotationReplayPayload === null ||
+          credential.rotationReplayExpiresAt === null ||
+          credential.rotationReplayExpiresAt <= now
+        ) {
+          throw new ControlRepositoryError("CREDENTIAL_INVALID");
+        }
+        const [successor] = await this.database
+          .select({ generation: deviceCredentialGenerations.generation })
+          .from(deviceCredentialGenerations)
+          .where(and(
+            eq(deviceCredentialGenerations.workspaceId, credential.workspaceId),
+            eq(deviceCredentialGenerations.deviceId, credential.deviceId),
+            eq(deviceCredentialGenerations.generation, credential.generation + 1),
+            isNull(deviceCredentialGenerations.revokedAt),
+          ))
+          .limit(1);
+        if (successor === undefined) throw new ControlRepositoryError("CREDENTIAL_INVALID");
       }
       return { workspaceId: credential.workspaceId, deviceId: credential.deviceId };
     } catch (error) {

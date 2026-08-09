@@ -1457,9 +1457,13 @@ fn exact_snapshot(revision: u64, enabled: bool) -> AgentControlSnapshot {
 }
 
 async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
-    for _ in 0..10_000 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
         if calls.load(Ordering::SeqCst) >= expected {
             return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
         }
         tokio::task::yield_now().await;
     }

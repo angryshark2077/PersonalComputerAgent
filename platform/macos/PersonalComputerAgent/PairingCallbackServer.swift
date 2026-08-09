@@ -71,7 +71,11 @@ final class PairingCallbackServer {
                     self.close(with: PairingError.invalidCallback)
                     return
                 }
-                self.respond(connection, status: "200 OK", body: "Pairing complete. You can return to Personal Computer Agent.")
+                self.respond(
+                    connection,
+                    status: "200 OK",
+                    body: "Authorization received. Return to Personal Computer Agent while local pairing finishes."
+                )
                 self.close(with: url)
             }
         }

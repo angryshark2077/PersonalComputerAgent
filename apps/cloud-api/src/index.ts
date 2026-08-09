@@ -38,6 +38,7 @@ import {
   accessCredentialLifetimeMs,
   errorResponse,
   hashSecret,
+  openRotatedCredentials,
   opaqueCredential,
   opaqueSessionId,
   PairingRateLimiter,
@@ -45,7 +46,9 @@ import {
   parsePairingExchange,
   parsePairingStart,
   pkceChallenge,
+  refreshCredentialReplayLifetimeMs,
   refreshCredentialLifetimeMs,
+  sealRotatedCredentials,
 } from "./pairing.js";
 
 export type { OwnerPrincipal } from "./auth.js";
@@ -179,13 +182,19 @@ export function createApp(options: CreateAppOptions): Hono {
         newRefreshTokenHash: hashSecret(nextRefreshToken),
         accessExpiresAt,
         refreshExpiresAt,
+        replayPayload: sealRotatedCredentials(refreshToken, accessToken, nextRefreshToken),
+        replayExpiresAt: new Date(now.getTime() + refreshCredentialReplayLifetimeMs),
         now,
       });
+      const rotated = openRotatedCredentials(refreshToken, grant.replayPayload);
+      if (rotated === null) {
+        return errorResponse(context, 503, "CREDENTIAL_REPLAY_UNAVAILABLE", "Credential refresh is temporarily unavailable.");
+      }
       return context.json({
         workspace_id: grant.workspaceId,
         device_id: grant.deviceId,
-        device_access_token: accessToken,
-        refresh_token: nextRefreshToken,
+        device_access_token: rotated.accessToken,
+        refresh_token: rotated.refreshToken,
         access_expires_at: grant.accessExpiresAt.toISOString(),
         refresh_expires_at: grant.refreshExpiresAt.toISOString(),
       });

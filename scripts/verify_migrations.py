@@ -56,6 +56,7 @@ EXPECTED_MIGRATIONS = {
         "0023_photo_library_assets.sql",
         "0024_photo_system_event_constraints.sql",
         "0025_device_network_history.sql",
+        "0026_refresh_credential_replay.sql",
     ],
 }
 

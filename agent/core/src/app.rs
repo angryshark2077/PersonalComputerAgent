@@ -51,7 +51,10 @@ use crate::config::ProcessTestFatalCleanupConfig;
 use crate::{
     collector_registry::CollectorIdentity,
     config::{CommandConfig, RunConfig},
-    lifecycle::{LifecycleError, LifecycleRuntime, NoopCapabilityRefresher, RuntimeIdentity},
+    lifecycle::{
+        CapabilityRefreshError, CapabilityRefresher, LifecycleError, LifecycleRuntime,
+        NoopCapabilityRefresher, RuntimeIdentity,
+    },
     system_runtime::SystemRuntimeHandle,
 };
 
@@ -255,6 +258,16 @@ struct RuntimeResources {
     schema_version: Option<u32>,
 }
 
+struct ControlCapabilityRefresher {
+    sender: mpsc::UnboundedSender<()>,
+}
+
+impl CapabilityRefresher for ControlCapabilityRefresher {
+    fn refresh(&self) -> Result<(), CapabilityRefreshError> {
+        self.sender.send(()).map_err(|_| CapabilityRefreshError)
+    }
+}
+
 impl RuntimeResources {
     fn new(database: DbActorHandle) -> Self {
         Self {
@@ -314,7 +327,10 @@ impl RuntimeResources {
             communication_authorization.clone(),
             screen_capture,
         );
+        let mut wake_refresh_sender = None;
         if !cfg!(feature = "process-test-hooks") {
+            let (sender, mut wake_refresh_receiver) = mpsc::unbounded_channel();
+            wake_refresh_sender = Some(sender);
             let bootstrap_store = Arc::clone(&credential_store);
             let bootstrap_commands = control_commands.clone();
             let bootstrap_network = Arc::clone(&network_observations);
@@ -326,7 +342,12 @@ impl RuntimeResources {
                         Arc::clone(&bootstrap_network),
                     )
                     .await;
-                    tokio::time::sleep(CONTROL_RECONCILIATION_INTERVAL).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(CONTROL_RECONCILIATION_INTERVAL) => {}
+                        wake = wake_refresh_receiver.recv() => {
+                            if wake.is_none() { return; }
+                        }
+                    }
                 }
             }));
         }
@@ -380,6 +401,10 @@ impl RuntimeResources {
                 identity.device_id.hyphenated().to_string(),
             )
         });
+        let capability_refresher: Arc<dyn CapabilityRefresher> = wake_refresh_sender.map_or_else(
+            || Arc::new(NoopCapabilityRefresher) as Arc<dyn CapabilityRefresher>,
+            |sender| Arc::new(ControlCapabilityRefresher { sender }),
+        );
         self.lifecycle = Some(LifecycleRuntime::start(
             Arc::clone(
                 self.database
@@ -388,7 +413,7 @@ impl RuntimeResources {
             ),
             lifecycle_identity.clone(),
             LIFECYCLE_CAPACITY,
-            Arc::new(NoopCapabilityRefresher),
+            capability_refresher,
         ));
         let lifecycle = self
             .lifecycle
@@ -1100,6 +1125,16 @@ mod tests {
     use crate::collector_registry::CollectorIdentity;
     use pca_db_local::PairingState;
     use uuid::Uuid;
+
+    #[test]
+    fn wake_refresher_requests_immediate_control_reconciliation() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let refresher = ControlCapabilityRefresher { sender };
+
+        refresher.refresh().expect("queue wake refresh");
+
+        assert_eq!(receiver.try_recv(), Ok(()));
+    }
 
     #[test]
     fn paired_startup_transitions_through_unpaired_before_running() {

@@ -130,7 +130,7 @@ test("owner config is scoped, strict, and reaches device control", async () => {
   assert.equal(badScope.status, 400);
 });
 
-test("refresh rotates credentials and a revoked device is rejected", async () => {
+test("refresh safely replays after a lost response and a revoked device is rejected", async () => {
   const { api, credentials } = await pairedApi();
   const refresh = await api.request("/v1/devices/token/refresh", {
     method: "POST",
@@ -145,7 +145,13 @@ test("refresh rotates credentials and a revoked device is rejected", async () =>
     method: "POST",
     headers: { authorization: `Bearer ${credentials.refresh_token}` },
   });
-  assert.equal(replay.status, 401);
+  assert.equal(replay.status, 200);
+  const replayed = (await replay.json()) as {
+    device_access_token: string;
+    refresh_token: string;
+  };
+  assert.equal(replayed.device_access_token, rotated.device_access_token);
+  assert.equal(replayed.refresh_token, rotated.refresh_token);
 
   const revoked = await api.request(`/v1/devices/${credentials.device_id}/revoke`, {
     method: "POST",

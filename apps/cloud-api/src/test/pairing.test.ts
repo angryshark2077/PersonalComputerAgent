@@ -12,7 +12,12 @@ import {
   type OwnerPrincipal,
 } from "../index.js";
 import { createBetterAuthOwnerAuthenticator } from "../auth.js";
-import { hashSecret, pkceChallenge } from "../pairing.js";
+import {
+  hashSecret,
+  openRotatedCredentials,
+  pkceChallenge,
+  sealRotatedCredentials,
+} from "../pairing.js";
 
 const owner: OwnerPrincipal = {
   userId: "01983333-7333-8333-8333-333333333333",
@@ -33,6 +38,19 @@ function app() {
     ownerAuthenticator: async () => owner,
   });
 }
+
+test("rotated credentials can only be replayed with the prior refresh token", () => {
+  const prior = "p".repeat(43);
+  const accessToken = "a".repeat(43);
+  const refreshToken = "r".repeat(43);
+  const sealed = sealRotatedCredentials(prior, accessToken, refreshToken);
+  const tampered = Buffer.from(sealed, "base64url");
+  tampered[28] = (tampered[28] ?? 0) ^ 1;
+
+  assert.deepEqual(openRotatedCredentials(prior, sealed), { accessToken, refreshToken });
+  assert.equal(openRotatedCredentials("x".repeat(43), sealed), null);
+  assert.equal(openRotatedCredentials(prior, tampered.toString("base64url")), null);
+});
 
 test("pairing session returns the fixed Dashboard authorization URL", async () => {
   const api = app();

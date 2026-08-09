@@ -378,10 +378,20 @@ pub struct PairingSessionHandoff {
 }
 
 /// The only one-time value Setup may return after accepting the loopback callback.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct PairingCallbackHandoff {
     pub session_id: String,
     pub authorization_code: String,
+}
+
+impl std::fmt::Debug for PairingCallbackHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairingCallbackHandoff")
+            .field("session_id", &self.session_id)
+            .field("authorization_code", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -398,14 +408,25 @@ pub struct PairingSessionResponse {
     pub authorization_url: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct PairingExchangeRequest {
     pub session_id: String,
     pub authorization_code: String,
     pub code_verifier: String,
 }
 
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for PairingExchangeRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairingExchangeRequest")
+            .field("session_id", &self.session_id)
+            .field("authorization_code", &"[redacted]")
+            .field("code_verifier", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 struct PendingPairing {
     session_id: String,
     code_verifier: String,
@@ -3552,10 +3573,10 @@ mod tests {
         quarantine_manifest, remember_screenshot_request, remove_uploaded_media_file, retry_delay,
         screenshot_prepare_payload, sync_pending_communication_events, sync_pending_system_events,
         AgentControlSnapshot, ControlClient, ControlError, ControlFuture, DeviceCredential,
-        HttpControlClient, MediaUploadFailure, MediaUploadFailureStage, PendingScreenshot,
-        PhotoMarker, ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL,
-        CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT,
-        PRODUCTION_CLOUD_API_ORIGIN,
+        HttpControlClient, MediaUploadFailure, MediaUploadFailureStage, PairingCallbackHandoff,
+        PairingExchangeRequest, PendingScreenshot, PhotoMarker, ScreenshotTrigger,
+        SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF,
+        MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
     use pca_domain::{
@@ -3573,6 +3594,23 @@ mod tests {
     };
 
     static PROXY_ENVIRONMENT_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+    #[test]
+    fn pairing_debug_output_redacts_one_time_secrets() {
+        let callback = PairingCallbackHandoff {
+            session_id: "session".to_owned(),
+            authorization_code: "authorization-must-not-appear".to_owned(),
+        };
+        let exchange = PairingExchangeRequest {
+            session_id: "session".to_owned(),
+            authorization_code: "authorization-must-not-appear".to_owned(),
+            code_verifier: "verifier-must-not-appear".to_owned(),
+        };
+        let debug = format!("{callback:?} {exchange:?}");
+        assert!(!debug.contains("authorization-must-not-appear"));
+        assert!(!debug.contains("verifier-must-not-appear"));
+        assert!(debug.contains("redacted"));
+    }
 
     struct ProxyEnvironment {
         values: Vec<(&'static str, Option<std::ffi::OsString>)>,

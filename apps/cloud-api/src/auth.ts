@@ -59,9 +59,10 @@ export async function requireDevice(
   }
   try {
     const tokenHash = hashSecret(token);
+    const now = new Date();
     return kind === "access"
-      ? await repository.authenticateDeviceAccess(tokenHash, new Date())
-      : await repository.authenticateDeviceRefresh(tokenHash, new Date());
+      ? await repository.authenticateDeviceAccess(tokenHash, now)
+      : await repository.authenticateDeviceRefresh(tokenHash, now);
   } catch (error) {
     if (error instanceof ControlRepositoryError && error.code === "DEVICE_NOT_FOUND") {
       return errorResponse(context, 401, "CREDENTIAL_INVALID", "The device credential is invalid.");

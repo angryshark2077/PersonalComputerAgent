@@ -7,7 +7,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { DrizzleControlRepository, type CommunicationMessageEventRecord } from "@pca/db-cloud/src/repository.js";
+import {
+  ControlRepositoryError,
+  DrizzleControlRepository,
+  type CommunicationMessageEventRecord,
+} from "@pca/db-cloud/src/repository.js";
 import { cloudSchema } from "@pca/db-cloud/src/schema.js";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
@@ -33,6 +37,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationMediaUpgrade(pool);
     await assertDeviceLocationSchema(pool);
     await assertScreenshotSchema(pool);
+    await assertCredentialRotationReplay(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
     await assertHashedSessionSchema(pool);
@@ -42,12 +47,72 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationObjectSchema(pool);
     await assertDeviceLocationSchema(pool);
     await assertScreenshotSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024", "0025"]);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024", "0025", "0026"]);
   } finally {
     await pool.end();
     await postgres.stop();
   }
 });
+
+async function assertCredentialRotationReplay(pool: Pool) {
+  const workspaceId = "01982222-7222-8222-8222-222222222229";
+  const userId = "01983333-7333-8333-8333-333333333339";
+  const deviceId = "01981111-7111-8111-8111-111111111119";
+  const now = new Date("2026-08-10T08:00:00.000Z");
+  const replayExpiresAt = new Date(now.getTime() + 5 * 60 * 1000);
+  await pool.query(
+    "INSERT INTO auth_users (id, name, email, created_at, updated_at) VALUES ($1, 'Rotation', 'rotation@example.invalid', $2, $2)",
+    [userId, now],
+  );
+  await pool.query(
+    "INSERT INTO workspaces (id, name, slug, created_at, updated_at) VALUES ($1, 'Rotation', 'rotation', $2, $2)",
+    [workspaceId, now],
+  );
+  await pool.query(
+    "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES ($1, $2, 'owner', $3)",
+    [workspaceId, userId, now],
+  );
+  await pool.query(
+    "INSERT INTO devices (id, workspace_id, owner_user_id, device_public_key_hash, platform, created_at) VALUES ($1, $2, $3, $4, 'macos', $5)",
+    [deviceId, workspaceId, userId, "f".repeat(64), now],
+  );
+  await pool.query(
+    `INSERT INTO device_credential_generations (
+       workspace_id, device_id, generation, access_token_hash, refresh_token_hash,
+       access_expires_at, refresh_expires_at, created_at
+     ) VALUES ($1, $2, 1, $3, $4, $5, $5, $6)`,
+    [workspaceId, deviceId, "1".repeat(64), "2".repeat(64), new Date("2026-09-10T08:00:00.000Z"), now],
+  );
+  const repository = new DrizzleControlRepository(drizzle(pool, { schema: cloudSchema }));
+  const rotation = {
+    workspaceId,
+    deviceId,
+    currentRefreshTokenHash: "2".repeat(64),
+    newAccessTokenHash: "3".repeat(64),
+    newRefreshTokenHash: "4".repeat(64),
+    accessExpiresAt: new Date("2026-08-10T09:00:00.000Z"),
+    refreshExpiresAt: new Date("2026-09-10T08:00:00.000Z"),
+    replayPayload: "sealed-postgres-rotation",
+    replayExpiresAt,
+    now,
+  };
+  const grant = await repository.rotateDeviceCredentials(rotation);
+  assert.equal(grant.replayPayload, rotation.replayPayload);
+  assert.deepEqual(await repository.rotateDeviceCredentials({
+    ...rotation,
+    newAccessTokenHash: "5".repeat(64),
+    newRefreshTokenHash: "6".repeat(64),
+    replayPayload: "discarded-retry-payload",
+  }), grant);
+  assert.deepEqual(await repository.authenticateDeviceRefresh("2".repeat(64), now), {
+    workspaceId,
+    deviceId,
+  });
+  await assert.rejects(
+    repository.authenticateDeviceRefresh("2".repeat(64), replayExpiresAt),
+    (error) => error instanceof ControlRepositoryError && error.code === "CREDENTIAL_INVALID",
+  );
+}
 
 test("PostgreSQL migrations reject a changed completed migration", async () => {
   const postgres = await startTemporaryPostgres();

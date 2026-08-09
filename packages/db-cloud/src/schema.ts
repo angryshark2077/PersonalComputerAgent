@@ -161,6 +161,8 @@ export const deviceCredentialGenerations = pgTable(
     refreshExpiresAt: timestampColumn("refresh_expires_at").notNull(),
     createdAt: timestampColumn("created_at").notNull(),
     revokedAt: timestampColumn("revoked_at"),
+    rotationReplayPayload: text("rotation_replay_payload"),
+    rotationReplayExpiresAt: timestampColumn("rotation_replay_expires_at"),
   },
   (table) => [
     primaryKey({ columns: [table.deviceId, table.generation] }),
@@ -178,6 +180,14 @@ export const deviceCredentialGenerations = pgTable(
     check(
       "device_credentials_refresh_hash_hex",
       sql`${table.refreshTokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      "device_credentials_rotation_replay_pair",
+      sql`(${table.rotationReplayPayload} IS NULL) = (${table.rotationReplayExpiresAt} IS NULL)`,
+    ),
+    check(
+      "device_credentials_rotation_replay_nonempty",
+      sql`${table.rotationReplayPayload} IS NULL OR length(${table.rotationReplayPayload}) > 0`,
     ),
   ],
 );

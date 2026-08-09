@@ -563,7 +563,7 @@ fn lifecycle_events_require_network_observation(events: &[PlatformLifecycleEvent
     events.iter().any(|event| {
         matches!(
             event.event_type.as_str(),
-            "network.offline" | "network.online" | "network.changed"
+            "system.wake" | "network.offline" | "network.online" | "network.changed"
         )
     })
 }
@@ -862,7 +862,7 @@ mod tests {
         assert!(lifecycle_events_require_network_observation(&[event(
             "network.offline"
         )]));
-        assert!(!lifecycle_events_require_network_observation(&[event(
+        assert!(lifecycle_events_require_network_observation(&[event(
             "system.wake"
         )]));
     }
