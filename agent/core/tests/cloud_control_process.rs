@@ -19,8 +19,8 @@ use pca_agentd::communication::{
 use pca_db_local::{DbActorHandle, PairingState};
 use pca_domain::{CollectorState, CollectorStatus, EventEnvelope, Sensitivity};
 use pca_keychain::{
-    CredentialError, CredentialStore, DeviceCredential, DEVICE_CREDENTIAL_ACCOUNT,
-    DEVICE_CREDENTIAL_SERVICE,
+    load_device_credential, CredentialError, CredentialStore, DeviceCredential,
+    DEVICE_CREDENTIAL_ACCOUNT, DEVICE_CREDENTIAL_SERVICE,
 };
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -32,10 +32,24 @@ struct MemoryStore {
     values: Mutex<BTreeMap<(String, String), Vec<u8>>>,
     fail_delete: AtomicBool,
     delete_attempts: AtomicUsize,
+    load_attempts: AtomicUsize,
+    load_failures_remaining: AtomicUsize,
+    store_attempts: AtomicUsize,
+    store_failures_remaining: AtomicUsize,
 }
 
 impl CredentialStore for MemoryStore {
     fn load(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+        self.load_attempts.fetch_add(1, Ordering::SeqCst);
+        if self
+            .load_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(CredentialError::Unavailable);
+        }
         Ok(self
             .values
             .lock()
@@ -45,6 +59,16 @@ impl CredentialStore for MemoryStore {
     }
 
     fn store(&self, service: &str, account: &str, value: &[u8]) -> Result<(), CredentialError> {
+        self.store_attempts.fetch_add(1, Ordering::SeqCst);
+        if self
+            .store_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(CredentialError::Unavailable);
+        }
         self.values
             .lock()
             .map_err(|_| CredentialError::Unavailable)?
@@ -147,6 +171,19 @@ struct TransientCountingClient {
     calls: AtomicUsize,
 }
 
+struct RefreshingClient {
+    calls: AtomicUsize,
+    refresh_calls: AtomicUsize,
+    refreshed: DeviceCredential,
+    snapshot: AgentControlSnapshot,
+}
+
+struct PanicOnceClient {
+    calls: AtomicUsize,
+    panic_once: AtomicBool,
+    snapshot: AgentControlSnapshot,
+}
+
 impl ControlClient for TransientCountingClient {
     fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
         Box::pin(async { Err(ControlError::Contract) })
@@ -159,6 +196,50 @@ impl ControlClient for TransientCountingClient {
     ) -> ControlFuture<'a, AgentControlSnapshot> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Err(ControlError::Transient) })
+    }
+}
+
+impl ControlClient for RefreshingClient {
+    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        let refreshed = self.refreshed.clone();
+        Box::pin(async move { Ok(refreshed) })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let snapshot = self.snapshot.clone();
+        Box::pin(async move {
+            if call == 0 {
+                Err(ControlError::InvalidCredential)
+            } else {
+                Ok(snapshot)
+            }
+        })
+    }
+}
+
+impl ControlClient for PanicOnceClient {
+    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let should_panic = self.panic_once.swap(false, Ordering::SeqCst);
+        let snapshot = self.snapshot.clone();
+        Box::pin(async move {
+            assert!(!should_panic, "injected Cloud worker panic");
+            Ok(snapshot)
+        })
     }
 }
 
@@ -906,6 +987,176 @@ async fn blocked_media_upload_does_not_delay_control_heartbeats() {
             panic!("control and media workers released database after shutdown");
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refreshed_credential_persistence_retries_without_stopping_cloud_control() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    store
+        .store(
+            DEVICE_CREDENTIAL_SERVICE,
+            DEVICE_CREDENTIAL_ACCOUNT,
+            &loaded.credential().encode().unwrap(),
+        )
+        .unwrap();
+    let initial_store_attempts = store.store_attempts.load(Ordering::SeqCst);
+    store.store_failures_remaining.store(2, Ordering::SeqCst);
+    let refreshed = DeviceCredential::new(
+        loaded.credential().device_id().to_owned(),
+        loaded.credential().workspace_id().to_owned(),
+        "refreshed-access",
+        "refreshed-refresh",
+    )
+    .unwrap()
+    .with_metadata(2, 1_800_000_000_000, 1_900_000_000_000);
+    let client = Arc::new(RefreshingClient {
+        calls: AtomicUsize::new(0),
+        refresh_calls: AtomicUsize::new(0),
+        refreshed,
+        snapshot: exact_snapshot(1, true),
+    });
+
+    let runtime = CloudControlRuntime::start(
+        Arc::clone(&database),
+        loaded,
+        Arc::clone(&client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+    wait_for_calls(&client.calls, 1).await;
+    wait_for_calls(&store.store_attempts, initial_store_attempts + 1).await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    wait_for_calls(&store.store_attempts, initial_store_attempts + 2).await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    wait_for_calls(&store.store_attempts, initial_store_attempts + 3).await;
+    wait_for_calls(&client.calls, 2).await;
+
+    assert_eq!(client.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.store_attempts.load(Ordering::SeqCst),
+        initial_store_attempts + 3
+    );
+    assert_eq!(
+        load_device_credential(store.as_ref())
+            .unwrap()
+            .unwrap()
+            .credential_generation(),
+        2
+    );
+
+    runtime.shutdown().await.unwrap();
+    shutdown_database(database).await;
+}
+
+#[tokio::test]
+async fn cloud_owner_reconciles_a_finished_worker_from_keychain() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    store
+        .store(
+            DEVICE_CREDENTIAL_SERVICE,
+            DEVICE_CREDENTIAL_ACCOUNT,
+            &loaded.credential().encode().unwrap(),
+        )
+        .unwrap();
+    let client = Arc::new(PanicOnceClient {
+        calls: AtomicUsize::new(0),
+        panic_once: AtomicBool::new(true),
+        snapshot: exact_snapshot(1, true),
+    });
+    let (pairing_state_sender, _) = watch::channel(false);
+    let (owner, commands) = CloudControlOwner::start(
+        Arc::clone(&database),
+        pairing_state_sender,
+        CommunicationAuthorization::new(),
+    );
+
+    assert!(commands
+        .replace_from_keychain(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::clone(&client) as Arc<dyn ControlClient>,
+        )
+        .await
+        .unwrap());
+    wait_for_calls(&client.calls, 1).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(commands
+        .replace_from_keychain(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::clone(&client) as Arc<dyn ControlClient>,
+        )
+        .await
+        .unwrap());
+    wait_for_calls(&client.calls, 2).await;
+
+    owner.shutdown().await.unwrap();
+    shutdown_database(database).await;
+}
+
+#[tokio::test]
+async fn cloud_owner_retries_keychain_reconciliation_without_replacing_a_live_worker() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    store
+        .store(
+            DEVICE_CREDENTIAL_SERVICE,
+            DEVICE_CREDENTIAL_ACCOUNT,
+            &loaded.credential().encode().unwrap(),
+        )
+        .unwrap();
+    store.load_failures_remaining.store(1, Ordering::SeqCst);
+    let concurrency = Arc::new(WorkerConcurrency::default());
+    let client = Arc::new(BlockingOwnerClient {
+        calls: AtomicUsize::new(0),
+        release: Notify::new(),
+        concurrency: Arc::clone(&concurrency),
+        snapshot: exact_snapshot(1, true),
+    });
+    let (pairing_state_sender, _) = watch::channel(false);
+    let (owner, commands) = CloudControlOwner::start(
+        Arc::clone(&database),
+        pairing_state_sender,
+        CommunicationAuthorization::new(),
+    );
+
+    assert!(matches!(
+        commands
+            .replace_from_keychain(
+                Arc::clone(&store) as Arc<dyn CredentialStore>,
+                Arc::clone(&client) as Arc<dyn ControlClient>,
+            )
+            .await,
+        Err(CloudControlRuntimeError::Keychain(
+            CredentialError::Unavailable
+        ))
+    ));
+    assert!(commands
+        .replace_from_keychain(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::clone(&client) as Arc<dyn ControlClient>,
+        )
+        .await
+        .unwrap());
+    wait_for_calls(&client.calls, 1).await;
+    assert!(commands
+        .replace_from_keychain(
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+            Arc::clone(&client) as Arc<dyn ControlClient>,
+        )
+        .await
+        .unwrap());
+    assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(concurrency.maximum.load(Ordering::SeqCst), 1);
+
+    client.release.notify_waiters();
+    owner.shutdown().await.unwrap();
+    shutdown_database(database).await;
 }
 
 #[tokio::test]

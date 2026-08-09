@@ -1276,7 +1276,7 @@ impl CloudControlCommands {
             .map_err(|_| CloudControlRuntimeError::WorkerStopped)?
     }
 
-    /// Reconciles startup Keychain state through the same serialized owner.
+    /// Reconciles Keychain state when no healthy worker is currently owned.
     ///
     /// # Errors
     ///
@@ -1439,8 +1439,14 @@ async fn replace_owned_control_from_keychain(
     screen_capture: Option<ScreenCaptureCommandHandle>,
     current: &mut Option<CloudControlHandle>,
 ) -> Result<bool, CloudControlRuntimeError> {
-    let owner_epoch =
-        invalidate_and_stop_owned_control(authorization, publication, current).await?;
+    if current.as_ref().is_some_and(|worker| !worker.is_finished()) {
+        return Ok(true);
+    }
+    let owner_epoch = authorization.replace_owner().await;
+    publication.replace_owner(owner_epoch).await;
+    if let Some(worker) = current.take() {
+        let _ = worker.shutdown().await;
+    }
     if !synchronize_pairing_state_with_authorization(database, store.as_ref(), authorization)
         .await?
     {
@@ -1510,6 +1516,12 @@ pub(crate) async fn synchronize_pairing_state_with_authorization(
 }
 
 impl CloudControlHandle {
+    fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
     #[must_use]
     pub async fn is_unpaired(&self) -> bool {
         self.state.lock().await.unpaired
@@ -1675,10 +1687,17 @@ async fn run_control_loop(
                             )
                             .await;
                         }
-                        store_device_credential(credentials.store.as_ref(), &next)?;
-                        media_credentials.send_replace(next.clone());
-                        credentials.credential = next;
-                        ensure_pairing_state(&database, &credentials.credential).await?;
+                        if !persist_refreshed_credential(
+                            &database,
+                            &mut credentials,
+                            next,
+                            &media_credentials,
+                            &mut shutdown,
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
                         retry_attempt = 0;
                         wait = Duration::ZERO;
                     }
@@ -1719,6 +1738,31 @@ async fn run_control_loop(
                 )
                 .await;
             }
+        }
+    }
+}
+
+async fn persist_refreshed_credential(
+    database: &DbActorHandle,
+    credentials: &mut LoadedDeviceCredentials,
+    next: DeviceCredential,
+    media_credentials: &watch::Sender<DeviceCredential>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    let mut retry_attempt = 0_u8;
+    let mut keychain_persisted = false;
+    loop {
+        if !keychain_persisted {
+            keychain_persisted = store_device_credential(credentials.store.as_ref(), &next).is_ok();
+        }
+        if keychain_persisted && ensure_pairing_state(database, &next).await.is_ok() {
+            media_credentials.send_replace(next.clone());
+            credentials.credential = next;
+            return true;
+        }
+        retry_attempt = retry_attempt.saturating_add(1);
+        if wait_or_shutdown(retry_delay(retry_attempt), shutdown).await {
+            return false;
         }
     }
 }

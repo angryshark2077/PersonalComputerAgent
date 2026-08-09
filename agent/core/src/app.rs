@@ -63,6 +63,7 @@ const EXIT_RUNTIME_FAILURE: u8 = 5;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEALTH_FRESHNESS: TimeDuration = TimeDuration::seconds(5);
 const LIFECYCLE_CAPACITY: usize = 32;
+const CONTROL_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 
 fn production_communication_factory(
     local_database: PathBuf,
@@ -318,9 +319,15 @@ impl RuntimeResources {
             let bootstrap_commands = control_commands.clone();
             let bootstrap_network = Arc::clone(&network_observations);
             self.control_bootstrap_task = Some(tokio::spawn(async move {
-                let _ =
-                    start_paired_control(bootstrap_store, &bootstrap_commands, bootstrap_network)
-                        .await;
+                loop {
+                    let _ = start_paired_control(
+                        Arc::clone(&bootstrap_store),
+                        &bootstrap_commands,
+                        Arc::clone(&bootstrap_network),
+                    )
+                    .await;
+                    tokio::time::sleep(CONTROL_RECONCILIATION_INTERVAL).await;
+                }
             }));
         }
         self.control = Some(control);
