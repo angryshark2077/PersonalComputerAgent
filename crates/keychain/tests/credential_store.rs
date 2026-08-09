@@ -234,7 +234,7 @@ fn production_credential_adapters_have_no_plaintext_fallback_channel() {
 }
 
 #[test]
-fn production_swift_store_recreates_items_instead_of_appending_acl_entries() {
+fn production_swift_store_recreates_secrets_and_replaces_migrated_access() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path =
         manifest.join("../../platform/macos/Sources/BridgeProtocol/KeychainCredentialStore.swift");
@@ -253,8 +253,8 @@ fn production_swift_store_recreates_items_instead_of_appending_acl_entries() {
         "replacement delete must happen before the credential is recreated"
     );
     assert!(
-        !source.contains("SecItemUpdate"),
-        "updating an existing item preserves stale ACL entries"
+        source.contains("let status = SecItemUpdate("),
+        "migration must replace kSecAttrAccess without reading or rewriting the secret"
     );
     assert!(
         !source.contains("SecKeychainItemSetAccess"),

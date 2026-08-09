@@ -74,18 +74,21 @@ async function main(): Promise<void> {
       cloud.origin,
       exchangedDevice.deviceId,
       {
+        ...initialDevice.collectors,
         network: { enabled: true },
         "communication.wechat": {
+          ...initialDevice.collectors["communication.wechat"],
           enabled: true,
-          direction: "outgoing",
-          message_type: "text",
-          sync_mode: "full",
         },
       },
     );
     assert.equal(revision, 1);
     const pairedProcess = await agent.result;
-    assert.equal(pairedProcess.code, 0, "acceptance Agent pair-control phase must exit cleanly");
+    assert.equal(
+      pairedProcess.code,
+      0,
+      `acceptance Agent pair-control phase must exit cleanly: ${pairedProcess.stderr.trim()}; control=${JSON.stringify(cloud.inspect().controlRequests)}`,
+    );
     const pairedStatusBytes = await readFile(pairedStatusPath);
     assert.deepEqual(JSON.parse(pairedStatusBytes.toString("utf8")), {
       phase: "pair-control",

@@ -1352,6 +1352,41 @@ final class InstallerViewModelTests: XCTestCase {
         }
     }
 
+    func testWechatRecoveryNonApplicableExitCodesDoNotFailInstallation() async throws {
+        for status in [3, 4, 6] {
+            let executable = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: executable) }
+            try Data("#!/bin/sh\nexit \(status)\n".utf8).write(to: executable)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+            let runner = ProcessWechatRepairRunner(executableURL: executable)
+
+            do {
+                try await runner.prepareAutomaticRecovery()
+                XCTFail("exit \(status) must be treated as not applicable")
+            } catch let error as WechatRepairRunnerError {
+                XCTAssertEqual(error, .notApplicable)
+            }
+        }
+    }
+
+    func testCancellingWechatRecoveryTerminatesThePendingHelper() async throws {
+        let executable = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: executable) }
+        try Data("#!/bin/sh\nexec /bin/sleep 30\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let runner = ProcessWechatRepairRunner(executableURL: executable)
+        let task = Task { try await runner.prepareAutomaticRecovery() }
+
+        try await Task.sleep(for: .milliseconds(50))
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("cancelled recovery must not complete successfully")
+        } catch is CancellationError {
+        }
+    }
+
     func testAutomaticWechatCaptureFailureRemainsRetryable() async throws {
         let repair = FakeWechatRepairRunner(error: .failed(message: "capture failed"))
         let model = InstallerViewModel(
@@ -1650,6 +1685,37 @@ final class BundleValidatorSigningTests: XCTestCase {
         XCTAssertTrue(result.signingIdentityChanged)
     }
 
+    func testDifferentSigningRequirementInTheSameTeamRequestsKeychainAccessMigration() throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let installed = temporary.appendingPathComponent("PersonalComputerAgent.app", isDirectory: true)
+        let candidate = temporary.appendingPathComponent(".staging-candidate", isDirectory: true)
+        try makeValidBundle(at: installed)
+        try makeValidBundle(at: candidate)
+        let productionTeam = BundleValidator.productionTeamIdentifier
+        let validator = BundleValidator(
+            signatureChecker: FakeSignatureChecker(
+                teams: [
+                    installed.lastPathComponent: productionTeam,
+                    candidate.lastPathComponent: productionTeam,
+                    "pca-agentd": productionTeam,
+                    "PCAPlatformBridge": productionTeam,
+                    "pca-wechat-repair": productionTeam,
+                    "ffmpeg": productionTeam,
+                ],
+                requirements: [
+                    installed.lastPathComponent: "identifier com.pca.PersonalComputerAgent and certificate old",
+                    candidate.lastPathComponent: "identifier com.pca.PersonalComputerAgent and certificate new",
+                ]
+            ),
+            architectureChecker: FakeArchitectureChecker()
+        )
+
+        let result = try validator.validate(candidate: candidate, replacing: installed)
+
+        XCTAssertTrue(result.signingIdentityChanged)
+    }
+
     private func makeValidBundle(at bundle: URL) throws {
         let executable = bundle.appendingPathComponent("Contents/MacOS/PersonalComputerAgent")
         let agent = bundle.appendingPathComponent("Contents/Resources/bin/pca-agentd")
@@ -1777,8 +1843,14 @@ final class WechatAppDataAccessControllerTests: XCTestCase {
 
 private struct FakeSignatureChecker: SignatureChecking {
     let teams: [String: String]
-    func verifyAndReadTeamIdentifier(of target: URL) throws -> String {
-        teams[target.lastPathComponent] ?? "TEAM123456"
+    var requirements: [String: String] = [:]
+
+    func verifyAndReadIdentity(of target: URL) throws -> CodeSigningIdentity {
+        let team = teams[target.lastPathComponent] ?? "TEAM123456"
+        return CodeSigningIdentity(
+            teamIdentifier: team,
+            designatedRequirement: requirements[target.lastPathComponent] ?? "requirement:\(team)"
+        )
     }
 }
 

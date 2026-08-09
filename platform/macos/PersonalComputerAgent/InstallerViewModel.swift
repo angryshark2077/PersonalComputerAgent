@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 
 enum InstallerState: Equatable, Sendable {
@@ -58,6 +59,28 @@ enum WechatRepairRunnerError: LocalizedError, Equatable {
     }
 }
 
+private final class ProcessCancellationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requested = false
+
+    func request() {
+        lock.withLock { requested = true }
+    }
+
+    var isRequested: Bool {
+        lock.withLock { requested }
+    }
+}
+
+private func terminateProcessGroup(_ process: Process) {
+    guard process.isRunning else { return }
+    let processIdentifier = process.processIdentifier
+    if processIdentifier > 0 {
+        _ = Darwin.kill(-processIdentifier, SIGTERM)
+    }
+    process.terminate()
+}
+
 @MainActor
 final class ProcessWechatRepairRunner: WechatRepairRunning {
     private let executableURL: URL
@@ -76,18 +99,34 @@ final class ProcessWechatRepairRunner: WechatRepairRunning {
         let process = Process()
         process.executableURL = executableURL
         process.arguments = ["prepare-automatic"]
+        process.environment = ProcessInfo.processInfo.environment.merging([
+            "PCA_INSTALLER_PID": String(ProcessInfo.processInfo.processIdentifier),
+        ]) { _, current in current }
         process.standardOutput = output
         process.standardError = output
+        let cancellationState = ProcessCancellationState()
         try Task.checkCancellation()
         let status = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
+                guard !cancellationState.isRequested else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
                 process.terminationHandler = { process in
                     continuation.resume(returning: process.terminationStatus)
                 }
-                do { try process.run() } catch { continuation.resume(throwing: error) }
+                do {
+                    try process.run()
+                    if cancellationState.isRequested {
+                        terminateProcessGroup(process)
+                    }
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
         } onCancel: {
-            if process.isRunning { process.terminate() }
+            cancellationState.request()
+            terminateProcessGroup(process)
         }
         try Task.checkCancellation()
         let data = try output.fileHandleForReading.readToEnd() ?? Data()

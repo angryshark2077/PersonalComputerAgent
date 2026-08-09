@@ -225,6 +225,14 @@ impl ControlClient for AcceptanceHttpClient {
                     agent_version: "s1b-acceptance",
                     presence: "online",
                     outbox_depth,
+                    local_media: HeartbeatLocalMedia {
+                        completed_file_count: 0,
+                        completed_bytes: 0,
+                        protected_file_count: 0,
+                        protected_bytes: 0,
+                    },
+                    cleanup_result: None,
+                    network: None,
                 })
                 .send()
                 .await
@@ -264,6 +272,17 @@ struct HeartbeatRequest {
     agent_version: &'static str,
     presence: &'static str,
     outbox_depth: u64,
+    local_media: HeartbeatLocalMedia,
+    cleanup_result: Option<()>,
+    network: Option<()>,
+}
+
+#[derive(Serialize)]
+struct HeartbeatLocalMedia {
+    completed_file_count: u64,
+    completed_bytes: u64,
+    protected_file_count: u64,
+    protected_bytes: u64,
 }
 
 #[derive(Deserialize)]

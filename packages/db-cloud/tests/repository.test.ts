@@ -307,7 +307,7 @@ test("network history records identity changes only and retains the latest five"
   assert.equal(device?.status?.networkHistory[4]?.network.ssid, "WiFi 2");
 });
 
-test("network history records a device location change beyond its accuracy radius", async () => {
+test("network history records a device location change beyond both accuracy radii", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);
   const deviceId = "01981111-7111-8111-8111-111111111111";
@@ -340,7 +340,7 @@ test("network history records a device location change beyond its accuracy radiu
   });
 
   await record(0, 1.3521);
-  await record(1, 1.35215);
+  await record(1, 1.35237);
   await record(2, 1.3531);
 
   const [device] = await repository.listOwnerDevices(workspaceId, ownerUserId);

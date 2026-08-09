@@ -2441,6 +2441,12 @@ export class DrizzleControlRepository implements ControlRepository {
     try {
       await requireDatabaseDevice(this.database, input.deviceId, input.workspaceId, false);
       await this.database.transaction(async (transaction) => {
+        await transaction.execute(sql`
+          SELECT id FROM ${devices}
+          WHERE ${devices.id} = ${input.deviceId}
+            AND ${devices.workspaceId} = ${input.workspaceId}
+          FOR UPDATE
+        `);
         if (input.cleanupResult !== null) {
           const updated = await transaction
             .update(deviceMediaCleanupRequests)
@@ -3886,9 +3892,8 @@ function deviceLocationsMatch(
     + Math.cos(latitudeRadians) * Math.cos(rightLatitudeRadians)
       * Math.sin(longitudeDelta / 2) ** 2;
   const distanceMeters = 2 * 6_371_000 * Math.asin(Math.min(1, Math.sqrt(haversine)));
-  return distanceMeters <= Math.max(
-    left.horizontalAccuracyMeters,
-    right.horizontalAccuracyMeters,
+  return distanceMeters <= (
+    left.horizontalAccuracyMeters + right.horizontalAccuracyMeters
   );
 }
 

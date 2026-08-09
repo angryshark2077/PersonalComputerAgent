@@ -17,6 +17,10 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -228,6 +232,8 @@ fn prepare_automatic() -> Result<(), RepairError> {
     }
     reviewed_capture_profile()?;
     lldb_capture::preflight().map_err(map_capture_error)?;
+    isolate_automatic_process_group()?;
+    let parent_monitor = monitor_installer_until_authorized();
 
     let executable = env::current_exe().map_err(|_| RepairError::CaptureFailed)?;
     let mut child = Command::new(executable)
@@ -239,17 +245,61 @@ fn prepare_automatic() -> Result<(), RepairError> {
         .map_err(|_| RepairError::CaptureFailed)?;
     let stdout = child.stdout.take().ok_or(RepairError::CaptureFailed)?;
     let mut line = String::new();
-    BufReader::new(stdout)
-        .read_line(&mut line)
-        .map_err(|_| RepairError::CaptureFailed)?;
-    if line.trim() != "AUTHORIZED" {
-        let _ = child.wait();
+    if BufReader::new(stdout).read_line(&mut line).is_err() {
+        terminate_pending_worker(&mut child);
         return Err(RepairError::CaptureFailed);
+    }
+    if line.trim() != "AUTHORIZED" {
+        terminate_pending_worker(&mut child);
+        return Err(RepairError::CaptureFailed);
+    }
+    if let Some(stop) = parent_monitor {
+        stop.store(true, Ordering::Release);
     }
     // `Child` does not terminate the process on drop. Setup can now exit while the one-time worker
     // remains under launchd and waits for the first official WeChat launch.
     drop(child);
     Ok(())
+}
+
+#[allow(unsafe_code)]
+fn isolate_automatic_process_group() -> Result<(), RepairError> {
+    // SAFETY: `setpgid(0, 0)` only places this helper in its own process group. It does not
+    // dereference pointers or access shared memory.
+    (unsafe { libc::setpgid(0, 0) } == 0)
+        .then_some(())
+        .ok_or(RepairError::CaptureFailed)
+}
+
+fn monitor_installer_until_authorized() -> Option<Arc<AtomicBool>> {
+    let installer_pid = env::var("PCA_INSTALLER_PID").ok()?;
+    if installer_pid.is_empty() || !installer_pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let process_group = format!("-{}", std::process::id());
+    let stop = Arc::new(AtomicBool::new(false));
+    let monitor_stop = Arc::clone(&stop);
+    thread::spawn(move || {
+        while !monitor_stop.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(250));
+            let installer_is_running = Command::new("/bin/kill")
+                .args(["-0", &installer_pid])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !installer_is_running {
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &process_group])
+                    .status();
+                break;
+            }
+        }
+    });
+    Some(stop)
+}
+
+fn terminate_pending_worker(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn run_automatic_worker() -> Result<(), RepairError> {

@@ -2,7 +2,12 @@ import Foundation
 import Security
 
 protocol SignatureChecking: Sendable {
-    func verifyAndReadTeamIdentifier(of target: URL) throws -> String
+    func verifyAndReadIdentity(of target: URL) throws -> CodeSigningIdentity
+}
+
+struct CodeSigningIdentity: Equatable, Sendable {
+    let teamIdentifier: String
+    let designatedRequirement: String
 }
 
 protocol ArchitectureChecking: Sendable {
@@ -10,7 +15,7 @@ protocol ArchitectureChecking: Sendable {
 }
 
 struct ProductionSignatureChecker: SignatureChecking {
-    func verifyAndReadTeamIdentifier(of target: URL) throws -> String {
+    func verifyAndReadIdentity(of target: URL) throws -> CodeSigningIdentity {
         var code: SecStaticCode?
         guard SecStaticCodeCreateWithPath(target as CFURL, [], &code) == errSecSuccess,
               let code
@@ -29,7 +34,19 @@ struct ProductionSignatureChecker: SignatureChecking {
             let team = information[kSecCodeInfoTeamIdentifier as String] as? String,
             !team.isEmpty
         else { throw InstallError.invalidBundle }
-        return team
+        var requirement: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(code, [], &requirement) == errSecSuccess,
+              let requirement
+        else { throw InstallError.invalidBundle }
+        var requirementText: CFString?
+        guard SecRequirementCopyString(requirement, [], &requirementText) == errSecSuccess,
+              let designatedRequirement = requirementText as String?,
+              !designatedRequirement.isEmpty
+        else { throw InstallError.invalidBundle }
+        return CodeSigningIdentity(
+            teamIdentifier: team,
+            designatedRequirement: designatedRequirement
+        )
     }
 }
 
@@ -135,20 +152,22 @@ struct BundleValidator: BundleValidating {
         guard let expectedTeamIdentifier, !expectedTeamIdentifier.isEmpty else {
             throw InstallError.invalidBundle
         }
-        let candidateTeamIdentifier = try signatureChecker.verifyAndReadTeamIdentifier(of: candidate)
-        guard candidateTeamIdentifier == expectedTeamIdentifier else { throw InstallError.invalidBundle }
+        let candidateSigningIdentity = try signatureChecker.verifyAndReadIdentity(of: candidate)
+        guard candidateSigningIdentity.teamIdentifier == expectedTeamIdentifier else { throw InstallError.invalidBundle }
         for signedTarget in [candidate, agent, bridge, wechatRepair, ffmpeg] {
-            guard try signatureChecker.verifyAndReadTeamIdentifier(of: signedTarget) == expectedTeamIdentifier else {
+            guard try signatureChecker.verifyAndReadIdentity(of: signedTarget).teamIdentifier == expectedTeamIdentifier else {
                 throw InstallError.invalidBundle
             }
         }
-        let previousTeamIdentifier = try installed.map {
-            try signatureChecker.verifyAndReadTeamIdentifier(of: $0)
+        let previousSigningIdentity = try installed.map {
+            try signatureChecker.verifyAndReadIdentity(of: $0)
         }
         return ValidatedBundle(
             version: candidateVersion,
             previousVersion: previousVersion,
-            signingIdentityChanged: previousTeamIdentifier.map { $0 != candidateTeamIdentifier } ?? false
+            signingIdentityChanged: previousSigningIdentity.map {
+                $0.designatedRequirement != candidateSigningIdentity.designatedRequirement
+            } ?? false
         )
     }
 

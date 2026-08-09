@@ -62,8 +62,7 @@ pub(super) fn capture_key(
     pid: libc::pid_t,
     profile: CaptureProfile,
 ) -> Result<[u8; 32], CaptureError> {
-    preflight()?;
-    let lldb_path = find_lldb()?;
+    let lldb_path = preflight_lldb_path()?;
     let directory = PrivateCaptureDirectory::create("manual")?;
     let socket_path = directory.path.join("key.sock");
     let socket = UnixDatagram::bind(&socket_path).map_err(|_| CaptureError::DebuggerFailed)?;
@@ -112,8 +111,7 @@ pub(super) fn capture_key_on_next_launch(
     profile: CaptureProfile,
     on_authorized: impl FnOnce(),
 ) -> Result<[u8; 32], CaptureError> {
-    preflight()?;
-    let lldb_path = find_lldb()?;
+    let lldb_path = preflight_lldb_path()?;
     let directory = PrivateCaptureDirectory::create("automatic")?;
     let socket_path = directory.path.join("key.sock");
     let socket = UnixDatagram::bind(&socket_path).map_err(|_| CaptureError::DebuggerFailed)?;
@@ -140,6 +138,7 @@ pub(super) fn capture_key_on_next_launch(
             &ready_path,
             &finished_path,
             &stop_path,
+            std::process::id(),
         ),
     )?;
 
@@ -165,8 +164,20 @@ pub(super) fn capture_key_on_next_launch(
 }
 
 pub(super) fn preflight() -> Result<(), CaptureError> {
-    ensure_sip_disabled()?;
-    find_lldb().map(|_| ())
+    preflight_lldb_path().map(|_| ())
+}
+
+fn preflight_lldb_path() -> Result<PathBuf, CaptureError> {
+    preflight_with(find_lldb, ensure_sip_disabled)
+}
+
+fn preflight_with(
+    find_debugger: impl FnOnce() -> Result<PathBuf, CaptureError>,
+    check_sip: impl FnOnce() -> Result<(), CaptureError>,
+) -> Result<PathBuf, CaptureError> {
+    let debugger = find_debugger()?;
+    check_sip()?;
+    Ok(debugger)
 }
 
 fn ensure_sip_disabled() -> Result<(), CaptureError> {
@@ -377,6 +388,7 @@ fn waiting_elevated_runner(
     ready_path: &Path,
     finished_path: &Path,
     stop_path: &Path,
+    worker_pid: u32,
 ) -> String {
     format!(
         "#!/bin/sh\n\
@@ -388,7 +400,7 @@ debugger_pid=$!\n\
 /bin/sleep 1\n\
 if ! /bin/kill -0 \"$debugger_pid\" 2>/dev/null; then wait \"$debugger_pid\"; exit $?; fi\n\
 : > {}\n\
-(remaining={}; while [ \"$remaining\" -gt 0 ] && [ ! -f {} ]; do sleep 1; remaining=$((remaining - 1)); done; /bin/kill -INT \"$debugger_pid\" 2>/dev/null || true; sleep 2; /bin/kill -TERM \"$debugger_pid\" 2>/dev/null || true; sleep 1; /bin/kill -KILL \"$debugger_pid\" 2>/dev/null || true) &\n\
+(remaining={}; while [ \"$remaining\" -gt 0 ] && [ ! -f {} ] && /bin/kill -0 {} 2>/dev/null; do sleep 1; remaining=$((remaining - 1)); done; /bin/kill -INT \"$debugger_pid\" 2>/dev/null || true; sleep 2; /bin/kill -TERM \"$debugger_pid\" 2>/dev/null || true; sleep 1; /bin/kill -KILL \"$debugger_pid\" 2>/dev/null || true) &\n\
 watchdog_pid=$!\n\
 wait \"$debugger_pid\"\n\
 status=$?\n\
@@ -402,6 +414,7 @@ exit \"$status\"\n",
         shell_quote(ready_path),
         AUTOMATIC_CAPTURE_TIMEOUT_SECS,
         shell_quote(stop_path),
+        worker_pid,
     )
 }
 
@@ -482,11 +495,12 @@ pub(super) enum CaptureError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{cell::Cell, path::Path};
 
     use super::{
         administrator_script, capture_commands, capture_has_failed, capture_script,
-        elevated_runner, next_launch_capture_commands, waiting_elevated_runner, CaptureProfile,
+        elevated_runner, next_launch_capture_commands, preflight_with, waiting_elevated_runner,
+        CaptureError, CaptureProfile,
     };
 
     fn profile() -> CaptureProfile {
@@ -557,14 +571,31 @@ mod tests {
             Path::new("/tmp/pca-test/debugger.ready"),
             Path::new("/tmp/pca-test/debugger.finished"),
             Path::new("/tmp/pca-test/debugger.stop"),
+            4242,
         );
         assert!(runner.contains("debugger.ready"));
         assert!(runner.contains("debugger.stop"));
         assert!(runner.contains("kill -0 \"$debugger_pid\""));
+        assert!(runner.contains("kill -0 4242"));
         assert!(runner.contains("kill -INT \"$debugger_pid\""));
         assert!(runner.contains("pkill -TERM -P \"$watchdog_pid\""));
         assert!(!runner.contains("open "));
         assert!(!runner.contains("codesign"));
+    }
+
+    #[test]
+    fn missing_debugger_is_reported_before_requesting_sip_changes() {
+        let sip_checked = Cell::new(false);
+        let result = preflight_with(
+            || Err(CaptureError::DebuggerUnavailable),
+            || {
+                sip_checked.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err(CaptureError::DebuggerUnavailable));
+        assert!(!sip_checked.get());
     }
 
     #[test]
