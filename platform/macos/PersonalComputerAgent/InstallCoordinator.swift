@@ -283,6 +283,13 @@ struct InstallPaths: Equatable, Sendable {
 struct ValidatedBundle: Equatable, Sendable {
     let version: String
     let previousVersion: String?
+    let signingIdentityChanged: Bool
+
+    init(version: String, previousVersion: String?, signingIdentityChanged: Bool = false) {
+        self.version = version
+        self.previousVersion = previousVersion
+        self.signingIdentityChanged = signingIdentityChanged
+    }
 }
 
 protocol BundleValidating {
@@ -344,6 +351,7 @@ struct InstallTransaction: Codable, Equatable, Sendable {
     let priorServiceState: ServiceState
     let stagingName: String
     let expectedLayoutIdentity: InstallLayoutIdentity
+    let signingIdentityChanged: Bool?
 
     init(
         phase: InstallPhase,
@@ -352,6 +360,7 @@ struct InstallTransaction: Codable, Equatable, Sendable {
         priorServiceState: ServiceState,
         stagingName: String,
         expectedLayoutIdentity: InstallLayoutIdentity,
+        signingIdentityChanged: Bool = false,
         rollbackPhase: RollbackPhase? = nil,
         rollbackAttemptStartedAt: Date? = nil
     ) {
@@ -363,6 +372,7 @@ struct InstallTransaction: Codable, Equatable, Sendable {
         self.priorServiceState = priorServiceState
         self.stagingName = stagingName
         self.expectedLayoutIdentity = expectedLayoutIdentity
+        self.signingIdentityChanged = signingIdentityChanged
     }
 
     func advancing(to phase: InstallPhase) -> InstallTransaction {
@@ -624,13 +634,19 @@ final class PhotosAccessController: PhotosAccessControlling {
             throw InstallError.invalidBundle
         }
         onWaitingForAuthorization()
+        try Task.checkCancellation()
         let process = Process()
         process.executableURL = helperExecutableURL
         process.arguments = ["--authorize-photos"]
-        let status = try await withCheckedThrowingContinuation { continuation in
-            process.terminationHandler = { process in continuation.resume(returning: process.terminationStatus) }
-            do { try process.run() } catch { continuation.resume(throwing: error) }
+        let status = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { process in continuation.resume(returning: process.terminationStatus) }
+                do { try process.run() } catch { continuation.resume(throwing: error) }
+            }
+        } onCancel: {
+            if process.isRunning { process.terminate() }
         }
+        try Task.checkCancellation()
         guard status == 0 else {
             if let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
                 NSWorkspace.shared.open(settings)
@@ -710,6 +726,11 @@ final class LocationAccessController: LocationAccessControlling {
 
 @MainActor
 protocol BridgeCredentialProvisioning {
+    func migrateExistingCredentials(
+        bridgeTrustedApplicationURLs: [URL],
+        deviceTrustedApplicationURLs: [URL],
+        wechatTrustedApplicationURLs: [URL]
+    ) throws
     func ensureCredential(trustedApplicationURLs: [URL]) throws
     func ensureDeviceCredentialPlaceholder(trustedApplicationURLs: [URL]) throws
     func ensureWechatCredentialPlaceholder(trustedApplicationURLs: [URL]) throws
@@ -718,6 +739,35 @@ protocol BridgeCredentialProvisioning {
 @MainActor
 struct KeychainBridgeCredentialProvisioner: BridgeCredentialProvisioning {
     private let store = KeychainCredentialStore()
+
+    func migrateExistingCredentials(
+        bridgeTrustedApplicationURLs: [URL],
+        deviceTrustedApplicationURLs: [URL],
+        wechatTrustedApplicationURLs: [URL]
+    ) throws {
+        do {
+            try store.updateAccessIfPresent(
+                service: KeychainCredentialStore.service,
+                account: KeychainCredentialStore.account,
+                label: "Personal Computer Agent Bridge Credential",
+                trustedApplicationURLs: bridgeTrustedApplicationURLs
+            )
+            try store.updateAccessIfPresent(
+                service: KeychainCredentialStore.deviceService,
+                account: KeychainCredentialStore.deviceAccount,
+                label: "Personal Computer Agent Device Credential",
+                trustedApplicationURLs: deviceTrustedApplicationURLs
+            )
+            try store.updateAccessIfPresent(
+                service: KeychainCredentialStore.wechatService,
+                account: KeychainCredentialStore.wechatAccount,
+                label: "Personal Computer Agent WeChat Credential",
+                trustedApplicationURLs: wechatTrustedApplicationURLs
+            )
+        } catch {
+            throw InstallError.credentialProvisioningFailed
+        }
+    }
 
     func ensureCredential(trustedApplicationURLs: [URL]) throws {
         do {
@@ -864,7 +914,8 @@ final class InstallCoordinator: InstallCoordinating {
             candidateVersion: validated.version,
             priorServiceState: inheritedPriorServiceState ?? service.status(),
             stagingName: staging.lastPathComponent,
-            expectedLayoutIdentity: layoutIdentity
+            expectedLayoutIdentity: layoutIdentity,
+            signingIdentityChanged: validated.signingIdentityChanged
         )
         do {
             try fileSystem.writeTransaction(transaction, paths: paths, layoutIdentity: layoutIdentity)
@@ -937,20 +988,70 @@ final class InstallCoordinator: InstallCoordinating {
         }
 
         let installedVersion = try validator.version(at: paths.installedBundleURL)
-        try await wechatAppDataAccess.waitForAuthorization(
-            agentExecutableURL: paths.installedAgentExecutableURL,
-            onWaitingForAuthorization: { onState(.waitingWechatAppDataAccess) }
-        )
-        try await locationAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
-            onState(.waitingLocationAccess)
-        }
-        try await screenCaptureAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
-            onState(.waitingScreenCaptureAccess)
-        }
-        try await photosAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
-            onState(.waitingPhotosAccess)
+        do {
+            try await wechatAppDataAccess.waitForAuthorization(
+                agentExecutableURL: paths.installedAgentExecutableURL,
+                onWaitingForAuthorization: { onState(.waitingWechatAppDataAccess) }
+            )
+        } catch InstallError.wechatAppDataAccessRequired {
+            // Communication is optional. The Agent records this collector as permission-required.
         }
         do {
+            try await locationAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
+                onState(.waitingLocationAccess)
+            }
+        } catch InstallError.locationAccessRequired {
+            // Network collection degrades without preventing the local runtime from starting.
+        }
+        do {
+            try await screenCaptureAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
+                onState(.waitingScreenCaptureAccess)
+            }
+        } catch InstallError.screenCaptureAccessRequired {
+            // Screenshots remain disabled until the owner grants access later.
+        }
+        do {
+            try await photosAccess.waitForAuthorization(helperExecutableURL: paths.installedBridgeExecutableURL) {
+                onState(.waitingPhotosAccess)
+            }
+        } catch InstallError.photosAccessRequired {
+            // Photos remain disabled until the owner grants access later.
+        }
+        do {
+            if transaction?.signingIdentityChanged == true {
+                onState(.migratingKeychainAccess)
+                let rollbackAgent = paths.rollbackBundleURL.appendingPathComponent("Contents/Resources/bin/pca-agentd")
+                let rollbackBridge = paths.rollbackBundleURL.appendingPathComponent(
+                    "Contents/Helpers/PCAPlatformBridge.app/Contents/MacOS/PCAPlatformBridge"
+                )
+                let rollbackRepair = paths.rollbackBundleURL.appendingPathComponent(
+                    "Contents/Resources/bin/pca-wechat-repair"
+                )
+                try credentialProvisioner.migrateExistingCredentials(
+                    bridgeTrustedApplicationURLs: [
+                        paths.installedBundleURL,
+                        paths.installedAgentExecutableURL,
+                        paths.installedBridgeExecutableURL,
+                        paths.rollbackBundleURL,
+                        rollbackAgent,
+                        rollbackBridge,
+                    ],
+                    deviceTrustedApplicationURLs: [
+                        paths.installedBundleURL,
+                        paths.installedAgentExecutableURL,
+                        paths.installedBridgeExecutableURL,
+                        paths.rollbackBundleURL,
+                        rollbackAgent,
+                        rollbackBridge,
+                    ],
+                    wechatTrustedApplicationURLs: [
+                        paths.installedAgentExecutableURL,
+                        paths.installedWechatRepairExecutableURL,
+                        rollbackAgent,
+                        rollbackRepair,
+                    ]
+                )
+            }
             let trustedApplicationURLs = [
                 paths.installedBundleURL,
                 paths.installedAgentExecutableURL,

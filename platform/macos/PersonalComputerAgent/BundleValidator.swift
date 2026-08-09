@@ -62,6 +62,7 @@ struct ProductionArchitectureChecker: ArchitectureChecking {
 struct BundleValidator: BundleValidating {
     static let bundleIdentifier = "com.pca.PersonalComputerAgent"
     static let launchAgentName = "com.pca.agentd.plist"
+    static let productionTeamIdentifier = "UHB669QQ6A"
 
     private let signatureChecker: any SignatureChecking
     private let architectureChecker: any ArchitectureChecking
@@ -77,8 +78,7 @@ struct BundleValidator: BundleValidating {
         self.signatureChecker = signatureChecker
         self.architectureChecker = architectureChecker
         self.fileManager = fileManager
-        self.expectedTeamIdentifier = expectedTeamIdentifier
-            ?? (try? signatureChecker.verifyAndReadTeamIdentifier(of: Bundle.main.bundleURL))
+        self.expectedTeamIdentifier = expectedTeamIdentifier ?? Self.productionTeamIdentifier
     }
 
     func validate(candidate: URL, replacing installed: URL?) throws -> ValidatedBundle {
@@ -135,12 +135,21 @@ struct BundleValidator: BundleValidating {
         guard let expectedTeamIdentifier, !expectedTeamIdentifier.isEmpty else {
             throw InstallError.invalidBundle
         }
+        let candidateTeamIdentifier = try signatureChecker.verifyAndReadTeamIdentifier(of: candidate)
+        guard candidateTeamIdentifier == expectedTeamIdentifier else { throw InstallError.invalidBundle }
         for signedTarget in [candidate, agent, bridge, wechatRepair, ffmpeg] {
             guard try signatureChecker.verifyAndReadTeamIdentifier(of: signedTarget) == expectedTeamIdentifier else {
                 throw InstallError.invalidBundle
             }
         }
-        return ValidatedBundle(version: candidateVersion, previousVersion: previousVersion)
+        let previousTeamIdentifier = try installed.map {
+            try signatureChecker.verifyAndReadTeamIdentifier(of: $0)
+        }
+        return ValidatedBundle(
+            version: candidateVersion,
+            previousVersion: previousVersion,
+            signingIdentityChanged: previousTeamIdentifier.map { $0 != candidateTeamIdentifier } ?? false
+        )
     }
 
     func version(at bundle: URL) throws -> String {

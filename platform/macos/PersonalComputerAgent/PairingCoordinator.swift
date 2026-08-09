@@ -57,6 +57,7 @@ final class PairingCoordinator {
 
     func cancel() async {
         let sessionID = activeSessionID
+        activeSessionID = nil
         closeListener()
         if let sessionID { await agent.cancelPairing(sessionID: sessionID) }
     }
@@ -65,11 +66,14 @@ final class PairingCoordinator {
 
     private func start() async throws -> PairingResult {
         guard callbackServer == nil else { throw PairingError.alreadyConsumed }
+        consumed = false
+        activeSessionID = nil
         let server = try callbackServerFactory()
         callbackServer = server
         listenerWasClosed = false
         let callbackURI = try await server.start()
 
+        var callbackWasAccepted = false
         do {
             let handoff = PairingStartHandoff(callbackURI: callbackURI)
             let session = try await agent.beginPairing(handoff)
@@ -91,6 +95,7 @@ final class PairingCoordinator {
                 return try await group.next()!
             }
             let acceptedCallback = try await accept(callback)
+            callbackWasAccepted = true
             let result = try await agent.completePairing(PairingCallbackHandoff(
                 sessionID: session.sessionID,
                 authorizationCode: acceptedCallback.authorizationCode
@@ -98,6 +103,10 @@ final class PairingCoordinator {
             activeSessionID = nil
             return result
         } catch {
+            if callbackWasAccepted, (try? await agent.isPaired()) == true {
+                activeSessionID = nil
+                return .alreadyPaired
+            }
             await cancel()
             throw error
         }

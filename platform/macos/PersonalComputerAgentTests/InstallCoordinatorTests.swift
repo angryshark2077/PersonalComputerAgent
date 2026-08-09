@@ -66,80 +66,68 @@ final class InstallCoordinatorTests: XCTestCase {
         XCTAssertTrue(fixture.relauncher.urls.isEmpty)
     }
 
-    func testMissingWechatAppDataAccessStopsBeforeOtherPermissionsAndRuntime() async throws {
+    func testMissingWechatAppDataAccessDoesNotStopOtherPermissionsOrRuntime() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
         fixture.wechatAppDataAccess.error = .wechatAppDataAccessRequired
         var states: [InstallerState] = []
 
-        await XCTAssertThrowsErrorAsync(
-            try await fixture.coordinator.finishInstalledSetup { states.append($0) }
-        ) { error in
-            XCTAssertEqual(error as? InstallError, .wechatAppDataAccessRequired)
-        }
+        let result = try await fixture.coordinator.finishInstalledSetup { states.append($0) }
 
-        XCTAssertEqual(states, [.waitingWechatAppDataAccess])
+        XCTAssertEqual(result, .success(version: "1.0.0"))
+        XCTAssertTrue(states.contains(.waitingWechatAppDataAccess))
         XCTAssertEqual(fixture.wechatAppDataAccess.checkCount, 1)
-        XCTAssertEqual(fixture.locationAccess.checkCount, 0)
-        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
-        XCTAssertEqual(fixture.service.registerCount, 0)
-        XCTAssertEqual(fixture.health.checkCount, 0)
+        XCTAssertEqual(fixture.locationAccess.checkCount, 1)
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.health.checkCount, 1)
     }
 
-    func testMissingLocationAccessStopsBeforeCredentialsServiceAndHealth() async throws {
+    func testMissingLocationAccessDoesNotStopCredentialsServiceAndHealth() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
         fixture.locationAccess.error = .locationAccessRequired
         var states: [InstallerState] = []
 
-        await XCTAssertThrowsErrorAsync(
-            try await fixture.coordinator.finishInstalledSetup { states.append($0) }
-        ) { error in
-            XCTAssertEqual(error as? InstallError, .locationAccessRequired)
-        }
+        let result = try await fixture.coordinator.finishInstalledSetup { states.append($0) }
 
-        XCTAssertEqual(states, [.waitingLocationAccess])
+        XCTAssertEqual(result, .success(version: "1.0.0"))
+        XCTAssertTrue(states.contains(.waitingLocationAccess))
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
-        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
-        XCTAssertEqual(fixture.service.registerCount, 0)
-        XCTAssertEqual(fixture.health.checkCount, 0)
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.health.checkCount, 1)
     }
 
-    func testMissingScreenCaptureAccessStopsBeforeCredentialsServiceAndHealth() async throws {
+    func testMissingScreenCaptureAccessDoesNotStopCredentialsServiceAndHealth() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
         fixture.screenCaptureAccess.error = .screenCaptureAccessRequired
         var states: [InstallerState] = []
 
-        await XCTAssertThrowsErrorAsync(
-            try await fixture.coordinator.finishInstalledSetup { states.append($0) }
-        ) { error in
-            XCTAssertEqual(error as? InstallError, .screenCaptureAccessRequired)
-        }
+        let result = try await fixture.coordinator.finishInstalledSetup { states.append($0) }
 
-        XCTAssertEqual(states, [.waitingScreenCaptureAccess])
+        XCTAssertEqual(result, .success(version: "1.0.0"))
+        XCTAssertTrue(states.contains(.waitingScreenCaptureAccess))
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
         XCTAssertEqual(fixture.screenCaptureAccess.checkCount, 1)
-        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
-        XCTAssertEqual(fixture.service.registerCount, 0)
-        XCTAssertEqual(fixture.health.checkCount, 0)
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.health.checkCount, 1)
     }
 
-    func testMissingPhotosAccessStopsBeforeCredentialsServiceAndHealth() async throws {
+    func testMissingPhotosAccessDoesNotStopCredentialsServiceAndHealth() async throws {
         let fixture = try Fixture(installedVersion: "1.0.0", candidateVersion: "1.0.0")
         fixture.photosAccess.error = .photosAccessRequired
         var states: [InstallerState] = []
 
-        await XCTAssertThrowsErrorAsync(
-            try await fixture.coordinator.finishInstalledSetup { states.append($0) }
-        ) { error in
-            XCTAssertEqual(error as? InstallError, .photosAccessRequired)
-        }
+        let result = try await fixture.coordinator.finishInstalledSetup { states.append($0) }
 
-        XCTAssertEqual(states, [.waitingPhotosAccess])
+        XCTAssertEqual(result, .success(version: "1.0.0"))
+        XCTAssertTrue(states.contains(.waitingPhotosAccess))
         XCTAssertEqual(fixture.locationAccess.checkCount, 1)
         XCTAssertEqual(fixture.screenCaptureAccess.checkCount, 1)
         XCTAssertEqual(fixture.photosAccess.checkCount, 1)
-        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 0)
-        XCTAssertEqual(fixture.service.registerCount, 0)
-        XCTAssertEqual(fixture.health.checkCount, 0)
+        XCTAssertEqual(fixture.credentialProvisioner.provisionCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+        XCTAssertEqual(fixture.health.checkCount, 1)
     }
 
     func testHealthyExistingRuntimeSkipsReregistrationWhenReopeningInstalledSetup() async throws {
@@ -166,6 +154,44 @@ final class InstallCoordinatorTests: XCTestCase {
             }
         }
 
+        XCTAssertEqual(fixture.service.registerCount, 0)
+        XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
+    }
+
+    func testSigningIdentityChangeMigratesExistingKeychainACLsBeforeStartingService() async throws {
+        let fixture = try Fixture(
+            installedVersion: "1.0.0",
+            candidateVersion: "2.0.0",
+            signingIdentityChanged: true
+        )
+        _ = try await fixture.coordinator.prepareInstallation(from: fixture.candidate)
+        var states: [InstallerState] = []
+
+        let result = try await fixture.coordinator.finishInstalledSetup { states.append($0) }
+
+        XCTAssertEqual(result, .success(version: "2.0.0"))
+        XCTAssertTrue(states.contains(.migratingKeychainAccess))
+        XCTAssertEqual(fixture.credentialProvisioner.migrationCount, 1)
+        XCTAssertEqual(fixture.service.registerCount, 1)
+    }
+
+    func testSigningIdentityMigrationFailureRestoresThePreviousInstallation() async throws {
+        let fixture = try Fixture(
+            installedVersion: "1.0.0",
+            candidateVersion: "2.0.0",
+            signingIdentityChanged: true
+        )
+        fixture.service.currentState = .enabled
+        _ = try await fixture.coordinator.prepareInstallation(from: fixture.candidate)
+        fixture.credentialProvisioner.error = .credentialProvisioningFailed
+
+        await XCTAssertThrowsErrorAsync(try await fixture.coordinator.finishInstalledSetup()) { error in
+            guard case .transactionFailed(primary: .registration, recovery: .restoredAndRelaunched) = error as? InstallError else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+
+        XCTAssertEqual(fixture.credentialProvisioner.migrationCount, 1)
         XCTAssertEqual(fixture.service.registerCount, 0)
         XCTAssertEqual(try fixture.version(at: fixture.paths.installedBundleURL), "1.0.0")
     }
@@ -549,7 +575,12 @@ private final class Fixture {
 
     var crashStagingURL: URL { try! paths.stagingBundleURL(identifier: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!) }
 
-    init(installedVersion: String?, candidateVersion: String, failActivation: Bool = false) throws {
+    init(
+        installedVersion: String?,
+        candidateVersion: String,
+        failActivation: Bool = false,
+        signingIdentityChanged: Bool = false
+    ) throws {
         temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         paths = try InstallPaths(rootURL: temporary.appendingPathComponent("root", isDirectory: true))
@@ -562,7 +593,7 @@ private final class Fixture {
         fileSystem = FaultingInstallFileSystem(failActivation: failActivation)
         coordinator = InstallCoordinator(
             paths: paths,
-            validator: TestBundleValidator(),
+            validator: TestBundleValidator(signingIdentityChanged: signingIdentityChanged),
             service: service,
             health: health,
             relauncher: relauncher,
@@ -701,6 +732,7 @@ private final class FakePhotosAccessController: PhotosAccessControlling {
 
 @MainActor
 private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisioning {
+    var migrationCount = 0
     var provisionCount = 0
     var trustedApplicationURLs: [[URL]] = []
     var deviceCredentialProvisionCount = 0
@@ -708,6 +740,18 @@ private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisionin
     var wechatCredentialProvisionCount = 0
     var wechatCredentialTrustedApplicationURLs: [[URL]] = []
     var error: InstallError?
+
+    func migrateExistingCredentials(
+        bridgeTrustedApplicationURLs _: [URL],
+        deviceTrustedApplicationURLs _: [URL],
+        wechatTrustedApplicationURLs _: [URL]
+    ) throws {
+        migrationCount += 1
+        if let error {
+            self.error = nil
+            throw error
+        }
+    }
 
     func ensureCredential(trustedApplicationURLs: [URL]) throws {
         provisionCount += 1
@@ -738,6 +782,12 @@ private final class FakeBridgeCredentialProvisioner: BridgeCredentialProvisionin
 }
 
 private struct TestBundleValidator: BundleValidating {
+    let signingIdentityChanged: Bool
+
+    init(signingIdentityChanged: Bool = false) {
+        self.signingIdentityChanged = signingIdentityChanged
+    }
+
     func validate(candidate: URL, replacing installed: URL?) throws -> ValidatedBundle {
         let candidateVersion = try version(at: candidate)
         let installedVersion = try installed.map(version(at:))
@@ -745,7 +795,11 @@ private struct TestBundleValidator: BundleValidating {
            Version(candidateVersion).compare(to: Version(installedVersion)) == .orderedAscending {
             throw InstallError.downgradeRejected(installed: installedVersion, candidate: candidateVersion)
         }
-        return ValidatedBundle(version: candidateVersion, previousVersion: installedVersion)
+        return ValidatedBundle(
+            version: candidateVersion,
+            previousVersion: installedVersion,
+            signingIdentityChanged: signingIdentityChanged
+        )
     }
 
     func version(at bundle: URL) throws -> String { try String(contentsOf: bundle.appendingPathComponent("version"), encoding: .utf8) }
@@ -1264,8 +1318,42 @@ final class InstallerViewModelTests: XCTestCase {
         XCTAssertEqual(repair.callCount, 0)
     }
 
-    func testAutomaticWechatAuthorizationFailureRemainsRetryable() async throws {
-        let repair = FakeWechatRepairRunner(error: .failed(message: "SIP must be disabled"))
+    func testSipRequirementDefersWechatRecoveryWithoutFailingHealthySetup() async throws {
+        let repair = FakeWechatRepairRunner(error: .requiresUserAction(message: "SIP must be disabled"))
+        let terminator = FakeTerminator()
+        let model = InstallerViewModel(
+            coordinator: CountingInstallCoordinator(),
+            sourceBundle: URL(fileURLWithPath: "/tmp/source.app"),
+            automaticallyStart: true,
+            wechatRepairRunner: repair,
+            terminator: terminator
+        )
+
+        model.startIfRequested()
+        try await waitUntil { repair.callCount == 1 && !model.isPreparingAutomaticWechatRecovery }
+
+        XCTAssertEqual(model.state, .automaticWechatRecoveryDeferred(message: "SIP must be disabled"))
+        XCTAssertTrue(model.wechatRepairAvailable)
+        XCTAssertEqual(terminator.count, 0)
+    }
+
+    func testWechatRecoveryExitNineRequiresUserAction() async throws {
+        let executable = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: executable) }
+        try Data("#!/bin/sh\necho 'SIP must be disabled' >&2\nexit 9\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let runner = ProcessWechatRepairRunner(executableURL: executable)
+
+        do {
+            try await runner.prepareAutomaticRecovery()
+            XCTFail("exit 9 must require user action")
+        } catch let error as WechatRepairRunnerError {
+            XCTAssertEqual(error, .requiresUserAction(message: "SIP must be disabled"))
+        }
+    }
+
+    func testAutomaticWechatCaptureFailureRemainsRetryable() async throws {
+        let repair = FakeWechatRepairRunner(error: .failed(message: "capture failed"))
         let model = InstallerViewModel(
             coordinator: CountingInstallCoordinator(),
             sourceBundle: URL(fileURLWithPath: "/tmp/source.app"),
@@ -1276,8 +1364,25 @@ final class InstallerViewModelTests: XCTestCase {
         model.retryAutomaticWechatRecoveryAuthorization()
         try await waitUntil { !model.isPreparingAutomaticWechatRecovery }
 
-        XCTAssertEqual(model.state, .automaticWechatRecoveryFailed(message: "SIP must be disabled"))
-        XCTAssertTrue(model.wechatRepairAvailable)
+        XCTAssertEqual(model.state, .automaticWechatRecoveryFailed(message: "capture failed"))
+    }
+
+    func testUnavailableWechatRecoveryDoesNotTurnAHealthyInstallIntoFailure() async throws {
+        let repair = FakeWechatRepairRunner(error: .notApplicable)
+        let terminator = FakeTerminator()
+        let model = InstallerViewModel(
+            coordinator: CountingInstallCoordinator(),
+            sourceBundle: URL(fileURLWithPath: "/tmp/source.app"),
+            automaticallyStart: true,
+            wechatRepairRunner: repair,
+            terminator: terminator
+        )
+
+        model.startIfRequested()
+        try await waitUntil { repair.callCount == 1 && !model.isPreparingAutomaticWechatRecovery }
+
+        XCTAssertEqual(model.state, .success)
+        XCTAssertEqual(terminator.count, 1)
     }
 }
 
@@ -1494,7 +1599,7 @@ final class BundleValidatorSigningTests: XCTestCase {
         }
     }
 
-    func testEnvironmentCannotOverrideCurrentlySignedInstallerTeamAnchor() throws {
+    func testEnvironmentCannotOverrideFixedProductionTeamAnchor() throws {
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
         let bundle = temporary.appendingPathComponent(".staging-candidate", isDirectory: true)
@@ -1518,6 +1623,31 @@ final class BundleValidatorSigningTests: XCTestCase {
         XCTAssertThrowsError(try validator.validate(candidate: bundle, replacing: nil)) { error in
             XCTAssertEqual(error as? InstallError, .invalidBundle)
         }
+    }
+
+    func testDifferentInstalledTeamRequestsKeychainAccessMigration() throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let installed = temporary.appendingPathComponent("PersonalComputerAgent.app", isDirectory: true)
+        let candidate = temporary.appendingPathComponent(".staging-candidate", isDirectory: true)
+        try makeValidBundle(at: installed)
+        try makeValidBundle(at: candidate)
+        let productionTeam = BundleValidator.productionTeamIdentifier
+        let validator = BundleValidator(
+            signatureChecker: FakeSignatureChecker(teams: [
+                installed.lastPathComponent: "OLDTEAM123",
+                candidate.lastPathComponent: productionTeam,
+                "pca-agentd": productionTeam,
+                "PCAPlatformBridge": productionTeam,
+                "pca-wechat-repair": productionTeam,
+                "ffmpeg": productionTeam,
+            ]),
+            architectureChecker: FakeArchitectureChecker()
+        )
+
+        let result = try validator.validate(candidate: candidate, replacing: installed)
+
+        XCTAssertTrue(result.signingIdentityChanged)
     }
 
     private func makeValidBundle(at bundle: URL) throws {
@@ -1551,7 +1681,7 @@ final class BundleValidatorSigningTests: XCTestCase {
             "CFBundleExecutable": "PCAPlatformBridge",
             "CFBundleShortVersionString": "2.0.0",
             "LSUIElement": true,
-            "NSLocationUsageDescription": "Read Wi-Fi identity for location matching.",
+            "NSLocationWhenInUseUsageDescription": "Read Wi-Fi identity for location matching.",
             "NSScreenCaptureUsageDescription": "Capture the active display.",
             "NSPhotoLibraryUsageDescription": "Read photo-library originals.",
         ]

@@ -130,10 +130,17 @@ pub(super) fn capture_key_on_next_launch(
     )?;
     let ready_path = directory.path.join("debugger.ready");
     let finished_path = directory.path.join("debugger.finished");
+    let stop_path = directory.path.join("debugger.stop");
     let runner_path = directory.path.join("run-debugger.sh");
     write_private_executable(
         &runner_path,
-        &waiting_elevated_runner(&lldb_path, &command_path, &ready_path, &finished_path),
+        &waiting_elevated_runner(
+            &lldb_path,
+            &command_path,
+            &ready_path,
+            &finished_path,
+            &stop_path,
+        ),
     )?;
 
     let apple_script = administrator_script(&runner_path);
@@ -152,6 +159,7 @@ pub(super) fn capture_key_on_next_launch(
         Some(Duration::from_secs(AUTOMATIC_CAPTURE_TIMEOUT_SECS)),
         on_authorized,
     );
+    let _ = File::create(&stop_path);
     finish_child(&mut child);
     result
 }
@@ -368,6 +376,7 @@ fn waiting_elevated_runner(
     command_path: &Path,
     ready_path: &Path,
     finished_path: &Path,
+    stop_path: &Path,
 ) -> String {
     format!(
         "#!/bin/sh\n\
@@ -379,7 +388,7 @@ debugger_pid=$!\n\
 /bin/sleep 1\n\
 if ! /bin/kill -0 \"$debugger_pid\" 2>/dev/null; then wait \"$debugger_pid\"; exit $?; fi\n\
 : > {}\n\
-(sleep {}; /bin/kill -INT \"$debugger_pid\" 2>/dev/null || true; sleep 2; /bin/kill -TERM \"$debugger_pid\" 2>/dev/null || true; sleep 1; /bin/kill -KILL \"$debugger_pid\" 2>/dev/null || true) &\n\
+(remaining={}; while [ \"$remaining\" -gt 0 ] && [ ! -f {} ]; do sleep 1; remaining=$((remaining - 1)); done; /bin/kill -INT \"$debugger_pid\" 2>/dev/null || true; sleep 2; /bin/kill -TERM \"$debugger_pid\" 2>/dev/null || true; sleep 1; /bin/kill -KILL \"$debugger_pid\" 2>/dev/null || true) &\n\
 watchdog_pid=$!\n\
 wait \"$debugger_pid\"\n\
 status=$?\n\
@@ -392,6 +401,7 @@ exit \"$status\"\n",
         shell_quote(command_path),
         shell_quote(ready_path),
         AUTOMATIC_CAPTURE_TIMEOUT_SECS,
+        shell_quote(stop_path),
     )
 }
 
@@ -546,8 +556,10 @@ mod tests {
             Path::new("/tmp/pca-test/capture.lldb"),
             Path::new("/tmp/pca-test/debugger.ready"),
             Path::new("/tmp/pca-test/debugger.finished"),
+            Path::new("/tmp/pca-test/debugger.stop"),
         );
         assert!(runner.contains("debugger.ready"));
+        assert!(runner.contains("debugger.stop"));
         assert!(runner.contains("kill -0 \"$debugger_pid\""));
         assert!(runner.contains("kill -INT \"$debugger_pid\""));
         assert!(runner.contains("pkill -TERM -P \"$watchdog_pid\""));

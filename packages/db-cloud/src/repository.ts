@@ -3869,7 +3869,27 @@ function networkIdentityMatches(left: NetworkHeartbeat | null, right: NetworkHea
     && left.observedExitIp === right.observedExitIp
     && left.ipLocation?.country === right.ipLocation?.country
     && left.ipLocation?.region === right.ipLocation?.region
-    && left.ipLocation?.city === right.ipLocation?.city;
+    && left.ipLocation?.city === right.ipLocation?.city
+    && deviceLocationsMatch(left.location, right.location);
+}
+
+function deviceLocationsMatch(
+  left: NetworkHeartbeat["location"],
+  right: NetworkHeartbeat["location"],
+): boolean {
+  if (left === null || right === null) return left === right;
+  const latitudeRadians = (left.latitude * Math.PI) / 180;
+  const rightLatitudeRadians = (right.latitude * Math.PI) / 180;
+  const latitudeDelta = ((right.latitude - left.latitude) * Math.PI) / 180;
+  const longitudeDelta = ((right.longitude - left.longitude) * Math.PI) / 180;
+  const haversine = Math.sin(latitudeDelta / 2) ** 2
+    + Math.cos(latitudeRadians) * Math.cos(rightLatitudeRadians)
+      * Math.sin(longitudeDelta / 2) ** 2;
+  const distanceMeters = 2 * 6_371_000 * Math.asin(Math.min(1, Math.sqrt(haversine)));
+  return distanceMeters <= Math.max(
+    left.horizontalAccuracyMeters,
+    right.horizontalAccuracyMeters,
+  );
 }
 
 function currentPresence(

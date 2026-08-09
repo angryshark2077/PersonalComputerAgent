@@ -123,6 +123,36 @@ final class PairingCoordinatorTests: XCTestCase {
             return XCTFail("cancelled pairing must return to repair")
         }
     }
+
+    func testAmbiguousCompletionReturnsAlreadyPairedWhenAgentPersistedTheCredential() async throws {
+        let agent = CallbackPairingAgent(completionResults: [.failure(.agentRejected)])
+        agent.pairedAfterFailedCompletion = true
+        let coordinator = PairingCoordinator(agent: agent, browser: SuccessfulPairingBrowser())
+
+        let result = try await coordinator.repair()
+
+        XCTAssertEqual(result, .alreadyPaired)
+        XCTAssertEqual(agent.beginCount, 1)
+    }
+
+    func testRetryStartsAFreshCallbackAfterAFailedCompletion() async throws {
+        let agent = CallbackPairingAgent(completionResults: [
+            .failure(.agentRejected),
+            .success(.paired(deviceID: "device", workspaceID: "workspace")),
+        ])
+        let coordinator = PairingCoordinator(agent: agent, browser: SuccessfulPairingBrowser())
+
+        do {
+            _ = try await coordinator.repair()
+            XCTFail("the first rejected completion must fail")
+        } catch let error as PairingError {
+            XCTAssertEqual(error, .agentRejected)
+        }
+        let result = try await coordinator.repair()
+
+        XCTAssertEqual(result, .paired(deviceID: "device", workspaceID: "workspace"))
+        XCTAssertEqual(agent.beginCount, 2)
+    }
 }
 
 private struct TestBeginPayload: Encodable, Sendable {
@@ -165,6 +195,49 @@ private final class ExpiringPairingAgent: PairingAgentHandingOff {
 @MainActor
 private final class SuccessfulPairingBrowser: PairingBrowserOpening {
     func open(_: URL) -> Bool { true }
+}
+
+@MainActor
+private final class CallbackPairingAgent: PairingAgentHandingOff {
+    var pairedAfterFailedCompletion = false
+    private(set) var beginCount = 0
+    private var completionResults: [Result<PairingResult, PairingError>]
+
+    init(completionResults: [Result<PairingResult, PairingError>]) {
+        self.completionResults = completionResults
+    }
+
+    func isPaired() async throws -> Bool { pairedAfterFailedCompletion }
+
+    func beginPairing(_ handoff: PairingStartHandoff) async throws -> PairingSessionHandoff {
+        beginCount += 1
+        let state = String(repeating: Character(String(beginCount)), count: 43)
+        var callback = URLComponents(url: handoff.callbackURI, resolvingAgainstBaseURL: false)!
+        callback.queryItems = [
+            URLQueryItem(name: "code", value: "code-\(beginCount)"),
+            URLQueryItem(name: "state", value: state),
+        ]
+        let callbackURL = callback.url!
+        Task.detached {
+            try? await Task.sleep(for: .milliseconds(10))
+            _ = try? await URLSession.shared.data(from: callbackURL)
+        }
+        return PairingSessionHandoff(
+            sessionID: "01982222-7222-8222-8222-22222222222\(beginCount)",
+            authorizationURL: URL(string: "https://pca-dashboard-production.up.railway.app/pair")!,
+            callbackState: state
+        )
+    }
+
+    func completePairing(_: PairingCallbackHandoff) async throws -> PairingResult {
+        let result = completionResults.removeFirst()
+        switch result {
+        case let .success(value): return value
+        case let .failure(error): throw error
+        }
+    }
+
+    func cancelPairing(sessionID _: String) async {}
 }
 
 @MainActor

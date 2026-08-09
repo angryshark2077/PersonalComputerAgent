@@ -325,8 +325,7 @@ fn reuse_existing_key_for_hardlink(source: &Source) -> Result<bool, RepairError>
     const MESSAGE_PATH: &str = "db_storage/message/message_0.db";
     const HARDLINK_PATH: &str = "db_storage/hardlink/hardlink.db";
 
-    let Some(material) =
-        load_wechat_key_material(&MacOSKeychainStore).map_err(|_| RepairError::Keychain)?
+    let Some(material) = reusable_key_material(load_wechat_key_material(&MacOSKeychainStore))?
     else {
         return Ok(false);
     };
@@ -354,6 +353,16 @@ fn reuse_existing_key_for_hardlink(source: &Source) -> Result<bool, RepairError>
         .store_validated_wechat_key_material(&extended)
         .map_err(|_| RepairError::Keychain)?;
     Ok(true)
+}
+
+fn reusable_key_material(
+    credential: Result<Option<WechatKeyMaterial>, CredentialError>,
+) -> Result<Option<WechatKeyMaterial>, RepairError> {
+    match credential {
+        Ok(material) => Ok(material),
+        Err(CredentialError::CorruptSecret | CredentialError::InvalidCredential) => Ok(None),
+        Err(_) => Err(RepairError::Keychain),
+    }
 }
 
 struct Source {
@@ -613,6 +622,26 @@ mod tests {
         ));
         assert!(matches!(
             automatic_recovery_required(&Err(CredentialError::OperationFailed)),
+            Err(RepairError::Keychain)
+        ));
+    }
+
+    #[test]
+    fn manual_recovery_ignores_installer_placeholders() {
+        assert!(matches!(
+            reusable_key_material(Err(CredentialError::InvalidCredential)),
+            Ok(None)
+        ));
+        assert!(matches!(
+            reusable_key_material(Err(CredentialError::CorruptSecret)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn manual_recovery_keeps_real_keychain_failures_visible() {
+        assert!(matches!(
+            reusable_key_material(Err(CredentialError::OperationFailed)),
             Err(RepairError::Keychain)
         ));
     }

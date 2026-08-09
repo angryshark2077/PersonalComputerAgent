@@ -80,6 +80,27 @@ public struct KeychainCredentialStore: Sendable {
         }
     }
 
+    public func updateAccessIfPresent(
+        service: String,
+        account: String,
+        label: String,
+        trustedApplicationURLs: [URL]
+    ) throws {
+        let query = Self.baseQuery(service: service, account: account)
+        let lookupStatus = SecItemCopyMatching(query as CFDictionary, nil)
+        if lookupStatus == errSecItemNotFound { return }
+        guard lookupStatus == errSecSuccess else { throw Self.error(for: lookupStatus) }
+        let access = try Self.makeAccess(
+            trustedApplicationURLs: trustedApplicationURLs,
+            label: label
+        )
+        let status = SecItemUpdate(
+            query as CFDictionary,
+            [kSecAttrAccess as String: access] as CFDictionary
+        )
+        guard status == errSecSuccess else { throw Self.error(for: status) }
+    }
+
     /// Creates the device item once with the installed-app ACL.
     ///
     /// `agentd` only updates this item after its token exchange, preserving the ACL rather than

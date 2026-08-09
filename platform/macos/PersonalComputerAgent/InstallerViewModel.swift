@@ -9,11 +9,13 @@ enum InstallerState: Equatable, Sendable {
     case waitingLocationAccess
     case waitingScreenCaptureAccess
     case waitingPhotosAccess
+    case migratingKeychainAccess
     case waitingApproval
     case starting
     case pairing
     case preparingAutomaticWechatRecovery
     case automaticWechatRecoveryPrepared
+    case automaticWechatRecoveryDeferred(message: String)
     case automaticWechatRecoveryFailed(message: String)
     case repair(message: String)
     case success
@@ -38,12 +40,18 @@ protocol WechatRepairRunning: AnyObject {
 
 enum WechatRepairRunnerError: LocalizedError, Equatable {
     case unavailable
+    case notApplicable
+    case requiresUserAction(message: String)
     case failed(message: String)
 
     var errorDescription: String? {
         switch self {
         case .unavailable:
             "The installed WeChat recovery tool is unavailable."
+        case .notApplicable:
+            "Automatic WeChat recovery is not available on this Mac."
+        case let .requiresUserAction(message):
+            message
         case let .failed(message):
             message
         }
@@ -70,19 +78,31 @@ final class ProcessWechatRepairRunner: WechatRepairRunning {
         process.arguments = ["prepare-automatic"]
         process.standardOutput = output
         process.standardError = output
-        let status = try await withCheckedThrowingContinuation { continuation in
-            process.terminationHandler = { process in
-                continuation.resume(returning: process.terminationStatus)
+        try Task.checkCancellation()
+        let status = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { process in
+                    continuation.resume(returning: process.terminationStatus)
+                }
+                do { try process.run() } catch { continuation.resume(throwing: error) }
             }
-            do { try process.run() } catch { continuation.resume(throwing: error) }
+        } onCancel: {
+            if process.isRunning { process.terminate() }
         }
+        try Task.checkCancellation()
         let data = try output.fileHandleForReading.readToEnd() ?? Data()
+        let message = String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .last
+            .map(String.init)
+            ?? "WeChat key recovery failed safely."
+        if [3, 4, 6].contains(status) {
+            throw WechatRepairRunnerError.notApplicable
+        }
+        if status == 9 {
+            throw WechatRepairRunnerError.requiresUserAction(message: message)
+        }
         guard status == 0 else {
-            let message = String(decoding: data, as: UTF8.self)
-                .split(whereSeparator: \.isNewline)
-                .last
-                .map(String.init)
-                ?? "WeChat key recovery failed safely."
             throw WechatRepairRunnerError.failed(message: message)
         }
     }
@@ -227,6 +247,13 @@ final class InstallerViewModel: ObservableObject {
                 if self?.terminateAfterSuccessfulSetup == true {
                     self?.terminator.terminate()
                 }
+            } catch WechatRepairRunnerError.notApplicable {
+                self?.state = .success
+                if self?.terminateAfterSuccessfulSetup == true {
+                    self?.terminator.terminate()
+                }
+            } catch let WechatRepairRunnerError.requiresUserAction(message) {
+                self?.state = .automaticWechatRecoveryDeferred(message: message)
             } catch {
                 self?.state = .automaticWechatRecoveryFailed(
                     message: (error as? LocalizedError)?.errorDescription

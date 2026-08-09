@@ -61,6 +61,8 @@ struct InstallerView: View {
             progress("Allow Screen Recording once so Dashboard screenshots remain available after restarts.")
         case .waitingPhotosAccess:
             progress("Allow Photos access once so recent and future original photos and videos can sync after restarts.")
+        case .migratingKeychainAccess:
+            progress("Approve the macOS Keychain prompts to preserve pairing and WeChat credentials across this signing change.")
         case .waitingApproval:
             progress("Approve Personal Computer Agent in System Settings > General > Login Items.")
         case .starting:
@@ -78,6 +80,15 @@ struct InstallerView: View {
                 Label("Automatic WeChat recovery is ready", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                 Text("Open and log in to the official WeChat normally. PCA will capture and validate the key in the background without another prompt.")
+                    .foregroundStyle(.secondary)
+            }
+        case let .automaticWechatRecoveryDeferred(message):
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Installed and running", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("WeChat recovery is deferred. Keep WeChat closed, disable SIP in macOS Recovery, restart, then retry here.")
                     .foregroundStyle(.secondary)
             }
         case let .automaticWechatRecoveryFailed(message):
@@ -120,11 +131,11 @@ struct InstallerView: View {
     }
 
     private var canRetryWechatAuthorization: Bool {
-        guard model.wechatRepairAvailable,
-              !model.isPreparingAutomaticWechatRecovery,
-              case .automaticWechatRecoveryFailed = model.state
-        else { return false }
-        return true
+        guard model.wechatRepairAvailable, !model.isPreparingAutomaticWechatRecovery else { return false }
+        return switch model.state {
+        case .automaticWechatRecoveryDeferred, .automaticWechatRecoveryFailed: true
+        default: false
+        }
     }
 
     private func progress(_ text: String) -> some View {

@@ -307,6 +307,47 @@ test("network history records identity changes only and retains the latest five"
   assert.equal(device?.status?.networkHistory[4]?.network.ssid, "WiFi 2");
 });
 
+test("network history records a device location change beyond its accuracy radius", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  const record = (index: number, latitude: number) => repository.recordHeartbeat({
+    heartbeatId: `01987777-7777-8777-8777-${String(index).padStart(12, "0")}`,
+    workspaceId,
+    deviceId,
+    receivedAt: new Date(now.getTime() + index * 1_000),
+    agentVersion: "0.3.0",
+    presence: "online" as const,
+    outboxDepth: 0,
+    localMedia: { completedFileCount: 0, completedBytes: 0, protectedFileCount: 0, protectedBytes: 0 },
+    cleanupResult: null,
+    network: {
+      interfaceType: "wifi" as const,
+      wifiIdentityAvailable: true,
+      ssid: "Same WiFi",
+      bssid: "00:00:00:00:00:01",
+      localIpv4: "192.168.1.20",
+      localIpv6: null,
+      observedExitIp: "203.0.113.25",
+      ipLocation: { country: "SG", region: "Singapore", city: "Singapore", accuracy: "ip_city" as const },
+      location: {
+        latitude,
+        longitude: 103.8198,
+        horizontalAccuracyMeters: 20,
+        observedAt: new Date(now.getTime() + index * 1_000),
+      },
+    },
+  });
+
+  await record(0, 1.3521);
+  await record(1, 1.35215);
+  await record(2, 1.3531);
+
+  const [device] = await repository.listOwnerDevices(workspaceId, ownerUserId);
+  assert.equal(device?.status?.networkHistory.length, 2);
+  assert.equal(device?.status?.networkHistory[0]?.network.location?.latitude, 1.3531);
+});
+
 test("screenshot retention selects and deletes only expired completed captures", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);
