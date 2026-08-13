@@ -56,6 +56,67 @@ async function pairedApi() {
   return { api, credentials, repository };
 }
 
+test("collector health reports are strict and visible to the owner", async () => {
+  const { api, credentials } = await pairedApi();
+  const headers = {
+    authorization: `Bearer ${credentials.device_access_token}`,
+    "content-type": "application/json",
+  };
+  assert.equal((await api.request("/v1/agent/control", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      heartbeat_id: "01985555-7555-8555-8555-555555555551",
+      agent_version: "0.1.133",
+      presence: "online",
+      outbox_depth: 0,
+      local_media: { completed_file_count: 0, completed_bytes: 0, protected_file_count: 0, protected_bytes: 0 },
+      cleanup_result: null,
+      network: null,
+    }),
+  })).status, 200);
+
+  const report = await api.request("/v1/agent/collector-health", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      report_id: "01985555-7555-8555-8555-555555555552",
+      agent_version: "0.1.133",
+      collectors: [{
+        collector_key: "communication.wechat",
+        collector_version: "0.1.133",
+        status: "degraded",
+        desired_config_revision: 5,
+        applied_config_revision: 5,
+        last_event_at_ms: Date.parse("2026-08-11T18:11:53.000Z"),
+        last_health_at_ms: Date.parse("2026-08-11T18:11:40.000Z"),
+        error_code: "WECHAT_KEY_REJECTED",
+      }],
+    }),
+  });
+  assert.equal(report.status, 204);
+
+  const detail = await api.request(`/v1/devices/${credentials.device_id}`);
+  const body = await detail.json() as { status: { collector_health: Array<Record<string, unknown>> } };
+  assert.equal(detail.status, 200);
+  assert.equal(body.status.collector_health.length, 1);
+  assert.equal(body.status.collector_health[0]?.collector_key, "communication.wechat");
+  assert.equal(body.status.collector_health[0]?.error_code, "WECHAT_KEY_REJECTED");
+  assert.equal(body.status.collector_health[0]?.last_event_at, "2026-08-11T18:11:53.000Z");
+  assert.equal(validateContract("dashboard-control", body).valid, true);
+
+  const invalid = await api.request("/v1/agent/collector-health", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      report_id: "01985555-7555-8555-8555-555555555553",
+      agent_version: "0.1.133",
+      collectors: [{ collector_key: "communication.wechat", status: "running" }],
+    }),
+  });
+  assert.equal(invalid.status, 400);
+});
+
 test("owner config is scoped, strict, and reaches device control", async () => {
   const { api, credentials } = await pairedApi();
   const config = await api.request(

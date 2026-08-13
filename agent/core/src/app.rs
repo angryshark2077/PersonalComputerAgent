@@ -476,6 +476,10 @@ impl RuntimeResources {
                 _ = interrupt.recv() => return Ok(()),
                 _ = terminate.recv() => return Ok(()),
                 _ = heartbeat_timer.tick() => {
+                    self.restart_communication_collector_if_finished(
+                        config,
+                        &communication_authorization,
+                    ).await?;
                     self.persist_status().await.map_err(|_| FailureStage::Heartbeat)?;
                 }
                 changed = bridge_status_receiver.changed() => {
@@ -582,6 +586,38 @@ impl RuntimeResources {
                 .map_err(|_| FailureStage::SystemCollectorCleanup)?;
         }
         self.start_system_collector(config, paired).await
+    }
+
+    async fn restart_communication_collector_if_finished(
+        &mut self,
+        config: &RunConfig,
+        authorization: &CommunicationAuthorization,
+    ) -> Result<(), FailureStage> {
+        if !self
+            .communication_runtime
+            .as_ref()
+            .is_some_and(CommunicationRuntime::is_finished)
+        {
+            return Ok(());
+        }
+        if let Some(runtime) = self.communication_runtime.take() {
+            let _ = runtime.shutdown().await;
+        }
+        self.communication_runtime = Some(
+            CommunicationRuntime::start_authorized(
+                Arc::clone(
+                    self.database
+                        .as_ref()
+                        .expect("database exists until cleanup"),
+                ),
+                config.paths.database_file.clone(),
+                production_communication_factory(config.paths.database_file.clone()),
+                authorization.clone(),
+            )
+            .await
+            .map_err(|_| FailureStage::CommunicationCollector)?,
+        );
+        Ok(())
     }
 
     async fn persist_status(&self) -> Result<(), FailureStage> {

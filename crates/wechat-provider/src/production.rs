@@ -179,7 +179,7 @@ impl MacOSWechatSource {
             return Err(DomainError::new(
                 "WECHAT_MULTIPLE_ACCOUNTS",
                 "multiple local WeChat accounts require explicit selection",
-                false,
+                true,
             ));
         }
         let local_username = account_root
@@ -4610,7 +4610,7 @@ fn load_material(paths: &SourcePaths) -> Result<WechatKeyMaterial, DomainError> 
         return Err(DomainError::new(
             "WECHAT_ACCOUNT_UNVERIFIED",
             "stored WeChat key belongs to a different local account",
-            false,
+            true,
         ));
     }
     Ok(material)
@@ -5436,7 +5436,7 @@ fn map_failure(failure: SqlcipherProbeFailure) -> DomainError {
         SqlcipherProbeFailure::KeyRejected => DomainError::new(
             "WECHAT_KEY_REJECTED",
             "stored WeChat key material was rejected",
-            false,
+            true,
         ),
         SqlcipherProbeFailure::TimedOut => DomainError::new(
             "WECHAT_PROBE_TIMEOUT",
@@ -5456,7 +5456,7 @@ fn map_failure(failure: SqlcipherProbeFailure) -> DomainError {
         SqlcipherProbeFailure::AccountUnverified => DomainError::new(
             "WECHAT_ACCOUNT_UNVERIFIED",
             "WeChat source account could not be verified",
-            false,
+            true,
         ),
     }
 }

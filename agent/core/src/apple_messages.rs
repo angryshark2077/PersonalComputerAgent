@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::{sync::watch, task, time};
 use uuid::Uuid;
 
-use crate::cloud_control::AppliedControl;
+use crate::cloud_control::{persist_aux_collector_state, AppliedControl};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const APPLE_EPOCH_UNIX_SECONDS: i128 = 978_307_200;
@@ -47,17 +47,32 @@ pub(crate) async fn run(
     mut controls: watch::Receiver<Option<AppliedControl>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let Some(source) = messages_database_path() else {
-        return;
-    };
     let mut interval = time::interval(POLL_INTERVAL);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if controls.borrow().as_ref().is_some_and(|value| value.communication_messages_enabled) {
-                    let _ = collect_once(&database, &bridge, &source, &workspace_id, &device_id).await;
-                }
+                let control = controls.borrow().clone();
+                let revision = control.as_ref().map_or(0, |value| value.configuration_revision);
+                let enabled = control.as_ref().is_some_and(|value| value.communication_messages_enabled);
+                let result = if enabled {
+                    match messages_database_path() {
+                        Some(source) => collect_once(&database, &bridge, &source, &workspace_id, &device_id)
+                            .await
+                            .map_err(|()| "MESSAGES_COLLECTION_FAILED"),
+                        None => Err("MESSAGES_DATABASE_UNAVAILABLE"),
+                    }
+                } else {
+                    Ok(false)
+                };
+                let _ = persist_aux_collector_state(
+                    &database,
+                    "communication.messages",
+                    enabled,
+                    revision,
+                    result.as_ref().copied().unwrap_or(false),
+                    result.err(),
+                ).await;
             }
             changed = controls.changed() => {
                 if changed.is_err() { return; }
@@ -75,7 +90,7 @@ async fn collect_once(
     source: &Path,
     workspace_id: &str,
     device_id: &str,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     let cursor = load_cursor().await?;
     let path = source.to_path_buf();
     let messages = task::spawn_blocking(move || load_recent_messages(&path, cursor))
@@ -108,6 +123,7 @@ async fn collect_once(
         );
     }
     let mut decoded = decoded.into_iter();
+    let mut event_observed = false;
     for source_message in messages {
         let row_id = source_message.row_id;
         let text = source_message
@@ -125,10 +141,11 @@ async fn collect_once(
             let events = message_events(&source_message, text, workspace_id, device_id)?;
             let commit = EventCommit::try_new(events, None).map_err(|_| ())?;
             database.commit_events(&commit).await.map_err(|_| ())?;
+            event_observed = true;
         }
         persist_cursor(row_id).await?;
     }
-    Ok(())
+    Ok(event_observed)
 }
 
 fn load_recent_messages(

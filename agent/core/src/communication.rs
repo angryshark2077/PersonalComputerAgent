@@ -183,6 +183,7 @@ pub struct CommunicationRuntime {
 #[derive(Clone, Copy)]
 struct AuthorizationState {
     control: CommunicationControl,
+    suspended_control: Option<CommunicationControl>,
     highest_revision: u64,
     generation: u64,
     owner_epoch: u64,
@@ -200,6 +201,7 @@ impl CommunicationAuthorization {
     pub fn new() -> Self {
         let initial = AuthorizationState {
             control: CommunicationControl::unpaired(),
+            suspended_control: None,
             highest_revision: 0,
             generation: 0,
             owner_epoch: 0,
@@ -224,8 +226,20 @@ impl CommunicationAuthorization {
             return Err(CommunicationRuntimeError::InvalidControl);
         }
         let mut state = self.state.write().await;
-        if control.configuration_revision == state.highest_revision && control == state.control {
-            return Ok(());
+        if control.configuration_revision == state.highest_revision {
+            if control == state.control {
+                return Ok(());
+            }
+            if state.control.identity.is_none() && state.suspended_control == Some(control) {
+                state.generation = state
+                    .generation
+                    .checked_add(1)
+                    .ok_or(CommunicationRuntimeError::InvalidControl)?;
+                state.control = control;
+                state.suspended_control = None;
+                self.updates.send_replace(*state);
+                return Ok(());
+            }
         }
         if control.configuration_revision <= state.highest_revision {
             return Err(CommunicationRuntimeError::StaleControl);
@@ -236,6 +250,7 @@ impl CommunicationAuthorization {
             .checked_add(1)
             .ok_or(CommunicationRuntimeError::InvalidControl)?;
         state.control = control;
+        state.suspended_control = None;
         self.updates.send_replace(*state);
         Ok(())
     }
@@ -245,6 +260,7 @@ impl CommunicationAuthorization {
         let mut state = self.state.write().await;
         state.generation = state.generation.saturating_add(1);
         state.control = CommunicationControl::unpaired();
+        state.suspended_control = None;
         self.updates.send_replace(*state);
     }
 
@@ -254,6 +270,7 @@ impl CommunicationAuthorization {
         state.highest_revision = 0;
         state.generation = state.generation.saturating_add(1);
         state.control = CommunicationControl::unpaired();
+        state.suspended_control = None;
         self.updates.send_replace(*state);
         state.owner_epoch
     }
@@ -274,8 +291,20 @@ impl CommunicationAuthorization {
         if state.owner_epoch != owner_epoch {
             return Ok(false);
         }
-        if control.configuration_revision == state.highest_revision && control == state.control {
-            return Ok(true);
+        if control.configuration_revision == state.highest_revision {
+            if control == state.control {
+                return Ok(true);
+            }
+            if state.control.identity.is_none() && state.suspended_control == Some(control) {
+                state.generation = state
+                    .generation
+                    .checked_add(1)
+                    .ok_or(CommunicationRuntimeError::InvalidControl)?;
+                state.control = control;
+                state.suspended_control = None;
+                self.updates.send_replace(*state);
+                return Ok(true);
+            }
         }
         if control.configuration_revision <= state.highest_revision {
             return Err(CommunicationRuntimeError::StaleControl);
@@ -286,6 +315,7 @@ impl CommunicationAuthorization {
             .checked_add(1)
             .ok_or(CommunicationRuntimeError::InvalidControl)?;
         state.control = control;
+        state.suspended_control = None;
         self.updates.send_replace(*state);
         Ok(true)
     }
@@ -297,7 +327,22 @@ impl CommunicationAuthorization {
         }
         state.generation = state.generation.saturating_add(1);
         state.control = CommunicationControl::unpaired();
+        state.suspended_control = None;
         self.updates.send_replace(*state);
+        true
+    }
+
+    pub(crate) async fn suspend_for_owner(&self, owner_epoch: u64) -> bool {
+        let mut state = self.state.write().await;
+        if state.owner_epoch != owner_epoch {
+            return false;
+        }
+        if state.control.identity.is_some() {
+            state.suspended_control = Some(state.control);
+            state.generation = state.generation.saturating_add(1);
+            state.control = CommunicationControl::unpaired();
+            self.updates.send_replace(*state);
+        }
         true
     }
 
@@ -326,6 +371,11 @@ impl Default for CommunicationAuthorization {
 }
 
 impl CommunicationRuntime {
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// Starts one serial supervisor over an injected Provider factory.
     ///
     /// # Errors
@@ -738,6 +788,7 @@ async fn run_supervisor(
                     records.sort_by_key(|record| !record.completed_media().is_empty());
                     let mut persistence_failed = false;
                     let mut batch_paused = false;
+                    let mut event_observed = false;
                     for record in records {
                         if let Some(identity) = control.identity {
                             let event_id = stable_communication_event_id(
@@ -898,6 +949,7 @@ async fn run_supervisor(
                         if persistence_failed {
                             break;
                         }
+                        event_observed = true;
                     }
                     if batch_paused {
                         if provider.stop().is_err() {
@@ -945,7 +997,11 @@ async fn run_supervisor(
                         }
                         return Ok(());
                     }
-                    persist_collector_state(&database, control, None).await?;
+                    if event_observed {
+                        persist_collector_event(&database, control).await?;
+                    } else {
+                        persist_collector_state(&database, control, None).await?;
+                    }
                 }
                 Err(error) => {
                     if provider.stop().is_err() {
@@ -1241,6 +1297,10 @@ fn should_retry(error: &DomainError) -> bool {
         && matches!(
             error.code.as_str(),
             "WECHAT_WAITING_SOURCE"
+                | "WECHAT_CAPABILITY_UNAVAILABLE"
+                | "WECHAT_KEY_REJECTED"
+                | "WECHAT_ACCOUNT_UNVERIFIED"
+                | "WECHAT_MULTIPLE_ACCOUNTS"
                 | "WECHAT_DATABASE_UNAVAILABLE"
                 | "WECHAT_PROBE_TIMEOUT"
                 | "WECHAT_PERMISSION_REQUIRED"
@@ -1891,6 +1951,12 @@ async fn persist_collector(
     } else {
         0
     };
+    let prior = database
+        .load_collector_states()
+        .await
+        .map_err(CommunicationRuntimeError::Database)?
+        .into_iter()
+        .find(|state| state.collector_key == COLLECTOR_KEY);
     database
         .upsert_collector_state(&CollectorState {
             collector_key: COLLECTOR_KEY.to_owned(),
@@ -1898,12 +1964,39 @@ async fn persist_collector(
             status,
             desired_config_revision: revision,
             applied_config_revision: revision,
-            last_event_at_ms: None,
-            last_health_at_ms: Some(now_ms),
+            last_event_at_ms: prior.as_ref().and_then(|state| state.last_event_at_ms),
+            last_health_at_ms: if error_code.is_none() && control.active() {
+                Some(now_ms)
+            } else {
+                prior.as_ref().and_then(|state| state.last_health_at_ms)
+            },
             last_error_code: error_code.map(str::to_owned),
-            created_at_ms: now_ms,
+            created_at_ms: prior.as_ref().map_or(now_ms, |state| state.created_at_ms),
             updated_at_ms: now_ms,
         })
+        .await
+        .map_err(CommunicationRuntimeError::Database)
+}
+
+async fn persist_collector_event(
+    database: &DbActorHandle,
+    control: CommunicationControl,
+) -> Result<(), CommunicationRuntimeError> {
+    persist_collector_state(database, control, None).await?;
+    let mut state = database
+        .load_collector_states()
+        .await
+        .map_err(CommunicationRuntimeError::Database)?
+        .into_iter()
+        .find(|state| state.collector_key == COLLECTOR_KEY)
+        .ok_or(CommunicationRuntimeError::InvalidControl)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| CommunicationRuntimeError::Clock)?;
+    state.last_event_at_ms =
+        Some(i64::try_from(now.as_millis()).map_err(|_| CommunicationRuntimeError::Clock)?);
+    database
+        .upsert_collector_state(&state)
         .await
         .map_err(CommunicationRuntimeError::Database)
 }
@@ -1950,6 +2043,10 @@ mod tests {
     #[test]
     fn transient_wechat_read_stage_failures_are_retried() {
         for code in [
+            "WECHAT_CAPABILITY_UNAVAILABLE",
+            "WECHAT_KEY_REJECTED",
+            "WECHAT_ACCOUNT_UNVERIFIED",
+            "WECHAT_MULTIPLE_ACCOUNTS",
             "WECHAT_SESSION_READ_FAILED",
             "WECHAT_CONTACT_READ_FAILED",
             "WECHAT_MESSAGE_READ_FAILED",
@@ -1957,10 +2054,37 @@ mod tests {
             assert!(should_retry(&DomainError::new(code, "read failed", true)));
         }
         assert!(!should_retry(&DomainError::new(
-            "WECHAT_ACCOUNT_UNVERIFIED",
-            "account changed",
+            "WECHAT_UNSUPPORTED_SCHEMA",
+            "unsupported schema",
             false,
         )));
+    }
+
+    #[tokio::test]
+    async fn suspended_authorization_accepts_the_same_persisted_revision() {
+        let authorization = super::CommunicationAuthorization::new();
+        let owner_epoch = authorization.replace_owner().await;
+        let control = CommunicationControl::paired(
+            CommunicationIdentity {
+                workspace_id: Uuid::new_v4(),
+                device_id: Uuid::new_v4(),
+            },
+            5,
+            true,
+        )
+        .expect("valid control");
+
+        assert!(authorization
+            .apply_persisted_for_owner(owner_epoch, control)
+            .await
+            .expect("apply control"));
+        assert!(authorization.suspend_for_owner(owner_epoch).await);
+        assert!(authorization.commit_permit(control).await.is_none());
+        assert!(authorization
+            .apply_persisted_for_owner(owner_epoch, control)
+            .await
+            .expect("restore same revision"));
+        assert!(authorization.commit_permit(control).await.is_some());
     }
 
     #[tokio::test]

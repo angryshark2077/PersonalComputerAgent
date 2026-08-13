@@ -20,6 +20,7 @@ import {
   updateCollectorConfig,
   type CollectorConfig,
   type CollectorConfigAudit,
+  type DashboardCollectorHealth,
   type DashboardDevice,
   type DashboardNetworkLocation,
   type DashboardSystemMetric,
@@ -27,6 +28,7 @@ import {
 import { getBrowserSession, redirectToSignIn } from "../../../lib/auth";
 import { DashboardShell } from "../../../components/dashboard-shell";
 import { summarizeSystemMetrics } from "../../../lib/system-metrics";
+import { collectorHealthPresentation } from "../../../lib/collector-health";
 
 interface DeviceScreen {
   device: DashboardDevice;
@@ -216,6 +218,7 @@ export default function DevicePage() {
         <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/photos`}>View photos</Link>
       </div>
       {error !== null ? <p role="alert">{error}</p> : null}
+      <CollectorHealthPanel health={screen.device.status?.collector_health ?? []} />
       <CollectorScopeCard
           name="Network"
           detail="SSID, BSSID, local IP and precise device location"
@@ -468,6 +471,48 @@ export default function DevicePage() {
         </section>
     </DashboardShell>
   );
+}
+
+const collectorHealthDefinitions = [
+  ["system", "System metrics"],
+  ["network", "Network"],
+  ["communication.wechat", "WeChat messages"],
+  ["communication.messages", "Messages"],
+  ["photos.library", "Photos"],
+  ["screen.capture", "Screenshots"],
+] as const;
+
+function CollectorHealthPanel({ health }: { health: DashboardCollectorHealth[] }) {
+  return (
+    <section className="dashboard-panel collector-card" aria-labelledby="collector-health-heading">
+      <h2 id="collector-health-heading">Collector health</h2>
+      <p>The Agent checks and reports collector health every 30 minutes while it is running.</p>
+      <div className="collector-health-list">
+        {collectorHealthDefinitions.map(([key, name]) => {
+          const record = health.find((candidate) => candidate.collector_key === key);
+          const presentation = collectorHealthPresentation(record);
+          return (
+            <article className={`collector-health-row${presentation.alert ? " is-alert" : ""}`} key={key}>
+              <div>
+                <h3>{name}</h3>
+                <p className="collector-health-state">Actual status: <strong>{presentation.label}</strong></p>
+                {presentation.reason === null ? null : <p role="alert">Failure: {presentation.reason}</p>}
+              </div>
+              <dl>
+                <div><dt>Last successful check</dt><dd>{formatHealthTime(record?.last_health_at)}</dd></div>
+                <div><dt>Last collected event</dt><dd>{formatHealthTime(record?.last_event_at)}</dd></div>
+                <div><dt>Last Agent report</dt><dd>{formatHealthTime(record?.reported_at)}</dd></div>
+              </dl>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function formatHealthTime(value: string | null | undefined): string {
+  return value === null || value === undefined ? "Never" : new Date(value).toLocaleString();
 }
 
 function CollectorScopeCard({

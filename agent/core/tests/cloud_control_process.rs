@@ -110,6 +110,12 @@ struct SequenceClient {
     snapshots: Mutex<VecDeque<Result<AgentControlSnapshot, ControlError>>>,
 }
 
+struct NetworkStateClient {
+    calls: AtomicUsize,
+    network_enabled: AtomicBool,
+    snapshot: AgentControlSnapshot,
+}
+
 struct BlockingSyncClient {
     calls: AtomicUsize,
     snapshots: Mutex<VecDeque<Result<AgentControlSnapshot, ControlError>>>,
@@ -325,6 +331,26 @@ impl ControlClient for SequenceClient {
             .pop_front()
             .unwrap_or(Err(ControlError::Transient));
         Box::pin(async move { result })
+    }
+}
+
+impl ControlClient for NetworkStateClient {
+    fn set_network_enabled(&self, enabled: bool) {
+        self.network_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+        Box::pin(async { Err(ControlError::Contract) })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let snapshot = self.snapshot.clone();
+        Box::pin(async move { Ok(snapshot) })
     }
 }
 
@@ -757,6 +783,91 @@ async fn communication_revision_notifications_are_monotonic_and_invalid_control_
             panic!("control runtime released database after shutdown");
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_enabled_revision_recovers_after_a_contract_failure() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    let enabled = exact_snapshot(5, true);
+    let client = Arc::new(SequenceClient {
+        calls: AtomicUsize::new(0),
+        snapshots: Mutex::new(VecDeque::from([
+            Ok(enabled.clone()),
+            Err(ControlError::Contract),
+            Ok(enabled),
+        ])),
+    });
+    let runtime = CloudControlRuntime::start(
+        Arc::clone(&database),
+        loaded,
+        Arc::clone(&client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+    let mut controls = runtime.communication_controls();
+
+    controls.changed().await.unwrap();
+    assert!(controls.borrow_and_update().is_some());
+    tokio::time::advance(Duration::from_secs(30)).await;
+    wait_for_calls(&client.calls, 2).await;
+    controls.changed().await.unwrap();
+    assert!(controls.borrow_and_update().is_none());
+
+    for _ in 0..10 {
+        if client.calls.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+    }
+    wait_for_calls(&client.calls, 3).await;
+    controls.changed().await.unwrap();
+    let restored = controls
+        .borrow_and_update()
+        .clone()
+        .expect("same enabled revision is restored");
+    assert_eq!(restored.configuration_revision, 5);
+    assert!(restored.communication_wechat_enabled);
+
+    runtime.shutdown().await.unwrap();
+    shutdown_database(database).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_revision_reasserts_network_enabled_after_in_memory_state_drift() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    let mut snapshot = exact_snapshot(5, false);
+    snapshot.collectors.network.enabled = true;
+    let client = Arc::new(NetworkStateClient {
+        calls: AtomicUsize::new(0),
+        network_enabled: AtomicBool::new(false),
+        snapshot,
+    });
+    let runtime = CloudControlRuntime::start(
+        Arc::clone(&database),
+        loaded,
+        Arc::clone(&client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+
+    wait_for_calls(&client.calls, 1).await;
+    wait_for_enabled(&client.network_enabled).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    client.network_enabled.store(false, Ordering::SeqCst);
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    wait_for_calls(&client.calls, 2).await;
+    wait_for_enabled(&client.network_enabled).await;
+
+    runtime.shutdown().await.unwrap();
+    shutdown_database(database).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -1468,6 +1579,20 @@ async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
         tokio::task::yield_now().await;
     }
     panic!("control client did not reach {expected} calls");
+}
+
+async fn wait_for_enabled(enabled: &AtomicBool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if enabled.load(Ordering::SeqCst) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("an unchanged valid control snapshot did not repair Network state drift");
 }
 
 async fn shutdown_database(database: Arc<DbActorHandle>) {

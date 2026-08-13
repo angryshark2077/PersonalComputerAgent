@@ -34,6 +34,87 @@ export interface HeartbeatRequest {
   } | null;
 }
 
+export interface CollectorHealthRequest {
+  reportId: string;
+  agentVersion: string;
+  collectors: Array<{
+    collectorKey: string;
+    collectorVersion: string;
+    status: "disabled" | "permission_required" | "initializing" | "running" | "paused" | "degraded" | "unsupported" | "error";
+    desiredConfigRevision: number;
+    appliedConfigRevision: number;
+    lastEventAt: Date | null;
+    lastHealthAt: Date | null;
+    errorCode: string | null;
+  }>;
+}
+
+export function parseCollectorHealth(value: unknown): CollectorHealthRequest | null {
+  if (!isRecord(value) || !hasOnly(value, ["report_id", "agent_version", "collectors"])) return null;
+  if (
+    typeof value.report_id !== "string"
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.report_id)
+    || typeof value.agent_version !== "string"
+    || value.agent_version.length === 0
+    || value.agent_version.length > 64
+    || !Array.isArray(value.collectors)
+    || value.collectors.length > 16
+  ) return null;
+  const collectors = value.collectors.map(parseCollectorHealthItem);
+  if (collectors.some((collector) => collector === null)) return null;
+  const parsed = collectors as CollectorHealthRequest["collectors"];
+  if (new Set(parsed.map((collector) => collector.collectorKey)).size !== parsed.length) return null;
+  return { reportId: value.report_id, agentVersion: value.agent_version, collectors: parsed };
+}
+
+function parseCollectorHealthItem(value: unknown): CollectorHealthRequest["collectors"][number] | null {
+  if (!isRecord(value) || !hasOnly(value, [
+    "collector_key",
+    "collector_version",
+    "status",
+    "desired_config_revision",
+    "applied_config_revision",
+    "last_event_at_ms",
+    "last_health_at_ms",
+    "error_code",
+  ])) return null;
+  if (
+    typeof value.collector_key !== "string"
+    || !/^[a-z][a-z0-9.-]{0,63}$/.test(value.collector_key)
+    || typeof value.collector_version !== "string"
+    || value.collector_version.length === 0
+    || value.collector_version.length > 64
+    || !isCollectorStatus(value.status)
+    || !isNonnegativeInteger(value.desired_config_revision)
+    || !isNonnegativeInteger(value.applied_config_revision)
+    || !isNullableTimestamp(value.last_event_at_ms)
+    || !isNullableTimestamp(value.last_health_at_ms)
+    || !(value.error_code === null || (typeof value.error_code === "string" && /^[A-Z][A-Z0-9_]{0,127}$/.test(value.error_code)))
+  ) return null;
+  return {
+    collectorKey: value.collector_key,
+    collectorVersion: value.collector_version,
+    status: value.status,
+    desiredConfigRevision: value.desired_config_revision,
+    appliedConfigRevision: value.applied_config_revision,
+    lastEventAt: value.last_event_at_ms === null ? null : new Date(value.last_event_at_ms),
+    lastHealthAt: value.last_health_at_ms === null ? null : new Date(value.last_health_at_ms),
+    errorCode: value.error_code,
+  };
+}
+
+function isCollectorStatus(value: unknown): value is CollectorHealthRequest["collectors"][number]["status"] {
+  return ["disabled", "permission_required", "initializing", "running", "paused", "degraded", "unsupported", "error"].includes(value as string);
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNullableTimestamp(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+}
+
 export function parseHeartbeat(value: unknown): HeartbeatRequest | null {
   if (!isRecord(value) || !hasOnly(value, [
     "heartbeat_id",

@@ -373,6 +373,40 @@ export const deviceHeartbeats = pgTable(
   ],
 );
 
+export const deviceCollectorHealth = pgTable(
+  "device_collector_health",
+  {
+    workspaceId: uuid("workspace_id").notNull(),
+    deviceId: uuid("device_id").notNull(),
+    collectorKey: text("collector_key").notNull(),
+    collectorVersion: text("collector_version").notNull(),
+    status: text("status").notNull(),
+    desiredConfigRevision: bigint("desired_config_revision", { mode: "number" }).notNull(),
+    appliedConfigRevision: bigint("applied_config_revision", { mode: "number" }).notNull(),
+    lastEventAt: timestampColumn("last_event_at"),
+    lastHealthAt: timestampColumn("last_health_at"),
+    errorCode: text("error_code"),
+    reportedAt: timestampColumn("reported_at").notNull(),
+    agentVersion: text("agent_version").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workspaceId, table.deviceId, table.collectorKey] }),
+    foreignKey({
+      columns: [table.workspaceId, table.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }).onDelete("cascade"),
+    index("idx_device_collector_health_reported").on(
+      table.workspaceId,
+      table.deviceId,
+      table.reportedAt.desc(),
+    ),
+    check("device_collector_health_key_valid", sql`${table.collectorKey} ~ '^[a-z][a-z0-9.-]{0,63}$'`),
+    check("device_collector_health_status_valid", sql`${table.status} IN ('disabled', 'permission_required', 'initializing', 'running', 'paused', 'degraded', 'unsupported', 'error')`),
+    check("device_collector_health_revisions_nonnegative", sql`${table.desiredConfigRevision} >= 0 AND ${table.appliedConfigRevision} >= 0`),
+    check("device_collector_health_error_code_valid", sql`${table.errorCode} IS NULL OR ${table.errorCode} ~ '^[A-Z][A-Z0-9_]{0,127}$'`),
+  ],
+);
+
 export const deviceNetworkHistory = pgTable(
   "device_network_history",
   {
@@ -835,6 +869,7 @@ export const cloudSchema = {
   collectorConfigs,
   collectorConfigAudit,
   deviceHeartbeats,
+  deviceCollectorHealth,
   deviceNetworkHistory,
   deviceMediaCleanupRequests,
   networkLocationLibrary,

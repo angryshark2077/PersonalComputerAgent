@@ -38,6 +38,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertDeviceLocationSchema(pool);
     await assertScreenshotSchema(pool);
     await assertCredentialRotationReplay(pool);
+    await assertCollectorHealthSchema(pool);
 
     await runCloudMigrations(postgres.connectionString, committedMigrationDirectory);
     await assertHashedSessionSchema(pool);
@@ -47,12 +48,33 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCommunicationObjectSchema(pool);
     await assertDeviceLocationSchema(pool);
     await assertScreenshotSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024", "0025", "0026"]);
+    await assertCollectorHealthSchema(pool);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024", "0025", "0026", "0027"]);
   } finally {
     await pool.end();
     await postgres.stop();
   }
 });
+
+async function assertCollectorHealthSchema(pool: Pool) {
+  const result = await pool.query<{ column_name: string }>(
+    "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'device_collector_health' ORDER BY ordinal_position",
+  );
+  assert.deepEqual(result.rows.map((row) => row.column_name), [
+    "workspace_id",
+    "device_id",
+    "collector_key",
+    "collector_version",
+    "status",
+    "desired_config_revision",
+    "applied_config_revision",
+    "last_event_at",
+    "last_health_at",
+    "error_code",
+    "reported_at",
+    "agent_version",
+  ]);
+}
 
 async function assertCredentialRotationReplay(pool: Pool) {
   const workspaceId = "01982222-7222-8222-8222-222222222229";

@@ -14,6 +14,7 @@ import {
   collectorConfigAudit,
   collectorConfigs,
   deviceCredentialGenerations,
+  deviceCollectorHealth,
   deviceHeartbeats,
   deviceNetworkHistory,
   deviceMediaCleanupRequests,
@@ -121,6 +122,30 @@ export interface HeartbeatInput {
   localMedia: LocalMediaStorageStatus;
   cleanupResult: LocalMediaCleanupResult | null;
   network: NetworkHeartbeat | null;
+}
+
+export type CollectorHealthStatus = "disabled" | "permission_required" | "initializing" | "running" | "paused" | "degraded" | "unsupported" | "error";
+
+export interface CollectorHealthRecord {
+  collectorKey: string;
+  collectorVersion: string;
+  status: CollectorHealthStatus;
+  desiredConfigRevision: number;
+  appliedConfigRevision: number;
+  lastEventAt: Date | null;
+  lastHealthAt: Date | null;
+  errorCode: string | null;
+  reportedAt: Date;
+  agentVersion: string;
+}
+
+export interface CollectorHealthReportInput {
+  reportId: string;
+  workspaceId: string;
+  deviceId: string;
+  receivedAt: Date;
+  agentVersion: string;
+  collectors: Array<Omit<CollectorHealthRecord, "reportedAt" | "agentVersion">>;
 }
 
 export interface NetworkHeartbeat {
@@ -339,6 +364,7 @@ export interface DeviceStatus {
     observedAt: Date;
   }>;
   observedAt: Date;
+  collectorHealth: CollectorHealthRecord[];
 }
 
 export interface OwnerDeviceSummary {
@@ -570,6 +596,7 @@ export interface ControlRepository {
   ): Promise<DeviceCredentialAuthentication>;
   loadControlSnapshot(deviceId: string, workspaceId: string): Promise<AgentControlSnapshot>;
   recordHeartbeat(input: HeartbeatInput): Promise<void>;
+  recordCollectorHealth(input: CollectorHealthReportInput): Promise<void>;
   requestLocalMediaCleanup(input: LocalMediaCleanupRequestInput): Promise<LocalMediaCleanupRecord>;
   loadLatestOwnerLocalMediaCleanup(
     deviceId: string,
@@ -750,6 +777,8 @@ export class MemoryControlRepository implements ControlRepository {
   readonly #revocationAuditIds = new Set<string>();
   readonly #workspaceNames = new Map<string, string>();
   readonly #latestHeartbeats = new Map<string, DeviceStatus>();
+  readonly #collectorHealth = new Map<string, Map<string, CollectorHealthRecord>>();
+  readonly #collectorHealthReportIds = new Set<string>();
   readonly #networkHistory = new Map<string, Array<{ network: NetworkHeartbeat; observedAt: Date }>>();
   readonly #mediaCleanupRequests = new Map<string, LocalMediaCleanupRecord & { workspaceId: string; deviceId: string }>();
   readonly #screenshotRequests = new Map<string, ScreenshotRequestRecord & { workspaceId: string; deviceId: string }>();
@@ -1004,7 +1033,25 @@ export class MemoryControlRepository implements ControlRepository {
       matchedLocation: null,
       networkHistory: [],
       observedAt: input.receivedAt,
+      collectorHealth: [...(this.#collectorHealth.get(input.deviceId)?.values() ?? [])],
     });
+  }
+
+  async recordCollectorHealth(input: CollectorHealthReportInput): Promise<void> {
+    this.#requireDevice(input.deviceId, input.workspaceId, false);
+    if (this.#collectorHealthReportIds.has(input.reportId)) return;
+    this.#collectorHealthReportIds.add(input.reportId);
+    const records = this.#collectorHealth.get(input.deviceId) ?? new Map<string, CollectorHealthRecord>();
+    for (const collector of input.collectors) {
+      records.set(collector.collectorKey, {
+        ...collector,
+        reportedAt: input.receivedAt,
+        agentVersion: input.agentVersion,
+      });
+    }
+    this.#collectorHealth.set(input.deviceId, records);
+    const heartbeat = this.#latestHeartbeats.get(input.deviceId);
+    if (heartbeat !== undefined) heartbeat.collectorHealth = [...records.values()];
   }
 
   async listOwnerNetworkLocations(workspaceId: string, userId: string): Promise<NetworkLocationRecord[]> {
@@ -2687,6 +2734,45 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
+  async recordCollectorHealth(input: CollectorHealthReportInput): Promise<void> {
+    try {
+      await requireDatabaseDevice(this.database, input.deviceId, input.workspaceId, false);
+      if (input.collectors.length === 0) return;
+      await this.database
+        .insert(deviceCollectorHealth)
+        .values(input.collectors.map((collector) => ({
+          workspaceId: input.workspaceId,
+          deviceId: input.deviceId,
+          collectorKey: collector.collectorKey,
+          collectorVersion: collector.collectorVersion,
+          status: collector.status,
+          desiredConfigRevision: collector.desiredConfigRevision,
+          appliedConfigRevision: collector.appliedConfigRevision,
+          lastEventAt: collector.lastEventAt,
+          lastHealthAt: collector.lastHealthAt,
+          errorCode: collector.errorCode,
+          reportedAt: input.receivedAt,
+          agentVersion: input.agentVersion,
+        })))
+        .onConflictDoUpdate({
+          target: [deviceCollectorHealth.workspaceId, deviceCollectorHealth.deviceId, deviceCollectorHealth.collectorKey],
+          set: {
+            collectorVersion: sql`excluded.collector_version`,
+            status: sql`excluded.status`,
+            desiredConfigRevision: sql`excluded.desired_config_revision`,
+            appliedConfigRevision: sql`excluded.applied_config_revision`,
+            lastEventAt: sql`excluded.last_event_at`,
+            lastHealthAt: sql`excluded.last_health_at`,
+            errorCode: sql`excluded.error_code`,
+            reportedAt: sql`excluded.reported_at`,
+            agentVersion: sql`excluded.agent_version`,
+          },
+        });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
   async requestLocalMediaCleanup(input: LocalMediaCleanupRequestInput): Promise<LocalMediaCleanupRecord> {
     try {
       await requireDatabaseOwnerMembership(this.database, input.workspaceId, input.actorUserId);
@@ -3067,6 +3153,14 @@ export class DrizzleControlRepository implements ControlRepository {
         ))
         .orderBy(desc(deviceNetworkHistory.observedAt))
         .limit(5);
+      const collectorHealth = await this.database
+        .select()
+        .from(deviceCollectorHealth)
+        .where(and(
+          eq(deviceCollectorHealth.workspaceId, workspaceId),
+          eq(deviceCollectorHealth.deviceId, deviceId),
+        ))
+        .orderBy(deviceCollectorHealth.collectorKey);
       const configRecord: ConfigRecord = {
         configurationRevision: config?.configurationRevision ?? 0,
         ...storedConfig(config ?? defaultCollectorConfig()),
@@ -3139,6 +3233,18 @@ export class DrizzleControlRepository implements ControlRepository {
                 matchedLocation,
                 networkHistory,
                 observedAt: heartbeat.observedAt,
+                collectorHealth: collectorHealth.map((record) => ({
+                  collectorKey: record.collectorKey,
+                  collectorVersion: record.collectorVersion,
+                  status: record.status as CollectorHealthStatus,
+                  desiredConfigRevision: record.desiredConfigRevision,
+                  appliedConfigRevision: record.appliedConfigRevision,
+                  lastEventAt: record.lastEventAt,
+                  lastHealthAt: record.lastHealthAt,
+                  errorCode: record.errorCode,
+                  reportedAt: record.reportedAt,
+                  agentVersion: record.agentVersion,
+                })),
               },
         snapshot: await this.loadControlSnapshot(deviceId, workspaceId),
         localMediaCleanup: await this.loadLatestOwnerLocalMediaCleanup(deviceId, workspaceId, userId),

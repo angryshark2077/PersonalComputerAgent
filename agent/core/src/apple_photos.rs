@@ -10,8 +10,8 @@ use tokio::{io::AsyncReadExt, sync::watch, time};
 use uuid::Uuid;
 
 use crate::cloud_control::{
-    persist_photo_manifest, persist_photo_marker, photo_asset_is_handled, photo_spool_root,
-    AppliedControl, PendingPhoto, PhotoMarker,
+    persist_aux_collector_state, persist_photo_manifest, persist_photo_marker,
+    photo_asset_is_handled, photo_spool_root, AppliedControl, PendingPhoto, PhotoMarker,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_mins(1);
@@ -32,9 +32,24 @@ pub(crate) async fn run(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if controls.borrow().as_ref().is_some_and(|value| value.photos_library_enabled) {
-                    let _ = collect_once(&database, &bridge, &workspace_id, &device_id).await;
-                }
+                let control = controls.borrow().clone();
+                let revision = control.as_ref().map_or(0, |value| value.configuration_revision);
+                let enabled = control.as_ref().is_some_and(|value| value.photos_library_enabled);
+                let result = if enabled {
+                    collect_once(&database, &bridge, &workspace_id, &device_id)
+                        .await
+                        .map_err(|()| "PHOTOS_COLLECTION_FAILED")
+                } else {
+                    Ok(false)
+                };
+                let _ = persist_aux_collector_state(
+                    &database,
+                    "photos.library",
+                    enabled,
+                    revision,
+                    result.as_ref().copied().unwrap_or(false),
+                    result.err(),
+                ).await;
             }
             changed = controls.changed() => {
                 if changed.is_err() { return; }
@@ -51,7 +66,7 @@ async fn collect_once(
     bridge: &ScreenCaptureCommandHandle,
     workspace_id: &str,
     device_id: &str,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     if bridge.photo_authorization().await.map_err(|_| ())? != "available" {
         return Err(());
     }
@@ -60,6 +75,7 @@ async fn collect_once(
         .map_err(|_| ())?;
     let mut after_created_at = None;
     let mut after_local_identifier = None;
+    let mut event_observed = false;
     loop {
         let (status, assets) = bridge
             .list_photo_assets(
@@ -74,16 +90,18 @@ async fn collect_once(
             return Err(());
         }
         if assets.is_empty() {
-            return Ok(());
+            return Ok(event_observed);
         }
         let count = assets.len();
         for asset in assets {
             after_created_at = Some(asset.created_at.clone());
             after_local_identifier = Some(asset.local_identifier.clone());
-            let _ = queue_asset(database, bridge, workspace_id, device_id, asset).await;
+            event_observed |= queue_asset(database, bridge, workspace_id, device_id, asset)
+                .await
+                .unwrap_or(false);
         }
         if count < usize::from(PAGE_SIZE) {
-            return Ok(());
+            return Ok(event_observed);
         }
     }
 }
@@ -94,12 +112,12 @@ async fn queue_asset(
     workspace_id: &str,
     device_id: &str,
     asset: PhotoAssetRecord,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     let photo_id = stable_uuid(workspace_id, device_id, "photo", &asset.local_identifier);
     let event_id = stable_uuid(workspace_id, device_id, "event", &asset.local_identifier);
     let spool_root = photo_spool_root().map_err(|_| ())?;
     if photo_asset_is_handled(&photo_id).await.map_err(|_| ())? {
-        return Ok(());
+        return Ok(false);
     }
     let file_uuid = Uuid::parse_str(&photo_id).map_err(|_| ())?;
     let exported = bridge
@@ -114,7 +132,7 @@ async fn queue_asset(
         persist_photo_marker(&photo_id, PhotoMarker::Oversized)
             .await
             .map_err(|_| ())?;
-        return Ok(());
+        return Ok(false);
     }
     let (sha256, size_bytes) = hash_file(&exported).await?;
     if size_bytes == 0 {
@@ -125,7 +143,7 @@ async fn queue_asset(
         persist_photo_marker(&photo_id, PhotoMarker::Oversized)
             .await
             .map_err(|_| ())?;
-        return Ok(());
+        return Ok(false);
     }
     let payload = serde_json::json!({
         "asset_id": asset.local_identifier,
@@ -174,7 +192,8 @@ async fn queue_asset(
         completed: false,
     })
     .await
-    .map_err(|_| ())
+    .map_err(|_| ())?;
+    Ok(true)
 }
 
 fn validate_export_path(path: &Path, root: &Path, photo_id: &str) -> Result<(), ()> {

@@ -64,14 +64,32 @@
     "DeviceStatus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "observed_at"],
+      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "collector_health", "observed_at"],
       "properties": {
         "presence": { "enum": ["online", "stale", "offline", "sleeping"] },
         "agent_version": { "type": "string", "minLength": 1 },
         "outbox_depth": { "type": "integer", "minimum": 0 },
         "local_media": { "$ref": "#/$defs/LocalMedia" },
         "network": { "anyOf": [{ "$ref": "#/$defs/NetworkStatus" }, { "type": "null" }] },
+        "collector_health": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/CollectorHealth" } },
         "observed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "CollectorHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collector_key", "collector_version", "status", "desired_config_revision", "applied_config_revision", "last_event_at", "last_health_at", "error_code", "reported_at", "agent_version"],
+      "properties": {
+        "collector_key": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,63}$" },
+        "collector_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "status": { "enum": ["disabled", "permission_required", "initializing", "running", "paused", "degraded", "unsupported", "error"] },
+        "desired_config_revision": { "type": "integer", "minimum": 0 },
+        "applied_config_revision": { "type": "integer", "minimum": 0 },
+        "last_event_at": { "type": ["string", "null"], "format": "date-time" },
+        "last_health_at": { "type": ["string", "null"], "format": "date-time" },
+        "error_code": { "type": ["string", "null"], "pattern": "^[A-Z][A-Z0-9_]{0,127}$" },
+        "reported_at": { "type": "string", "format": "date-time" },
+        "agent_version": { "type": "string", "minLength": 1, "maxLength": 64 }
       }
     },
     "NetworkStatus": {

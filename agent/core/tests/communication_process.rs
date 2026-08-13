@@ -635,6 +635,24 @@ async fn transient_contact_read_failure_restarts_and_commits_the_next_message() 
     })
     .await
     .expect("message commits after transient contact read recovery");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let last_event_at = harness
+                .database
+                .load_collector_states()
+                .await
+                .expect("load collector state")
+                .into_iter()
+                .find(|state| state.collector_key == "communication.wechat")
+                .and_then(|state| state.last_event_at_ms);
+            if last_event_at.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("collector records the last committed message time");
 
     runtime.shutdown().await.unwrap();
     time_guard.abort();
@@ -743,13 +761,13 @@ async fn b2_retry_schedule_is_exact_and_caps_at_five_minutes() {
     let harness = Harness::new().await;
     let time_guard = prevent_virtual_time_auto_advance();
     let codes = [
+        "WECHAT_CAPABILITY_UNAVAILABLE",
+        "WECHAT_KEY_REJECTED",
+        "WECHAT_ACCOUNT_UNVERIFIED",
+        "WECHAT_MULTIPLE_ACCOUNTS",
         "WECHAT_DATABASE_UNAVAILABLE",
         "WECHAT_PROBE_TIMEOUT",
         "WECHAT_WAITING_SOURCE",
-        "WECHAT_DATABASE_UNAVAILABLE",
-        "WECHAT_PROBE_TIMEOUT",
-        "WECHAT_WAITING_SOURCE",
-        "WECHAT_DATABASE_UNAVAILABLE",
     ];
     harness.state.discover_results.lock().unwrap().extend(
         codes
@@ -874,7 +892,6 @@ async fn b2_success_and_new_control_reset_retry_delay_to_thirty_seconds() {
 async fn b2_terminal_or_malformed_errors_never_retry_even_when_flagged_retryable() {
     let time_guard = prevent_virtual_time_auto_advance();
     for code in [
-        "WECHAT_CAPABILITY_UNAVAILABLE",
         "WECHAT_UNSUPPORTED_SOURCE_VERSION",
         "WECHAT_INVALID_CONFIG",
         "WECHAT_STOP_FAILED",

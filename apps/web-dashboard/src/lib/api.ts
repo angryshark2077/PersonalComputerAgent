@@ -123,6 +123,7 @@ export interface DashboardDevice {
     };
     network: DashboardNetworkObservation | null;
     network_history?: Array<DashboardNetworkObservation & { observed_at: string }>;
+    collector_health: DashboardCollectorHealth[];
     observed_at: string;
   } | null;
   local_media_cleanup: {
@@ -135,6 +136,19 @@ export interface DashboardDevice {
     error_code: string | null;
   } | null;
   collectors: CollectorConfig;
+}
+
+export interface DashboardCollectorHealth {
+  collector_key: string;
+  collector_version: string;
+  status: "disabled" | "permission_required" | "initializing" | "running" | "paused" | "degraded" | "unsupported" | "error";
+  desired_config_revision: number;
+  applied_config_revision: number;
+  last_event_at: string | null;
+  last_health_at: string | null;
+  error_code: string | null;
+  reported_at: string;
+  agent_version: string;
 }
 
 export interface DashboardNetworkLocation {
@@ -276,6 +290,9 @@ export function normalizeDashboardDevice(device: DashboardDevice): DashboardDevi
   const collectors = device.collectors as Partial<CollectorConfig>;
   return {
     ...device,
+    status: device.status === null
+      ? null
+      : { ...device.status, collector_health: device.status.collector_health ?? [] },
     collectors: {
       ...device.collectors,
       "screen.capture": collectors["screen.capture"] ?? defaultScreenCaptureConfig,

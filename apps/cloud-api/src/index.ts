@@ -30,7 +30,7 @@ import {
   requireOwner,
   type OwnerAuthenticator,
 } from "./auth.js";
-import { parseCollectorConfig, parseHeartbeat } from "./control.js";
+import { parseCollectorConfig, parseCollectorHealth, parseHeartbeat } from "./control.js";
 import { CountryIsGeoEnricher, type GeoEnrichmentPort } from "./geo.js";
 import { createR2ObjectStore, type R2ObjectHead, type R2ObjectStore } from "./r2.js";
 import { parseCommunicationSyncBatch, parseSyncBatch } from "./sync.js";
@@ -231,6 +231,26 @@ export function createApp(options: CreateAppOptions): Hono {
       });
       const snapshot = await options.repository.loadControlSnapshot(device.deviceId, device.workspaceId);
       return context.json({ snapshot, server_time: now.toISOString() });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
+  app.post("/v1/agent/collector-health", async (context) => {
+    const device = await requireDevice(context, options.repository, "access");
+    if (device instanceof Response) return device;
+    const report = parseCollectorHealth(await context.req.json().catch(() => null));
+    if (report === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid collector health report.");
+    }
+    try {
+      await options.repository.recordCollectorHealth({
+        ...report,
+        workspaceId: device.workspaceId,
+        deviceId: device.deviceId,
+        receivedAt: new Date(),
+      });
+      return context.body(null, 204);
     } catch (error) {
       return repositoryErrorResponse(context, error);
     }
@@ -1558,6 +1578,18 @@ function ownerDeviceSummaryResponse(device: {
       } | null;
       observedAt: Date;
     }>;
+    collectorHealth: Array<{
+      collectorKey: string;
+      collectorVersion: string;
+      status: string;
+      desiredConfigRevision: number;
+      appliedConfigRevision: number;
+      lastEventAt: Date | null;
+      lastHealthAt: Date | null;
+      errorCode: string | null;
+      reportedAt: Date;
+      agentVersion: string;
+    }>;
     observedAt: Date;
   } | null;
 }) {
@@ -1617,6 +1649,18 @@ function ownerDeviceSummaryResponse(device: {
               },
               matched_location: record.matchedLocation === null ? null : networkLocationResponse(record.matchedLocation),
               observed_at: record.observedAt.toISOString(),
+            })),
+            collector_health: device.status.collectorHealth.map((collector) => ({
+              collector_key: collector.collectorKey,
+              collector_version: collector.collectorVersion,
+              status: collector.status,
+              desired_config_revision: collector.desiredConfigRevision,
+              applied_config_revision: collector.appliedConfigRevision,
+              last_event_at: collector.lastEventAt?.toISOString() ?? null,
+              last_health_at: collector.lastHealthAt?.toISOString() ?? null,
+              error_code: collector.errorCode,
+              reported_at: collector.reportedAt.toISOString(),
+              agent_version: collector.agentVersion,
             })),
             observed_at: device.status.observedAt.toISOString(),
           },
