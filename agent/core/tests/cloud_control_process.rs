@@ -1195,7 +1195,7 @@ async fn refreshed_credential_persistence_retries_without_stopping_cloud_control
 }
 
 #[tokio::test]
-async fn cloud_owner_reconciles_a_finished_worker_from_keychain() {
+async fn cloud_owner_propagates_a_finished_worker_failure_for_agent_restart() {
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -1226,19 +1226,27 @@ async fn cloud_owner_reconciles_a_finished_worker_from_keychain() {
         .await
         .unwrap());
     wait_for_calls(&client.calls, 1).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
+    for _ in 0..200 {
+        if owner.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(commands
-        .replace_from_keychain(
-            Arc::clone(&store) as Arc<dyn CredentialStore>,
-            Arc::clone(&client) as Arc<dyn ControlClient>,
-        )
-        .await
-        .unwrap());
-    wait_for_calls(&client.calls, 2).await;
+    assert!(owner.is_finished());
+    assert!(matches!(
+        commands
+            .replace_from_keychain(
+                Arc::clone(&store) as Arc<dyn CredentialStore>,
+                Arc::clone(&client) as Arc<dyn ControlClient>,
+            )
+            .await,
+        Err(CloudControlRuntimeError::WorkerStopped)
+    ));
 
-    owner.shutdown().await.unwrap();
+    assert!(matches!(
+        owner.shutdown().await,
+        Err(CloudControlRuntimeError::WorkerStopped)
+    ));
     shutdown_database(database).await;
 }
 

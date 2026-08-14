@@ -162,8 +162,7 @@ async fn collect_once(
             });
         if let Some(text) = text {
             if let Ok(commit) = message_commit(&source_message, text, workspace_id, device_id) {
-                database.commit_events(&commit).await.map_err(|_| ())?;
-                event_observed = true;
+                event_observed |= commit_message_or_accept_replay(database, &commit).await?;
             } else {
                 persist_cursor(workspace_id, device_id, row_id).await?;
                 continue;
@@ -172,6 +171,26 @@ async fn collect_once(
         persist_cursor(workspace_id, device_id, row_id).await?;
     }
     Ok(event_observed)
+}
+
+async fn commit_message_or_accept_replay(
+    database: &DbActorHandle,
+    commit: &EventCommit,
+) -> Result<bool, ()> {
+    if database.commit_events(commit).await.is_ok() {
+        return Ok(true);
+    }
+    for event in commit.events() {
+        if database
+            .count_event_and_outbox(&event.event_id)
+            .await
+            .map_err(|_| ())?
+            != (1, 1)
+        {
+            return Err(());
+        }
+    }
+    Ok(false)
 }
 
 fn message_commit(
@@ -396,15 +415,38 @@ fn cursor_path(workspace_id: &str, device_id: &str) -> Option<PathBuf> {
     })
 }
 
-async fn load_cursor(workspace_id: &str, device_id: &str) -> Result<Option<i64>, ()> {
-    let Some(path) = cursor_path(workspace_id, device_id) else {
-        return Err(());
-    };
+fn legacy_cursor_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library/Application Support/PersonalComputerAgent/messages-cursor"))
+}
+
+async fn read_cursor(path: PathBuf) -> Result<Option<i64>, ()> {
     match tokio::fs::read_to_string(path).await {
         Ok(value) => value.trim().parse::<i64>().map(Some).map_err(|_| ()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(()),
     }
+}
+
+fn migrate_established_cursor(scoped: Option<i64>, legacy: Option<i64>) -> Option<i64> {
+    scoped.map(|scoped| legacy.map_or(scoped, |legacy| scoped.max(legacy)))
+}
+
+async fn load_cursor(workspace_id: &str, device_id: &str) -> Result<Option<i64>, ()> {
+    let Some(path) = cursor_path(workspace_id, device_id) else {
+        return Err(());
+    };
+    let scoped = read_cursor(path).await?;
+    let legacy = if scoped.is_some() {
+        match legacy_cursor_path() {
+            Some(path) => read_cursor(path).await.ok().flatten(),
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok(migrate_established_cursor(scoped, legacy))
 }
 
 async fn persist_cursor(workspace_id: &str, device_id: &str, row_id: i64) -> Result<(), ()> {
@@ -424,8 +466,10 @@ async fn persist_cursor(workspace_id: &str, device_id: &str, row_id: i64) -> Res
 #[cfg(test)]
 mod tests {
     use super::{
-        apple_date_to_rfc3339, message_commit, message_events, stable_uuid, SourceMessage,
+        apple_date_to_rfc3339, commit_message_or_accept_replay, message_commit, message_events,
+        migrate_established_cursor, stable_uuid, SourceMessage,
     };
+    use pca_db_local::DbActorHandle;
 
     #[test]
     fn outgoing_messages_use_local_sender_and_stable_private_events() {
@@ -500,5 +544,72 @@ mod tests {
         };
 
         assert!(message_commit(&message, "hello".to_owned(), "workspace", "device").is_err());
+    }
+
+    #[test]
+    fn established_device_cursor_advances_to_legacy_progress_without_seeding_a_new_device() {
+        assert_eq!(
+            migrate_established_cursor(Some(12_393), Some(12_442)),
+            Some(12_442)
+        );
+        assert_eq!(
+            migrate_established_cursor(Some(12_500), Some(12_442)),
+            Some(12_500)
+        );
+        assert_eq!(migrate_established_cursor(None, Some(12_442)), None);
+    }
+
+    #[tokio::test]
+    async fn an_already_persisted_apple_message_replay_advances_without_hiding_partial_commits() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        let source = SourceMessage {
+            row_id: 12_394,
+            guid: "message-guid".to_owned(),
+            chat_guid: "chat-guid".to_owned(),
+            display_name: "Chat".to_owned(),
+            sender_id: "sender".to_owned(),
+            sender_display_name: "Sender".to_owned(),
+            is_from_me: false,
+            apple_date: 0,
+            member_count: 1,
+            text: None,
+            attributed_body: None,
+        };
+        let original = message_commit(&source, "original".to_owned(), "workspace", "device")
+            .expect("original commit");
+        assert!(commit_message_or_accept_replay(&database, &original)
+            .await
+            .expect("commit original message"));
+
+        let replay = message_commit(&source, "edited".to_owned(), "workspace", "device")
+            .expect("replayed commit");
+        assert!(!commit_message_or_accept_replay(&database, &replay)
+            .await
+            .expect("accept fully persisted replay"));
+
+        let partial_source = SourceMessage {
+            row_id: 12_395,
+            guid: "partial-message-guid".to_owned(),
+            ..source
+        };
+        let partial = message_commit(&partial_source, "partial".to_owned(), "workspace", "device")
+            .expect("partial commit");
+        let mut conflicting_event = partial.events()[0].clone();
+        conflicting_event.payload.insert(
+            "display_name".to_owned(),
+            serde_json::Value::String("Conflicting chat".to_owned()),
+        );
+        database
+            .append_event_with_outbox(&conflicting_event)
+            .await
+            .expect("persist one conflicting metadata event");
+        assert!(commit_message_or_accept_replay(&database, &partial)
+            .await
+            .is_err());
+
+        database.shutdown().await.expect("shutdown database");
     }
 }
