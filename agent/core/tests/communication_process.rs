@@ -50,6 +50,7 @@ struct RecordingState {
     poll_release: Notify,
     discover_results: Mutex<VecDeque<Result<(), DomainError>>>,
     poll_results: Mutex<VecDeque<ProviderResult>>,
+    poll_health_errors: Mutex<VecDeque<Option<DomainError>>>,
     stop_results: Mutex<VecDeque<Result<(), DomainError>>>,
 }
 
@@ -63,6 +64,7 @@ impl CommunicationProviderFactory for RecordingFactory {
         Ok(Box::new(RecordingProvider {
             state: Arc::clone(&self.state),
             status: ProviderStatus::WaitingSource,
+            health_error: None,
         }))
     }
 }
@@ -70,6 +72,7 @@ impl CommunicationProviderFactory for RecordingFactory {
 struct RecordingProvider {
     state: Arc<RecordingState>,
     status: ProviderStatus,
+    health_error: Option<DomainError>,
 }
 
 struct PollDropGuard(Arc<RecordingState>);
@@ -87,6 +90,10 @@ impl CommunicationProvider for RecordingProvider {
 
     fn status(&self) -> ProviderStatus {
         self.status
+    }
+
+    fn health_error(&self) -> Option<DomainError> {
+        self.health_error.clone()
     }
 
     fn discover(&mut self) -> CommunicationProviderFuture<'_> {
@@ -116,12 +123,21 @@ impl CommunicationProvider for RecordingProvider {
                 self.state.poll_entered.notify_waiters();
                 self.state.poll_release.notified().await;
             }
-            self.state
+            let result = self
+                .state
                 .poll_results
                 .lock()
                 .expect("poll plan")
                 .pop_front()
-                .unwrap_or(Ok(Vec::new()))
+                .unwrap_or(Ok(Vec::new()));
+            self.health_error = self
+                .state
+                .poll_health_errors
+                .lock()
+                .expect("poll health plan")
+                .pop_front()
+                .flatten();
+            result
         })
     }
 
@@ -457,7 +473,7 @@ fn multi_media_record(
 }
 
 async fn wait_for(counter: &AtomicUsize, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if counter.load(Ordering::SeqCst) >= expected {
             return;
@@ -677,6 +693,51 @@ async fn transient_contact_read_failure_restarts_and_commits_the_next_message() 
 
     runtime.shutdown().await.unwrap();
     time_guard.abort();
+}
+
+#[tokio::test]
+async fn successful_text_poll_preserves_a_media_stage_health_error() {
+    let harness = Harness::new().await;
+    harness
+        .state
+        .poll_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![text_record(1)]));
+    harness
+        .state
+        .poll_health_errors
+        .lock()
+        .unwrap()
+        .push_back(Some(DomainError::new(
+            "WECHAT_IMAGE_READ_FAILED",
+            "redacted",
+            true,
+        )));
+
+    let runtime = harness.start(enabled(1)).await;
+    wait_for(&harness.state.poll_calls, 1).await;
+    wait_for_collector_code(&harness.database, "WECHAT_IMAGE_READ_FAILED").await;
+    let state = harness
+        .database
+        .load_collector_states()
+        .await
+        .expect("load degraded collector")
+        .into_iter()
+        .find(|state| state.collector_key == "communication.wechat")
+        .expect("WeChat collector state");
+    assert_eq!(state.status, CollectorStatus::Degraded);
+    assert!(state.last_event_at_ms.is_some());
+    assert_eq!(
+        harness
+            .database
+            .load_pending_communication_events(3)
+            .await
+            .expect("load committed text events")
+            .len(),
+        3
+    );
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

@@ -26,6 +26,7 @@ const COLLECTION_DEADLINE: Duration = Duration::from_mins(5);
 const STATE_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
 const APPLE_EPOCH_UNIX_SECONDS: i128 = 978_307_200;
 const LOOKBACK_DAYS: i64 = 7;
+const MESSAGE_PAGE_SIZE: usize = 200;
 
 struct SourceMessage {
     row_id: i64,
@@ -114,61 +115,72 @@ async fn collect_once(
     workspace_id: &str,
     device_id: &str,
 ) -> Result<bool, ()> {
-    let cursor = load_cursor(workspace_id, device_id).await?;
-    let path = source.to_path_buf();
-    let messages = task::spawn_blocking(move || load_recent_messages(&path, cursor))
+    let mut cursor = load_cursor(workspace_id, device_id).await?;
+    let initial_scan = cursor.is_none();
+    let mut event_observed = false;
+    loop {
+        let path = source.to_path_buf();
+        let page_cursor = cursor;
+        let messages = task::spawn_blocking(move || {
+            load_recent_messages(&path, page_cursor, initial_scan, MESSAGE_PAGE_SIZE)
+        })
         .await
         .map_err(|_| ())?
         .map_err(|_| ())?;
-    let encoded = messages
-        .iter()
-        .filter_map(|message| {
-            (message
+        let page_len = messages.len();
+        if page_len == 0 {
+            break;
+        }
+        let encoded = messages
+            .iter()
+            .filter_map(|message| {
+                (message
+                    .text
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty()))
+                .then(|| {
+                    message
+                        .attributed_body
+                        .as_ref()
+                        .map(|body| STANDARD.encode(body))
+                })
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        let mut decoded = Vec::with_capacity(encoded.len());
+        for chunk in encoded.chunks(100) {
+            decoded.extend(
+                bridge
+                    .decode_message_bodies(chunk.to_vec())
+                    .await
+                    .map_err(|_| ())?,
+            );
+        }
+        let mut decoded = decoded.into_iter();
+        for source_message in messages {
+            let row_id = source_message.row_id;
+            let text = source_message
                 .text
                 .as_deref()
-                .is_none_or(|value| value.trim().is_empty()))
-            .then(|| {
-                message
-                    .attributed_body
-                    .as_ref()
-                    .map(|body| STANDARD.encode(body))
-            })
-            .flatten()
-        })
-        .collect::<Vec<_>>();
-    let mut decoded = Vec::with_capacity(encoded.len());
-    for chunk in encoded.chunks(100) {
-        decoded.extend(
-            bridge
-                .decode_message_bodies(chunk.to_vec())
-                .await
-                .map_err(|_| ())?,
-        );
-    }
-    let mut decoded = decoded.into_iter();
-    let mut event_observed = false;
-    for source_message in messages {
-        let row_id = source_message.row_id;
-        let text = source_message
-            .text
-            .as_deref()
-            .and_then(normalize_text)
-            .map(str::to_owned)
-            .or_else(|| {
-                source_message
-                    .attributed_body
-                    .as_ref()
-                    .and_then(|_| decoded.next().flatten())
-            });
-        if let Some(text) = text {
-            if let Ok(commit) = message_commit(&source_message, text, workspace_id, device_id) {
-                event_observed |= commit_message_or_accept_replay(database, &commit).await?;
-            } else {
-                persist_cursor(workspace_id, device_id, row_id).await?;
-                continue;
+                .and_then(normalize_text)
+                .map(str::to_owned)
+                .or_else(|| {
+                    source_message
+                        .attributed_body
+                        .as_ref()
+                        .and_then(|_| decoded.next().flatten())
+                });
+            if let Some(text) = text {
+                if let Ok(commit) = message_commit(&source_message, text, workspace_id, device_id) {
+                    event_observed |= commit_message_or_accept_replay(database, &commit).await?;
+                }
             }
+            persist_cursor(workspace_id, device_id, row_id).await?;
+            cursor = Some(row_id);
         }
-        persist_cursor(workspace_id, device_id, row_id).await?;
+        if page_len < MESSAGE_PAGE_SIZE {
+            break;
+        }
     }
     Ok(event_observed)
 }
@@ -206,6 +218,8 @@ fn message_commit(
 fn load_recent_messages(
     path: &PathBuf,
     after_row_id: Option<i64>,
+    initial_scan: bool,
+    limit: usize,
 ) -> rusqlite::Result<Vec<SourceMessage>> {
     let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection.busy_timeout(Duration::from_secs(5))?;
@@ -221,37 +235,43 @@ fn load_recent_messages(
          INNER JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
          INNER JOIN chat c ON c.ROWID = cmj.chat_id
          LEFT JOIN handle h ON h.ROWID = m.handle_id
-         WHERE ((?1 IS NULL AND m.date >= ?2) OR (?1 IS NOT NULL AND m.ROWID > ?1)) AND m.is_empty = 0
-         ORDER BY m.ROWID ASC"
+         WHERE (?1 IS NULL OR m.ROWID > ?1)
+           AND (?3 = 0 OR m.date >= ?2)
+           AND m.is_empty = 0
+         ORDER BY m.ROWID ASC
+         LIMIT ?4"
     )?;
     let rows = statement
-        .query_map(rusqlite::params![after_row_id, cutoff_apple_ns], |row| {
-            let members =
-                u8::try_from(row.get::<_, i64>(8)?.clamp(1, i64::from(u8::MAX))).unwrap_or(u8::MAX);
-            let is_from_me = row.get::<_, i64>(6)? != 0;
-            let remote_sender = row.get::<_, String>(4)?;
-            Ok(SourceMessage {
-                row_id: row.get(0)?,
-                guid: row.get(1)?,
-                chat_guid: row.get(2)?,
-                display_name: row.get(3)?,
-                sender_id: if is_from_me {
-                    "me".to_owned()
-                } else {
-                    remote_sender.clone()
-                },
-                sender_display_name: if is_from_me {
-                    "Me".to_owned()
-                } else {
-                    remote_sender
-                },
-                is_from_me,
-                apple_date: row.get(7)?,
-                member_count: members,
-                text: row.get(9)?,
-                attributed_body: row.get(10)?,
-            })
-        })?
+        .query_map(
+            rusqlite::params![after_row_id, cutoff_apple_ns, initial_scan, limit],
+            |row| {
+                let members = u8::try_from(row.get::<_, i64>(8)?.clamp(1, i64::from(u8::MAX)))
+                    .unwrap_or(u8::MAX);
+                let is_from_me = row.get::<_, i64>(6)? != 0;
+                let remote_sender = row.get::<_, String>(4)?;
+                Ok(SourceMessage {
+                    row_id: row.get(0)?,
+                    guid: row.get(1)?,
+                    chat_guid: row.get(2)?,
+                    display_name: row.get(3)?,
+                    sender_id: if is_from_me {
+                        "me".to_owned()
+                    } else {
+                        remote_sender.clone()
+                    },
+                    sender_display_name: if is_from_me {
+                        "Me".to_owned()
+                    } else {
+                        remote_sender
+                    },
+                    is_from_me,
+                    apple_date: row.get(7)?,
+                    member_count: members,
+                    text: row.get(9)?,
+                    attributed_body: row.get(10)?,
+                })
+            },
+        )?
         .collect();
     rows
 }
@@ -466,10 +486,12 @@ async fn persist_cursor(workspace_id: &str, device_id: &str, row_id: i64) -> Res
 #[cfg(test)]
 mod tests {
     use super::{
-        apple_date_to_rfc3339, commit_message_or_accept_replay, message_commit, message_events,
-        migrate_established_cursor, stable_uuid, SourceMessage,
+        apple_date_to_rfc3339, commit_message_or_accept_replay, load_recent_messages,
+        message_commit, message_events, migrate_established_cursor, stable_uuid, SourceMessage,
+        MESSAGE_PAGE_SIZE,
     };
     use pca_db_local::DbActorHandle;
+    use rusqlite::{params, Connection};
 
     #[test]
     fn outgoing_messages_use_local_sender_and_stable_private_events() {
@@ -517,6 +539,62 @@ mod tests {
         let later_events = message_events(&later, "later".to_owned(), "workspace", "device")
             .expect("later message events");
         assert_ne!(first[0].event_id, later_events[0].event_id);
+    }
+
+    #[test]
+    fn message_loading_is_bounded_and_keeps_the_initial_cutoff_across_pages() {
+        let directory = tempfile::tempdir().expect("temporary Messages database");
+        let path = directory.path().join("chat.db");
+        let connection = Connection::open(&path).expect("open Messages fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE message (
+                    ROWID INTEGER PRIMARY KEY, guid TEXT, handle_id INTEGER, is_from_me INTEGER,
+                    date INTEGER, text TEXT, attributedBody BLOB, is_empty INTEGER
+                 );
+                 CREATE TABLE chat (
+                    ROWID INTEGER PRIMARY KEY, guid TEXT, display_name TEXT, chat_identifier TEXT
+                 );
+                 CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+                 CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+                 CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER);
+                 INSERT INTO chat VALUES (1, 'chat-guid', 'Chat', 'chat');",
+            )
+            .expect("create Messages fixture schema");
+        for row_id in 1_i64..=250 {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, NULL, 1, ?3, 'text', NULL, 0)",
+                    params![row_id, format!("message-{row_id}"), i64::MAX],
+                )
+                .expect("insert recent message");
+            connection
+                .execute("INSERT INTO chat_message_join VALUES (1, ?1)", [row_id])
+                .expect("join recent message");
+        }
+        connection
+            .execute(
+                "INSERT INTO message VALUES (251, 'old-message', NULL, 1, 0, 'old', NULL, 0)",
+                [],
+            )
+            .expect("insert old message");
+        connection
+            .execute("INSERT INTO chat_message_join VALUES (1, 251)", [])
+            .expect("join old message");
+        drop(connection);
+
+        let first = load_recent_messages(&path, None, true, MESSAGE_PAGE_SIZE)
+            .expect("load first bounded page");
+        assert_eq!(first.len(), MESSAGE_PAGE_SIZE);
+        assert_eq!(first.last().map(|message| message.row_id), Some(200));
+        let second = load_recent_messages(&path, Some(200), true, MESSAGE_PAGE_SIZE)
+            .expect("load second bounded page");
+        assert_eq!(second.len(), 50);
+        assert_eq!(second.last().map(|message| message.row_id), Some(250));
+        let resumed = load_recent_messages(&path, Some(250), false, MESSAGE_PAGE_SIZE)
+            .expect("load post-cursor delayed row");
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].row_id, 251);
     }
 
     #[test]

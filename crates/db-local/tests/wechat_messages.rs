@@ -683,3 +683,51 @@ async fn communication_load_and_ack_never_load_or_acknowledge_system_events() {
         vec![system]
     );
 }
+
+#[tokio::test]
+async fn cloud_rejected_communication_event_becomes_terminal_without_deleting_local_history() {
+    let (_directory, path) = database_path();
+    let store = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let communication = valid_commit(&path);
+    store
+        .commit_communication_message(&communication)
+        .await
+        .expect("persist communication event");
+
+    store
+        .dead_letter_rejected_communication_events(std::slice::from_ref(
+            &communication.event.event_id,
+        ))
+        .await
+        .expect("dead-letter rejected communication event");
+
+    assert!(store
+        .load_pending_communication_events(200)
+        .await
+        .expect("load pending communication events")
+        .is_empty());
+    assert_eq!(store.active_outbox_depth().await.expect("active depth"), 0);
+    let connection = Connection::open(&path).expect("inspect rejected communication event");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM sync_outbox WHERE event_id = ?1",
+                [&communication.event.event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read rejected state"),
+        "dead_letter"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM communication_messages WHERE event_id = ?1",
+                [&communication.event.event_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("read retained local message"),
+        1
+    );
+}

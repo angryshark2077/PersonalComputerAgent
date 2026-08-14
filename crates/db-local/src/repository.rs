@@ -1120,7 +1120,7 @@ pub(crate) fn count_event_and_outbox(
 pub(crate) fn active_outbox_depth(connection: &Connection) -> Result<u64, DbError> {
     connection
         .query_row(
-            "SELECT COUNT(*) FROM sync_outbox WHERE state <> 'acked'",
+            "SELECT COUNT(*) FROM sync_outbox WHERE state IN ('pending', 'sending')",
             [],
             |row| row.get(0),
         )
@@ -1364,6 +1364,18 @@ pub(crate) fn acknowledge_system_events(
         .map_err(|error| DbError::sqlite("commit system event acknowledgement", error))
 }
 
+pub(crate) fn dead_letter_rejected_system_events(
+    connection: &mut Connection,
+    event_ids: &[String],
+) -> Result<(), DbError> {
+    dead_letter_rejected_events(
+        connection,
+        event_ids,
+        "system",
+        "CLOUD_SYSTEM_EVENT_REJECTED",
+    )
+}
+
 pub(crate) fn load_pending_communication_events(
     connection: &Connection,
     limit: u16,
@@ -1478,6 +1490,98 @@ pub(crate) fn acknowledge_communication_events(
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit communication event acknowledgement", error))
+}
+
+pub(crate) fn dead_letter_rejected_communication_events(
+    connection: &mut Connection,
+    event_ids: &[String],
+) -> Result<(), DbError> {
+    dead_letter_rejected_events(
+        connection,
+        event_ids,
+        "communication",
+        "CLOUD_COMMUNICATION_EVENT_REJECTED",
+    )
+}
+
+fn dead_letter_rejected_events(
+    connection: &mut Connection,
+    event_ids: &[String],
+    event_class: &'static str,
+    diagnostic_code: &'static str,
+) -> Result<(), DbError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start rejected event quarantine", error))?;
+    let occurred_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    for event_id in event_ids {
+        let updated = transaction
+            .execute(
+                "UPDATE sync_outbox
+                 SET state = 'dead_letter'
+                 WHERE event_id = ?1 AND state = 'pending'
+                   AND EXISTS (
+                       SELECT 1 FROM events_local AS e
+                       WHERE e.event_id = sync_outbox.event_id
+                         AND (
+                           (?2 = 'system' AND e.event_type IN (
+                               'system.metric_sampled', 'system.health_changed',
+                               'collector.status_changed', 'agent.started', 'agent.stopped',
+                               'agent.crash_recovered', 'system.sleep', 'system.wake',
+                               'network.offline', 'network.online', 'network.changed',
+                               'photos.asset_recorded', 'AGENT_STARTED', 'AGENT_STOPPED',
+                               'AGENT_CRASH_RECOVERED', 'SYSTEM_SLEEP', 'SYSTEM_WAKE'
+                           ))
+                           OR
+                           (?2 = 'communication'
+                            AND e.event_type IN (
+                                'communication.message_recorded',
+                                'communication.conversation_observed',
+                                'communication.message_sender_observed'
+                            )
+                            AND e.source IN ('communication.wechat', 'communication.messages')
+                            AND e.schema_version = 1
+                            AND e.sensitivity = 'high')
+                         )
+                   )",
+                params![event_id, event_class],
+            )
+            .map_err(|error| DbError::sqlite("quarantine rejected event", error))?;
+        if updated != 1 {
+            return Err(DbError::sqlite(
+                "quarantine rejected event",
+                "event was not pending",
+            ));
+        }
+        let diagnostic_id = format!("{diagnostic_code}:{event_id}");
+        let redacted_json = serde_json::json!({ "event_id": event_id }).to_string();
+        transaction
+            .execute(
+                "INSERT INTO diagnostic_events (
+                    diagnostic_id, occurred_at_ms, level, code, redacted_json
+                 ) VALUES (?1, ?2, 'error', ?3, ?4)
+                 ON CONFLICT(diagnostic_id) DO UPDATE SET
+                    occurred_at_ms = excluded.occurred_at_ms,
+                    level = excluded.level,
+                    code = excluded.code,
+                    redacted_json = excluded.redacted_json",
+                params![
+                    diagnostic_id,
+                    occurred_at_ms,
+                    diagnostic_code,
+                    redacted_json
+                ],
+            )
+            .map_err(|error| DbError::sqlite("record rejected event diagnostic", error))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit rejected event quarantine", error))
 }
 
 struct PendingAttachmentManifest {

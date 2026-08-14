@@ -160,6 +160,7 @@ struct MacOSWechatSource {
     verified: Arc<Mutex<bool>>,
     last_pending_media_retry_at: Arc<Mutex<Option<Instant>>>,
     last_message_snapshot: Arc<Mutex<Option<MessageSourceSnapshot>>>,
+    media_health_error: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl MacOSWechatSource {
@@ -175,6 +176,7 @@ impl MacOSWechatSource {
             verified: Arc::new(Mutex::new(false)),
             last_pending_media_retry_at: Arc::new(Mutex::new(None)),
             last_message_snapshot: Arc::new(Mutex::new(None)),
+            media_health_error: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -261,6 +263,7 @@ impl WechatSource for MacOSWechatSource {
         let verified = Arc::clone(&self.verified);
         let last_pending_media_retry_at = Arc::clone(&self.last_pending_media_retry_at);
         let last_message_snapshot = Arc::clone(&self.last_message_snapshot);
+        let media_health_error = Arc::clone(&self.media_health_error);
         Box::pin(async move {
             if !verified.lock().is_ok_and(|state| *state) {
                 return Err(waiting_source());
@@ -297,11 +300,20 @@ impl WechatSource for MacOSWechatSource {
                     &refreshed_paths,
                     &cursors,
                     &last_message_snapshot,
+                    &media_health_error,
                     retry_pending_media,
                 )
             })
             .await
         })
+    }
+
+    fn health_error(&self) -> Option<DomainError> {
+        self.media_health_error
+            .lock()
+            .ok()
+            .and_then(|error| *error)
+            .map(media_stage_error)
     }
 }
 
@@ -495,6 +507,7 @@ fn read_message_batch(
     paths: &SourcePaths,
     cursors: &Mutex<BTreeMap<String, i64>>,
     last_message_snapshot: &Mutex<Option<MessageSourceSnapshot>>,
+    media_health_error: &Mutex<Option<&'static str>>,
     retry_pending_media: bool,
 ) -> Result<Vec<SourceRecord>, DomainError> {
     let current_snapshot = message_source_snapshot(&paths.message_databases);
@@ -507,6 +520,9 @@ fn read_message_batch(
     if !should_scan {
         return Ok(Vec::new());
     }
+    *media_health_error
+        .lock()
+        .map_err(|_| capability_unavailable())? = None;
     let material = extend_message_database_routes(paths, load_material(paths)?)?;
     let sessions = with_database(&paths.session_database, &material, read_sessions)
         .map_err(|_| read_stage_error("WECHAT_SESSION_READ_FAILED"))?;
@@ -614,6 +630,7 @@ fn read_message_batch(
                 retry_pending_media,
             );
             let file_batch = file_batch.unwrap_or_else(|_| {
+                remember_media_stage_error(media_health_error, "WECHAT_FILE_READ_FAILED");
                 eprintln!("WeChat media stage deferred: WECHAT_FILE_READ_FAILED");
                 FileReadBatch {
                     records: Vec::new(),
@@ -651,6 +668,7 @@ fn read_message_batch(
                 retry_pending_media,
             );
             let image_batch = image_batch.unwrap_or_else(|_| {
+                remember_media_stage_error(media_health_error, "WECHAT_IMAGE_READ_FAILED");
                 eprintln!("WeChat media stage deferred: WECHAT_IMAGE_READ_FAILED");
                 ImageReadBatch {
                     records: Vec::new(),
@@ -698,6 +716,7 @@ fn read_message_batch(
                 retry_pending_media,
             );
             let emoticon_batch = emoticon_batch.unwrap_or_else(|_| {
+                remember_media_stage_error(media_health_error, "WECHAT_EMOTICON_READ_FAILED");
                 eprintln!("WeChat media stage deferred: WECHAT_EMOTICON_READ_FAILED");
                 EmoticonReadBatch {
                     records: Vec::new(),
@@ -741,6 +760,7 @@ fn read_message_batch(
                     records.push(SourceRecord::Message(Box::new(record)));
                 }
             } else {
+                remember_media_stage_error(media_health_error, "WECHAT_AUDIO_READ_FAILED");
                 eprintln!("WeChat media stage deferred: WECHAT_AUDIO_READ_FAILED");
             }
             if records.len() >= MAX_BATCH {
@@ -758,6 +778,7 @@ fn read_message_batch(
                 retry_pending_media,
             );
             let video_batch = video_batch.unwrap_or_else(|_| {
+                remember_media_stage_error(media_health_error, "WECHAT_VIDEO_READ_FAILED");
                 eprintln!("WeChat media stage deferred: WECHAT_VIDEO_READ_FAILED");
                 VideoReadBatch {
                     records: Vec::new(),
@@ -4698,6 +4719,16 @@ fn valid_display_name(value: &str) -> Option<String> {
 
 fn read_stage_error(code: &str) -> DomainError {
     DomainError::new(code, "WeChat read stage failed", true)
+}
+
+fn media_stage_error(code: &'static str) -> DomainError {
+    DomainError::new(code, "WeChat media read stage failed", true)
+}
+
+fn remember_media_stage_error(health_error: &Mutex<Option<&'static str>>, code: &'static str) {
+    if let Ok(mut health_error) = health_error.lock() {
+        health_error.get_or_insert(code);
+    }
 }
 
 fn load_material(paths: &SourcePaths) -> Result<WechatKeyMaterial, DomainError> {

@@ -239,6 +239,13 @@ pub trait CommunicationProvider: Send {
     fn key(&self) -> &'static str;
     fn status(&self) -> ProviderStatus;
 
+    /// Returns a redacted partial-degradation reason from the most recent successful poll.
+    ///
+    /// A provider may return records and still report that one optional source stage failed.
+    fn health_error(&self) -> Option<DomainError> {
+        None
+    }
+
     /// Discovers the configured communication source without producing events.
     ///
     /// # Errors

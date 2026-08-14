@@ -1194,6 +1194,60 @@ async fn refreshed_credential_persistence_retries_without_stopping_cloud_control
     shutdown_database(database).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn permanently_unwritable_refreshed_credential_stops_cloud_control_after_deadline() {
+    let time_guard = prevent_virtual_time_auto_advance();
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(Arc::clone(&store));
+    store
+        .store(
+            DEVICE_CREDENTIAL_SERVICE,
+            DEVICE_CREDENTIAL_ACCOUNT,
+            &loaded.credential().encode().unwrap(),
+        )
+        .unwrap();
+    let initial_store_attempts = store.store_attempts.load(Ordering::SeqCst);
+    store
+        .store_failures_remaining
+        .store(usize::MAX, Ordering::SeqCst);
+    let refreshed = DeviceCredential::new(
+        loaded.credential().device_id().to_owned(),
+        loaded.credential().workspace_id().to_owned(),
+        "refreshed-access",
+        "refreshed-refresh",
+    )
+    .unwrap()
+    .with_metadata(2, 1_800_000_000_000, 1_900_000_000_000);
+    let client = Arc::new(RefreshingClient {
+        calls: AtomicUsize::new(0),
+        refresh_calls: AtomicUsize::new(0),
+        refreshed,
+        snapshot: exact_snapshot(1, true),
+    });
+
+    let runtime = CloudControlRuntime::start(
+        Arc::clone(&database),
+        loaded,
+        Arc::clone(&client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+    wait_for_calls(&client.calls, 1).await;
+    wait_for_calls(&store.store_attempts, initial_store_attempts + 1).await;
+    tokio::time::advance(Duration::from_mins(5)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(matches!(
+        runtime.shutdown().await,
+        Err(CloudControlRuntimeError::WorkerStopped)
+    ));
+    time_guard.abort();
+    shutdown_database(database).await;
+}
+
 #[tokio::test]
 async fn cloud_owner_propagates_a_finished_worker_failure_for_agent_restart() {
     let (_temp, database) = db().await;

@@ -43,6 +43,7 @@ use crate::communication::{
 const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
 const COLLECTOR_HEALTH_INTERVAL: Duration = Duration::from_mins(30);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const CREDENTIAL_PERSIST_TIMEOUT: Duration = Duration::from_mins(5);
 const MEDIA_UPLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOUD_WORKER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -1828,16 +1829,21 @@ async fn run_control_loop(
                             )
                             .await;
                         }
-                        if !persist_refreshed_credential(
-                            &database,
-                            &mut credentials,
-                            next,
-                            &media_credentials,
-                            &mut shutdown,
+                        match time::timeout(
+                            CREDENTIAL_PERSIST_TIMEOUT,
+                            persist_refreshed_credential(
+                                &database,
+                                &mut credentials,
+                                next,
+                                &media_credentials,
+                                &mut shutdown,
+                            ),
                         )
                         .await
                         {
-                            return Ok(());
+                            Ok(true) => {}
+                            Ok(false) => return Ok(()),
+                            Err(_) => return Err(CloudControlRuntimeError::WorkerStopped),
                         }
                         retry_attempt = 0;
                         wait = Duration::ZERO;
@@ -2968,15 +2974,22 @@ async fn sync_pending_system_events(
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    database
-        .acknowledge_system_events(&event_ids)
-        .await
-        .map_err(|_| ControlError::Transient)?;
-    if rejected.is_empty() {
-        Ok(())
-    } else {
-        Err(ControlError::Transient)
+    if !event_ids.is_empty() {
+        database
+            .acknowledge_system_events(&event_ids)
+            .await
+            .map_err(|_| ControlError::Transient)?;
     }
+    if !rejected.is_empty() {
+        let event_ids = rejected.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        persist_rejected_event_health(database, &events, &event_ids, "CLOUD_SYSTEM_EVENT_REJECTED")
+            .await?;
+        database
+            .dead_letter_rejected_system_events(&event_ids)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+    }
+    Ok(())
 }
 
 async fn sync_pending_communication_events(
@@ -3023,14 +3036,74 @@ async fn sync_pending_communication_events(
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    database
-        .acknowledge_communication_events(&event_ids)
-        .await
+    if !event_ids.is_empty() {
+        database
+            .acknowledge_communication_events(&event_ids)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+    }
+    if !rejected.is_empty() {
+        let event_ids = rejected.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        persist_rejected_event_health(
+            database,
+            &events,
+            &event_ids,
+            "CLOUD_COMMUNICATION_EVENT_REJECTED",
+        )
+        .await?;
+        database
+            .dead_letter_rejected_communication_events(&event_ids)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+    }
+    Ok(())
+}
+
+async fn persist_rejected_event_health(
+    database: &DbActorHandle,
+    events: &[EventEnvelope],
+    rejected_event_ids: &[String],
+    error_code: &'static str,
+) -> Result<(), ControlError> {
+    let rejected = rejected_event_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let affected = events
+        .iter()
+        .filter(|event| rejected.contains(event.event_id.as_str()))
+        .map(collector_key_for_event)
+        .collect::<HashSet<_>>();
+    let now_ms = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
         .map_err(|_| ControlError::Transient)?;
-    if rejected.is_empty() {
-        Ok(())
-    } else {
-        Err(ControlError::Transient)
+    for mut state in database
+        .load_collector_states()
+        .await
+        .map_err(|_| ControlError::Transient)?
+        .into_iter()
+        .filter(|state| affected.contains(state.collector_key.as_str()))
+    {
+        if state.status == CollectorStatus::Disabled {
+            continue;
+        }
+        state.status = CollectorStatus::Degraded;
+        state.last_error_code = Some(error_code.to_owned());
+        state.updated_at_ms = now_ms;
+        database
+            .upsert_collector_state(&state)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+    }
+    Ok(())
+}
+
+fn collector_key_for_event(event: &EventEnvelope) -> &'static str {
+    match event.source.as_str() {
+        "communication.wechat" => "communication.wechat",
+        "communication.messages" => "communication.messages",
+        "photos.library" => "photos",
+        _ if event.event_type.starts_with("network.") => "network",
+        _ => "system",
     }
 }
 
@@ -4047,9 +4120,9 @@ mod tests {
         sync_pending_system_events, AgentControlSnapshot, AppliedControl, ControlClient,
         ControlError, ControlFuture, DeviceCredential, HttpControlClient, MediaUploadFailure,
         MediaUploadFailureStage, PairingCallbackHandoff, PairingExchangeRequest, PendingScreenshot,
-        PhotoMarker, ScreenCaptureControl, ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL,
-        CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT,
-        PRODUCTION_CLOUD_API_ORIGIN,
+        PhotoMarker, ScreenCaptureControl, ScreenshotTrigger, SyncEventRejection,
+        SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF,
+        MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
     };
     use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
     use pca_domain::{
@@ -4621,6 +4694,8 @@ mod tests {
 
     struct AcceptingSyncClient;
 
+    struct RejectingSystemSyncClient;
+
     impl ControlClient for AcceptingSyncClient {
         fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
             Box::pin(async { Err(ControlError::Contract) })
@@ -4651,9 +4726,44 @@ mod tests {
         }
     }
 
-    struct PartialCommunicationSyncClient;
+    impl ControlClient for RejectingSystemSyncClient {
+        fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
 
-    impl ControlClient for PartialCommunicationSyncClient {
+        fn heartbeat_and_control<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: u64,
+        ) -> ControlFuture<'a, AgentControlSnapshot> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn sync_system_events<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            events: &'a [EventEnvelope],
+        ) -> ControlFuture<'a, SyncEventsResponse> {
+            let rejected = events
+                .iter()
+                .map(|event| SyncEventRejection {
+                    event_id: event.event_id.clone(),
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(SyncEventsResponse {
+                    batch_id: "test-batch".to_owned(),
+                    accepted: Vec::new(),
+                    duplicates: Vec::new(),
+                    rejected,
+                })
+            })
+        }
+    }
+
+    struct RejectingCommunicationSyncClient;
+
+    impl ControlClient for RejectingCommunicationSyncClient {
         fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
             Box::pin(async { Err(ControlError::Contract) })
         }
@@ -4669,21 +4779,27 @@ mod tests {
         fn sync_communication_events<'a>(
             &'a self,
             _: &'a DeviceCredential,
-            _: &'a [EventEnvelope],
+            events: &'a [EventEnvelope],
         ) -> ControlFuture<'a, SyncEventsResponse> {
-            Box::pin(async {
+            let rejected = events
+                .iter()
+                .map(|event| SyncEventRejection {
+                    event_id: event.event_id.clone(),
+                })
+                .collect();
+            Box::pin(async move {
                 Ok(SyncEventsResponse {
                     batch_id: "test-batch".to_owned(),
                     accepted: Vec::new(),
                     duplicates: Vec::new(),
-                    rejected: Vec::new(),
+                    rejected,
                 })
             })
         }
     }
 
     #[tokio::test]
-    async fn partial_communication_ack_keeps_the_local_outbox_pending() {
+    async fn rejected_communication_event_is_quarantined_without_retry() {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
             .await
@@ -4739,22 +4855,21 @@ mod tests {
         )
         .expect("valid device credential");
 
-        assert!(matches!(
-            sync_pending_communication_events(
-                &database,
-                &credential,
-                &PartialCommunicationSyncClient
-            )
-            .await,
-            Err(ControlError::Transient)
-        ));
+        sync_pending_communication_events(
+            &database,
+            &credential,
+            &RejectingCommunicationSyncClient,
+        )
+        .await
+        .expect("quarantine rejected communication event");
+        assert!(database
+            .load_pending_communication_events(200)
+            .await
+            .expect("pending communication events")
+            .is_empty());
         assert_eq!(
-            database
-                .load_pending_communication_events(200)
-                .await
-                .expect("pending communication events")
-                .len(),
-            1
+            database.active_outbox_depth().await.expect("outbox depth"),
+            0
         );
         database.shutdown().await.expect("shutdown database");
     }
@@ -4808,6 +4923,68 @@ mod tests {
         assert_eq!(
             database.active_outbox_depth().await.expect("outbox depth"),
             0
+        );
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn cloud_rejected_system_event_is_quarantined_without_outbox_backpressure() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        let event = system_metric_event("01986666-7666-8666-8666-666666666669");
+        database
+            .append_event_with_outbox(&event)
+            .await
+            .expect("persist rejected system event");
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "system".to_owned(),
+                collector_version: "test".to_owned(),
+                status: CollectorStatus::Running,
+                desired_config_revision: 1,
+                applied_config_revision: 1,
+                last_event_at_ms: Some(1),
+                last_health_at_ms: Some(1),
+                last_error_code: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .expect("seed collector health");
+        let credential = DeviceCredential::new(
+            event.device_id.clone(),
+            event.workspace_id.clone(),
+            "access-credential-for-sync-test",
+            "refresh-credential-for-sync-test",
+        )
+        .expect("valid device credential");
+
+        sync_pending_system_events(&database, &credential, &RejectingSystemSyncClient)
+            .await
+            .expect("quarantine rejected event");
+
+        assert!(database
+            .load_pending_system_events(20)
+            .await
+            .expect("load pending system events")
+            .is_empty());
+        assert_eq!(
+            database.active_outbox_depth().await.expect("outbox depth"),
+            0
+        );
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("load collector health")
+            .into_iter()
+            .find(|state| state.collector_key == "system")
+            .expect("system collector health");
+        assert_eq!(state.status, CollectorStatus::Degraded);
+        assert_eq!(
+            state.last_error_code.as_deref(),
+            Some("CLOUD_SYSTEM_EVENT_REJECTED")
         );
         database.shutdown().await.expect("shutdown database");
     }

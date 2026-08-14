@@ -897,7 +897,7 @@ async fn collector_commit_state_failure_rolls_back_events_outbox_and_prior_state
 }
 
 #[tokio::test]
-async fn active_depth_excludes_only_acked_rows() {
+async fn active_depth_excludes_every_terminal_outbox_state() {
     let (_directory, path) = database_path();
     let db = DbActorHandle::open(&path, "0.2.0")
         .await
@@ -917,7 +917,51 @@ async fn active_depth_excludes_only_acked_rows() {
             .expect("set Outbox state");
     }
 
-    assert_eq!(db.active_outbox_depth().await.expect("active depth"), 4);
+    assert_eq!(db.active_outbox_depth().await.expect("active depth"), 2);
+}
+
+#[tokio::test]
+async fn rejected_system_event_is_dead_lettered_with_a_redacted_diagnostic() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let event = system_metric_event("cloud-rejected-system");
+    db.append_event_with_outbox(&event)
+        .await
+        .expect("seed rejected event");
+
+    db.dead_letter_rejected_system_events(std::slice::from_ref(&event.event_id))
+        .await
+        .expect("dead-letter rejected event");
+
+    assert!(db
+        .load_pending_system_events(20)
+        .await
+        .expect("load pending system events")
+        .is_empty());
+    assert_eq!(db.active_outbox_depth().await.expect("active depth"), 0);
+    let connection = Connection::open(&path).expect("inspect rejected event");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM sync_outbox WHERE event_id = ?1",
+                [&event.event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read rejected state"),
+        "dead_letter"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT code FROM diagnostic_events WHERE diagnostic_id = ?1",
+                [format!("CLOUD_SYSTEM_EVENT_REJECTED:{}", event.event_id)],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read rejected diagnostic"),
+        "CLOUD_SYSTEM_EVENT_REJECTED"
+    );
 }
 
 #[tokio::test]

@@ -120,4 +120,8 @@ pub struct SourceCompletedMedia {
 pub trait WechatSource: Send + Sync {
     fn probe(&self) -> SourceProbeFuture<'_>;
     fn read_after(&self, cursor: &SourceCursor) -> SourceReadFuture<'_>;
+
+    fn health_error(&self) -> Option<DomainError> {
+        None
+    }
 }

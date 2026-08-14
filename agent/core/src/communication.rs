@@ -814,6 +814,7 @@ async fn run_supervisor(
 
             match records {
                 Ok(mut records) => {
+                    let provider_health_error = provider.health_error();
                     records.sort_by_key(|record| !record.completed_media().is_empty());
                     let batch_deadline = time::Instant::now() + PROVIDER_OPERATION_TIMEOUT;
                     let mut persistence_failed = false;
@@ -1074,13 +1075,21 @@ async fn run_supervisor(
                     let status_persisted = if event_observed {
                         time::timeout(
                             batch_deadline.saturating_duration_since(time::Instant::now()),
-                            persist_collector_event(&database, control),
+                            persist_collector_event(
+                                &database,
+                                control,
+                                provider_health_error.as_ref(),
+                            ),
                         )
                         .await
                     } else {
                         time::timeout(
                             batch_deadline.saturating_duration_since(time::Instant::now()),
-                            persist_collector_state(&database, control, None),
+                            persist_collector_state(
+                                &database,
+                                control,
+                                provider_health_error.as_ref(),
+                            ),
                         )
                         .await
                     };
@@ -2021,7 +2030,18 @@ async fn persist_collector_state(
     control: CommunicationControl,
     error: Option<&DomainError>,
 ) -> Result<(), CommunicationRuntimeError> {
-    let status = if !control.active() {
+    persist_collector(
+        database,
+        control,
+        collector_status(control, error),
+        error.map(|error| error.code.as_str()),
+        false,
+    )
+    .await
+}
+
+fn collector_status(control: CommunicationControl, error: Option<&DomainError>) -> CollectorStatus {
+    if !control.active() {
         CollectorStatus::Disabled
     } else if error.is_some_and(|error| error.code == "WECHAT_PERMISSION_REQUIRED") {
         CollectorStatus::PermissionRequired
@@ -2031,14 +2051,7 @@ async fn persist_collector_state(
         CollectorStatus::Degraded
     } else {
         CollectorStatus::Running
-    };
-    persist_collector(
-        database,
-        control,
-        status,
-        error.map(|error| error.code.as_str()),
-    )
-    .await
+    }
 }
 
 async fn persist_collector_code(
@@ -2051,6 +2064,7 @@ async fn persist_collector_code(
         control,
         CollectorStatus::Degraded,
         Some(error_code),
+        false,
     )
     .await
 }
@@ -2060,6 +2074,7 @@ async fn persist_collector(
     control: CommunicationControl,
     status: CollectorStatus,
     error_code: Option<&str>,
+    event_observed: bool,
 ) -> Result<(), CommunicationRuntimeError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2083,7 +2098,11 @@ async fn persist_collector(
             status,
             desired_config_revision: revision,
             applied_config_revision: revision,
-            last_event_at_ms: prior.as_ref().and_then(|state| state.last_event_at_ms),
+            last_event_at_ms: if event_observed {
+                Some(now_ms)
+            } else {
+                prior.as_ref().and_then(|state| state.last_event_at_ms)
+            },
             last_health_at_ms: if error_code.is_none() && control.active() {
                 Some(now_ms)
             } else {
@@ -2100,24 +2119,16 @@ async fn persist_collector(
 async fn persist_collector_event(
     database: &DbActorHandle,
     control: CommunicationControl,
+    error: Option<&DomainError>,
 ) -> Result<(), CommunicationRuntimeError> {
-    persist_collector_state(database, control, None).await?;
-    let mut state = database
-        .load_collector_states()
-        .await
-        .map_err(CommunicationRuntimeError::Database)?
-        .into_iter()
-        .find(|state| state.collector_key == COLLECTOR_KEY)
-        .ok_or(CommunicationRuntimeError::InvalidControl)?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| CommunicationRuntimeError::Clock)?;
-    state.last_event_at_ms =
-        Some(i64::try_from(now.as_millis()).map_err(|_| CommunicationRuntimeError::Clock)?);
-    database
-        .upsert_collector_state(&state)
-        .await
-        .map_err(CommunicationRuntimeError::Database)
+    persist_collector(
+        database,
+        control,
+        collector_status(control, error),
+        error.map(|error| error.code.as_str()),
+        true,
+    )
+    .await
 }
 
 /// Fail-closed factory used by process-test and unsupported-platform builds.

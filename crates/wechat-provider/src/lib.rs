@@ -31,6 +31,7 @@ pub struct WechatProvider<S> {
     source: S,
     cursor: SourceCursor,
     status: ProviderStatus,
+    health_error: Option<DomainError>,
 }
 
 impl<S> WechatProvider<S>
@@ -43,6 +44,7 @@ where
             source,
             cursor: SourceCursor,
             status: ProviderStatus::WaitingSource,
+            health_error: None,
         }
     }
 
@@ -54,7 +56,12 @@ where
     /// omitted without retaining their body, path, or media data.
     pub async fn poll_once(&mut self) -> Result<Vec<NormalizedCommunicationRecord>, DomainError> {
         let records = self.source.read_after(&self.cursor).await?;
-        self.status = ProviderStatus::Active;
+        self.health_error = self.source.health_error();
+        self.status = if self.health_error.is_some() {
+            ProviderStatus::Degraded
+        } else {
+            ProviderStatus::Active
+        };
         Ok(records.into_iter().filter_map(eligible_message).collect())
     }
 }
@@ -69,6 +76,10 @@ where
 
     fn status(&self) -> ProviderStatus {
         self.status
+    }
+
+    fn health_error(&self) -> Option<DomainError> {
+        self.health_error.clone()
     }
 
     fn discover(&mut self) -> CommunicationProviderFuture<'_> {
@@ -87,5 +98,51 @@ where
     fn stop(&mut self) -> Result<(), DomainError> {
         self.status = ProviderStatus::Disabled;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommunicationProvider, ProviderStatus, WechatProvider};
+    use crate::source::{
+        SourceCapabilities, SourceCursor, SourceProbeFuture, SourceReadFuture, WechatSource,
+    };
+    use pca_domain::DomainError;
+
+    struct DegradedSource;
+
+    impl WechatSource for DegradedSource {
+        fn probe(&self) -> SourceProbeFuture<'_> {
+            Box::pin(async {
+                Ok(SourceCapabilities {
+                    source_version: "test".to_owned(),
+                    schema_version: 1,
+                })
+            })
+        }
+
+        fn read_after(&self, _: &SourceCursor) -> SourceReadFuture<'_> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn health_error(&self) -> Option<DomainError> {
+            Some(DomainError::new(
+                "WECHAT_IMAGE_READ_FAILED",
+                "redacted",
+                true,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_poll_exposes_optional_source_degradation() {
+        let mut provider = WechatProvider::new(DegradedSource);
+        provider.poll_once().await.expect("successful partial poll");
+
+        assert_eq!(provider.status(), ProviderStatus::Degraded);
+        assert_eq!(
+            provider.health_error().map(|error| error.code),
+            Some("WECHAT_IMAGE_READ_FAILED".to_owned())
+        );
     }
 }

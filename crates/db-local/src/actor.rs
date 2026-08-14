@@ -171,6 +171,10 @@ enum Request {
         event_ids: Vec<String>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    DeadLetterRejectedSystemEvents {
+        event_ids: Vec<String>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     CommitCommunicationMessage {
         commit: Box<CommunicationMessageCommit>,
         response: oneshot::Sender<Result<(), DbError>>,
@@ -180,6 +184,10 @@ enum Request {
         response: oneshot::Sender<Result<Vec<EventEnvelope>, DbError>>,
     },
     AcknowledgeCommunicationEvents {
+        event_ids: Vec<String>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    DeadLetterRejectedCommunicationEvents {
         event_ids: Vec<String>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
@@ -221,8 +229,10 @@ impl Request {
             | Self::ClearPairingStateAndDisableSensitiveCollectors { response }
             | Self::Checkpoint { response }
             | Self::AcknowledgeSystemEvents { response, .. }
+            | Self::DeadLetterRejectedSystemEvents { response, .. }
             | Self::CommitCommunicationMessage { response, .. }
             | Self::AcknowledgeCommunicationEvents { response, .. }
+            | Self::DeadLetterRejectedCommunicationEvents { response, .. }
             | Self::CompleteCommunicationAttachment { response, .. }
             | Self::DeferCommunicationAttachment { response, .. } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
@@ -561,7 +571,7 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
-    /// Counts Outbox rows that have not reached the acknowledged terminal state.
+    /// Counts Outbox rows that are still eligible for upload work.
     ///
     /// # Errors
     ///
@@ -638,6 +648,25 @@ impl DbActorHandle {
         }
         let (response_sender, response_receiver) = oneshot::channel();
         self.send(Request::AcknowledgeSystemEvents {
+            event_ids: event_ids.to_vec(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Moves Cloud-rejected System events to a terminal local diagnostic state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, transaction, or diagnostic-persistence error.
+    pub async fn dead_letter_rejected_system_events(
+        &self,
+        event_ids: &[String],
+    ) -> Result<(), DbError> {
+        validate_event_ids("dead-letter rejected system events", event_ids)?;
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::DeadLetterRejectedSystemEvents {
             event_ids: event_ids.to_vec(),
             response: response_sender,
         })
@@ -727,6 +756,25 @@ impl DbActorHandle {
         }
         let (response_sender, response_receiver) = oneshot::channel();
         self.send(Request::AcknowledgeCommunicationEvents {
+            event_ids: event_ids.to_vec(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Moves Cloud-rejected communication events to a terminal local diagnostic state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, transaction, or diagnostic-persistence error.
+    pub async fn dead_letter_rejected_communication_events(
+        &self,
+        event_ids: &[String],
+    ) -> Result<(), DbError> {
+        validate_event_ids("dead-letter rejected communication events", event_ids)?;
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::DeadLetterRejectedCommunicationEvents {
             event_ids: event_ids.to_vec(),
             response: response_sender,
         })
@@ -1057,6 +1105,15 @@ fn run(
                     &event_ids,
                 ));
             }
+            Request::DeadLetterRejectedSystemEvents {
+                event_ids,
+                response,
+            } => {
+                let _ = response.send(repository::dead_letter_rejected_system_events(
+                    &mut connection,
+                    &event_ids,
+                ));
+            }
             Request::CommitCommunicationMessage { commit, response } => {
                 let _ = response.send(repository::commit_communication_message(
                     &mut connection,
@@ -1075,6 +1132,15 @@ fn run(
                 response,
             } => {
                 let _ = response.send(repository::acknowledge_communication_events(
+                    &mut connection,
+                    &event_ids,
+                ));
+            }
+            Request::DeadLetterRejectedCommunicationEvents {
+                event_ids,
+                response,
+            } => {
+                let _ = response.send(repository::dead_letter_rejected_communication_events(
                     &mut connection,
                     &event_ids,
                 ));
@@ -1136,5 +1202,16 @@ fn validate_communication_limit(operation: &'static str, limit: u16) -> Result<(
         Ok(())
     } else {
         Err(DbError::sqlite(operation, "limit must be 1 through 200"))
+    }
+}
+
+fn validate_event_ids(operation: &'static str, event_ids: &[String]) -> Result<(), DbError> {
+    if (1..=200).contains(&event_ids.len()) {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            operation,
+            "event IDs must contain 1 through 200 items",
+        ))
     }
 }
