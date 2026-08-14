@@ -60,7 +60,7 @@ impl SystemRuntimeHandle {
     pub(crate) fn is_finished(&self) -> bool {
         self.worker
             .as_ref()
-            .is_none_or(tokio::task::JoinHandle::is_finished)
+            .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 
     pub(crate) async fn start(
@@ -1047,12 +1047,14 @@ mod tests {
             SystemRuntimeHandle::start(Arc::clone(&database), None, directory.path().to_path_buf())
                 .await
                 .expect("start disabled runtime");
+        assert!(!runtime.is_finished());
         runtime.shutdown().await.expect("shutdown runtime");
         let controls = FakeControls::new();
         let injected =
             SystemRuntimeHandle::start_with_source(Arc::clone(&database), None, controls.source())
                 .await
                 .expect("start disabled injected runtime");
+        assert!(!injected.is_finished());
         injected
             .shutdown()
             .await

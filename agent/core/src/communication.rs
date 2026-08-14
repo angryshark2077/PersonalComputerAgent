@@ -791,6 +791,7 @@ async fn run_supervisor(
             match records {
                 Ok(mut records) => {
                     records.sort_by_key(|record| !record.completed_media().is_empty());
+                    let batch_deadline = time::Instant::now() + PROVIDER_OPERATION_TIMEOUT;
                     let mut persistence_failed = false;
                     let mut batch_paused = false;
                     let mut event_observed = false;
@@ -801,13 +802,42 @@ async fn run_supervisor(
                                 record.account_id(),
                                 record.message().source_key(),
                             );
-                            let (event_count, _) =
-                                database.count_event_and_outbox(&event_id).await?;
+                            let (event_count, _) = match time::timeout(
+                                batch_deadline.saturating_duration_since(time::Instant::now()),
+                                database.count_event_and_outbox(&event_id),
+                            )
+                            .await
+                            {
+                                Ok(result) => result?,
+                                Err(_) => {
+                                    return Err(stop_timed_out_provider(
+                                        provider.as_mut(),
+                                        &database,
+                                        control,
+                                    )
+                                    .await);
+                                }
+                            };
                             if event_count == 1 {
                                 continue;
                             }
                         }
-                        let depth = database.active_outbox_depth().await?;
+                        let depth = match time::timeout(
+                            batch_deadline.saturating_duration_since(time::Instant::now()),
+                            database.active_outbox_depth(),
+                        )
+                        .await
+                        {
+                            Ok(result) => result?,
+                            Err(_) => {
+                                return Err(stop_timed_out_provider(
+                                    provider.as_mut(),
+                                    &database,
+                                    control,
+                                )
+                                .await);
+                            }
+                        };
                         update_hysteresis(
                             &mut outbox_paused,
                             depth,
@@ -821,6 +851,8 @@ async fn run_supervisor(
                         let preparation =
                             prepare_record(&database_path, control, record, &mut spool_paused);
                         tokio::pin!(preparation);
+                        let preparation_deadline = time::sleep_until(batch_deadline);
+                        tokio::pin!(preparation_deadline);
                         let commit = tokio::select! {
                             biased;
                             changed = authorization.changed() => {
@@ -868,6 +900,13 @@ async fn run_supervisor(
                                     },
                                 }
                             }
+                            () = &mut preparation_deadline => {
+                                return Err(stop_timed_out_provider(
+                                    provider.as_mut(),
+                                    &database,
+                                    control,
+                                ).await);
+                            }
                             result = &mut preparation => result,
                         };
                         let Ok(mut prepared) = commit else {
@@ -905,7 +944,20 @@ async fn run_supervisor(
                             }
                             Err(mpsc::error::TryRecvError::Empty) => {}
                         }
-                        let Some(_permit) = authorization_gate.commit_permit(control).await else {
+                        let Ok(permit) = time::timeout(
+                            batch_deadline.saturating_duration_since(time::Instant::now()),
+                            authorization_gate.commit_permit(control),
+                        )
+                        .await
+                        else {
+                            return Err(stop_timed_out_provider(
+                                provider.as_mut(),
+                                &database,
+                                control,
+                            )
+                            .await);
+                        };
+                        let Some(_permit) = permit else {
                             let stop_result = provider.stop();
                             if authorization.has_changed().unwrap_or(false) {
                                 control = authorization.borrow_and_update().control;
@@ -926,12 +978,23 @@ async fn run_supervisor(
                             }
                             continue 'supervisor;
                         };
-                        if database
-                            .commit_communication_message(&prepared.commit)
-                            .await
-                            .map_err(|_| LocalPersistenceError::Database)
-                            .is_err()
-                        {
+                        let persisted = time::timeout(
+                            batch_deadline.saturating_duration_since(time::Instant::now()),
+                            database.commit_communication_message(&prepared.commit),
+                        )
+                        .await;
+                        let persisted = match persisted {
+                            Ok(result) => result.map_err(|_| LocalPersistenceError::Database),
+                            Err(_) => {
+                                return Err(stop_timed_out_provider(
+                                    provider.as_mut(),
+                                    &database,
+                                    control,
+                                )
+                                .await);
+                            }
+                        };
+                        if persisted.is_err() {
                             persistence_failed = true;
                             break;
                         }
@@ -984,10 +1047,29 @@ async fn run_supervisor(
                         }
                         return Ok(());
                     }
-                    if event_observed {
-                        persist_collector_event(&database, control).await?;
+                    let status_persisted = if event_observed {
+                        time::timeout(
+                            batch_deadline.saturating_duration_since(time::Instant::now()),
+                            persist_collector_event(&database, control),
+                        )
+                        .await
                     } else {
-                        persist_collector_state(&database, control, None).await?;
+                        time::timeout(
+                            batch_deadline.saturating_duration_since(time::Instant::now()),
+                            persist_collector_state(&database, control, None),
+                        )
+                        .await
+                    };
+                    match status_persisted {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(stop_timed_out_provider(
+                                provider.as_mut(),
+                                &database,
+                                control,
+                            )
+                            .await);
+                        }
                     }
                 }
                 Err(error) => {
@@ -1114,6 +1196,20 @@ async fn poll_or_command(
             Operation::Completed(result.unwrap_or_else(|_| Err(provider_operation_timeout())))
         },
     }
+}
+
+async fn stop_timed_out_provider(
+    provider: &mut dyn CommunicationProvider,
+    database: &DbActorHandle,
+    control: CommunicationControl,
+) -> CommunicationRuntimeError {
+    let _ = provider.stop();
+    let _ = time::timeout(
+        Duration::from_secs(5),
+        persist_collector_code(database, control, "WECHAT_OPERATION_DEADLINE_EXCEEDED"),
+    )
+    .await;
+    CommunicationRuntimeError::ProviderTimedOut
 }
 
 async fn apply_command(

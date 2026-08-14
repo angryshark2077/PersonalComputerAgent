@@ -17,7 +17,7 @@ use thiserror::Error;
 use tokio::{
     process::{Child, Command},
     sync::{mpsc, oneshot, watch},
-    time::{sleep, Instant},
+    time::{sleep, timeout, Instant},
 };
 
 use crate::{
@@ -30,6 +30,8 @@ const DEFAULT_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_STABLE_READY: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const CHILD_REAP_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+const CHILD_TERMINATE_GRACE: Duration = Duration::from_secs(5);
+const CHILD_KILL_GRACE: Duration = Duration::from_secs(5);
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STABLE_READY: Duration = Duration::from_secs(30);
 const NETWORK_OBSERVATION_INTERVAL: Duration = Duration::from_mins(30);
@@ -373,9 +375,9 @@ impl BridgeSupervisor {
     ///
     /// # Errors
     ///
-    /// Returns only when confirmed socket cleanup fails. Child termination deliberately has no
-    /// wall-clock deadline: the supervisor retries kill/wait observations and retains ownership
-    /// until `wait` or `try_wait` confirms reap, even if process APIs repeatedly fail.
+    /// Returns when confirmed socket or child cleanup fails. Child termination first allows the
+    /// production wrapper to forward `SIGTERM`, then escalates to `SIGKILL` within a bounded
+    /// deadline so a stuck Bridge cannot prevent the Agent from exiting for launchd recovery.
     #[allow(clippy::too_many_lines)] // Child, bridge, network, and lifecycle signals share one cancellation boundary.
     pub async fn run(
         mut self,
@@ -443,8 +445,8 @@ impl BridgeSupervisor {
                         return Ok(());
                     }
                     result = child.wait() => {
-                        if result.is_err() {
-                            reap_child(&mut child).await;
+                        if result.is_err() && !reap_child(&mut child).await {
+                            return Err(BridgeSupervisorError::ProcessCleanup);
                         }
                         break true;
                     }
@@ -641,13 +643,16 @@ fn spawn_bridge(config: &BridgeSupervisorConfig) -> Result<Child, ()> {
 }
 
 async fn cleanup_child(child: &mut Child, socket_path: &Path) -> Result<(), BridgeSupervisorError> {
-    reap_child(child).await;
+    if !reap_child(child).await {
+        return Err(BridgeSupervisorError::ProcessCleanup);
+    }
     remove_confirmed_socket(socket_path)
 }
 
 trait ReapProcess {
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
-    fn start_kill(&mut self) -> io::Result<()>;
+    fn start_terminate(&mut self) -> io::Result<()>;
+    fn start_force_kill(&mut self) -> io::Result<()>;
     fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>>;
 }
 
@@ -656,7 +661,7 @@ impl ReapProcess for Child {
         Child::try_wait(self)
     }
 
-    fn start_kill(&mut self) -> io::Result<()> {
+    fn start_terminate(&mut self) -> io::Result<()> {
         let process_id = self
             .id()
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
@@ -670,27 +675,50 @@ impl ReapProcess for Child {
         }
     }
 
+    fn start_force_kill(&mut self) -> io::Result<()> {
+        Child::start_kill(self)
+    }
+
     fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> {
         Child::wait(self)
     }
 }
 
-async fn reap_child(child: &mut impl ReapProcess) {
-    // `kill_on_drop` is a last-resort process fallback, never evidence of reap. The normal
-    // SIGTERM path lets the production wrapper forward termination to its LaunchServices child.
-    // Once Child is owned, even pathological termination/wait errors keep this loop pending until
-    // an explicit wait observation confirms the child has exited and been reaped.
+async fn reap_child(child: &mut impl ReapProcess) -> bool {
+    reap_child_with_deadlines(child, CHILD_TERMINATE_GRACE, CHILD_KILL_GRACE).await
+}
+
+async fn reap_child_with_deadlines(
+    child: &mut impl ReapProcess,
+    terminate_grace: Duration,
+    kill_grace: Duration,
+) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
+    }
+    let _ = child.start_terminate();
+    if wait_for_reap(child, terminate_grace).await {
+        return true;
+    }
+    let _ = child.start_force_kill();
+    wait_for_reap(child, kill_grace).await
+}
+
+async fn wait_for_reap(child: &mut impl ReapProcess, deadline: Duration) -> bool {
+    let started = Instant::now();
     loop {
         if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
+            return true;
         }
-        if child.start_kill().is_err() && matches!(child.try_wait(), Ok(Some(_))) {
-            return;
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
         }
-        if child.wait().await.is_ok() || matches!(child.try_wait(), Ok(Some(_))) {
-            return;
+        match timeout(remaining, child.wait()).await {
+            Ok(Ok(_)) => return true,
+            Ok(Err(_)) => sleep(CHILD_REAP_RETRY_BACKOFF.min(remaining)).await,
+            Err(_) => return matches!(child.try_wait(), Ok(Some(_))),
         }
-        sleep(CHILD_REAP_RETRY_BACKOFF).await;
     }
 }
 
@@ -779,15 +807,16 @@ impl Backoff {
 mod tests {
     use super::{
         lifecycle_events_require_network_observation, network_observation_error_requires_reconnect,
-        reap_child, remove_confirmed_socket, Backoff, BridgeSupervisorConfig, ReapProcess,
-        StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT, MAX_STABLE_READY,
+        reap_child, reap_child_with_deadlines, remove_confirmed_socket, Backoff,
+        BridgeSupervisorConfig, ReapProcess, StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT,
+        MAX_STABLE_READY,
     };
     use crate::{BridgeClientError, PlatformLifecycleEvent};
     use pca_domain::BridgeStatus;
     use std::{
         collections::VecDeque,
         fs,
-        future::{ready, Future},
+        future::{pending, ready, Future},
         io,
         os::unix::process::ExitStatusExt,
         os::unix::{fs::symlink, fs::PermissionsExt, net::UnixListener},
@@ -914,7 +943,8 @@ mod tests {
 
     struct ErrorThenExitProcess {
         try_waits: VecDeque<io::Result<Option<ExitStatus>>>,
-        kills: VecDeque<io::Result<()>>,
+        terminations: VecDeque<io::Result<()>>,
+        force_kills: VecDeque<io::Result<()>>,
         waits: VecDeque<io::Result<ExitStatus>>,
     }
 
@@ -923,8 +953,16 @@ mod tests {
             self.try_waits.pop_front().expect("scripted try_wait")
         }
 
-        fn start_kill(&mut self) -> io::Result<()> {
-            self.kills.pop_front().expect("scripted start_kill")
+        fn start_terminate(&mut self) -> io::Result<()> {
+            self.terminations
+                .pop_front()
+                .expect("scripted start_terminate")
+        }
+
+        fn start_force_kill(&mut self) -> io::Result<()> {
+            self.force_kills
+                .pop_front()
+                .expect("scripted start_force_kill")
         }
 
         fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> {
@@ -939,17 +977,60 @@ mod tests {
             try_waits: VecDeque::from([
                 Err(api_error()),
                 Ok(None),
-                Ok(None),
                 Ok(Some(ExitStatus::from_raw(0))),
             ]),
-            kills: VecDeque::from([Err(api_error())]),
+            terminations: VecDeque::from([Err(api_error())]),
+            force_kills: VecDeque::new(),
             waits: VecDeque::from([Err(api_error())]),
         };
 
-        reap_child(&mut child).await;
+        assert!(reap_child(&mut child).await);
 
         assert!(child.try_waits.is_empty());
-        assert!(child.kills.is_empty());
+        assert!(child.terminations.is_empty());
+        assert!(child.force_kills.is_empty());
         assert!(child.waits.is_empty());
+    }
+
+    #[derive(Default)]
+    struct NeverExitsProcess {
+        terminations: usize,
+        force_kills: usize,
+    }
+
+    impl ReapProcess for NeverExitsProcess {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn start_terminate(&mut self) -> io::Result<()> {
+            self.terminations += 1;
+            Ok(())
+        }
+
+        fn start_force_kill(&mut self) -> io::Result<()> {
+            self.force_kills += 1;
+            Ok(())
+        }
+
+        fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> {
+            pending()
+        }
+    }
+
+    #[tokio::test]
+    async fn reap_escalates_and_returns_when_child_never_exits() {
+        let mut child = NeverExitsProcess::default();
+
+        assert!(
+            !reap_child_with_deadlines(
+                &mut child,
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            )
+            .await
+        );
+        assert_eq!(child.terminations, 1);
+        assert_eq!(child.force_kills, 1);
     }
 }

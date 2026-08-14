@@ -6,7 +6,7 @@ use std::{
     fs::OpenOptions,
     io::{self, Read, Write},
     os::unix::ffi::OsStrExt,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -144,6 +144,7 @@ struct SourcePaths {
     media_databases: Vec<PathBuf>,
     local_username: String,
     account_id: String,
+    source_instance_id: String,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -221,11 +222,15 @@ fn discover_source_paths() -> Result<SourcePaths, DomainError> {
         .filter(|path| is_media_database(path))
         .collect::<Vec<_>>();
     media_databases.sort();
+    let session_database = account_root.join(SESSION_DATABASE);
+    let contact_database = account_root.join(CONTACT_DATABASE);
     let account_id = account_id_for_root(&account_root);
+    let source_instance_id =
+        source_instance_id(&account_root, &session_database, &contact_database)?;
     Ok(SourcePaths {
         account_root: account_root.clone(),
-        session_database: account_root.join(SESSION_DATABASE),
-        contact_database: account_root.join(CONTACT_DATABASE),
+        session_database,
+        contact_database,
         emoticon_database: account_root
             .join(EMOTICON_DATABASE)
             .is_file()
@@ -234,6 +239,7 @@ fn discover_source_paths() -> Result<SourcePaths, DomainError> {
         media_databases,
         local_username,
         account_id,
+        source_instance_id,
     })
 }
 
@@ -267,7 +273,9 @@ impl WechatSource for MacOSWechatSource {
             };
             run_source_thread(move || {
                 let refreshed_paths = discover_source_paths()?;
-                if refreshed_paths.account_id != paths.account_id {
+                if refreshed_paths.account_id != paths.account_id
+                    || refreshed_paths.source_instance_id != paths.source_instance_id
+                {
                     return Err(DomainError::new(
                         "WECHAT_ACCOUNT_UNVERIFIED",
                         "the active local WeChat account changed",
@@ -5347,6 +5355,22 @@ fn account_id_for_root(root: &Path) -> String {
     format!("wechat-db-v1:{fingerprint:x}")
 }
 
+fn source_instance_id(
+    account_root: &Path,
+    session_database: &Path,
+    contact_database: &Path,
+) -> Result<String, DomainError> {
+    let mut fingerprint = Sha256::new();
+    for path in [account_root, session_database, contact_database] {
+        let metadata = path
+            .metadata()
+            .map_err(|error| source_access_error(&error))?;
+        fingerprint.update(metadata.dev().to_le_bytes());
+        fingerprint.update(metadata.ino().to_le_bytes());
+    }
+    Ok(format!("wechat-source-v1:{:x}", fingerprint.finalize()))
+}
+
 type PendingSourceCursor = (String, i64, Option<String>);
 type BootstrappedSourceCursor = (String, i64, Option<PendingSourceCursor>);
 
@@ -5554,10 +5578,29 @@ mod tests {
         resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
         resolve_message_file, resolve_video_path, retention_cutoff_from, select_image_candidate,
         should_retire_failed_full_image_retry, should_scan_message_source, source_access_error,
-        stage_decrypted_image, video_attachment, voice_same_time_index, ContactCardProfile,
-        ConversationMetadata, ImageKeys, MessageSourceSnapshot, Session, SourceFileStamp,
-        SourcePaths, SourcePayload, TextReadContext, WechatAppDataAccess, SESSION_DATABASE,
+        source_instance_id, stage_decrypted_image, video_attachment, voice_same_time_index,
+        ContactCardProfile, ConversationMetadata, ImageKeys, MessageSourceSnapshot, Session,
+        SourceFileStamp, SourcePaths, SourcePayload, TextReadContext, WechatAppDataAccess,
+        SESSION_DATABASE,
     };
+
+    #[test]
+    fn source_instance_changes_when_account_databases_are_replaced() {
+        let account = tempfile::tempdir().expect("create account fixture");
+        let session_a = account.path().join("session-a.db");
+        let session_b = account.path().join("session-b.db");
+        let contact = account.path().join("contact.db");
+        std::fs::write(&session_a, []).expect("write first session database");
+        std::fs::write(&session_b, []).expect("write second session database");
+        std::fs::write(&contact, []).expect("write contact database");
+
+        let first = source_instance_id(account.path(), &session_a, &contact)
+            .expect("fingerprint first source");
+        let second = source_instance_id(account.path(), &session_b, &contact)
+            .expect("fingerprint replacement source");
+
+        assert_ne!(first, second);
+    }
     use pca_keychain::{WechatDatabaseKeyMaterial, WechatKeyMaterial};
 
     #[test]
@@ -6374,6 +6417,7 @@ mod tests {
             media_databases: vec![media.clone()],
             local_username: "wxid_example".to_owned(),
             account_id: "account-proof".to_owned(),
+            source_instance_id: "source-instance".to_owned(),
         };
         let message_key = WechatDatabaseKeyMaterial::new(
             "db_storage/message/message_0.db",

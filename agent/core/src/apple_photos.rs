@@ -15,6 +15,8 @@ use crate::cloud_control::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_mins(1);
+const COLLECTION_DEADLINE: Duration = Duration::from_mins(30);
+const STATE_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
 const LOOKBACK_DAYS: i64 = 60;
 const PAGE_SIZE: u8 = 50;
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
@@ -36,20 +38,41 @@ pub(crate) async fn run(
                 let revision = control.as_ref().map_or(0, |value| value.configuration_revision);
                 let enabled = control.as_ref().is_some_and(|value| value.photos_library_enabled);
                 let result = if enabled {
-                    collect_once(&database, &bridge, &workspace_id, &device_id)
-                        .await
-                        .map_err(|()| "PHOTOS_COLLECTION_FAILED")
+                    if let Ok(result) = time::timeout(
+                        COLLECTION_DEADLINE,
+                        collect_once(&database, &bridge, &workspace_id, &device_id),
+                    ).await {
+                        result.map_err(|()| "PHOTOS_COLLECTION_FAILED")
+                    } else {
+                        let _ = time::timeout(
+                            STATE_PERSIST_DEADLINE,
+                            persist_aux_collector_state(
+                                &database,
+                                "photos.library",
+                                true,
+                                revision,
+                                false,
+                                Some("PHOTOS_COLLECTION_TIMEOUT"),
+                            ),
+                        ).await;
+                        return;
+                    }
                 } else {
                     Ok(false)
                 };
-                let _ = persist_aux_collector_state(
-                    &database,
-                    "photos.library",
-                    enabled,
-                    revision,
-                    result.as_ref().copied().unwrap_or(false),
-                    result.err(),
-                ).await;
+                if !matches!(time::timeout(
+                    STATE_PERSIST_DEADLINE,
+                    persist_aux_collector_state(
+                        &database,
+                        "photos.library",
+                        enabled,
+                        revision,
+                        result.as_ref().copied().unwrap_or(false),
+                        result.err(),
+                    ),
+                ).await, Ok(Ok(()))) {
+                    return;
+                }
             }
             changed = controls.changed() => {
                 if changed.is_err() { return; }

@@ -22,6 +22,8 @@ use uuid::Uuid;
 use crate::cloud_control::{persist_aux_collector_state, AppliedControl};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const COLLECTION_DEADLINE: Duration = Duration::from_mins(5);
+const STATE_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
 const APPLE_EPOCH_UNIX_SECONDS: i128 = 978_307_200;
 const LOOKBACK_DAYS: i64 = 7;
 
@@ -57,22 +59,43 @@ pub(crate) async fn run(
                 let enabled = control.as_ref().is_some_and(|value| value.communication_messages_enabled);
                 let result = if enabled {
                     match messages_database_path() {
-                        Some(source) => collect_once(&database, &bridge, &source, &workspace_id, &device_id)
-                            .await
-                            .map_err(|()| "MESSAGES_COLLECTION_FAILED"),
+                        Some(source) => if let Ok(result) = time::timeout(
+                            COLLECTION_DEADLINE,
+                            collect_once(&database, &bridge, &source, &workspace_id, &device_id),
+                        ).await {
+                            result.map_err(|()| "MESSAGES_COLLECTION_FAILED")
+                        } else {
+                            let _ = time::timeout(
+                                STATE_PERSIST_DEADLINE,
+                                persist_aux_collector_state(
+                                    &database,
+                                    "communication.messages",
+                                    true,
+                                    revision,
+                                    false,
+                                    Some("MESSAGES_COLLECTION_TIMEOUT"),
+                                ),
+                            ).await;
+                            return;
+                        },
                         None => Err("MESSAGES_DATABASE_UNAVAILABLE"),
                     }
                 } else {
                     Ok(false)
                 };
-                let _ = persist_aux_collector_state(
-                    &database,
-                    "communication.messages",
-                    enabled,
-                    revision,
-                    result.as_ref().copied().unwrap_or(false),
-                    result.err(),
-                ).await;
+                if !matches!(time::timeout(
+                    STATE_PERSIST_DEADLINE,
+                    persist_aux_collector_state(
+                        &database,
+                        "communication.messages",
+                        enabled,
+                        revision,
+                        result.as_ref().copied().unwrap_or(false),
+                        result.err(),
+                    ),
+                ).await, Ok(Ok(()))) {
+                    return;
+                }
             }
             changed = controls.changed() => {
                 if changed.is_err() { return; }

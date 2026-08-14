@@ -150,7 +150,6 @@ enum FailureStage {
     Signal,
     PairingConfiguration,
     ControlConfiguration,
-    #[cfg(feature = "process-test-hooks")]
     BridgeConfiguration,
     #[cfg(feature = "process-test-hooks")]
     InjectedHeartbeat,
@@ -183,7 +182,6 @@ impl FailureStage {
             Self::Signal => "signal",
             Self::PairingConfiguration => "pairing_configuration",
             Self::ControlConfiguration => "control_configuration",
-            #[cfg(feature = "process-test-hooks")]
             Self::BridgeConfiguration => "bridge_configuration",
             #[cfg(feature = "process-test-hooks")]
             Self::InjectedHeartbeat => "injected_heartbeat",
@@ -363,11 +361,19 @@ impl RuntimeResources {
             screen_capture_receiver,
             bridge_shutdown_receiver,
         );
-        #[cfg(feature = "process-test-hooks")]
-        if bridge_task.is_err() && config.process_test_fatal_cleanup.is_some() {
-            return Err(FailureStage::BridgeConfiguration);
-        }
-        self.bridge_task = bridge_task.ok();
+        self.bridge_task = match bridge_task {
+            Ok(task) => Some(task),
+            Err(()) => {
+                #[cfg(feature = "process-test-hooks")]
+                if config.process_test_fatal_cleanup.is_none() {
+                    None
+                } else {
+                    return Err(FailureStage::BridgeConfiguration);
+                }
+                #[cfg(not(feature = "process-test-hooks"))]
+                return Err(FailureStage::BridgeConfiguration);
+            }
+        };
         self.bridge_shutdown = Some(bridge_shutdown_sender);
         let (pairing_shutdown_sender, pairing_shutdown_receiver) = watch::channel(false);
         self.pairing_task = Some(
