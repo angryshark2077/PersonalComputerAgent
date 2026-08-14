@@ -161,14 +161,27 @@ async fn collect_once(
                     .and_then(|_| decoded.next().flatten())
             });
         if let Some(text) = text {
-            let events = message_events(&source_message, text, workspace_id, device_id)?;
-            let commit = EventCommit::try_new(events, None).map_err(|_| ())?;
-            database.commit_events(&commit).await.map_err(|_| ())?;
-            event_observed = true;
+            if let Ok(commit) = message_commit(&source_message, text, workspace_id, device_id) {
+                database.commit_events(&commit).await.map_err(|_| ())?;
+                event_observed = true;
+            } else {
+                persist_cursor(workspace_id, device_id, row_id).await?;
+                continue;
+            }
         }
         persist_cursor(workspace_id, device_id, row_id).await?;
     }
     Ok(event_observed)
+}
+
+fn message_commit(
+    source: &SourceMessage,
+    text: String,
+    workspace_id: &str,
+    device_id: &str,
+) -> Result<EventCommit, ()> {
+    let events = message_events(source, text, workspace_id, device_id)?;
+    EventCommit::try_new(events, None).map_err(|_| ())
 }
 
 fn load_recent_messages(
@@ -410,7 +423,9 @@ async fn persist_cursor(workspace_id: &str, device_id: &str, row_id: i64) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::{apple_date_to_rfc3339, message_events, stable_uuid, SourceMessage};
+    use super::{
+        apple_date_to_rfc3339, message_commit, message_events, stable_uuid, SourceMessage,
+    };
 
     #[test]
     fn outgoing_messages_use_local_sender_and_stable_private_events() {
@@ -466,5 +481,24 @@ mod tests {
             apple_date_to_rfc3339(800_000_000_123_999_999).as_deref(),
             Ok("2026-05-09T06:13:20.123Z")
         );
+    }
+
+    #[test]
+    fn malformed_source_message_is_classified_before_database_commit() {
+        let message = SourceMessage {
+            row_id: 7,
+            guid: "message-guid".to_owned(),
+            chat_guid: "chat-guid".to_owned(),
+            display_name: "Chat".to_owned(),
+            sender_id: "sender".to_owned(),
+            sender_display_name: "invalid\nname".to_owned(),
+            is_from_me: false,
+            apple_date: 0,
+            member_count: 1,
+            text: Some("hello".to_owned()),
+            attributed_body: None,
+        };
+
+        assert!(message_commit(&message, "hello".to_owned(), "workspace", "device").is_err());
     }
 }

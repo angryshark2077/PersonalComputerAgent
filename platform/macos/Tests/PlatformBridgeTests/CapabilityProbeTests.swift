@@ -6,6 +6,19 @@ import Foundation
 import XCTest
 
 final class CapabilityProbeTests: XCTestCase {
+    func testDeviceLocationCacheOutlivesTheThirtyMinuteNetworkCadence() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        XCTAssertTrue(deviceLocationIsFresh(
+            observedAt: now.addingTimeInterval(-30 * 60),
+            now: now
+        ))
+        XCTAssertFalse(deviceLocationIsFresh(
+            observedAt: now.addingTimeInterval(-(deviceLocationCacheLifetime + 1)),
+            now: now
+        ))
+    }
+
     func testDeviceLocationObservationUsesStrictCoordinatePayload() {
         let observation = DeviceLocationObservation(
             latitude: 1.352083,

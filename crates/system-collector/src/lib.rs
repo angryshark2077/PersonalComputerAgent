@@ -9,7 +9,7 @@ pub use runtime::{
     SystemObservation, CPU_MEMORY_INTERVAL, DISK_INTERVAL, RETRY_DELAYS,
 };
 pub use sampler_actor::{
-    start_sampler, MetricGroup, SamplerHandle, SystemMetricsSource, SystemSampleError,
-    SystemSampleErrorKind,
+    start_sampler, try_start_sampler, MetricGroup, SamplerHandle, SystemMetricsSource,
+    SystemSampleError, SystemSampleErrorKind,
 };
 pub use source::SysinfoMetricsSource;

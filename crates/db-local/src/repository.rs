@@ -1776,11 +1776,12 @@ fn record_media_diagnostic(
         .map_err(|error| DbError::sqlite("record media diagnostic", error))
 }
 
-pub(crate) fn cleanup_completed_communication_attachments(
+pub(crate) fn cleanup_completed_communication_attachments_batch(
     connection: &Connection,
     spool_root: &Path,
     cutoff_ms: i64,
-) -> Result<u64, DbError> {
+    after_file_name: Option<&str>,
+) -> Result<(u64, Option<String>), DbError> {
     let mut statement = connection
         .prepare(
             "SELECT DISTINCT current.spool_relative_path
@@ -1788,6 +1789,7 @@ pub(crate) fn cleanup_completed_communication_attachments(
              WHERE current.transfer_state = 'completed'
                AND current.completed_at_ms IS NOT NULL
                AND current.completed_at_ms <= ?1
+               AND (?2 IS NULL OR current.spool_relative_path > ?2)
                AND NOT EXISTS (
                    SELECT 1 FROM attachment_spool AS other
                    WHERE other.spool_relative_path = current.spool_relative_path
@@ -1796,18 +1798,22 @@ pub(crate) fn cleanup_completed_communication_attachments(
                          OR other.completed_at_ms IS NULL
                          OR other.completed_at_ms > ?1
                      )
-               )",
+               )
+             ORDER BY current.spool_relative_path
+             LIMIT 32",
         )
         .map_err(|error| DbError::sqlite("prepare completed attachment cleanup", error))?;
     let files = statement
-        .query_map([cutoff_ms], |row| row.get::<_, String>(0))
+        .query_map(rusqlite::params![cutoff_ms, after_file_name], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|error| DbError::sqlite("query completed attachment cleanup", error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| DbError::sqlite("read completed attachment cleanup", error))?;
     let mut removed = 0_u64;
-    for file_name in files {
-        validate_spool_file_name(&file_name)?;
-        match remove_communication_spool_file(spool_root, &file_name) {
+    for file_name in &files {
+        validate_spool_file_name(file_name)?;
+        match remove_communication_spool_file(spool_root, file_name) {
             Ok(()) => removed = removed.saturating_add(1),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -1818,12 +1824,52 @@ pub(crate) fn cleanup_completed_communication_attachments(
             }
         }
     }
-    Ok(removed)
+    Ok((removed, files.last().cloned()))
+}
+
+pub(crate) fn communication_media_storage_entries(
+    connection: &Connection,
+) -> Result<Vec<(String, u64, bool)>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT spool_relative_path,
+                    MAX(size_bytes),
+                    MIN(CASE
+                        WHEN transfer_state = 'completed' AND completed_at_ms IS NOT NULL
+                        THEN 1 ELSE 0
+                    END) AS completed_only
+             FROM attachment_spool
+             GROUP BY spool_relative_path",
+        )
+        .map_err(|error| DbError::sqlite("prepare communication media statistics", error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })
+        .map_err(|error| DbError::sqlite("query communication media statistics", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DbError::sqlite("read communication media statistics", error))?;
+    let mut entries = Vec::with_capacity(rows.len());
+    for (file_name, size_bytes, completed_only) in rows {
+        validate_spool_file_name(&file_name)?;
+        let size_bytes = u64::try_from(size_bytes).map_err(|_| {
+            DbError::sqlite(
+                "read communication media statistics",
+                "communication attachment size must be non-negative",
+            )
+        })?;
+        entries.push((file_name, size_bytes, completed_only));
+    }
+    Ok(entries)
 }
 
 pub(crate) fn communication_media_storage_stats(
-    connection: &Connection,
     spool_root: &Path,
+    entries: Vec<(String, u64, bool)>,
 ) -> Result<crate::CommunicationMediaStorageStats, DbError> {
     let directory = rustix::fs::open(
         spool_root,
@@ -1835,27 +1881,8 @@ pub(crate) fn communication_media_storage_stats(
     )
     .map(File::from)
     .map_err(|error| DbError::sqlite("open communication spool for statistics", error))?;
-    let mut statement = connection
-        .prepare(
-            "SELECT spool_relative_path,
-                    MIN(CASE
-                        WHEN transfer_state = 'completed' AND completed_at_ms IS NOT NULL
-                        THEN 1 ELSE 0
-                    END) AS completed_only
-             FROM attachment_spool
-             GROUP BY spool_relative_path",
-        )
-        .map_err(|error| DbError::sqlite("prepare communication media statistics", error))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
-        })
-        .map_err(|error| DbError::sqlite("query communication media statistics", error))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| DbError::sqlite("read communication media statistics", error))?;
     let mut stats = crate::CommunicationMediaStorageStats::default();
-    for (file_name, completed_only) in rows {
-        validate_spool_file_name(&file_name)?;
+    for (file_name, _expected_size, completed_only) in entries {
         let file = match rustix::fs::openat(
             &directory,
             file_name.as_str(),

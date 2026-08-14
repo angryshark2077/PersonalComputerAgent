@@ -6,7 +6,7 @@ use std::{
     fs::File,
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{mpsc as std_mpsc, Arc},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +38,7 @@ pub const SPOOL_RESUME_BELOW_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_mins(5);
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(30),
     Duration::from_mins(1),
@@ -486,9 +487,32 @@ impl CommunicationRuntime {
     pub async fn shutdown(mut self) -> Result<(), CommunicationRuntimeError> {
         self.commands.take();
         match self.worker.take() {
-            Some(worker) => worker
-                .await
-                .map_err(|_| CommunicationRuntimeError::WorkerStopped)?,
+            Some(mut worker) => {
+                let (cancel_deadline, deadline_cancelled) = std_mpsc::channel();
+                let mut deadline = tokio::task::spawn_blocking(move || {
+                    matches!(
+                        deadline_cancelled.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT),
+                        Err(std_mpsc::RecvTimeoutError::Timeout)
+                    )
+                });
+                tokio::select! {
+                    biased;
+                    result = &mut worker => {
+                        let _ = cancel_deadline.send(());
+                        let _ = deadline.await;
+                        result.map_err(|_| CommunicationRuntimeError::WorkerStopped)?
+                    }
+                    deadline_result = &mut deadline => {
+                        let timed_out = deadline_result.unwrap_or(true);
+                        if !timed_out {
+                            return worker.await.map_err(|_| CommunicationRuntimeError::WorkerStopped)?;
+                        }
+                        worker.abort();
+                        let _ = worker.await;
+                        Err(CommunicationRuntimeError::WorkerStopped)
+                    }
+                }
+            }
             None => Ok(()),
         }
     }

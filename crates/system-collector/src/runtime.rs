@@ -12,6 +12,7 @@ use tokio::{
 
 pub const CPU_MEMORY_INTERVAL: Duration = Duration::from_secs(30);
 pub const DISK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const SAMPLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(30),
     Duration::from_secs(60),
@@ -262,7 +263,13 @@ async fn run_group(
                 continue;
             }
             () = observations.closed() => return,
-            result = sampler.sample(group) => result,
+            result = time::timeout(SAMPLE_OPERATION_TIMEOUT, sampler.sample(group)) => {
+                result.unwrap_or_else(|_| Err(SystemSampleError::new(
+                    SystemSampleErrorKind::Fatal,
+                    "SYSTEM_SAMPLE_TIMEOUT",
+                    "the system metrics source did not return before the operation deadline",
+                )))
+            },
         };
         if control.borrow().mode != ControlMode::Running {
             continue;
@@ -415,4 +422,69 @@ fn runtime_stopped_error() -> SystemSampleError {
         "SYSTEM_COLLECTOR_STOPPED",
         "the system collector runtime is not available",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use pca_domain::{CpuMemorySample, DiskSample};
+
+    use crate::{start_sampler, SystemMetricsSource};
+
+    use super::{start_system_collector, SystemObservation, SAMPLE_OPERATION_TIMEOUT};
+
+    struct BlockingSource {
+        entered: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl BlockingSource {
+        fn blocked_error(&mut self) -> crate::SystemSampleError {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).expect("report blocked system sample");
+            }
+            self.release.recv().expect("release blocked system sample");
+            crate::SystemSampleError::new(
+                crate::SystemSampleErrorKind::Fatal,
+                "TEST_RELEASED",
+                "blocking fixture released",
+            )
+        }
+    }
+
+    impl SystemMetricsSource for BlockingSource {
+        fn sample_cpu_memory(&mut self) -> Result<CpuMemorySample, crate::SystemSampleError> {
+            Err(self.blocked_error())
+        }
+
+        fn sample_disk(&mut self) -> Result<DiskSample, crate::SystemSampleError> {
+            Err(self.blocked_error())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_system_source_becomes_a_fatal_timeout() {
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let sampler = start_sampler(BlockingSource {
+            entered: Some(entered_sender),
+            release: release_receiver,
+        });
+        let (collector, mut observations) = start_system_collector(sampler, 4);
+        tokio::task::spawn_blocking(move || entered_receiver.recv())
+            .await
+            .expect("wait task")
+            .expect("system sample entered");
+
+        tokio::time::advance(SAMPLE_OPERATION_TIMEOUT).await;
+        let observation = observations.recv().await.expect("timeout observation");
+        assert!(matches!(
+            observation,
+            SystemObservation::Failed { error, .. } if error.code == "SYSTEM_SAMPLE_TIMEOUT"
+        ));
+
+        release_sender.send(()).expect("release system sampler");
+        collector.shutdown().await.expect("shut down collector");
+    }
 }

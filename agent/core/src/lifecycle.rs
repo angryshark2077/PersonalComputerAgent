@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use pca_bridge_client::PlatformLifecycleEvent;
 use pca_db_local::{DbActorHandle, DbError};
@@ -8,10 +8,13 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::{
     sync::{mpsc, oneshot, Mutex, RwLock},
     task::JoinHandle,
+    time as tokio_time,
 };
 use uuid::Uuid;
 
 const EVENT_SOURCE: &str = "runtime.lifecycle";
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CapabilityRefreshError;
@@ -49,6 +52,7 @@ pub(crate) enum LifecycleError {
     NotAccepting,
     QueueClosed,
     WorkerStopped,
+    TimedOut,
     CapabilityRefresh,
     IdentityUnavailable,
     Clock,
@@ -61,6 +65,7 @@ impl fmt::Display for LifecycleError {
             Self::NotAccepting => formatter.write_str("lifecycle side effects are paused"),
             Self::QueueClosed => formatter.write_str("lifecycle queue is closed"),
             Self::WorkerStopped => formatter.write_str("lifecycle worker stopped"),
+            Self::TimedOut => formatter.write_str("lifecycle operation timed out"),
             Self::CapabilityRefresh => formatter.write_str("capability refresh failed"),
             Self::IdentityUnavailable => {
                 formatter.write_str("paired lifecycle identity unavailable")
@@ -148,9 +153,6 @@ impl LifecycleRuntime {
             "system.wake" => {
                 let identity = self.current_identity().await?;
                 let mut accepting = self.accepting.lock().await;
-                if *accepting {
-                    return Ok(None);
-                }
                 let envelope = lifecycle_event_at(&identity, event)?;
                 let event_id = send_persist(&self.sender, envelope, false).await?;
                 self.capability_refresher
@@ -245,23 +247,29 @@ impl LifecycleRuntime {
             None => None,
         };
         let (response_sender, response_receiver) = oneshot::channel();
-        let send_result = self
-            .sender
-            .send(Command::Stop {
-                event,
-                response: response_sender,
-            })
-            .await;
-        let result = if send_result.is_ok() {
-            match response_receiver.await {
-                Ok(result) => result,
-                Err(_) => Err(LifecycleError::WorkerStopped),
-            }
-        } else {
-            Err(LifecycleError::QueueClosed)
-        };
+        let result = tokio_time::timeout(OPERATION_TIMEOUT, async {
+            self.sender
+                .send(Command::Stop {
+                    event,
+                    response: response_sender,
+                })
+                .await
+                .map_err(|_| LifecycleError::QueueClosed)?;
+            response_receiver
+                .await
+                .map_err(|_| LifecycleError::WorkerStopped)?
+        })
+        .await
+        .unwrap_or(Err(LifecycleError::TimedOut));
         drop(self.sender);
-        let worker_result = self.worker.await;
+        let mut worker = self.worker;
+        let Ok(worker_result) = tokio_time::timeout(WORKER_SHUTDOWN_TIMEOUT, &mut worker).await
+        else {
+            worker.abort();
+            let _ = worker.await;
+            first_error.get_or_insert(LifecycleError::TimedOut);
+            return Err(first_error.expect("timeout records lifecycle error"));
+        };
 
         let event_id = match result {
             Ok(event_id) => event_id,
@@ -310,17 +318,21 @@ async fn send_persist(
     checkpoint: bool,
 ) -> Result<String, LifecycleError> {
     let (response_sender, response_receiver) = oneshot::channel();
-    sender
-        .send(Command::Persist {
-            event,
-            checkpoint,
-            response: response_sender,
-        })
-        .await
-        .map_err(|_| LifecycleError::QueueClosed)?;
-    response_receiver
-        .await
-        .map_err(|_| LifecycleError::WorkerStopped)?
+    tokio_time::timeout(OPERATION_TIMEOUT, async {
+        sender
+            .send(Command::Persist {
+                event,
+                checkpoint,
+                response: response_sender,
+            })
+            .await
+            .map_err(|_| LifecycleError::QueueClosed)?;
+        response_receiver
+            .await
+            .map_err(|_| LifecycleError::WorkerStopped)?
+    })
+    .await
+    .unwrap_or(Err(LifecycleError::TimedOut))
 }
 
 async fn run_worker(database: Arc<DbActorHandle>, mut receiver: mpsc::Receiver<Command>) {
@@ -433,8 +445,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CapabilityRefreshError, CapabilityRefresher, LifecycleError, LifecycleRuntime,
-        RuntimeIdentity,
+        lifecycle_event, send_persist, CapabilityRefreshError, CapabilityRefresher, Command,
+        LifecycleError, LifecycleRuntime, RuntimeIdentity, OPERATION_TIMEOUT,
     };
 
     struct RecordingRefresher {
@@ -694,5 +706,65 @@ mod tests {
             "wake Event+Outbox precedes capability refresh"
         );
         runtime.abort_and_drain().await.expect("abort lifecycle");
+    }
+
+    #[tokio::test]
+    async fn wake_refreshes_capabilities_even_when_the_sleep_event_was_missed() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = Arc::new(
+            DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.0.0")
+                .await
+                .expect("open database"),
+        );
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let runtime = LifecycleRuntime::start(
+            database,
+            Some(RuntimeIdentity::new("local-workspace", "local-device")),
+            2,
+            Arc::new(RecordingRefresher {
+                calls: Arc::clone(&calls),
+                database_path: None,
+                fail: false,
+            }),
+        );
+
+        let recorded = runtime
+            .record_platform_event(&PlatformLifecycleEvent {
+                sequence: 1,
+                event_id: Uuid::new_v4(),
+                event_type: "system.wake".to_owned(),
+                occurred_at: "2026-08-14T08:00:00Z".to_owned(),
+            })
+            .await
+            .expect("record standalone wake");
+
+        assert!(recorded.is_some());
+        assert_eq!(*calls.lock().expect("refresh calls"), vec!["refresh"]);
+        runtime.abort_and_drain().await.expect("abort lifecycle");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_queue_wait_has_a_hard_deadline() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (stop_sender, _stop_receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(Command::Stop {
+                event: None,
+                response: stop_sender,
+            })
+            .await
+            .expect("fill lifecycle queue");
+        let event = lifecycle_event(
+            &RuntimeIdentity::new("workspace", "device"),
+            "agent.started",
+        )
+        .expect("lifecycle fixture");
+
+        let started = tokio::time::Instant::now();
+        let result = send_persist(&sender, event, false).await;
+
+        assert!(matches!(result, Err(LifecycleError::TimedOut)));
+        assert_eq!(started.elapsed(), OPERATION_TIMEOUT);
+        drop(receiver);
     }
 }

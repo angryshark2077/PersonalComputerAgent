@@ -5,6 +5,12 @@ import Darwin
 import Foundation
 import Network
 
+let deviceLocationCacheLifetime: TimeInterval = 35 * 60
+
+func deviceLocationIsFresh(observedAt: Date, now: Date = Date()) -> Bool {
+    now.timeIntervalSince(observedAt) <= deviceLocationCacheLifetime
+}
+
 func locationAccessGranted(_ status: CLAuthorizationStatus) -> Bool {
     status == .authorizedAlways
 }
@@ -126,7 +132,9 @@ final class DeviceLocationSource: NSObject, CLLocationManagerDelegate, @unchecke
         refreshIfNeeded()
         return lock.withLock {
             guard let latestObservedAt,
-                  Date().timeIntervalSince(latestObservedAt) <= 600 else { return nil }
+                  deviceLocationIsFresh(observedAt: latestObservedAt) else {
+                return nil
+            }
             return latest
         }
     }
@@ -137,6 +145,7 @@ final class DeviceLocationSource: NSObject, CLLocationManagerDelegate, @unchecke
         manager.desiredAccuracy = kCLLocationAccuracyBest
         self.manager = manager
         manager.delegate = self
+        requestLocationIfAuthorized()
     }
 
     private func refreshIfNeeded() {

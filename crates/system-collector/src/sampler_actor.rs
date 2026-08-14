@@ -1,8 +1,9 @@
 use pca_domain::{CpuMemorySample, DiskSample, SystemMetricSample};
-use std::{fmt, thread};
+use std::{fmt, thread, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 const REQUEST_QUEUE_CAPACITY: usize = 4;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricGroup {
@@ -103,7 +104,18 @@ impl SamplerHandle {
     pub async fn shutdown(mut self) -> Result<(), SystemSampleError> {
         self.requests.take();
         let owner_signaled = match self.owner_stopped.take() {
-            Some(receiver) => receiver.await.is_ok(),
+            Some(receiver) => {
+                if let Ok(result) = tokio::time::timeout(SHUTDOWN_TIMEOUT, receiver).await {
+                    result.is_ok()
+                } else {
+                    self.owner_thread.take();
+                    return Err(SystemSampleError::new(
+                        SystemSampleErrorKind::Fatal,
+                        "SYSTEM_SAMPLER_STOP_TIMEOUT",
+                        "the system sampler owner thread did not stop before the shutdown deadline",
+                    ));
+                }
+            }
             None => false,
         };
         let owner_thread = self.owner_thread.take().ok_or_else(actor_stopped_error)?;
@@ -130,10 +142,12 @@ impl SamplerHandle {
 
 /// Starts a bounded sampler actor on one named owner thread.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the operating system cannot create the dedicated owner thread.
-pub fn start_sampler<S: SystemMetricsSource>(mut source: S) -> SamplerHandle {
+/// Returns a typed fatal error if the operating system cannot create the owner thread.
+pub fn try_start_sampler<S: SystemMetricsSource>(
+    mut source: S,
+) -> Result<SamplerHandle, SystemSampleError> {
     let (requests, mut receiver) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
     let (owner_stopped, stopped_receiver) = oneshot::channel();
     let owner_thread = thread::Builder::new()
@@ -153,13 +167,30 @@ pub fn start_sampler<S: SystemMetricsSource>(mut source: S) -> SamplerHandle {
             }
             let _ = owner_stopped.send(());
         })
-        .expect("system sampler owner thread must start");
+        .map_err(|error| {
+            SystemSampleError::new(
+                SystemSampleErrorKind::Fatal,
+                "SYSTEM_SAMPLER_START_FAILED",
+                error.to_string(),
+            )
+        })?;
 
-    SamplerHandle {
+    Ok(SamplerHandle {
         requests: Some(requests),
         owner_stopped: Some(stopped_receiver),
         owner_thread: Some(owner_thread),
-    }
+    })
+}
+
+/// Starts a sampler for callers whose source is test-controlled and thread creation is assumed.
+///
+/// # Panics
+///
+/// Panics if the operating system cannot create the owner thread. Production callers should use
+/// [`try_start_sampler`] and propagate the typed failure.
+#[must_use]
+pub fn start_sampler<S: SystemMetricsSource>(source: S) -> SamplerHandle {
+    try_start_sampler(source).expect("system sampler owner thread must start")
 }
 
 fn actor_stopped_error() -> SystemSampleError {
@@ -315,5 +346,38 @@ mod tests {
             .shutdown()
             .await
             .expect("shut down actor");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_owner_has_a_bounded_shutdown() {
+        let cpu_calls = Arc::new(AtomicUsize::new(0));
+        let disk_calls = Arc::new(AtomicUsize::new(0));
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let sampler = Arc::new(start_sampler(BlockingSource {
+            cpu_calls,
+            disk_calls,
+            entered: Some(entered_sender),
+            release: release_receiver,
+        }));
+        let request_sampler = Arc::clone(&sampler);
+        let request =
+            tokio::spawn(async move { request_sampler.sample(MetricGroup::CpuMemory).await });
+        tokio::task::spawn_blocking(move || entered_receiver.recv())
+            .await
+            .expect("wait task")
+            .expect("blocked sample entered");
+        request.abort();
+        request.await.expect_err("cancel sample");
+
+        let sampler =
+            Arc::try_unwrap(sampler).unwrap_or_else(|_| panic!("all sampler references dropped"));
+        let error = sampler
+            .shutdown()
+            .await
+            .expect_err("shutdown must time out");
+        assert_eq!(error.code, "SYSTEM_SAMPLER_STOP_TIMEOUT");
+
+        release_sender.send(()).expect("release detached owner");
     }
 }

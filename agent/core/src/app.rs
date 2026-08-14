@@ -67,6 +67,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEALTH_FRESHNESS: TimeDuration = TimeDuration::seconds(5);
 const LIFECYCLE_CAPACITY: usize = 32;
 const CONTROL_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
+const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const STATUS_PERSIST_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn production_communication_factory(
     local_database: PathBuf,
@@ -291,6 +293,16 @@ impl RuntimeResources {
             .expect("database exists until cleanup")
     }
 
+    async fn load_pairing_state(
+        &self,
+        failure: FailureStage,
+    ) -> Result<Option<PairingState>, FailureStage> {
+        tokio::time::timeout(STATUS_PERSIST_TIMEOUT, self.database().load_pairing_state())
+            .await
+            .map_err(|_| failure)?
+            .map_err(|_| failure)
+    }
+
     #[allow(clippy::too_many_lines)] // Startup and signal handling deliberately share one ordered lifecycle.
     async fn run_until_signal(
         &mut self,
@@ -511,10 +523,8 @@ impl RuntimeResources {
                         .map_err(|_| FailureStage::State)?;
                         let identity = if paired {
                             lifecycle_identity_from_pairing_state(
-                                self.database()
-                                    .load_pairing_state()
-                                    .await
-                                    .map_err(|_| FailureStage::Lifecycle)?
+                                self.load_pairing_state(FailureStage::Lifecycle)
+                                    .await?
                                     .as_ref(),
                             )
                         } else {
@@ -560,10 +570,8 @@ impl RuntimeResources {
     ) -> Result<(), FailureStage> {
         let identity = if paired {
             collector_identity_from_pairing_state(
-                self.database()
-                    .load_pairing_state()
-                    .await
-                    .map_err(|_| FailureStage::SystemCollector)?
+                self.load_pairing_state(FailureStage::SystemCollector)
+                    .await?
                     .as_ref(),
             )
         } else {
@@ -591,9 +599,9 @@ impl RuntimeResources {
         paired: bool,
     ) -> Result<(), FailureStage> {
         if let Some(runtime) = self.system_runtime.take() {
-            runtime
-                .shutdown()
+            tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, runtime.shutdown())
                 .await
+                .map_err(|_| FailureStage::SystemCollectorCleanup)?
                 .map_err(|_| FailureStage::SystemCollectorCleanup)?;
         }
         self.start_system_collector(config, paired).await
@@ -611,10 +619,8 @@ impl RuntimeResources {
             return Ok(());
         }
         let paired = self
-            .database()
-            .load_pairing_state()
-            .await
-            .map_err(|_| FailureStage::SystemCollector)?
+            .load_pairing_state(FailureStage::SystemCollector)
+            .await?
             .is_some();
         self.restart_system_collector(config, paired).await
     }
@@ -716,14 +722,18 @@ impl RuntimeResources {
                 .pairing_task
                 .as_ref()
                 .is_some_and(tokio::task::JoinHandle::is_finished);
-        persist_runtime_status(
-            self.database(),
-            heartbeat,
-            self.state,
-            schema_version,
-            local_healthy,
+        tokio::time::timeout(
+            STATUS_PERSIST_TIMEOUT,
+            persist_runtime_status(
+                self.database(),
+                heartbeat,
+                self.state,
+                schema_version,
+                local_healthy,
+            ),
         )
         .await
+        .map_err(|_| FailureStage::Heartbeat)?
         .map_err(|_| FailureStage::Heartbeat)
     }
 
@@ -737,7 +747,9 @@ impl RuntimeResources {
         }
 
         if let Some(system_runtime) = self.system_runtime.take() {
-            if system_runtime.shutdown().await.is_err() {
+            let result =
+                tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, system_runtime.shutdown()).await;
+            if !matches!(result, Ok(Ok(()))) {
                 failures.push(FailureStage::SystemCollectorCleanup);
             }
         }
@@ -969,7 +981,9 @@ async fn stop_bridge(
 ) -> Result<(), FailureStage> {
     if let Some(task) = bridge_task {
         // Never abort a supervisor that owns a child: it must finish its kill-and-wait reap path.
-        task.await
+        tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, task)
+            .await
+            .map_err(|_| FailureStage::BridgeCleanup)?
             .map_err(|_| FailureStage::BridgeCleanup)?
             .map_err(|_| FailureStage::BridgeCleanup)?;
     }
@@ -1074,7 +1088,13 @@ async fn stop_pairing_server(
     pairing_task: Option<JoinHandle<Result<(), PairingIpcServerError>>>,
 ) -> Result<(), FailureStage> {
     if let Some(task) = pairing_task {
-        task.await
+        let mut task = task;
+        let Ok(result) = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut task).await else {
+            task.abort();
+            let _ = task.await;
+            return Err(FailureStage::PairingCleanup);
+        };
+        result
             .map_err(|_| FailureStage::PairingCleanup)?
             .map_err(|_| FailureStage::PairingCleanup)?;
     }

@@ -3,6 +3,7 @@ use std::{
     fs::File,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::mpsc as std_mpsc,
     thread,
     time::Duration,
 };
@@ -17,6 +18,9 @@ use crate::{
 };
 
 const REQUEST_CAPACITY: usize = 64;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+type CommunicationMediaEntry = (String, u64, bool);
 
 #[cfg(feature = "process-test-hooks")]
 #[derive(Clone, Debug)]
@@ -196,10 +200,11 @@ enum Request {
     },
     CleanupCompletedCommunicationAttachments {
         cutoff_ms: i64,
-        response: oneshot::Sender<Result<u64, DbError>>,
+        after_file_name: Option<String>,
+        response: oneshot::Sender<Result<(u64, Option<String>), DbError>>,
     },
     CommunicationMediaStorageStats {
-        response: oneshot::Sender<Result<CommunicationMediaStorageStats, DbError>>,
+        response: oneshot::Sender<Result<Vec<CommunicationMediaEntry>, DbError>>,
     },
 }
 
@@ -225,13 +230,11 @@ impl Request {
             Self::Health { response } => response.is_closed(),
             Self::CountEventAndOutbox { response, .. } => response.is_closed(),
             Self::ActiveOutboxDepth { response }
-            | Self::CleanupCompletedCommunicationAttachments { response, .. } => {
-                response.is_closed()
-            }
+            | Self::AcknowledgeMismatchedLifecycleEvents { response, .. } => response.is_closed(),
+            Self::CleanupCompletedCommunicationAttachments { response, .. } => response.is_closed(),
             Self::CommunicationMediaStorageStats { response } => response.is_closed(),
             Self::LoadPendingSystemEvents { response, .. }
             | Self::LoadPendingCommunicationEvents { response, .. } => response.is_closed(),
-            Self::AcknowledgeMismatchedLifecycleEvents { response, .. } => response.is_closed(),
             Self::LoadPendingCommunicationAttachments { response, .. } => response.is_closed(),
         }
     }
@@ -245,8 +248,9 @@ impl Request {
 /// deterministic thread join.
 pub struct DbActorHandle {
     requests: Option<mpsc::Sender<Request>>,
-    owner_stopped: Option<oneshot::Receiver<()>>,
+    owner_stopped: Option<std::sync::Mutex<std_mpsc::Receiver<()>>>,
     owner_thread: Option<thread::JoinHandle<()>>,
+    communication_spool_root: PathBuf,
 }
 
 impl DbActorHandle {
@@ -286,10 +290,11 @@ impl DbActorHandle {
         options: ActorOptions,
     ) -> Result<Self, DbError> {
         let (request_sender, request_receiver) = mpsc::channel(REQUEST_CAPACITY);
-        let (startup_sender, startup_receiver) = oneshot::channel();
-        let (owner_stopped_sender, owner_stopped_receiver) = oneshot::channel();
+        let (startup_sender, startup_receiver) = std_mpsc::sync_channel(1);
+        let (owner_stopped_sender, owner_stopped_receiver) = std_mpsc::sync_channel(1);
         let path = path.to_owned();
         let communication_spool_root = Self::communication_spool_root(&path);
+        let handle_spool_root = communication_spool_root.clone();
         let app_version = app_version.to_owned();
         let owner_thread = thread::Builder::new()
             .name("pca-sqlite-owner".to_owned())
@@ -318,18 +323,28 @@ impl DbActorHandle {
             })
             .map_err(|error| DbError::sqlite("spawn database owner thread", error))?;
 
-        match startup_receiver.await {
+        let startup_result =
+            tokio::task::spawn_blocking(move || startup_receiver.recv_timeout(STARTUP_TIMEOUT))
+                .await
+                .map_err(|_| DbError::ActorUnavailable)?;
+        match startup_result {
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                drop(request_sender);
+                drop(owner_thread);
+                Err(DbError::ActorUnavailable)
+            }
             Ok(Ok(())) => Ok(Self {
                 requests: Some(request_sender),
-                owner_stopped: Some(owner_stopped_receiver),
+                owner_stopped: Some(std::sync::Mutex::new(owner_stopped_receiver)),
                 owner_thread: Some(owner_thread),
+                communication_spool_root: handle_spool_root,
             }),
             Ok(Err(error)) => {
                 drop(request_sender);
                 owner_thread.join().map_err(|_| DbError::ActorThreadPanic)?;
                 Err(error)
             }
-            Err(_) => {
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 drop(request_sender);
                 owner_thread.join().map_err(|_| DbError::ActorThreadPanic)?;
                 Err(DbError::ActorUnavailable)
@@ -790,13 +805,23 @@ impl DbActorHandle {
         &self,
         cutoff_ms: i64,
     ) -> Result<u64, DbError> {
-        let (response_sender, response_receiver) = oneshot::channel();
-        self.send(Request::CleanupCompletedCommunicationAttachments {
-            cutoff_ms,
-            response: response_sender,
-        })
-        .await?;
-        receive(response_receiver).await
+        let mut removed = 0_u64;
+        let mut after_file_name = None;
+        loop {
+            let (response_sender, response_receiver) = oneshot::channel();
+            self.send(Request::CleanupCompletedCommunicationAttachments {
+                cutoff_ms,
+                after_file_name,
+                response: response_sender,
+            })
+            .await?;
+            let (batch_removed, last_file_name) = receive(response_receiver).await?;
+            removed = removed.saturating_add(batch_removed);
+            let Some(last_file_name) = last_file_name else {
+                return Ok(removed);
+            };
+            after_file_name = Some(last_file_name);
+        }
     }
 
     /// Measures physical communication-spool files without counting already-removed history.
@@ -812,7 +837,13 @@ impl DbActorHandle {
             response: response_sender,
         })
         .await?;
-        receive(response_receiver).await
+        let entries = receive(response_receiver).await?;
+        let spool_root = self.communication_spool_root.clone();
+        tokio::task::spawn_blocking(move || {
+            repository::communication_media_storage_stats(&spool_root, entries)
+        })
+        .await
+        .map_err(|error| DbError::sqlite("join communication media statistics", error))?
     }
 
     /// Closes the request queue, waits without blocking the async executor, and joins the owner.
@@ -826,14 +857,23 @@ impl DbActorHandle {
     /// the owner thread reports a panic.
     pub async fn shutdown(mut self) -> Result<(), DbError> {
         self.requests.take();
-        let owner_stopped = self.owner_stopped.take().ok_or(DbError::ActorUnavailable)?;
+        let owner_stopped = self
+            .owner_stopped
+            .take()
+            .ok_or(DbError::ActorUnavailable)?
+            .into_inner()
+            .map_err(|_| DbError::ActorUnavailable)?;
         let owner_thread = self.owner_thread.take().ok_or(DbError::ActorUnavailable)?;
-        let stopped_result = owner_stopped.await;
-        while !owner_thread.is_finished() {
-            tokio::task::yield_now().await;
+        let stopped_result =
+            tokio::task::spawn_blocking(move || owner_stopped.recv_timeout(SHUTDOWN_TIMEOUT))
+                .await
+                .map_err(|_| DbError::ActorUnavailable)?;
+        if stopped_result.is_err() {
+            drop(owner_thread);
+            return Err(DbError::ActorUnavailable);
         }
         owner_thread.join().map_err(|_| DbError::ActorThreadPanic)?;
-        stopped_result.map_err(|_| DbError::ActorUnavailable)
+        Ok(())
     }
 
     async fn send(&self, request: Request) -> Result<(), DbError> {
@@ -1072,19 +1112,20 @@ fn run(
             }
             Request::CleanupCompletedCommunicationAttachments {
                 cutoff_ms,
+                after_file_name,
                 response,
             } => {
-                let _ = response.send(repository::cleanup_completed_communication_attachments(
-                    &connection,
-                    communication_spool_root,
-                    cutoff_ms,
-                ));
+                let _ = response.send(
+                    repository::cleanup_completed_communication_attachments_batch(
+                        &connection,
+                        communication_spool_root,
+                        cutoff_ms,
+                        after_file_name.as_deref(),
+                    ),
+                );
             }
             Request::CommunicationMediaStorageStats { response } => {
-                let _ = response.send(repository::communication_media_storage_stats(
-                    &connection,
-                    communication_spool_root,
-                ));
+                let _ = response.send(repository::communication_media_storage_entries(&connection));
             }
         }
     }

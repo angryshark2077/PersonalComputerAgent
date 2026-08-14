@@ -6,7 +6,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{mpsc as std_mpsc, Arc},
     time::{Duration, Instant},
 };
 
@@ -44,6 +44,7 @@ const CONTROL_INTERVAL: Duration = Duration::from_secs(30);
 const COLLECTOR_HEALTH_INTERVAL: Duration = Duration::from_mins(30);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_UPLOAD_TIMEOUT: Duration = Duration::from_mins(5);
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const MEDIA_BATCH_SIZE: u16 = 4;
 const MAX_BACKOFF: Duration = CONTROL_INTERVAL;
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
@@ -1349,9 +1350,7 @@ impl CloudControlOwner {
             shutdown.send_replace(true);
         }
         match self.worker.take() {
-            Some(worker) => worker
-                .await
-                .map_err(|_| CloudControlRuntimeError::WorkerStopped)?,
+            Some(worker) => stop_cloud_worker(worker).await,
             None => Ok(()),
         }
     }
@@ -1657,10 +1656,37 @@ impl CloudControlHandle {
             shutdown.send_replace(true);
         }
         match self.worker.take() {
-            Some(worker) => worker
-                .await
-                .map_err(|_| CloudControlRuntimeError::WorkerStopped)?,
+            Some(worker) => stop_cloud_worker(worker).await,
             None => Ok(()),
+        }
+    }
+}
+
+async fn stop_cloud_worker(
+    mut worker: JoinHandle<Result<(), CloudControlRuntimeError>>,
+) -> Result<(), CloudControlRuntimeError> {
+    let (cancel_deadline, deadline_cancelled) = std_mpsc::channel();
+    let mut deadline = tokio::task::spawn_blocking(move || {
+        matches!(
+            deadline_cancelled.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        )
+    });
+    tokio::select! {
+        biased;
+        result = &mut worker => {
+            let _ = cancel_deadline.send(());
+            let _ = deadline.await;
+            result.map_err(|_| CloudControlRuntimeError::WorkerStopped)?
+        }
+        deadline_result = &mut deadline => {
+            let timed_out = deadline_result.unwrap_or(true);
+            if !timed_out {
+                return worker.await.map_err(|_| CloudControlRuntimeError::WorkerStopped)?;
+            }
+            worker.abort();
+            let _ = worker.await;
+            Err(CloudControlRuntimeError::WorkerStopped)
         }
     }
 }

@@ -9,7 +9,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -312,13 +312,38 @@ where
     T: Send + 'static,
 {
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    thread::Builder::new()
-        .name("pca-wechat-source".to_owned())
-        .spawn(move || {
-            let _ = sender.send(operation());
-        })
+    source_worker()?
+        .try_send(Box::new(move || {
+            if !sender.is_closed() {
+                let _ = sender.send(operation());
+            }
+        }))
         .map_err(|_| capability_unavailable())?;
     receiver.await.map_err(|_| capability_unavailable())?
+}
+
+type SourceJob = Box<dyn FnOnce() + Send + 'static>;
+
+static SOURCE_WORKER: OnceLock<Result<mpsc::SyncSender<SourceJob>, ()>> = OnceLock::new();
+
+fn source_worker() -> Result<&'static mpsc::SyncSender<SourceJob>, DomainError> {
+    SOURCE_WORKER
+        .get_or_init(|| start_source_worker("pca-wechat-source"))
+        .as_ref()
+        .map_err(|()| capability_unavailable())
+}
+
+fn start_source_worker(name: &str) -> Result<mpsc::SyncSender<SourceJob>, ()> {
+    let (sender, receiver) = mpsc::sync_channel::<SourceJob>(1);
+    thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                job();
+            }
+        })
+        .map(|_| sender)
+        .map_err(|_| ())
 }
 
 fn claim_pending_media_retry(last_retry_at: &mut Option<Instant>, now: Instant) -> bool {
@@ -5578,10 +5603,10 @@ mod tests {
         resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
         resolve_message_file, resolve_video_path, retention_cutoff_from, select_image_candidate,
         should_retire_failed_full_image_retry, should_scan_message_source, source_access_error,
-        source_instance_id, stage_decrypted_image, video_attachment, voice_same_time_index,
-        ContactCardProfile, ConversationMetadata, ImageKeys, MessageSourceSnapshot, Session,
-        SourceFileStamp, SourcePaths, SourcePayload, TextReadContext, WechatAppDataAccess,
-        SESSION_DATABASE,
+        source_instance_id, stage_decrypted_image, start_source_worker, video_attachment,
+        voice_same_time_index, ContactCardProfile, ConversationMetadata, ImageKeys,
+        MessageSourceSnapshot, Session, SourceFileStamp, SourcePaths, SourcePayload,
+        TextReadContext, WechatAppDataAccess, SESSION_DATABASE,
     };
 
     #[test]
@@ -5617,6 +5642,27 @@ mod tests {
             &mut last_retry_at,
             start + std::time::Duration::from_mins(5)
         ));
+    }
+
+    #[test]
+    fn source_worker_has_one_active_and_one_queued_job() {
+        let worker = start_source_worker("pca-wechat-source-test").expect("start source worker");
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        worker
+            .try_send(Box::new(move || {
+                entered_sender.send(()).expect("report active job");
+                release_receiver.recv().expect("release active job");
+            }))
+            .expect("queue active job");
+        entered_receiver.recv().expect("active job entered");
+
+        worker
+            .try_send(Box::new(|| {}))
+            .expect("queue one waiting job");
+        assert!(worker.try_send(Box::new(|| {})).is_err());
+
+        release_sender.send(()).expect("release active job");
     }
 
     #[test]

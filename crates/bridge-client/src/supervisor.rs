@@ -37,6 +37,7 @@ const MAX_STABLE_READY: Duration = Duration::from_secs(30);
 const NETWORK_OBSERVATION_INTERVAL: Duration = Duration::from_mins(30);
 const NETWORK_ENABLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const SCREEN_COMMAND_TIMEOUT: Duration = Duration::from_secs(31);
 
 #[derive(Clone, Debug)]
 pub struct ScreenCaptureCommandHandle {
@@ -44,20 +45,41 @@ pub struct ScreenCaptureCommandHandle {
 }
 
 impl ScreenCaptureCommandHandle {
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, BridgeClientError>>) -> ScreenCaptureCommand,
+    ) -> Result<T, BridgeClientError> {
+        self.request_with_timeout(command, SCREEN_COMMAND_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, BridgeClientError>>) -> ScreenCaptureCommand,
+        deadline: Duration,
+    ) -> Result<T, BridgeClientError> {
+        timeout(deadline, async {
+            let (response, receiver) = oneshot::channel();
+            self.sender
+                .send(command(response))
+                .await
+                .map_err(|_| BridgeClientError::Disconnected)?;
+            receiver
+                .await
+                .map_err(|_| BridgeClientError::Disconnected)?
+        })
+        .await
+        .map_err(|_| BridgeClientError::Timeout)?
+    }
+
     /// Reads the current lock and activity state through the supervised Bridge connection.
     ///
     /// # Errors
     ///
     /// Returns `Disconnected` when the supervisor is unavailable, otherwise the Bridge error.
     pub async fn context(&self) -> Result<ScreenContext, BridgeClientError> {
-        let (sender, receiver) = oneshot::channel();
-        self.sender
-            .send(ScreenCaptureCommand::Context { response: sender })
+        self.request(|response| ScreenCaptureCommand::Context { response })
             .await
-            .map_err(|_| BridgeClientError::Disconnected)?;
-        receiver
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?
     }
 
     /// Captures the active display through the supervised Bridge connection.
@@ -69,17 +91,11 @@ impl ScreenCaptureCommandHandle {
         &self,
         excluded_bundle_ids: Vec<String>,
     ) -> Result<ScreenCaptureResult, BridgeClientError> {
-        let (sender, receiver) = oneshot::channel();
-        self.sender
-            .send(ScreenCaptureCommand::Capture {
-                excluded_bundle_ids,
-                response: sender,
-            })
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?;
-        receiver
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?
+        self.request(|response| ScreenCaptureCommand::Capture {
+            excluded_bundle_ids,
+            response,
+        })
+        .await
     }
 
     /// Decodes Apple attributed message bodies using the supervised Bridge.
@@ -91,17 +107,11 @@ impl ScreenCaptureCommandHandle {
         &self,
         encoded_bodies: Vec<String>,
     ) -> Result<Vec<Option<String>>, BridgeClientError> {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(ScreenCaptureCommand::DecodeMessages {
-                encoded_bodies,
-                response,
-            })
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?;
-        receiver
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?
+        self.request(|response| ScreenCaptureCommand::DecodeMessages {
+            encoded_bodies,
+            response,
+        })
+        .await
     }
 
     /// Reads the Photo Library authorization status using the supervised Bridge.
@@ -110,14 +120,8 @@ impl ScreenCaptureCommandHandle {
     ///
     /// Returns `Disconnected` when supervision stops, otherwise the Bridge error.
     pub async fn photo_authorization(&self) -> Result<String, BridgeClientError> {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(ScreenCaptureCommand::PhotoAuthorization { response })
+        self.request(|response| ScreenCaptureCommand::PhotoAuthorization { response })
             .await
-            .map_err(|_| BridgeClientError::Disconnected)?;
-        receiver
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?
     }
 
     /// Lists Photo Library assets using the supervised Bridge.
@@ -132,20 +136,14 @@ impl ScreenCaptureCommandHandle {
         cutoff: String,
         limit: u8,
     ) -> Result<(String, Vec<PhotoAssetRecord>), BridgeClientError> {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(ScreenCaptureCommand::ListPhotos {
-                after_created_at,
-                after_local_identifier,
-                cutoff,
-                limit,
-                response,
-            })
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?;
-        receiver
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?
+        self.request(|response| ScreenCaptureCommand::ListPhotos {
+            after_created_at,
+            after_local_identifier,
+            cutoff,
+            limit,
+            response,
+        })
+        .await
     }
 
     /// Exports one original Photo Library asset using the supervised Bridge.
@@ -158,18 +156,12 @@ impl ScreenCaptureCommandHandle {
         local_identifier: String,
         file_name: uuid::Uuid,
     ) -> Result<Option<PathBuf>, BridgeClientError> {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send(ScreenCaptureCommand::ExportPhoto {
-                local_identifier,
-                file_name,
-                response,
-            })
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?;
-        receiver
-            .await
-            .map_err(|_| BridgeClientError::Disconnected)?
+        self.request(|response| ScreenCaptureCommand::ExportPhoto {
+            local_identifier,
+            file_name,
+            response,
+        })
+        .await
     }
 }
 
@@ -474,9 +466,10 @@ impl BridgeSupervisor {
                         }
                     }
                     _ = network_timer.tick() => {
-                        if !self.network_observations.is_enabled()
-                            || last_network_observation.is_some_and(|last| last.elapsed() < NETWORK_OBSERVATION_INTERVAL)
-                        {
+                        if !network_observation_due(
+                            self.network_observations.as_ref(),
+                            last_network_observation,
+                        ) {
                             continue;
                         }
                         match client.observe_network().await {
@@ -534,6 +527,15 @@ impl BridgeSupervisor {
             }
         }
     }
+}
+
+fn network_observation_due(
+    observations: &NetworkObservationState,
+    last_observation: Option<Instant>,
+) -> bool {
+    observations.is_enabled()
+        && (observations.current_if_enabled().is_none()
+            || last_observation.is_none_or(|last| last.elapsed() >= NETWORK_OBSERVATION_INTERVAL))
 }
 
 async fn receive_screen_capture_command(
@@ -806,12 +808,14 @@ impl Backoff {
 #[cfg(test)]
 mod tests {
     use super::{
-        lifecycle_events_require_network_observation, network_observation_error_requires_reconnect,
-        reap_child, reap_child_with_deadlines, remove_confirmed_socket, Backoff,
-        BridgeSupervisorConfig, ReapProcess, StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT,
-        MAX_STABLE_READY,
+        lifecycle_events_require_network_observation, network_observation_due,
+        network_observation_error_requires_reconnect, reap_child, reap_child_with_deadlines,
+        remove_confirmed_socket, screen_capture_command_channel, Backoff, BridgeSupervisorConfig,
+        ReapProcess, StatusEmitter, MAX_BACKOFF, MAX_OPERATION_TIMEOUT, MAX_STABLE_READY,
     };
-    use crate::{BridgeClientError, PlatformLifecycleEvent};
+    use crate::{
+        BridgeClientError, NetworkObservation, NetworkObservationState, PlatformLifecycleEvent,
+    };
     use pca_domain::BridgeStatus;
     use std::{
         collections::VecDeque,
@@ -823,7 +827,7 @@ mod tests {
         process::ExitStatus,
         time::Duration,
     };
-    use tokio::sync::watch;
+    use tokio::{sync::watch, time::Instant};
     use uuid::Uuid;
 
     #[test]
@@ -894,6 +898,42 @@ mod tests {
         assert!(lifecycle_events_require_network_observation(&[event(
             "system.wake"
         )]));
+    }
+
+    #[test]
+    fn reenabled_network_without_a_current_sample_is_due_immediately() {
+        let observations = NetworkObservationState::default();
+        observations.set_enabled(true);
+        observations.replace(NetworkObservation {
+            interface_type: "wired".to_owned(),
+            wifi_identity_available: false,
+            ssid: None,
+            bssid: None,
+            local_ipv4: Some("192.168.1.5".to_owned()),
+            local_ipv6: None,
+            location: None,
+        });
+        let just_observed = Instant::now();
+        assert!(!network_observation_due(&observations, Some(just_observed)));
+
+        observations.set_enabled(false);
+        observations.set_enabled(true);
+
+        assert!(network_observation_due(&observations, Some(just_observed)));
+    }
+
+    #[tokio::test]
+    async fn queued_bridge_command_has_a_hard_deadline() {
+        let (commands, _receiver) = screen_capture_command_channel();
+
+        let result = commands
+            .request_with_timeout(
+                |response| super::ScreenCaptureCommand::Context { response },
+                Duration::from_millis(1),
+            )
+            .await;
+
+        assert!(matches!(result, Err(BridgeClientError::Timeout)));
     }
 
     #[test]

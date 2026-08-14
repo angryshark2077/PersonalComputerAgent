@@ -15,11 +15,23 @@ use crate::cloud_control::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_mins(1);
+const FULL_RESCAN_INTERVAL: Duration = Duration::from_mins(30);
 const COLLECTION_DEADLINE: Duration = Duration::from_mins(30);
 const STATE_PERSIST_DEADLINE: Duration = Duration::from_secs(10);
 const LOOKBACK_DAYS: i64 = 60;
 const PAGE_SIZE: u8 = 50;
 const MAX_UPLOAD_BYTES: u64 = 500 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PhotoCursor {
+    created_at: Option<String>,
+    local_identifier: Option<String>,
+}
+
+struct CollectionResult {
+    event_observed: bool,
+    cursor: PhotoCursor,
+}
 
 pub(crate) async fn run(
     database: Arc<DbActorHandle>,
@@ -31,6 +43,8 @@ pub(crate) async fn run(
 ) {
     let mut interval = time::interval(POLL_INTERVAL);
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut cursor = PhotoCursor::default();
+    let mut last_full_scan = None;
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -38,11 +52,30 @@ pub(crate) async fn run(
                 let revision = control.as_ref().map_or(0, |value| value.configuration_revision);
                 let enabled = control.as_ref().is_some_and(|value| value.photos_library_enabled);
                 let result = if enabled {
+                    let now = time::Instant::now();
+                    let full_scan = full_scan_due(last_full_scan, now);
+                    let start_cursor = if full_scan {
+                        PhotoCursor::default()
+                    } else {
+                        cursor.clone()
+                    };
                     if let Ok(result) = time::timeout(
                         COLLECTION_DEADLINE,
-                        collect_once(&database, &bridge, &workspace_id, &device_id),
+                        collect_once(
+                            &database,
+                            &bridge,
+                            &workspace_id,
+                            &device_id,
+                            start_cursor,
+                        ),
                     ).await {
-                        result.map_err(|()| "PHOTOS_COLLECTION_FAILED")
+                        result.map(|collected| {
+                            cursor = collected.cursor;
+                            if full_scan {
+                                last_full_scan = Some(now);
+                            }
+                            collected.event_observed
+                        }).map_err(|()| "PHOTOS_COLLECTION_FAILED")
                     } else {
                         let _ = time::timeout(
                             STATE_PERSIST_DEADLINE,
@@ -89,21 +122,20 @@ async fn collect_once(
     bridge: &ScreenCaptureCommandHandle,
     workspace_id: &str,
     device_id: &str,
-) -> Result<bool, ()> {
+    mut cursor: PhotoCursor,
+) -> Result<CollectionResult, ()> {
     if bridge.photo_authorization().await.map_err(|_| ())? != "available" {
         return Err(());
     }
     let cutoff = (OffsetDateTime::now_utc() - TimeDuration::days(LOOKBACK_DAYS))
         .format(&Rfc3339)
         .map_err(|_| ())?;
-    let mut after_created_at = None;
-    let mut after_local_identifier = None;
     let mut event_observed = false;
     loop {
         let (status, assets) = bridge
             .list_photo_assets(
-                after_created_at.clone(),
-                after_local_identifier.clone(),
+                cursor.created_at.clone(),
+                cursor.local_identifier.clone(),
                 cutoff.clone(),
                 PAGE_SIZE,
             )
@@ -113,20 +145,31 @@ async fn collect_once(
             return Err(());
         }
         if assets.is_empty() {
-            return Ok(event_observed);
+            return Ok(CollectionResult {
+                event_observed,
+                cursor,
+            });
         }
         let count = assets.len();
         for asset in assets {
-            after_created_at = Some(asset.created_at.clone());
-            after_local_identifier = Some(asset.local_identifier.clone());
-            event_observed |= queue_asset(database, bridge, workspace_id, device_id, asset)
-                .await
-                .unwrap_or(false);
+            cursor.created_at = Some(asset.created_at.clone());
+            cursor.local_identifier = Some(asset.local_identifier.clone());
+            event_observed |= queue_asset(database, bridge, workspace_id, device_id, asset).await?;
         }
         if count < usize::from(PAGE_SIZE) {
-            return Ok(event_observed);
+            return Ok(CollectionResult {
+                event_observed,
+                cursor,
+            });
         }
     }
+}
+
+fn full_scan_due(last_full_scan: Option<time::Instant>, now: time::Instant) -> bool {
+    last_full_scan.is_none_or(|last| {
+        now.checked_duration_since(last)
+            .is_some_and(|elapsed| elapsed >= FULL_RESCAN_INTERVAL)
+    })
 }
 
 async fn queue_asset(
@@ -265,7 +308,10 @@ fn object(value: &Value) -> Result<Map<String, Value>, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exceeds_upload_limit, stable_uuid, LOOKBACK_DAYS, MAX_UPLOAD_BYTES};
+    use super::{
+        exceeds_upload_limit, full_scan_due, stable_uuid, FULL_RESCAN_INTERVAL, LOOKBACK_DAYS,
+        MAX_UPLOAD_BYTES,
+    };
 
     #[test]
     fn photo_library_initial_history_is_sixty_days() {
@@ -285,5 +331,16 @@ mod tests {
         assert_eq!(MAX_UPLOAD_BYTES, 500 * 1024 * 1024);
         assert!(!exceeds_upload_limit(MAX_UPLOAD_BYTES));
         assert!(exceeds_upload_limit(MAX_UPLOAD_BYTES + 1));
+    }
+
+    #[test]
+    fn photo_library_only_reconciles_the_full_window_every_thirty_minutes() {
+        let now = tokio::time::Instant::now();
+        assert!(full_scan_due(None, now));
+        assert!(!full_scan_due(
+            Some(now),
+            now + FULL_RESCAN_INTERVAL - std::time::Duration::from_secs(1)
+        ));
+        assert!(full_scan_due(Some(now), now + FULL_RESCAN_INTERVAL));
     }
 }

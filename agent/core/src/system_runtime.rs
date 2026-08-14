@@ -7,7 +7,7 @@ use ::time::OffsetDateTime;
 use pca_db_local::{DbActorHandle, DbError};
 use pca_domain::{CollectorState, DomainError, EventCommit, EventSink, SystemMetricSample};
 use pca_system_collector::{
-    start_sampler, start_system_collector_with_suppression, SysinfoMetricsSource,
+    start_system_collector_with_suppression, try_start_sampler, SysinfoMetricsSource,
     SystemCollectorHandle, SystemMetricsSource, SystemObservation, SystemSampleError, RETRY_DELAYS,
 };
 use std::{
@@ -254,7 +254,7 @@ async fn run_paired<S: SystemMetricsSource>(
     }
 
     let (collector, mut observations) = start_system_collector_with_suppression(
-        start_sampler(source),
+        try_start_sampler(source).map_err(SystemRuntimeError::Collector)?,
         OBSERVATION_CAPACITY,
         registry.sampling_suppressed(),
     );
