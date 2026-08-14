@@ -62,6 +62,9 @@ pub const REPAIR_APPLE_MESSAGE_IDEMPOTENCY_MIGRATION: &str =
 /// Normalizes unsynced Apple Messages payload timestamps to the local event millisecond boundary.
 pub const NORMALIZE_APPLE_MESSAGE_TIMESTAMPS_MIGRATION: &str =
     include_str!("../migrations/0012_normalize_apple_message_timestamps.sql");
+/// Makes photo Event, Outbox, and private upload-task persistence atomic.
+pub const PHOTO_UPLOAD_SPOOL_MIGRATION: &str =
+    include_str!("../migrations/0013_photo_upload_spool.sql");
 
 /// A private spool-file reference corresponding to one validated media manifest.
 ///
@@ -114,6 +117,24 @@ pub struct CommunicationMessageCommit {
     pub metadata_events: Vec<EventEnvelope>,
     pub message: CommunicationMessageRecorded,
     pub attachment_spool: Vec<CommunicationAttachmentSpoolReference>,
+}
+
+/// The private upload-task manifest committed with one photo Event and its Outbox intent.
+///
+/// `manifest_json` intentionally has no `Debug` implementation because it includes photo
+/// metadata. The media body remains in the private `PhotoSpool` directory.
+#[derive(Clone, PartialEq)]
+pub struct PhotoUploadCommit {
+    pub event: EventEnvelope,
+    pub photo_id: String,
+    pub manifest_json: String,
+}
+
+/// One pending private photo upload task. The caller deserializes the manifest only when it is
+/// ready to make a bounded Cloud upload attempt.
+pub struct PendingPhotoUpload {
+    pub photo_id: String,
+    pub manifest_json: String,
 }
 
 /// Non-secret local pointer to an Agent credential validated in Keychain.
@@ -176,8 +197,9 @@ pub struct DbHealth {
 mod tests {
     use super::{
         ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION, BASELINE_MIGRATION,
-        HARDEN_ATTACHMENT_SPOOL_MIGRATION, S1A_RUNTIME_MIGRATION, S1B_CLOUD_API_ORIGIN_MIGRATION,
-        S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION, WECHAT_MESSAGES_MIGRATION,
+        HARDEN_ATTACHMENT_SPOOL_MIGRATION, PHOTO_UPLOAD_SPOOL_MIGRATION, S1A_RUNTIME_MIGRATION,
+        S1B_CLOUD_API_ORIGIN_MIGRATION, S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION,
+        WECHAT_MESSAGES_MIGRATION,
     };
 
     #[test]
@@ -238,5 +260,12 @@ mod tests {
             .contains("UNIQUE (account_id, external_conversation_id, source_sequence)"));
         assert!(ALLOW_MESSAGE_KIND_SEQUENCE_OVERLAP_MIGRATION
             .contains("UNIQUE (account_id, source_key)"));
+    }
+
+    #[test]
+    fn photo_upload_spool_is_private_and_event_bound() {
+        assert!(PHOTO_UPLOAD_SPOOL_MIGRATION.contains("photo_upload_spool"));
+        assert!(PHOTO_UPLOAD_SPOOL_MIGRATION.contains("FOREIGN KEY (event_id)"));
+        assert!(PHOTO_UPLOAD_SPOOL_MIGRATION.contains("json_valid(manifest_json)"));
     }
 }

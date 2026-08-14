@@ -2,16 +2,16 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use ::time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use pca_bridge_client::{PhotoAssetRecord, ScreenCaptureCommandHandle};
-use pca_db_local::DbActorHandle;
-use pca_domain::{EventCommit, EventEnvelope, Sensitivity};
+use pca_db_local::{DbActorHandle, PhotoUploadCommit};
+use pca_domain::{EventEnvelope, Sensitivity};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncReadExt, sync::watch, time};
 use uuid::Uuid;
 
 use crate::cloud_control::{
-    persist_aux_collector_state, persist_photo_manifest, persist_photo_marker,
-    photo_asset_is_handled, photo_spool_root, AppliedControl, PendingPhoto, PhotoMarker,
+    persist_aux_collector_state, persist_photo_marker, photo_asset_is_handled, photo_spool_root,
+    AppliedControl, PendingPhoto, PhotoMarker,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_mins(1);
@@ -88,12 +88,12 @@ pub(crate) async fn run(
                                 Some("PHOTOS_COLLECTION_TIMEOUT"),
                             ),
                         ).await;
-                        return;
+                        continue;
                     }
                 } else {
                     Ok(false)
                 };
-                if !matches!(time::timeout(
+                let _ = time::timeout(
                     STATE_PERSIST_DEADLINE,
                     persist_aux_collector_state(
                         &database,
@@ -103,9 +103,8 @@ pub(crate) async fn run(
                         result.as_ref().copied().unwrap_or(false),
                         result.err(),
                     ),
-                ).await, Ok(Ok(()))) {
-                    return;
-                }
+                )
+                .await;
             }
             changed = controls.changed() => {
                 if changed.is_err() { return; }
@@ -182,7 +181,10 @@ async fn queue_asset(
     let photo_id = stable_uuid(workspace_id, device_id, "photo", &asset.local_identifier);
     let event_id = stable_uuid(workspace_id, device_id, "event", &asset.local_identifier);
     let spool_root = photo_spool_root().map_err(|_| ())?;
-    if photo_asset_is_handled(&photo_id).await.map_err(|_| ())? {
+    if photo_asset_is_handled(database, &photo_id)
+        .await
+        .map_err(|_| ())?
+    {
         return Ok(false);
     }
     let file_uuid = Uuid::parse_str(&photo_id).map_err(|_| ())?;
@@ -236,13 +238,9 @@ async fn queue_asset(
         attachment_refs: Vec::new(),
         idempotency_key: Some(format!("photos:asset:{}", asset.local_identifier)),
     };
-    database
-        .commit_events(&EventCommit::try_new(vec![event], None).map_err(|_| ())?)
-        .await
-        .map_err(|_| ())?;
-    persist_photo_manifest(&PendingPhoto {
+    let photo = PendingPhoto {
         photo_id: photo_id.clone(),
-        event_id,
+        event_id: event_id.clone(),
         asset_id: asset.local_identifier,
         captured_at: asset.created_at,
         media_type: asset.media_type,
@@ -256,9 +254,20 @@ async fn queue_asset(
         size_bytes,
         media_file_name: Some(photo_id),
         completed: false,
-    })
-    .await
-    .map_err(|_| ())?;
+    };
+    let manifest_json = serde_json::to_string(&photo).map_err(|_| ())?;
+    if database
+        .commit_photo_upload(&PhotoUploadCommit {
+            event,
+            photo_id: photo.photo_id.clone(),
+            manifest_json,
+        })
+        .await
+        .is_err()
+    {
+        let _ = tokio::fs::remove_file(&exported).await;
+        return Err(());
+    }
     Ok(true)
 }
 

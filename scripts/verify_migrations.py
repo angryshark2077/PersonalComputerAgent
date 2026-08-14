@@ -28,6 +28,7 @@ EXPECTED_MIGRATIONS = {
         "0010_add_file_messages.sql",
         "0011_repair_apple_message_idempotency.sql",
         "0012_normalize_apple_message_timestamps.sql",
+        "0013_photo_upload_spool.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",
@@ -57,6 +58,7 @@ EXPECTED_MIGRATIONS = {
         "0024_photo_system_event_constraints.sql",
         "0025_device_network_history.sql",
         "0026_refresh_credential_replay.sql",
+        "0027_device_collector_health.sql",
     ],
 }
 
@@ -207,6 +209,7 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "network_location_library",
         "device_network_history",
         "photo_library_assets",
+        "device_collector_health",
     }
     actual_tables = set(
         re.findall(
@@ -221,9 +224,12 @@ def validate_cloud_chain(files: list[Path]) -> str | None:
         "idx_collector_config_audit_chronology",
         "idx_device_heartbeats_last",
         "idx_system_events_device_chronology",
+        "idx_device_collector_health_reported",
     }
     actual_indexes = set(
-        re.findall(r"CREATE INDEX IF NOT EXISTS\s+([a-z_]+)", sql, flags=re.IGNORECASE)
+        re.findall(
+            r"CREATE INDEX (?:IF NOT EXISTS\s+)?([a-z_]+)", sql, flags=re.IGNORECASE
+        )
     )
     if not required_indexes.issubset(actual_indexes):
         return f"missing S1B Cloud indexes: {sorted(required_indexes - actual_indexes)}"

@@ -1019,7 +1019,7 @@ export class MemoryControlRepository implements ControlRepository {
     }
     if (input.network !== null) {
       const history = this.#networkHistory.get(input.deviceId) ?? [];
-      if (!networkIdentityMatches(history[0]?.network ?? null, input.network)) {
+      if (!networkHistoryIdentityMatches(history[0]?.network ?? null, input.network)) {
         history.unshift({ network: cloneNetwork(input.network), observedAt: input.receivedAt });
         this.#networkHistory.set(input.deviceId, history.slice(0, 5));
       }
@@ -2695,7 +2695,7 @@ export class DrizzleControlRepository implements ControlRepository {
             ))
             .orderBy(desc(deviceNetworkHistory.observedAt))
             .limit(1);
-          if (latest === undefined || !networkIdentityMatches(networkFromHistoryRow(latest), input.network)) {
+          if (latest === undefined || !networkHistoryIdentityMatches(networkFromHistoryRow(latest), input.network)) {
             await transaction.insert(deviceNetworkHistory).values(networkHistoryValues(input));
             const excess = await transaction
               .select({ id: deviceNetworkHistory.id })
@@ -3200,7 +3200,7 @@ export class DrizzleControlRepository implements ControlRepository {
       const networkHistory: DeviceStatus["networkHistory"] = [];
       for (const row of networkHistoryRows) {
         const historicalNetwork = networkFromHistoryRow(row);
-        if (networkIdentityMatches(networkHistory.at(-1)?.network ?? null, historicalNetwork)) {
+        if (networkHistoryIdentityMatches(networkHistory.at(-1)?.network ?? null, historicalNetwork)) {
           continue;
         }
         networkHistory.push({
@@ -4141,33 +4141,17 @@ function cloneNetwork(network: NetworkHeartbeat): NetworkHeartbeat {
   };
 }
 
-function networkIdentityMatches(left: NetworkHeartbeat | null, right: NetworkHeartbeat): boolean {
+/**
+ * Network history is a record of connection identity changes, not every
+ * heartbeat detail refresh.  The current heartbeat retains IP and location
+ * fields together with its observed-at time for the Dashboard's current view.
+ */
+function networkHistoryIdentityMatches(left: NetworkHeartbeat | null, right: NetworkHeartbeat): boolean {
   return left !== null
     && left.interfaceType === right.interfaceType
     && left.wifiIdentityAvailable === right.wifiIdentityAvailable
     && left.ssid === right.ssid
-    && left.bssid === right.bssid
-    && left.localIpv4 === right.localIpv4
-    && left.localIpv6 === right.localIpv6
-    && deviceLocationsMatch(left.location, right.location);
-}
-
-function deviceLocationsMatch(
-  left: NetworkHeartbeat["location"],
-  right: NetworkHeartbeat["location"],
-): boolean {
-  if (left === null || right === null) return left === right;
-  const latitudeRadians = (left.latitude * Math.PI) / 180;
-  const rightLatitudeRadians = (right.latitude * Math.PI) / 180;
-  const latitudeDelta = ((right.latitude - left.latitude) * Math.PI) / 180;
-  const longitudeDelta = ((right.longitude - left.longitude) * Math.PI) / 180;
-  const haversine = Math.sin(latitudeDelta / 2) ** 2
-    + Math.cos(latitudeRadians) * Math.cos(rightLatitudeRadians)
-      * Math.sin(longitudeDelta / 2) ** 2;
-  const distanceMeters = 2 * 6_371_000 * Math.asin(Math.min(1, Math.sqrt(haversine)));
-  return distanceMeters <= (
-    left.horizontalAccuracyMeters + right.horizontalAccuracyMeters
-  );
+    && left.bssid === right.bssid;
 }
 
 function currentPresence(

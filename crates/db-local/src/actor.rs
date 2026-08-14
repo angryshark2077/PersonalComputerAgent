@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     migrations, repository, CommunicationMediaStorageStats, CommunicationMessageCommit, DbError,
-    DbHealth, PairingState, PendingCommunicationAttachment,
+    DbHealth, PairingState, PendingCommunicationAttachment, PendingPhotoUpload, PhotoUploadCommit,
 };
 
 const REQUEST_CAPACITY: usize = 64;
@@ -179,6 +179,22 @@ enum Request {
         commit: Box<CommunicationMessageCommit>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    CommitPhotoUpload {
+        commit: Box<PhotoUploadCommit>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    PhotoUploadExists {
+        photo_id: String,
+        response: oneshot::Sender<Result<bool, DbError>>,
+    },
+    LoadPendingPhotoUploads {
+        limit: u16,
+        response: oneshot::Sender<Result<Vec<PendingPhotoUpload>, DbError>>,
+    },
+    CompletePhotoUpload {
+        photo_id: String,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     LoadPendingCommunicationEvents {
         limit: u16,
         response: oneshot::Sender<Result<Vec<EventEnvelope>, DbError>>,
@@ -231,6 +247,8 @@ impl Request {
             | Self::AcknowledgeSystemEvents { response, .. }
             | Self::DeadLetterRejectedSystemEvents { response, .. }
             | Self::CommitCommunicationMessage { response, .. }
+            | Self::CommitPhotoUpload { response, .. }
+            | Self::CompletePhotoUpload { response, .. }
             | Self::AcknowledgeCommunicationEvents { response, .. }
             | Self::DeadLetterRejectedCommunicationEvents { response, .. }
             | Self::CompleteCommunicationAttachment { response, .. }
@@ -246,6 +264,8 @@ impl Request {
             Self::LoadPendingSystemEvents { response, .. }
             | Self::LoadPendingCommunicationEvents { response, .. } => response.is_closed(),
             Self::LoadPendingCommunicationAttachments { response, .. } => response.is_closed(),
+            Self::PhotoUploadExists { response, .. } => response.is_closed(),
+            Self::LoadPendingPhotoUploads { response, .. } => response.is_closed(),
         }
     }
 }
@@ -720,6 +740,71 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Atomically stores one photo Event, stable Outbox intent, and its private upload task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, serialization, constraint, or transaction error. Any error
+    /// leaves no Event, Outbox, or upload-task row from this commit.
+    pub async fn commit_photo_upload(&self, commit: &PhotoUploadCommit) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::CommitPhotoUpload {
+            commit: Box::new(commit.clone()),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Returns whether a photo already has a durable pending or completed upload task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, or query error.
+    pub async fn photo_upload_exists(&self, photo_id: &str) -> Result<bool, DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::PhotoUploadExists {
+            photo_id: photo_id.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Loads bounded private photo upload manifests in durable task order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, decoding, or query error.
+    pub async fn load_pending_photo_uploads(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<PendingPhotoUpload>, DbError> {
+        validate_photo_limit(limit)?;
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::LoadPendingPhotoUploads {
+            limit,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Marks one durable photo upload task completed only after Cloud accepts its media.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, or database error.
+    pub async fn complete_photo_upload(&self, photo_id: &str) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::CompletePhotoUpload {
+            photo_id: photo_id.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Loads at most 200 pending, high-sensitivity communication events in Outbox order.
     ///
     /// # Errors
@@ -1121,6 +1206,18 @@ fn run(
                     &commit,
                 ));
             }
+            Request::CommitPhotoUpload { commit, response } => {
+                let _ = response.send(repository::commit_photo_upload(&mut connection, &commit));
+            }
+            Request::PhotoUploadExists { photo_id, response } => {
+                let _ = response.send(repository::photo_upload_exists(&connection, &photo_id));
+            }
+            Request::LoadPendingPhotoUploads { limit, response } => {
+                let _ = response.send(repository::load_pending_photo_uploads(&connection, limit));
+            }
+            Request::CompletePhotoUpload { photo_id, response } => {
+                let _ = response.send(repository::complete_photo_upload(&connection, &photo_id));
+            }
             Request::LoadPendingCommunicationEvents { limit, response } => {
                 let _ = response.send(repository::load_pending_communication_events(
                     &connection,
@@ -1202,6 +1299,17 @@ fn validate_communication_limit(operation: &'static str, limit: u16) -> Result<(
         Ok(())
     } else {
         Err(DbError::sqlite(operation, "limit must be 1 through 200"))
+    }
+}
+
+fn validate_photo_limit(limit: u16) -> Result<(), DbError> {
+    if (1..=4).contains(&limit) {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "load pending photo uploads",
+            "limit must be 1 through 4",
+        ))
     }
 }
 

@@ -16,6 +16,9 @@ use pca_agentd::{
     },
     communication::{CommunicationAuthorization, CommunicationRuntime},
     pairing_ipc::{PairingIpcServer, PairingIpcServerError, PairingSocket},
+    sleep_ipc::{
+        SleepControlCommand, SleepControlIpcServer, SleepControlIpcServerError, SleepControlSocket,
+    },
 };
 use pca_bridge_client::supervisor::{
     BridgeSupervisor, BridgeSupervisorConfig, BridgeSupervisorError,
@@ -69,6 +72,7 @@ const LIFECYCLE_CAPACITY: usize = 32;
 const CONTROL_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_PERSIST_TIMEOUT: Duration = Duration::from_secs(15);
+const SLEEP_PREPARE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn production_communication_factory(
     local_database: PathBuf,
@@ -102,7 +106,7 @@ pub(crate) async fn execute(command: CommandConfig) -> u8 {
         CommandConfig::Health(paths) => health(&paths),
         CommandConfig::PrepareSleep => {
             eprintln!(
-                "pca-agentd: live prepare-sleep control is unsupported by Bridge protocol v1"
+                "pca-agentd: prepare-sleep is available only through the authenticated Bridge control socket"
             );
             EXIT_UNSUPPORTED
         }
@@ -251,6 +255,9 @@ struct RuntimeResources {
     bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
     pairing_shutdown: Option<watch::Sender<bool>>,
     pairing_task: Option<JoinHandle<Result<(), PairingIpcServerError>>>,
+    sleep_control_shutdown: Option<watch::Sender<bool>>,
+    sleep_control_task: Option<JoinHandle<Result<(), SleepControlIpcServerError>>>,
+    collectors_suspended_for_sleep: bool,
     control: Option<CloudControlOwner>,
     control_bootstrap_task: Option<JoinHandle<()>>,
     heartbeat: Option<LocalHeartbeatWriter>,
@@ -259,12 +266,15 @@ struct RuntimeResources {
 }
 
 struct ControlCapabilityRefresher {
-    sender: mpsc::UnboundedSender<()>,
+    sender: mpsc::Sender<()>,
 }
 
 impl CapabilityRefresher for ControlCapabilityRefresher {
     fn refresh(&self) -> Result<(), CapabilityRefreshError> {
-        self.sender.send(()).map_err(|_| CapabilityRefreshError)
+        match self.sender.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(())) => Err(CapabilityRefreshError),
+        }
     }
 }
 
@@ -279,6 +289,9 @@ impl RuntimeResources {
             bridge_task: None,
             pairing_shutdown: None,
             pairing_task: None,
+            sleep_control_shutdown: None,
+            sleep_control_task: None,
+            collectors_suspended_for_sleep: false,
             control: None,
             control_bootstrap_task: None,
             heartbeat: None,
@@ -339,7 +352,7 @@ impl RuntimeResources {
         );
         let mut wake_refresh_sender = None;
         if !cfg!(feature = "process-test-hooks") {
-            let (sender, mut wake_refresh_receiver) = mpsc::unbounded_channel();
+            let (sender, mut wake_refresh_receiver) = mpsc::channel(1);
             wake_refresh_sender = Some(sender);
             let bootstrap_store = Arc::clone(&credential_store);
             let bootstrap_commands = control_commands.clone();
@@ -396,7 +409,7 @@ impl RuntimeResources {
                         .as_ref()
                         .expect("database exists until cleanup"),
                 ),
-                credential_store,
+                Arc::clone(&credential_store),
                 control_commands,
                 Arc::clone(&network_observations),
                 pairing_shutdown_receiver,
@@ -451,6 +464,17 @@ impl RuntimeResources {
                 .map_err(|_| FailureStage::Lifecycle)?;
         }
         let mut lifecycle_started = lifecycle_identity.is_some();
+
+        let (sleep_control_commands, mut sleep_control_receiver) = mpsc::channel(1);
+        let (sleep_control_shutdown_sender, sleep_control_shutdown_receiver) =
+            watch::channel(false);
+        self.sleep_control_task = Some(start_sleep_control_server(
+            config,
+            Arc::clone(&credential_store),
+            sleep_control_commands,
+            sleep_control_shutdown_receiver,
+        )?);
+        self.sleep_control_shutdown = Some(sleep_control_shutdown_sender);
 
         self.start_system_collector(config, pairing_valid).await?;
         self.communication_runtime = Some(
@@ -554,10 +578,23 @@ impl RuntimeResources {
                 Some(event) = platform_event_receiver.recv() => {
                     if let Some(lifecycle) = self.lifecycle.as_ref() {
                         match lifecycle.record_platform_event(&event).await {
-                            Ok(_) | Err(LifecycleError::IdentityUnavailable) => {}
+                            Ok(_) => {
+                                if event.event_type == "system.wake" {
+                                    self.resume_collectors_after_wake(
+                                        config,
+                                        &communication_authorization,
+                                        *pairing_state_receiver.borrow(),
+                                    ).await?;
+                                }
+                            }
+                            Err(LifecycleError::IdentityUnavailable) => {}
                             Err(_) => return Err(FailureStage::Lifecycle),
                         }
                     }
+                }
+                Some(command) = sleep_control_receiver.recv() => {
+                    let result = self.prepare_for_sleep().await;
+                    let _ = command.response().send(result.map_err(|_| ()));
                 }
             }
         }
@@ -641,6 +678,13 @@ impl RuntimeResources {
             return Err(FailureStage::PairingCleanup);
         }
         if self
+            .sleep_control_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(FailureStage::LifecycleCleanup);
+        }
+        if self
             .control
             .as_ref()
             .is_some_and(CloudControlOwner::is_finished)
@@ -675,6 +719,50 @@ impl RuntimeResources {
         }
         self.start_communication_collector(config, authorization)
             .await
+    }
+
+    async fn prepare_for_sleep(&mut self) -> Result<(), FailureStage> {
+        if self.collectors_suspended_for_sleep {
+            return Ok(());
+        }
+        let lifecycle = self.lifecycle.as_ref().ok_or(FailureStage::Lifecycle)?;
+        if !lifecycle.has_identity().await {
+            return Err(FailureStage::Lifecycle);
+        }
+        if let Some(runtime) = self.system_runtime.take() {
+            tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+                .await
+                .map_err(|_| FailureStage::SystemCollectorCleanup)?
+                .map_err(|_| FailureStage::SystemCollectorCleanup)?;
+        }
+        if let Some(runtime) = self.communication_runtime.take() {
+            tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+                .await
+                .map_err(|_| FailureStage::CommunicationCollectorCleanup)?
+                .map_err(|_| FailureStage::CommunicationCollectorCleanup)?;
+        }
+        tokio::time::timeout(SLEEP_PREPARE_TIMEOUT, lifecycle.prepare_sleep())
+            .await
+            .map_err(|_| FailureStage::Lifecycle)?
+            .map_err(|_| FailureStage::Lifecycle)?;
+        self.collectors_suspended_for_sleep = true;
+        Ok(())
+    }
+
+    async fn resume_collectors_after_wake(
+        &mut self,
+        config: &RunConfig,
+        authorization: &CommunicationAuthorization,
+        paired: bool,
+    ) -> Result<(), FailureStage> {
+        if !self.collectors_suspended_for_sleep {
+            return Ok(());
+        }
+        self.start_system_collector(config, paired).await?;
+        self.start_communication_collector(config, authorization)
+            .await?;
+        self.collectors_suspended_for_sleep = false;
+        Ok(())
     }
 
     async fn start_communication_collector(
@@ -721,6 +809,10 @@ impl RuntimeResources {
             && !self
                 .pairing_task
                 .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            && !self
+                .sleep_control_task
+                .as_ref()
                 .is_some_and(tokio::task::JoinHandle::is_finished);
         tokio::time::timeout(
             STATUS_PERSIST_TIMEOUT,
@@ -739,6 +831,16 @@ impl RuntimeResources {
 
     async fn cleanup(mut self, clean_shutdown: bool) -> Vec<FailureStage> {
         let mut failures = Vec::new();
+
+        if let Some(shutdown) = self.sleep_control_shutdown.take() {
+            shutdown.send_replace(true);
+        }
+        if stop_sleep_control_server(self.sleep_control_task.take())
+            .await
+            .is_err()
+        {
+            failures.push(FailureStage::LifecycleCleanup);
+        }
 
         if let Some(communication_runtime) = self.communication_runtime.take() {
             if communication_runtime.shutdown().await.is_err() {
@@ -937,6 +1039,8 @@ fn start_bridge(
         app_version(),
     )
     .map_err(|_| ())?
+    .with_sleep_control_socket(&config.paths.sleep_control_socket_file)
+    .map_err(|_| ())?
     .with_operation_timeout(Duration::from_secs(10));
     #[cfg(feature = "process-test-hooks")]
     let bridge_config = if config.process_test_fatal_cleanup.is_some() {
@@ -953,6 +1057,35 @@ fn start_bridge(
     .with_lifecycle_events(lifecycle_events)
     .with_screen_capture_commands(screen_capture_commands);
     Ok(tokio::spawn(supervisor.run(shutdown)))
+}
+
+fn start_sleep_control_server(
+    config: &RunConfig,
+    credential_store: Arc<dyn CredentialStore>,
+    commands: mpsc::Sender<SleepControlCommand>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<JoinHandle<Result<(), SleepControlIpcServerError>>, FailureStage> {
+    let socket = SleepControlSocket::bind(&config.paths.sleep_control_socket_file)
+        .map_err(|_| FailureStage::Lifecycle)?;
+    let server = SleepControlIpcServer::new(socket, credential_store, commands);
+    Ok(tokio::spawn(server.serve(shutdown)))
+}
+
+async fn stop_sleep_control_server(
+    sleep_control_task: Option<JoinHandle<Result<(), SleepControlIpcServerError>>>,
+) -> Result<(), FailureStage> {
+    if let Some(task) = sleep_control_task {
+        let mut task = task;
+        let Ok(result) = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut task).await else {
+            task.abort();
+            let _ = task.await;
+            return Err(FailureStage::LifecycleCleanup);
+        };
+        result
+            .map_err(|_| FailureStage::LifecycleCleanup)?
+            .map_err(|_| FailureStage::LifecycleCleanup)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "process-test-hooks")]
@@ -1284,12 +1417,19 @@ mod tests {
 
     #[test]
     fn wake_refresher_requests_immediate_control_reconciliation() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = mpsc::channel(1);
         let refresher = ControlCapabilityRefresher { sender };
 
         refresher.refresh().expect("queue wake refresh");
+        refresher
+            .refresh()
+            .expect("coalesce duplicate wake refresh");
 
         assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

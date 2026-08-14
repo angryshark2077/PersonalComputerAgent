@@ -360,8 +360,9 @@ export default function DevicePage() {
             <>
               <h3>Current network and location</h3>
               <NetworkObservationDetails network={screen.device.status.network} />
+              <p>Last observed {new Date(screen.device.status.observed_at).toLocaleString()}</p>
               <h3 id="network-history">Recent network and location changes</h3>
-              {hasNetworkChanges(screen.device.status.network_history ?? [], screen.device.status.network) ? (
+              {hasNetworkChanges(screen.device.status.network_history ?? []) ? (
                 <ol>
                   {(screen.device.status.network_history ?? []).map((record) => (
                     <li key={`${record.observed_at}:${record.interface_type}:${record.bssid ?? record.observed_exit_ip ?? "none"}`}>
@@ -585,16 +586,8 @@ function NetworkObservationDetails({
 
 function hasNetworkChanges(
   history: Array<NonNullable<NonNullable<DashboardDevice["status"]>["network"]> & { observed_at: string }>,
-  current: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>,
 ): boolean {
-  return history.length > 1
-    || history.some((record) => record.interface_type !== current.interface_type
-      || record.ssid !== current.ssid
-      || record.bssid !== current.bssid
-      || record.observed_exit_ip !== current.observed_exit_ip
-      || record.exit_ip_location?.country !== current.exit_ip_location?.country
-      || record.exit_ip_location?.region !== current.exit_ip_location?.region
-      || record.exit_ip_location?.city !== current.exit_ip_location?.city);
+  return history.length > 1;
 }
 
 function networkLocationLabel(network: NonNullable<NonNullable<DashboardDevice["status"]>["network"]>): string {

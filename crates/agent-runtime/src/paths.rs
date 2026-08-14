@@ -19,6 +19,7 @@ pub struct RuntimePaths {
     pub lock_file: PathBuf,
     pub socket_file: PathBuf,
     pub pairing_socket_file: PathBuf,
+    pub sleep_control_socket_file: PathBuf,
     pub status_file: PathBuf,
 }
 
@@ -37,6 +38,7 @@ impl RuntimePaths {
             lock_file: run_dir.join("agent.lock"),
             socket_file: run_dir.join("bridge.sock"),
             pairing_socket_file: run_dir.join("pairing.sock"),
+            sleep_control_socket_file: run_dir.join("sleep-control.sock"),
             status_file: run_dir.join("runtime-status.json"),
             root,
             app_dir,

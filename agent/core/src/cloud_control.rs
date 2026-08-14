@@ -2265,7 +2265,7 @@ async fn run_media_loop(
                 sync_pending_communication_attachments(&database, &credential, client.as_ref())
                     .await
                     .unwrap_or(0);
-            let _ = upload_pending_photos(client.as_ref(), &credential).await;
+            let _ = upload_pending_photos(&database, client.as_ref(), &credential).await;
             completed_media
         };
         let completed_media = time::timeout(MEDIA_CYCLE_TIMEOUT, cycle)
@@ -2387,7 +2387,19 @@ async fn run_screenshot_loop(
         .await
         .is_err()
         {
-            return Err(CloudControlRuntimeError::WorkerStopped);
+            let timeout_control = controls.borrow().clone();
+            if let Some(control) = timeout_control {
+                let _ = persist_aux_collector_state(
+                    &database,
+                    "screen.capture",
+                    control.screen_capture.enabled,
+                    control.configuration_revision,
+                    false,
+                    Some("SCREEN_UPLOAD_TIMEOUT"),
+                )
+                .await;
+            }
+            continue;
         }
         let Some(control) = controls.borrow().clone() else {
             continue;
@@ -2738,9 +2750,19 @@ fn photo_marker_path(root: &Path, photo_id: &str, marker: PhotoMarker) -> PathBu
     photo_handled_root(root).join(format!("{photo_id}.{}", marker.extension()))
 }
 
-pub(crate) async fn photo_asset_is_handled(photo_id: &str) -> Result<bool, ControlError> {
+pub(crate) async fn photo_asset_is_handled(
+    database: &DbActorHandle,
+    photo_id: &str,
+) -> Result<bool, ControlError> {
     if Uuid::parse_str(photo_id).is_err() {
         return Err(ControlError::Contract);
+    }
+    if database
+        .photo_upload_exists(photo_id)
+        .await
+        .map_err(|_| ControlError::Transient)?
+    {
+        return Ok(true);
     }
     let root = photo_spool_root()?;
     for path in [
@@ -2787,34 +2809,84 @@ pub(crate) async fn persist_photo_marker(
         .map_err(|_| ControlError::Transient)
 }
 
-pub(crate) async fn persist_photo_manifest(photo: &PendingPhoto) -> Result<(), ControlError> {
-    let root = photo_spool_root()?;
-    tokio::fs::create_dir_all(&root)
-        .await
-        .map_err(|_| ControlError::Transient)?;
-    tokio::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .await
-        .map_err(|_| ControlError::Transient)?;
-    let bytes = serde_json::to_vec(photo).map_err(|_| ControlError::Contract)?;
-    let final_path = root.join(format!("{}.json", photo.photo_id));
-    let temporary_path = root.join(format!(".{}.tmp", photo.photo_id));
-    tokio::fs::write(&temporary_path, bytes)
-        .await
-        .map_err(|_| ControlError::Transient)?;
-    tokio::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600))
-        .await
-        .map_err(|_| ControlError::Transient)?;
-    tokio::fs::rename(temporary_path, final_path)
-        .await
-        .map_err(|_| ControlError::Transient)
-}
-
 async fn upload_pending_photos(
+    database: &DbActorHandle,
     client: &dyn ControlClient,
     credentials: &DeviceCredential,
 ) -> Result<(), ControlError> {
     let root = photo_spool_root()?;
-    for path in pending_manifest_paths(&root).await?.into_iter().take(4) {
+    for task in database
+        .load_pending_photo_uploads(4)
+        .await
+        .map_err(|_| ControlError::Transient)?
+    {
+        let already_terminal = tokio::fs::try_exists(photo_marker_path(
+            &root,
+            &task.photo_id,
+            PhotoMarker::Completed,
+        ))
+        .await
+        .map_err(|_| ControlError::Transient)?
+            || tokio::fs::try_exists(photo_marker_path(
+                &root,
+                &task.photo_id,
+                PhotoMarker::Oversized,
+            ))
+            .await
+            .map_err(|_| ControlError::Transient)?;
+        if already_terminal {
+            database
+                .complete_photo_upload(&task.photo_id)
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            continue;
+        }
+        let photo: PendingPhoto =
+            serde_json::from_str(&task.manifest_json).map_err(|_| ControlError::Contract)?;
+        if photo.photo_id != task.photo_id
+            || Uuid::parse_str(&photo.photo_id).is_err()
+            || Uuid::parse_str(&photo.event_id).is_err()
+            || photo.media_file_name.as_deref() != Some(photo.photo_id.as_str())
+        {
+            return Err(ControlError::Contract);
+        }
+        let media_path = root.join(
+            photo
+                .media_file_name
+                .as_deref()
+                .ok_or(ControlError::Contract)?,
+        );
+        if media_path.parent().is_none_or(|parent| parent != root) {
+            return Err(ControlError::Contract);
+        }
+        if photo.size_bytes > 500 * 1024 * 1024 {
+            remove_uploaded_media_file(&media_path).await?;
+            persist_photo_marker(&photo.photo_id, PhotoMarker::Oversized).await?;
+            database
+                .complete_photo_upload(&photo.photo_id)
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            continue;
+        }
+        if client.sync_photo(credentials, &photo).await.is_err() {
+            continue;
+        }
+        remove_uploaded_media_file(&media_path).await?;
+        persist_photo_marker(&photo.photo_id, PhotoMarker::Completed).await?;
+        database
+            .complete_photo_upload(&photo.photo_id)
+            .await
+            .map_err(|_| ControlError::Transient)?;
+    }
+    upload_pending_legacy_photos(client, credentials, &root).await
+}
+
+async fn upload_pending_legacy_photos(
+    client: &dyn ControlClient,
+    credentials: &DeviceCredential,
+    root: &Path,
+) -> Result<(), ControlError> {
+    for path in pending_manifest_paths(root).await?.into_iter().take(4) {
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|_| ControlError::Transient)?;
@@ -2862,7 +2934,7 @@ async fn upload_pending_photos(
                 .as_deref()
                 .ok_or(ControlError::Contract)?,
         );
-        if media_path.parent() != Some(root.as_path()) {
+        if media_path.parent() != Some(root) {
             return Err(ControlError::Contract);
         }
         remove_uploaded_media_file(&media_path).await?;
@@ -2982,7 +3054,7 @@ async fn sync_pending_system_events(
     }
     if !rejected.is_empty() {
         let event_ids = rejected.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        persist_rejected_event_health(database, &events, &event_ids, "CLOUD_SYSTEM_EVENT_REJECTED")
+        persist_rejected_event_health(database, &events, &event_ids, "SYNC_PAYLOAD_REJECTED")
             .await?;
         database
             .dead_letter_rejected_system_events(&event_ids)
@@ -3044,13 +3116,8 @@ async fn sync_pending_communication_events(
     }
     if !rejected.is_empty() {
         let event_ids = rejected.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        persist_rejected_event_health(
-            database,
-            &events,
-            &event_ids,
-            "CLOUD_COMMUNICATION_EVENT_REJECTED",
-        )
-        .await?;
+        persist_rejected_event_health(database, &events, &event_ids, "SYNC_PAYLOAD_REJECTED")
+            .await?;
         database
             .dead_letter_rejected_communication_events(&event_ids)
             .await
@@ -3101,7 +3168,7 @@ fn collector_key_for_event(event: &EventEnvelope) -> &'static str {
     match event.source.as_str() {
         "communication.wechat" => "communication.wechat",
         "communication.messages" => "communication.messages",
-        "photos.library" => "photos",
+        "photos.library" => "photos.library",
         _ if event.event_type.starts_with("network.") => "network",
         _ => "system",
     }
@@ -4928,6 +4995,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression verifies rejection, sync fencing, and recovery in one lifecycle"
+    )]
     async fn cloud_rejected_system_event_is_quarantined_without_outbox_backpressure() {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
@@ -4984,8 +5055,59 @@ mod tests {
         assert_eq!(state.status, CollectorStatus::Degraded);
         assert_eq!(
             state.last_error_code.as_deref(),
-            Some("CLOUD_SYSTEM_EVENT_REJECTED")
+            Some("SYNC_PAYLOAD_REJECTED")
         );
+
+        let healthy_observation = CollectorState {
+            collector_key: "system".to_owned(),
+            collector_version: "test".to_owned(),
+            status: CollectorStatus::Running,
+            desired_config_revision: 1,
+            applied_config_revision: 1,
+            last_event_at_ms: Some(2),
+            last_health_at_ms: Some(2),
+            last_error_code: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        database
+            .upsert_collector_state(&healthy_observation)
+            .await
+            .expect("persist local healthy observation");
+        let fenced = database
+            .load_collector_states()
+            .await
+            .expect("load fenced collector health")
+            .into_iter()
+            .find(|state| state.collector_key == "system")
+            .expect("system collector health");
+        assert_eq!(fenced.status, CollectorStatus::Degraded);
+        assert_eq!(
+            fenced.last_error_code.as_deref(),
+            Some("SYNC_PAYLOAD_REJECTED")
+        );
+
+        let accepted = system_metric_event("01986666-7666-8666-8666-666666666670");
+        database
+            .append_event_with_outbox(&accepted)
+            .await
+            .expect("persist recovery event");
+        sync_pending_system_events(&database, &credential, &AcceptingSyncClient)
+            .await
+            .expect("accept recovery event");
+        database
+            .upsert_collector_state(&healthy_observation)
+            .await
+            .expect("persist recovered collector health");
+        let recovered = database
+            .load_collector_states()
+            .await
+            .expect("load recovered collector health")
+            .into_iter()
+            .find(|state| state.collector_key == "system")
+            .expect("system collector health");
+        assert_eq!(recovered.status, CollectorStatus::Running);
+        assert_eq!(recovered.last_error_code, None);
         database.shutdown().await.expect("shutdown database");
     }
 

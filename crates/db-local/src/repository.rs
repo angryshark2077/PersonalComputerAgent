@@ -26,7 +26,7 @@ use std::{
 use crate::actor::{ProcessTestBarrier, ProcessTestHooks};
 use crate::{
     migrations::MAX_SUPPORTED_SCHEMA_VERSION, CommunicationMessageCommit, DbError, DbHealth,
-    PairingState, PendingCommunicationAttachment,
+    PairingState, PendingCommunicationAttachment, PendingPhotoUpload, PhotoUploadCommit,
 };
 
 struct SerializedEvent<'a> {
@@ -145,6 +145,171 @@ pub(crate) fn commit_communication_message(
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit communication message transaction", error))
+}
+
+pub(crate) fn commit_photo_upload(
+    connection: &mut Connection,
+    commit: &PhotoUploadCommit,
+) -> Result<(), DbError> {
+    validate_photo_upload_commit(commit)?;
+    let serialized = serialize_event(&commit.event)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start photo upload transaction", error))?;
+    insert_event(&transaction, &serialized)?;
+    insert_stable_outbox(&transaction, &serialized)?;
+    let created_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .map_err(|_| DbError::sqlite("read photo upload timestamp", "out of range"))?;
+    let inserted = transaction
+        .execute(
+            "INSERT INTO photo_upload_spool (
+                photo_id, event_id, manifest_json, transfer_state, created_at_ms
+             ) VALUES (?1, ?2, ?3, 'pending', ?4)
+             ON CONFLICT(photo_id) DO NOTHING",
+            params![
+                commit.photo_id,
+                commit.event.event_id,
+                commit.manifest_json,
+                created_at_ms,
+            ],
+        )
+        .map_err(|error| DbError::sqlite("insert photo upload task", error))?;
+    if inserted == 0 {
+        let identical = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM photo_upload_spool
+                    WHERE photo_id = ?1
+                      AND event_id = ?2
+                      AND manifest_json = ?3
+                )",
+                params![commit.photo_id, commit.event.event_id, commit.manifest_json],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| DbError::sqlite("validate existing photo upload task", error))?;
+        if !identical {
+            return Err(DbError::sqlite(
+                "validate existing photo upload task",
+                "photo ID conflicts with different immutable upload data",
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit photo upload transaction", error))
+}
+
+fn validate_photo_upload_commit(commit: &PhotoUploadCommit) -> Result<(), DbError> {
+    if !is_uuid_like(&commit.photo_id)
+        || commit.event.event_id.trim().is_empty()
+        || commit.event.event_type != "photos.asset_recorded"
+        || commit.event.source != "photos.library"
+        || commit.event.schema_version != 1
+        || commit.event.sensitivity != Sensitivity::High
+        || commit.event.attachment_refs != Vec::<String>::new()
+    {
+        return Err(DbError::sqlite(
+            "validate photo upload commit",
+            "event does not match the fixed photo upload contract",
+        ));
+    }
+    let manifest = serde_json::from_str::<serde_json::Value>(&commit.manifest_json)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    if manifest.get("photo_id").and_then(serde_json::Value::as_str)
+        != Some(commit.photo_id.as_str())
+        || manifest.get("event_id").and_then(serde_json::Value::as_str)
+            != Some(commit.event.event_id.as_str())
+    {
+        return Err(DbError::sqlite(
+            "validate photo upload commit",
+            "manifest does not match the immutable photo event identity",
+        ));
+    }
+    Ok(())
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) && byte == b'-' || byte.is_ascii_hexdigit()
+        })
+}
+
+pub(crate) fn photo_upload_exists(
+    connection: &Connection,
+    photo_id: &str,
+) -> Result<bool, DbError> {
+    if !is_uuid_like(photo_id) {
+        return Err(DbError::sqlite(
+            "check photo upload task",
+            "photo ID is not a UUID",
+        ));
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM photo_upload_spool WHERE photo_id = ?1)",
+            [photo_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| DbError::sqlite("check photo upload task", error))
+}
+
+pub(crate) fn load_pending_photo_uploads(
+    connection: &Connection,
+    limit: u16,
+) -> Result<Vec<PendingPhotoUpload>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT photo_id, manifest_json
+             FROM photo_upload_spool
+             WHERE transfer_state = 'pending'
+             ORDER BY created_at_ms, photo_id
+             LIMIT ?1",
+        )
+        .map_err(|error| DbError::sqlite("prepare pending photo upload query", error))?;
+    let rows = statement
+        .query_map([i64::from(limit)], |row| {
+            Ok(PendingPhotoUpload {
+                photo_id: row.get(0)?,
+                manifest_json: row.get(1)?,
+            })
+        })
+        .map_err(|error| DbError::sqlite("query pending photo uploads", error))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DbError::sqlite("read pending photo upload", error))
+}
+
+pub(crate) fn complete_photo_upload(
+    connection: &Connection,
+    photo_id: &str,
+) -> Result<(), DbError> {
+    if !is_uuid_like(photo_id) {
+        return Err(DbError::sqlite(
+            "complete photo upload",
+            "photo ID is not a UUID",
+        ));
+    }
+    let updated = connection
+        .execute(
+            "UPDATE photo_upload_spool
+             SET transfer_state = 'completed',
+                 completed_at_ms = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+             WHERE photo_id = ?1 AND transfer_state = 'pending'",
+            [photo_id],
+        )
+        .map_err(|error| DbError::sqlite("complete photo upload", error))?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(DbError::sqlite(
+            "complete photo upload",
+            "photo upload is not pending",
+        ))
+    }
 }
 
 fn validate_communication_commit(commit: &CommunicationMessageCommit) -> Result<(), DbError> {
@@ -953,13 +1118,25 @@ pub(crate) fn upsert_collector_state_in(
                 created_at_ms, updated_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(collector_key) DO UPDATE SET
-                status = excluded.status,
+                status = CASE
+                    WHEN collector_states.last_error_code = 'SYNC_PAYLOAD_REJECTED'
+                     AND excluded.status = 'running'
+                     AND excluded.last_error_code IS NULL
+                    THEN 'degraded'
+                    ELSE excluded.status
+                END,
                 version = excluded.version,
                 desired_revision = excluded.desired_revision,
                 applied_revision = excluded.applied_revision,
                 last_event_at_ms = excluded.last_event_at_ms,
                 last_health_at_ms = excluded.last_health_at_ms,
-                last_error_code = excluded.last_error_code,
+                last_error_code = CASE
+                    WHEN collector_states.last_error_code = 'SYNC_PAYLOAD_REJECTED'
+                     AND excluded.status = 'running'
+                     AND excluded.last_error_code IS NULL
+                    THEN collector_states.last_error_code
+                    ELSE excluded.last_error_code
+                END,
                 created_at_ms = excluded.created_at_ms,
                 updated_at_ms = excluded.updated_at_ms",
             params![
@@ -1358,6 +1535,7 @@ pub(crate) fn acknowledge_system_events(
                 "event was not pending system data",
             ));
         }
+        clear_sync_failure_after_acknowledgement(&transaction, event_id)?;
     }
     transaction
         .commit()
@@ -1368,12 +1546,7 @@ pub(crate) fn dead_letter_rejected_system_events(
     connection: &mut Connection,
     event_ids: &[String],
 ) -> Result<(), DbError> {
-    dead_letter_rejected_events(
-        connection,
-        event_ids,
-        "system",
-        "CLOUD_SYSTEM_EVENT_REJECTED",
-    )
+    dead_letter_rejected_events(connection, event_ids, "system", "SYNC_DEAD_LETTER")
 }
 
 pub(crate) fn load_pending_communication_events(
@@ -1486,6 +1659,7 @@ pub(crate) fn acknowledge_communication_events(
                 "event was not pending communication data",
             ));
         }
+        clear_sync_failure_after_acknowledgement(&transaction, event_id)?;
     }
     transaction
         .commit()
@@ -1496,12 +1670,32 @@ pub(crate) fn dead_letter_rejected_communication_events(
     connection: &mut Connection,
     event_ids: &[String],
 ) -> Result<(), DbError> {
-    dead_letter_rejected_events(
-        connection,
-        event_ids,
-        "communication",
-        "CLOUD_COMMUNICATION_EVENT_REJECTED",
-    )
+    dead_letter_rejected_events(connection, event_ids, "communication", "SYNC_DEAD_LETTER")
+}
+
+fn clear_sync_failure_after_acknowledgement(
+    transaction: &Transaction<'_>,
+    event_id: &str,
+) -> Result<(), DbError> {
+    transaction
+        .execute(
+            "UPDATE collector_states
+             SET last_error_code = NULL
+             WHERE last_error_code = 'SYNC_PAYLOAD_REJECTED'
+               AND collector_key = (
+                    SELECT CASE
+                        WHEN source = 'communication.wechat' THEN 'communication.wechat'
+                        WHEN source = 'communication.messages' THEN 'communication.messages'
+                        WHEN source = 'photos.library' THEN 'photos.library'
+                        WHEN event_type LIKE 'network.%' THEN 'network'
+                        ELSE 'system'
+                    END
+                    FROM events_local WHERE event_id = ?1
+               )",
+            [event_id],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("clear recovered sync failure", error))
 }
 
 fn dead_letter_rejected_events(

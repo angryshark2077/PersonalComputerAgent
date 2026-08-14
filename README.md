@@ -42,7 +42,7 @@ security find-identity -v -p codesigning
 ./scripts/build-s1a-dmg.sh \
   --team-id "$PCA_TEAM_ID" \
   --identity "$PCA_APPLE_DEVELOPMENT_IDENTITY" \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --output dist/PersonalComputerAgent-S1A-arm64.dmg
 ```
 

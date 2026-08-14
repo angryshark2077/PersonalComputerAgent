@@ -5,3 +5,4 @@ mod apple_photos;
 pub mod cloud_control;
 pub mod communication;
 pub mod pairing_ipc;
+pub mod sleep_ipc;

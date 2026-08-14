@@ -871,7 +871,7 @@ AND extension_reports_active_tab</th>
 
 ## 12.6 Sleep / Wake / Lid Close
 
-- Swift Bridge 发送 willSleep：Rust 停止新截图、Provider watcher 和命令副作用，提交 SQLite 事务，WAL checkpoint，写 sleep Event。
+- Swift Bridge 在 AppKit `willSleep` 的有界等待窗口内，通过仅限本机、0600 Unix socket 且使用 Bridge shared secret 认证的 `prepare_sleep` 请求等待 Rust 确认；Rust 先停止 System/Communication collector，再提交 SQLite 事务、WAL checkpoint 并写 sleep Event。认证、超时或 Agent 不可用时，Bridge 仍记录生命周期事件，但不宣称已完成 flush。
 
 - 睡眠期间不采集、不上传、不执行命令，Dashboard 显示 sleeping 或 offline。
 
@@ -1433,7 +1433,7 @@ Agent BrowserCollector<br />
 | Collector   | collector_configs, collector_states, permission_states                                                                        | 配置 revision 双向，状态上行。     |
 | Event       | events_local                                                                                                                  | 创建源；进入 Outbox。              |
 | Projection  | activity_sessions_local, browser_visits_local, messages_local, location_points_local, file_events_local, system_metrics_local | 短期缓存；可重建。                 |
-| Assets      | screenshots_local, attachments_local                                                                                          | 上传前本地事实，ACK 后按策略清理。 |
+| Assets      | screenshots_local, attachments_local, photo_upload_spool                                                                      | 上传前本地事实，ACK 后按策略清理。 |
 | Sync        | sync_outbox, sync_attachment_outbox, sync_cursors, sync_dead_letters, tombstones_local                                        | 可靠同步。                         |
 | Commands    | agent_commands_local, command_attempts_local                                                                                  | 执行和恢复点。                     |
 | Diagnostics | diagnostic_events, update_state                                                                                               | 脱敏本地诊断。                     |
@@ -2275,6 +2275,19 @@ rustfmt、clippy -D warnings、cargo nextest、Rust/Swift/TypeScript 编译、Br
 | updated_at_ms    | INTEGER  | NOT NULL        | 更新时间，UTC epoch ms      |
 
 `collector_key` 主键已覆盖状态读取，本切片不增加额外索引。每个 Collector 结果的 Event、对应 Sync Outbox 行和最新 `collector_states` 必须在 DbActor 的同一 SQLite 事务中提交；任一写入失败则全部回滚。
+
+**photo_upload_spool · 公共字段：—**
+
+| **字段**        | **类型** | **约束/默认**                           | **说明**                                  |
+|-----------------|----------|-------------------------------------------|-------------------------------------------|
+| photo_id        | TEXT     | PRIMARY KEY，UUID                         | 私有照片任务 ID                           |
+| event_id        | TEXT     | UNIQUE NOT NULL，FK → events_local        | 对应 `photos.asset_recorded` Event        |
+| manifest_json   | TEXT     | NOT NULL，json_valid                      | 私有照片元数据与本地媒体文件名            |
+| transfer_state  | TEXT     | pending/completed，DEFAULT 'pending'      | 云端媒体上传终态                          |
+| created_at_ms   | INTEGER  | NOT NULL                                  | 任务落盘时间，UTC epoch ms                |
+| completed_at_ms | INTEGER  | NULL                                      | Cloud 确认媒体后写入，UTC epoch ms        |
+
+新照片的 Event、对应 `sync_outbox` 行和 `photo_upload_spool` 行必须在同一 DbActor SQLite 事务中提交。媒体文件继续仅保存于私有 PhotoSpool 目录；升级时遗留 JSON manifest 仅兼容读取，不能作为新任务的事实源。
 
 **agent_commands_local · 公共字段：LOCAL_ROW**
 

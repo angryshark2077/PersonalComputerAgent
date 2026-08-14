@@ -21,6 +21,7 @@ EXPECTED_TABLES = [
     "communication_message_attachments",
     "communication_messages",
     "communication_objects",
+    "device_collector_health",
     "device_credential_generations",
     "device_heartbeats",
     "device_media_cleanup_requests",

@@ -133,6 +133,10 @@ impl LifecycleRuntime {
         *self.identity.write().await = identity;
     }
 
+    pub(crate) async fn has_identity(&self) -> bool {
+        self.identity.read().await.is_some()
+    }
+
     pub(crate) async fn record_platform_event(
         &self,
         event: &PlatformLifecycleEvent,

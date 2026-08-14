@@ -214,6 +214,7 @@ pub fn screen_capture_command_channel() -> (ScreenCaptureCommandHandle, ScreenCa
 pub struct BridgeSupervisorConfig {
     executable_path: PathBuf,
     client_config: BridgeClientConfig,
+    sleep_control_socket_path: Option<PathBuf>,
     operation_timeout: Duration,
     backoff_base: Duration,
     backoff_cap: Duration,
@@ -265,11 +266,42 @@ impl BridgeSupervisorConfig {
         Ok(Self {
             executable_path: executable_path.to_path_buf(),
             client_config,
+            sleep_control_socket_path: None,
             operation_timeout: Duration::from_secs(1),
             backoff_base: DEFAULT_BACKOFF,
             backoff_cap: MAX_BACKOFF,
             stable_ready: DEFAULT_STABLE_READY,
         })
+    }
+
+    /// Adds the Agent-owned authenticated endpoint used to prepare durable local state for sleep.
+    ///
+    /// # Errors
+    ///
+    /// Rejects paths outside the Bridge socket's secure run directory.
+    pub fn with_sleep_control_socket(
+        mut self,
+        socket_path: impl AsRef<Path>,
+    ) -> Result<Self, BridgeClientError> {
+        let socket_path = socket_path.as_ref();
+        let parent = socket_path
+            .parent()
+            .ok_or(BridgeClientError::InvalidConfiguration)?;
+        let bridge_socket_parent = self
+            .client_config
+            .socket_path()
+            .parent()
+            .ok_or(BridgeClientError::InvalidConfiguration)?;
+        if !socket_path.is_absolute()
+            || socket_path.as_os_str().is_empty()
+            || socket_path == Path::new("/")
+            || has_parent_traversal(socket_path)
+            || parent != bridge_socket_parent
+        {
+            return Err(BridgeClientError::InvalidConfiguration);
+        }
+        self.sleep_control_socket_path = Some(socket_path.to_path_buf());
+        Ok(self)
     }
 
     #[must_use]
@@ -360,7 +392,8 @@ impl BridgeSupervisor {
 
     /// Runs the Bridge child lifecycle until cancellation or protocol incompatibility.
     ///
-    /// The signed helper executable is started directly with exactly `--socket <absolute-path>`;
+    /// The signed helper executable is started directly with its Bridge socket and, when enabled,
+    /// its Agent-owned sleep-control socket;
     /// its production app wrapper relaunches the server through `LaunchServices` so macOS privacy
     /// permissions are attributed to the signed helper bundle. No shell, command interpolation,
     /// secret environment variable, or inherited standard stream is used.
@@ -633,9 +666,14 @@ async fn connect_until_ready(
 }
 
 fn spawn_bridge(config: &BridgeSupervisorConfig) -> Result<Child, ()> {
-    Command::new(&config.executable_path)
+    let mut command = Command::new(&config.executable_path);
+    command
         .arg("--socket")
-        .arg(config.client_config.socket_path())
+        .arg(config.client_config.socket_path());
+    if let Some(socket_path) = &config.sleep_control_socket_path {
+        command.arg("--sleep-control-socket").arg(socket_path);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

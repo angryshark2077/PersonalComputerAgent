@@ -73,6 +73,7 @@ class EngineeringGateTests(unittest.TestCase):
         self.assertIn("0010_add_file_messages.sql sha256=", result.stdout)
         self.assertIn("0011_repair_apple_message_idempotency.sql sha256=", result.stdout)
         self.assertIn("0012_normalize_apple_message_timestamps.sql sha256=", result.stdout)
+        self.assertIn("0013_photo_upload_spool.sql sha256=", result.stdout)
         self.assertIn("0001_s1b_control_plane.sql sha256=", result.stdout)
         self.assertIn("0002_s1b_device_revocation_audit.sql sha256=", result.stdout)
         self.assertIn("0003_s1b_pairing_state_and_better_auth_session.sql sha256=", result.stdout)
@@ -83,6 +84,7 @@ class EngineeringGateTests(unittest.TestCase):
         self.assertIn("0015_network_locations.sql sha256=", result.stdout)
         self.assertIn("0025_device_network_history.sql sha256=", result.stdout)
         self.assertIn("0026_refresh_credential_replay.sql sha256=", result.stdout)
+        self.assertIn("0027_device_collector_health.sql sha256=", result.stdout)
 
     def test_domain_to_platform_import_is_rejected(self) -> None:
         root = self.make_repo()

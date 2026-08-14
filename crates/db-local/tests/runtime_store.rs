@@ -10,9 +10,10 @@ use std::{
 };
 
 use pca_db_local::{
-    DbActorHandle, DbError, BASELINE_MIGRATION, NORMALIZE_APPLE_MESSAGE_TIMESTAMPS_MIGRATION,
-    REPAIR_APPLE_MESSAGE_IDEMPOTENCY_MIGRATION, S1A_RUNTIME_MIGRATION,
-    S1B_CLOUD_API_ORIGIN_MIGRATION, S1B_PAIRING_STATE_MIGRATION, S2_COLLECTOR_STATE_MIGRATION,
+    DbActorHandle, DbError, PhotoUploadCommit, BASELINE_MIGRATION,
+    NORMALIZE_APPLE_MESSAGE_TIMESTAMPS_MIGRATION, REPAIR_APPLE_MESSAGE_IDEMPOTENCY_MIGRATION,
+    S1A_RUNTIME_MIGRATION, S1B_CLOUD_API_ORIGIN_MIGRATION, S1B_PAIRING_STATE_MIGRATION,
+    S2_COLLECTOR_STATE_MIGRATION,
 };
 use pca_domain::{
     AgentStatus, BridgeStatus, CollectorState, CollectorStatus, EventCommit, EventEnvelope,
@@ -94,6 +95,23 @@ fn system_metric_event(event_id: &str) -> EventEnvelope {
         payload,
         attachment_refs: Vec::new(),
         idempotency_key: Some(format!("system:{event_id}")),
+    }
+}
+
+fn photo_event(event_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        event_id: event_id.to_owned(),
+        workspace_id: "01983333-7333-8333-8333-333333333333".to_owned(),
+        device_id: "01982222-7222-8222-2222-222222222222".to_owned(),
+        event_type: "photos.asset_recorded".to_owned(),
+        source: "photos.library".to_owned(),
+        schema_version: 1,
+        occurred_at: "2026-08-02T00:00:00Z".to_owned(),
+        created_at: "2026-08-02T00:00:00Z".to_owned(),
+        sensitivity: Sensitivity::High,
+        payload: Map::new(),
+        attachment_refs: Vec::new(),
+        idempotency_key: Some("photos:asset:test".to_owned()),
     }
 }
 
@@ -260,7 +278,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 12);
+    assert_eq!(health.schema_version, 13);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -285,6 +303,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
             "local_meta",
             "local_tombstones",
             "pairing_state",
+            "photo_upload_spool",
             "schema_migrations",
             "sync_outbox",
         ]
@@ -415,7 +434,7 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        12
+        13
     );
     db.shutdown().await.expect("close upgraded database");
 
@@ -956,12 +975,59 @@ async fn rejected_system_event_is_dead_lettered_with_a_redacted_diagnostic() {
         connection
             .query_row(
                 "SELECT code FROM diagnostic_events WHERE diagnostic_id = ?1",
-                [format!("CLOUD_SYSTEM_EVENT_REJECTED:{}", event.event_id)],
+                [format!("SYNC_DEAD_LETTER:{}", event.event_id)],
                 |row| row.get::<_, String>(0),
             )
             .expect("read rejected diagnostic"),
-        "CLOUD_SYSTEM_EVENT_REJECTED"
+        "SYNC_DEAD_LETTER"
     );
+}
+
+#[tokio::test]
+async fn photo_upload_commit_keeps_event_outbox_and_manifest_in_one_transaction() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let event = photo_event("01986666-7666-8666-8666-666666666671");
+    let photo_id = "01986666-7666-8666-8666-666666666672";
+    let manifest_json = serde_json::json!({
+        "photo_id": photo_id,
+        "event_id": event.event_id,
+        "media_file_name": photo_id,
+    })
+    .to_string();
+
+    db.commit_photo_upload(&PhotoUploadCommit {
+        event: event.clone(),
+        photo_id: photo_id.to_owned(),
+        manifest_json,
+    })
+    .await
+    .expect("commit photo upload");
+
+    assert_eq!(
+        db.count_event_and_outbox(&event.event_id)
+            .await
+            .expect("count event and outbox"),
+        (1, 1)
+    );
+    let pending = db
+        .load_pending_photo_uploads(4)
+        .await
+        .expect("load pending photo upload");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].photo_id, photo_id);
+
+    db.complete_photo_upload(photo_id)
+        .await
+        .expect("complete photo upload");
+    assert!(db
+        .load_pending_photo_uploads(4)
+        .await
+        .expect("load completed photo upload")
+        .is_empty());
+    db.shutdown().await.expect("close database");
 }
 
 #[tokio::test]
@@ -1030,7 +1096,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0013', 'future', '13.0.0', 1, 1, 'completed')",
+             VALUES ('0014', 'future', '14.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -1041,8 +1107,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 13,
-            max_supported: 12
+            found: 14,
+            max_supported: 13
         })
     ));
 }
@@ -1065,7 +1131,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 12);
+    assert_eq!(health.schema_version, 13);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(

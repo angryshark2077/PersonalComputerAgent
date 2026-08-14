@@ -11,14 +11,24 @@ private enum BridgeArgumentsError: Error {
 
 private struct BridgeArguments {
     let socketURL: URL
+    let sleepControlSocketURL: URL?
 
     static func parse(_ arguments: [String]) throws -> BridgeArguments {
-        guard arguments.count == 3,
+        guard (arguments.count == 3 || arguments.count == 5),
               arguments[1] == "--socket",
               arguments[2].hasPrefix("/") else {
             throw BridgeArgumentsError.invalid
         }
-        return BridgeArguments(socketURL: URL(fileURLWithPath: arguments[2]))
+        if arguments.count == 5 {
+            guard arguments[3] == "--sleep-control-socket", arguments[4].hasPrefix("/") else {
+                throw BridgeArgumentsError.invalid
+            }
+            return BridgeArguments(
+                socketURL: URL(fileURLWithPath: arguments[2]),
+                sleepControlSocketURL: URL(fileURLWithPath: arguments[4])
+            )
+        }
+        return BridgeArguments(socketURL: URL(fileURLWithPath: arguments[2]), sleepControlSocketURL: nil)
     }
 }
 
@@ -36,10 +46,15 @@ public enum PlatformBridgeExecutable {
         signalRuntime: TerminationSignalRuntime
     ) async -> Int32 {
         let server: BridgeServer
+        let sleepControlSocketURL: URL?
         do {
             let arguments = try BridgeArguments.parse(commandLineArguments)
             let validator = SocketPathValidator()
             try validator.validate(socketURL: arguments.socketURL)
+            if let sleepControlSocketURL = arguments.sleepControlSocketURL {
+                try validator.validate(socketURL: sleepControlSocketURL)
+            }
+            sleepControlSocketURL = arguments.sleepControlSocketURL
             server = BridgeServer(
                 socketURL: arguments.socketURL,
                 pathValidator: validator,
@@ -49,18 +64,23 @@ public enum PlatformBridgeExecutable {
         } catch {
             return startupFailureCode(signalRuntime: signalRuntime)
         }
-        return await run(server: server, signalRuntime: signalRuntime)
+        return await run(
+            server: server,
+            sleepControlSocketURL: sleepControlSocketURL,
+            signalRuntime: signalRuntime
+        )
     }
 
     static func run(
         server: BridgeServer,
+        sleepControlSocketURL: URL? = nil,
         signalRuntime: TerminationSignalRuntime
     ) async -> Int32 {
         if let failureCode = await start(server: server, signalRuntime: signalRuntime) {
             return failureCode
         }
         signalRuntime.startReader()
-        return await serveStarted(server: server)
+        return await serveStarted(server: server, sleepControlSocketURL: sleepControlSocketURL)
     }
 
     static func start(
@@ -78,9 +98,16 @@ public enum PlatformBridgeExecutable {
         }
     }
 
-    static func serveStarted(server: BridgeServer) async -> Int32 {
+    static func serveStarted(server: BridgeServer, sleepControlSocketURL: URL? = nil) async -> Int32 {
+        let sleepControl = sleepControlSocketURL.map {
+            SleepControlClient(
+                socketURL: $0,
+                credentialProvider: KeychainBridgeCredentialProvider()
+            )
+        }
         let powerMonitor = await MainActor.run {
             let monitor = PowerMonitor { event in
+                if event == .systemSleep { _ = sleepControl?.prepareSleep() }
                 server.recordPowerLifecycleEvent(event)
             }
             monitor.start()

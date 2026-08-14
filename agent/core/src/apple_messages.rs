@@ -77,14 +77,14 @@ pub(crate) async fn run(
                                     Some("MESSAGES_COLLECTION_TIMEOUT"),
                                 ),
                             ).await;
-                            return;
+                            continue;
                         },
                         None => Err("MESSAGES_DATABASE_UNAVAILABLE"),
                     }
                 } else {
                     Ok(false)
                 };
-                if !matches!(time::timeout(
+                let _ = time::timeout(
                     STATE_PERSIST_DEADLINE,
                     persist_aux_collector_state(
                         &database,
@@ -94,9 +94,8 @@ pub(crate) async fn run(
                         result.as_ref().copied().unwrap_or(false),
                         result.err(),
                     ),
-                ).await, Ok(Ok(()))) {
-                    return;
-                }
+                )
+                .await;
             }
             changed = controls.changed() => {
                 if changed.is_err() { return; }

@@ -327,7 +327,7 @@ test("network history records identity changes only and retains the latest five"
   assert.equal(device?.status?.networkHistory[4]?.network.ssid, "WiFi 2");
 });
 
-test("network history ignores rotating exit IPs but records local address changes", async () => {
+test("network history keeps one Wi-Fi entry while heartbeat details refresh", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);
   const deviceId = "01981111-7111-8111-8111-111111111111";
@@ -365,12 +365,11 @@ test("network history ignores rotating exit IPs but records local address change
 
   const [device] = await repository.listOwnerDevices(workspaceId, ownerUserId);
   assert.equal(device?.status?.network?.observedExitIp, "203.0.113.2");
-  assert.equal(device?.status?.networkHistory.length, 2);
-  assert.equal(device?.status?.networkHistory[0]?.network.localIpv4, "192.168.1.21");
-  assert.equal(device?.status?.networkHistory[1]?.network.localIpv4, "192.168.1.20");
+  assert.equal(device?.status?.networkHistory.length, 1);
+  assert.equal(device?.status?.network?.localIpv4, "192.168.1.21");
 });
 
-test("network history records a device location change beyond both accuracy radii", async () => {
+test("network history keeps one Wi-Fi entry while device location refreshes", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);
   const deviceId = "01981111-7111-8111-8111-111111111111";
@@ -407,8 +406,8 @@ test("network history records a device location change beyond both accuracy radi
   await record(2, 1.3531);
 
   const [device] = await repository.listOwnerDevices(workspaceId, ownerUserId);
-  assert.equal(device?.status?.networkHistory.length, 2);
-  assert.equal(device?.status?.networkHistory[0]?.network.location?.latitude, 1.3531);
+  assert.equal(device?.status?.networkHistory.length, 1);
+  assert.equal(device?.status?.network?.location?.latitude, 1.3531);
 });
 
 test("photo library pages expose every completed asset", async () => {
