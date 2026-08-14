@@ -111,6 +111,7 @@ pub struct CommunicationMessageCommit {
     pub account_id: String,
     pub source_sequence: u64,
     pub event: EventEnvelope,
+    pub metadata_events: Vec<EventEnvelope>,
     pub message: CommunicationMessageRecorded,
     pub attachment_spool: Vec<CommunicationAttachmentSpoolReference>,
 }

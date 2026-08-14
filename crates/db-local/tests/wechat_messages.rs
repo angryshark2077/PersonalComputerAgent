@@ -85,6 +85,7 @@ fn valid_commit(database: &Path) -> CommunicationMessageCommit {
             attachment_refs: vec!["attachment-1".to_owned()],
             idempotency_key: Some("source-key-1".to_owned()),
         },
+        metadata_events: Vec::new(),
         message,
         attachment_spool: vec![CommunicationAttachmentSpoolReference {
             attachment_id: "attachment-1".to_owned(),

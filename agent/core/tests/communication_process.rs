@@ -555,6 +555,7 @@ async fn cancellation_joins_the_poll_and_prevents_a_post_cancel_commit() {
 
 #[tokio::test(start_paused = true)]
 async fn retryable_provider_failure_uses_bounded_backoff_but_terminal_failure_does_not_restart() {
+    let time_guard = prevent_virtual_time_auto_advance();
     let retryable = Harness::new().await;
     retryable
         .state
@@ -594,6 +595,26 @@ async fn retryable_provider_failure_uses_bounded_backoff_but_terminal_failure_do
     assert_eq!(terminal.state.factory_calls.load(Ordering::SeqCst), 1);
     assert_eq!(terminal.state.discover_calls.load(Ordering::SeqCst), 1);
     terminal_runtime.shutdown().await.unwrap();
+    time_guard.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_provider_poll_times_out_and_requests_process_restart() {
+    let harness = Harness::new().await;
+    let time_guard = prevent_virtual_time_auto_advance();
+    harness.state.block_poll.store(true, Ordering::SeqCst);
+    let runtime = harness.start(enabled(1)).await;
+    wait_for(&harness.state.poll_calls, 1).await;
+
+    tokio::time::advance(Duration::from_mins(5)).await;
+    wait_for(&harness.state.stop_calls, 1).await;
+    assert!(harness.state.poll_dropped.load(Ordering::SeqCst));
+    harness.state.block_poll.store(false, Ordering::SeqCst);
+    time_guard.abort();
+    assert!(matches!(
+        runtime.shutdown().await,
+        Err(CommunicationRuntimeError::ProviderTimedOut)
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1827,6 +1848,7 @@ async fn authoritative_disable_cancels_media_preparation_without_app_forwarding_
 
 #[tokio::test(start_paused = true)]
 async fn cloud_disable_invalidates_runtime_before_failing_system_sync() {
+    let time_guard = prevent_virtual_time_auto_advance();
     let harness = Harness::new().await;
     harness.state.block_poll.store(true, Ordering::SeqCst);
     harness
@@ -1883,6 +1905,7 @@ async fn cloud_disable_invalidates_runtime_before_failing_system_sync() {
     client.sync_release.notify_waiters();
     cloud.shutdown().await.unwrap();
     communication.shutdown().await.unwrap();
+    time_guard.abort();
 }
 
 #[tokio::test(start_paused = true)]

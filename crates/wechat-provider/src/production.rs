@@ -154,6 +154,7 @@ struct ImageKeys {
 
 struct MacOSWechatSource {
     paths: Arc<SourcePaths>,
+    local_database: Option<PathBuf>,
     cursors: Arc<Mutex<BTreeMap<String, i64>>>,
     verified: Arc<Mutex<bool>>,
     last_pending_media_retry_at: Arc<Mutex<Option<Instant>>>,
@@ -162,66 +163,13 @@ struct MacOSWechatSource {
 
 impl MacOSWechatSource {
     fn discover(local_database: Option<&Path>) -> Result<Self, DomainError> {
-        let home = env::var_os("HOME").ok_or_else(source_unavailable)?;
-        let root = PathBuf::from(home).join(SOURCE_ROOT);
-        let mut accounts = fs::read_dir(root)
-            .map_err(|error| source_access_error(&error))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .filter(|path| {
-                path.join(SESSION_DATABASE).is_file()
-                    && path.join(CONTACT_DATABASE).is_file()
-                    && path.join(MESSAGE_DIRECTORY).is_dir()
-            });
-        let account_root = accounts.next().ok_or_else(source_unavailable)?;
-        if accounts.next().is_some() {
-            return Err(DomainError::new(
-                "WECHAT_MULTIPLE_ACCOUNTS",
-                "multiple local WeChat accounts require explicit selection",
-                true,
-            ));
-        }
-        let local_username = account_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(clean_account_directory_name)
-            .ok_or_else(source_unavailable)?;
-        let mut message_databases = fs::read_dir(account_root.join(MESSAGE_DIRECTORY))
-            .map_err(|error| source_access_error(&error))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| is_message_database(path))
-            .collect::<Vec<_>>();
-        message_databases.sort();
-        if message_databases.is_empty() {
-            return Err(source_unavailable());
-        }
-        let mut media_databases = fs::read_dir(account_root.join(MESSAGE_DIRECTORY))
-            .map_err(|error| source_access_error(&error))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| is_media_database(path))
-            .collect::<Vec<_>>();
-        media_databases.sort();
-        let account_id = account_id_for_root(&account_root);
+        let paths = discover_source_paths()?;
         let cursors = local_database.map_or_else(BTreeMap::new, |database| {
-            bootstrap_source_cursors(database, &account_id, &message_databases)
+            bootstrap_source_cursors(database, &paths.account_id, &paths.message_databases)
         });
         Ok(Self {
-            paths: Arc::new(SourcePaths {
-                account_root: account_root.clone(),
-                session_database: account_root.join(SESSION_DATABASE),
-                contact_database: account_root.join(CONTACT_DATABASE),
-                emoticon_database: account_root
-                    .join(EMOTICON_DATABASE)
-                    .is_file()
-                    .then(|| account_root.join(EMOTICON_DATABASE)),
-                message_databases,
-                media_databases,
-                local_username,
-                account_id,
-            }),
+            paths: Arc::new(paths),
+            local_database: local_database.map(Path::to_path_buf),
             cursors: Arc::new(Mutex::new(cursors)),
             verified: Arc::new(Mutex::new(false)),
             last_pending_media_retry_at: Arc::new(Mutex::new(None)),
@@ -230,14 +178,71 @@ impl MacOSWechatSource {
     }
 }
 
+fn discover_source_paths() -> Result<SourcePaths, DomainError> {
+    let home = env::var_os("HOME").ok_or_else(source_unavailable)?;
+    let root = PathBuf::from(home).join(SOURCE_ROOT);
+    let mut accounts = fs::read_dir(root)
+        .map_err(|error| source_access_error(&error))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.join(SESSION_DATABASE).is_file()
+                && path.join(CONTACT_DATABASE).is_file()
+                && path.join(MESSAGE_DIRECTORY).is_dir()
+        });
+    let account_root = accounts.next().ok_or_else(source_unavailable)?;
+    if accounts.next().is_some() {
+        return Err(DomainError::new(
+            "WECHAT_MULTIPLE_ACCOUNTS",
+            "multiple local WeChat accounts require explicit selection",
+            true,
+        ));
+    }
+    let local_username = account_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(clean_account_directory_name)
+        .ok_or_else(source_unavailable)?;
+    let mut message_databases = fs::read_dir(account_root.join(MESSAGE_DIRECTORY))
+        .map_err(|error| source_access_error(&error))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| is_message_database(path))
+        .collect::<Vec<_>>();
+    message_databases.sort();
+    if message_databases.is_empty() {
+        return Err(source_unavailable());
+    }
+    let mut media_databases = fs::read_dir(account_root.join(MESSAGE_DIRECTORY))
+        .map_err(|error| source_access_error(&error))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| is_media_database(path))
+        .collect::<Vec<_>>();
+    media_databases.sort();
+    let account_id = account_id_for_root(&account_root);
+    Ok(SourcePaths {
+        account_root: account_root.clone(),
+        session_database: account_root.join(SESSION_DATABASE),
+        contact_database: account_root.join(CONTACT_DATABASE),
+        emoticon_database: account_root
+            .join(EMOTICON_DATABASE)
+            .is_file()
+            .then(|| account_root.join(EMOTICON_DATABASE)),
+        message_databases,
+        media_databases,
+        local_username,
+        account_id,
+    })
+}
+
 impl WechatSource for MacOSWechatSource {
     fn probe(&self) -> SourceProbeFuture<'_> {
         let paths = Arc::clone(&self.paths);
         let verified = Arc::clone(&self.verified);
         Box::pin(async move {
-            let capabilities = tokio::task::spawn_blocking(move || probe_source(&paths))
-                .await
-                .map_err(|_| capability_unavailable())??;
+            let capabilities = run_source_thread(move || probe_source(&paths)).await?;
             *verified.lock().map_err(|_| capability_unavailable())? = true;
             Ok(capabilities)
         })
@@ -245,6 +250,7 @@ impl WechatSource for MacOSWechatSource {
 
     fn read_after(&self, _: &SourceCursor) -> SourceReadFuture<'_> {
         let paths = Arc::clone(&self.paths);
+        let local_database = self.local_database.clone();
         let cursors = Arc::clone(&self.cursors);
         let verified = Arc::clone(&self.verified);
         let last_pending_media_retry_at = Arc::clone(&self.last_pending_media_retry_at);
@@ -259,18 +265,52 @@ impl WechatSource for MacOSWechatSource {
                     .map_err(|_| capability_unavailable())?;
                 claim_pending_media_retry(&mut last_retry_at, Instant::now())
             };
-            tokio::task::spawn_blocking(move || {
+            run_source_thread(move || {
+                let refreshed_paths = discover_source_paths()?;
+                if refreshed_paths.account_id != paths.account_id {
+                    return Err(DomainError::new(
+                        "WECHAT_ACCOUNT_UNVERIFIED",
+                        "the active local WeChat account changed",
+                        true,
+                    ));
+                }
+                if let Some(database) = local_database.as_deref() {
+                    let restored = bootstrap_source_cursors(
+                        database,
+                        &refreshed_paths.account_id,
+                        &refreshed_paths.message_databases,
+                    );
+                    let mut cursors = cursors.lock().map_err(|_| capability_unavailable())?;
+                    for (key, sequence) in restored {
+                        cursors.entry(key).or_insert(sequence);
+                    }
+                }
                 read_message_batch(
-                    &paths,
+                    &refreshed_paths,
                     &cursors,
                     &last_message_snapshot,
                     retry_pending_media,
                 )
             })
             .await
-            .map_err(|_| capability_unavailable())?
         })
     }
+}
+
+async fn run_source_thread<T>(
+    operation: impl FnOnce() -> Result<T, DomainError> + Send + 'static,
+) -> Result<T, DomainError>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    thread::Builder::new()
+        .name("pca-wechat-source".to_owned())
+        .spawn(move || {
+            let _ = sender.send(operation());
+        })
+        .map_err(|_| capability_unavailable())?;
+    receiver.await.map_err(|_| capability_unavailable())?
 }
 
 fn claim_pending_media_retry(last_retry_at: &mut Option<Instant>, now: Instant) -> bool {

@@ -292,9 +292,9 @@ impl PairingIpcServer {
                     }
                 }
                 accepted = self.socket.listener().accept() => {
-                    if let Ok((stream, _)) = accepted {
-                        let _ = self.handle_connection(stream).await;
-                    }
+                    let (stream, _) = accepted
+                        .map_err(|error| PairingIpcServerError::Socket(PairingSocketError::Io(error)))?;
+                    let _ = self.handle_connection(stream).await;
                 }
             }
         }

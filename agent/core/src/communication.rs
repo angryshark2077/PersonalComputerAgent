@@ -37,6 +37,7 @@ pub const SPOOL_RESUME_BELOW_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
+const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_mins(5);
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(30),
     Duration::from_mins(1),
@@ -126,6 +127,7 @@ pub enum CommunicationRuntimeError {
     QueueClosed,
     WorkerStopped,
     ProviderStopFailed,
+    ProviderTimedOut,
     Clock,
 }
 
@@ -141,6 +143,7 @@ impl fmt::Display for CommunicationRuntimeError {
             Self::QueueClosed => formatter.write_str("communication command queue is closed"),
             Self::WorkerStopped => formatter.write_str("communication worker stopped"),
             Self::ProviderStopFailed => formatter.write_str("communication provider stop failed"),
+            Self::ProviderTimedOut => formatter.write_str("communication provider timed out"),
             Self::Clock => formatter.write_str("communication clock unavailable"),
         }
     }
@@ -510,7 +513,6 @@ async fn run_supervisor(
     let mut spool_paused = false;
     let mut retry_index = 0_usize;
     let mut retry_revision = control.configuration_revision;
-    let mut emitted_metadata_events = BTreeSet::new();
 
     'supervisor: loop {
         let authoritative_control = authorization.borrow().control;
@@ -671,6 +673,9 @@ async fn run_supervisor(
                 .await;
             }
             persist_collector_state(&database, control, Some(&error)).await?;
+            if error.code == "WECHAT_OPERATION_DEADLINE_EXCEEDED" {
+                return Err(CommunicationRuntimeError::ProviderTimedOut);
+            }
             if should_retry(&error) {
                 let delay = RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)];
                 retry_index = (retry_index + 1).min(RETRY_DELAYS.len() - 1);
@@ -931,24 +936,6 @@ async fn run_supervisor(
                             break;
                         }
                         prepared.spool.disarm();
-                        for metadata_event in [&prepared.conversation_event, &prepared.sender_event]
-                        {
-                            if !emitted_metadata_events.contains(&metadata_event.event_id) {
-                                if database
-                                    .append_event_with_outbox(metadata_event)
-                                    .await
-                                    .map_err(|_| LocalPersistenceError::Database)
-                                    .is_err()
-                                {
-                                    persistence_failed = true;
-                                    break;
-                                }
-                                emitted_metadata_events.insert(metadata_event.event_id.clone());
-                            }
-                        }
-                        if persistence_failed {
-                            break;
-                        }
                         event_observed = true;
                     }
                     if batch_paused {
@@ -1016,6 +1003,9 @@ async fn run_supervisor(
                         .await;
                     }
                     persist_collector_state(&database, control, Some(&error)).await?;
+                    if error.code == "WECHAT_OPERATION_DEADLINE_EXCEEDED" {
+                        return Err(CommunicationRuntimeError::ProviderTimedOut);
+                    }
                     if should_retry(&error) {
                         let delay = RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)];
                         retry_index = (retry_index + 1).min(RETRY_DELAYS.len() - 1);
@@ -1099,7 +1089,9 @@ async fn discover_or_command(
             }
         },
         command = commands.recv() => Operation::Command(command),
-        result = provider.discover() => Operation::Completed(result),
+        result = time::timeout(PROVIDER_OPERATION_TIMEOUT, provider.discover()) => {
+            Operation::Completed(result.unwrap_or_else(|_| Err(provider_operation_timeout())))
+        },
     }
 }
 
@@ -1118,7 +1110,9 @@ async fn poll_or_command(
             }
         },
         command = commands.recv() => Operation::Command(command),
-        result = provider.poll_once() => Operation::Completed(result),
+        result = time::timeout(PROVIDER_OPERATION_TIMEOUT, provider.poll_once()) => {
+            Operation::Completed(result.unwrap_or_else(|_| Err(provider_operation_timeout())))
+        },
     }
 }
 
@@ -1310,6 +1304,14 @@ fn should_retry(error: &DomainError) -> bool {
         )
 }
 
+fn provider_operation_timeout() -> DomainError {
+    DomainError::new(
+        "WECHAT_OPERATION_DEADLINE_EXCEEDED",
+        "WeChat Provider operation exceeded its bounded deadline",
+        true,
+    )
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one transaction prepares all normalized communication payload variants"
@@ -1439,12 +1441,11 @@ async fn prepare_record(
         idempotency_key: Some(message.source_key().to_owned()),
     };
     Ok(PreparedRecord {
-        conversation_event,
-        sender_event,
         commit: CommunicationMessageCommit {
             account_id,
             source_sequence,
             event,
+            metadata_events: vec![conversation_event, sender_event],
             message,
             attachment_spool: prepared_media.references,
         },
@@ -1471,8 +1472,6 @@ fn stable_communication_event_id(
 }
 
 struct PreparedRecord {
-    conversation_event: EventEnvelope,
-    sender_event: EventEnvelope,
     commit: CommunicationMessageCommit,
     spool: AttemptSpoolLease,
 }

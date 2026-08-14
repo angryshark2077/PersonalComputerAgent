@@ -101,6 +101,11 @@ pub(crate) fn commit_communication_message(
 ) -> Result<(), DbError> {
     validate_communication_commit(commit)?;
     let serialized = serialize_event(&commit.event)?;
+    let metadata = commit
+        .metadata_events
+        .iter()
+        .map(serialize_event)
+        .collect::<Result<Vec<_>, _>>()?;
     let spool_references = validate_spool_references(spool_root, commit)?;
     let source_sequence = i64::try_from(commit.source_sequence).map_err(|_| {
         DbError::sqlite(
@@ -116,10 +121,20 @@ pub(crate) fn commit_communication_message(
         validate_existing_communication_event(&transaction, &serialized)?;
         validate_existing_outbox(&transaction, &serialized)?;
         validate_existing_attachment_spool(&transaction, commit)?;
-        return Ok(());
+        for event in &metadata {
+            insert_event(&transaction, event)?;
+            insert_stable_outbox(&transaction, event)?;
+        }
+        return transaction
+            .commit()
+            .map_err(|error| DbError::sqlite("commit communication metadata transaction", error));
     }
 
     insert_event(&transaction, &serialized)?;
+    for event in &metadata {
+        insert_event(&transaction, event)?;
+        insert_stable_outbox(&transaction, event)?;
+    }
     upsert_communication_conversation(&transaction, commit)?;
     let local_message_id = insert_communication_message(&transaction, commit, source_sequence)?;
     for spool_reference in &spool_references {
@@ -148,6 +163,22 @@ fn validate_communication_commit(commit: &CommunicationMessageCommit) -> Result<
         return Err(DbError::sqlite(
             "validate communication message commit",
             "event does not match the fixed communication message contract",
+        ));
+    }
+    if commit.metadata_events.iter().any(|event| {
+        event.workspace_id != commit.event.workspace_id
+            || event.device_id != commit.event.device_id
+            || event.source != commit.event.source
+            || event.schema_version != 1
+            || event.sensitivity != Sensitivity::High
+            || !matches!(
+                event.event_type.as_str(),
+                "communication.conversation_observed" | "communication.message_sender_observed"
+            )
+    }) {
+        return Err(DbError::sqlite(
+            "validate communication metadata commit",
+            "metadata events do not match the communication message identity",
         ));
     }
 

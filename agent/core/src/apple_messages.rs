@@ -91,7 +91,7 @@ async fn collect_once(
     workspace_id: &str,
     device_id: &str,
 ) -> Result<bool, ()> {
-    let cursor = load_cursor().await?;
+    let cursor = load_cursor(workspace_id, device_id).await?;
     let path = source.to_path_buf();
     let messages = task::spawn_blocking(move || load_recent_messages(&path, cursor))
         .await
@@ -143,7 +143,7 @@ async fn collect_once(
             database.commit_events(&commit).await.map_err(|_| ())?;
             event_observed = true;
         }
-        persist_cursor(row_id).await?;
+        persist_cursor(workspace_id, device_id, row_id).await?;
     }
     Ok(event_observed)
 }
@@ -347,14 +347,21 @@ fn messages_database_path() -> Option<PathBuf> {
         .map(|home| home.join("Library/Messages/chat.db"))
 }
 
-fn cursor_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library/Application Support/PersonalComputerAgent/messages-cursor"))
+fn cursor_path(workspace_id: &str, device_id: &str) -> Option<PathBuf> {
+    let workspace_id = Uuid::parse_str(workspace_id).ok()?;
+    let device_id = Uuid::parse_str(device_id).ok()?;
+    std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+        home.join("Library/Application Support/PersonalComputerAgent")
+            .join(format!(
+                "messages-cursor-{}-{}",
+                workspace_id.hyphenated(),
+                device_id.hyphenated()
+            ))
+    })
 }
 
-async fn load_cursor() -> Result<Option<i64>, ()> {
-    let Some(path) = cursor_path() else {
+async fn load_cursor(workspace_id: &str, device_id: &str) -> Result<Option<i64>, ()> {
+    let Some(path) = cursor_path(workspace_id, device_id) else {
         return Err(());
     };
     match tokio::fs::read_to_string(path).await {
@@ -364,8 +371,8 @@ async fn load_cursor() -> Result<Option<i64>, ()> {
     }
 }
 
-async fn persist_cursor(row_id: i64) -> Result<(), ()> {
-    let path = cursor_path().ok_or(())?;
+async fn persist_cursor(workspace_id: &str, device_id: &str, row_id: i64) -> Result<(), ()> {
+    let path = cursor_path(workspace_id, device_id).ok_or(())?;
     let parent = path.parent().ok_or(())?;
     tokio::fs::create_dir_all(parent).await.map_err(|_| ())?;
     let temporary = path.with_extension("tmp");

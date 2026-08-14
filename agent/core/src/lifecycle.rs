@@ -134,23 +134,23 @@ impl LifecycleRuntime {
     ) -> Result<Option<String>, LifecycleError> {
         match event.event_type.as_str() {
             "system.sleep" => {
+                let identity = self.current_identity().await?;
                 let mut accepting = self.accepting.lock().await;
                 if !*accepting {
                     return Ok(None);
                 }
                 *accepting = false;
-                let identity = self.current_identity().await?;
                 let envelope = lifecycle_event_at(&identity, event)?;
                 let result = send_persist(&self.sender, envelope, true).await?;
                 drop(accepting);
                 Ok(Some(result))
             }
             "system.wake" => {
+                let identity = self.current_identity().await?;
                 let mut accepting = self.accepting.lock().await;
                 if *accepting {
                     return Ok(None);
                 }
-                let identity = self.current_identity().await?;
                 let envelope = lifecycle_event_at(&identity, event)?;
                 let event_id = send_persist(&self.sender, envelope, false).await?;
                 self.capability_refresher
@@ -180,12 +180,12 @@ impl LifecycleRuntime {
         reason = "typed boundary awaits a frozen authenticated sleep wire"
     )]
     pub(crate) async fn prepare_sleep(&self) -> Result<String, LifecycleError> {
+        let identity = self.current_identity().await?;
         let mut accepting = self.accepting.lock().await;
         if !*accepting {
             return Err(LifecycleError::NotAccepting);
         }
         *accepting = false;
-        let identity = self.current_identity().await?;
         let event = lifecycle_event(&identity, "system.sleep")?;
         let result = send_persist(&self.sender, event, true).await;
         drop(accepting);
@@ -598,6 +598,54 @@ mod tests {
                 .expect("count lifecycle events"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn unpaired_sleep_does_not_leave_lifecycle_paused_after_pairing() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = Arc::new(
+            DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.0.0")
+                .await
+                .expect("open database"),
+        );
+        let runtime = LifecycleRuntime::start(
+            database,
+            None,
+            2,
+            Arc::new(RecordingRefresher {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                database_path: None,
+                fail: false,
+            }),
+        );
+        assert!(matches!(
+            runtime
+                .record_platform_event(&PlatformLifecycleEvent {
+                    sequence: 1,
+                    event_id: Uuid::new_v4(),
+                    event_type: "system.sleep".to_owned(),
+                    occurred_at: "2026-08-04T15:00:00Z".to_owned(),
+                })
+                .await,
+            Err(LifecycleError::IdentityUnavailable)
+        ));
+        runtime
+            .update_identity(Some(RuntimeIdentity::new(
+                "01983333-7333-8333-8333-333333333333",
+                "01982222-7222-8222-8222-222222222222",
+            )))
+            .await;
+        let recorded = runtime
+            .record_platform_event(&PlatformLifecycleEvent {
+                sequence: 2,
+                event_id: Uuid::new_v4(),
+                event_type: "network.changed".to_owned(),
+                occurred_at: "2026-08-04T15:01:00Z".to_owned(),
+            })
+            .await
+            .expect("record network event after pairing");
+        assert!(recorded.is_some());
+        runtime.abort_and_drain().await.expect("drain lifecycle");
     }
 
     #[tokio::test]

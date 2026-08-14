@@ -50,6 +50,15 @@ const CREDENTIAL_REF: &str = "keychain://pca/device/current";
 const CONTROL_OWNER_COMMAND_CAPACITY: usize = 8;
 pub const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.up.railway.app";
 
+enum CloudWorkerExit {
+    Control(Result<(), CloudControlRuntimeError>),
+    Media,
+    CollectorHealth,
+    Screen,
+    AppleMessages,
+    Photos,
+}
+
 /// Future returned by the small Cloud-control port.
 pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlError>> + Send + 'a>>;
 
@@ -255,7 +264,7 @@ pub struct SyncEventsResponse {
 #[derive(Clone, Debug, Deserialize)]
 struct SyncEventRejection {
     #[serde(rename = "event_id")]
-    _event_id: String,
+    event_id: String,
 }
 
 #[derive(Deserialize)]
@@ -1124,19 +1133,20 @@ async fn run_cloud_workers(
     let (media_credentials, media_credential_receiver) =
         watch::channel(credentials.credential.clone());
     let (media_shutdown, media_shutdown_receiver) = watch::channel(false);
-    let media_worker = tokio::spawn(run_media_loop(
+    let mut media_worker = tokio::spawn(run_media_loop(
         Arc::clone(&database),
         media_credential_receiver,
         Arc::clone(&client),
         media_shutdown_receiver,
     ));
-    let collector_health_worker = tokio::spawn(run_collector_health_loop(
+    let mut collector_health_worker = tokio::spawn(run_collector_health_loop(
         Arc::clone(&database),
         media_credentials.subscribe(),
+        screen_controls.clone(),
         Arc::clone(&client),
         media_shutdown.subscribe(),
     ));
-    let apple_worker = screen_capture.as_ref().map(|bridge| {
+    let mut apple_worker = screen_capture.as_ref().map(|bridge| {
         tokio::spawn(crate::apple_messages::run(
             Arc::clone(&database),
             bridge.clone(),
@@ -1146,7 +1156,7 @@ async fn run_cloud_workers(
             media_shutdown.subscribe(),
         ))
     });
-    let photo_worker = screen_capture.as_ref().map(|bridge| {
+    let mut photo_worker = screen_capture.as_ref().map(|bridge| {
         tokio::spawn(crate::apple_photos::run(
             Arc::clone(&database),
             bridge.clone(),
@@ -1156,7 +1166,7 @@ async fn run_cloud_workers(
             media_shutdown.subscribe(),
         ))
     });
-    let screen_worker = screen_capture.map(|bridge| {
+    let mut screen_worker = screen_capture.map(|bridge| {
         tokio::spawn(run_screenshot_loop(
             Arc::clone(&database),
             screen_controls,
@@ -1166,7 +1176,7 @@ async fn run_cloud_workers(
             media_shutdown.subscribe(),
         ))
     });
-    let control_result = run_control_loop(
+    let control = run_control_loop(
         database,
         credentials,
         client,
@@ -1177,8 +1187,26 @@ async fn run_cloud_workers(
         authorization,
         owner_epoch,
         media_credentials,
-    )
-    .await;
+    );
+    tokio::pin!(control);
+    let worker_exit = tokio::select! {
+        biased;
+        result = &mut control => CloudWorkerExit::Control(result),
+        _ = &mut media_worker => CloudWorkerExit::Media,
+        _ = &mut collector_health_worker => CloudWorkerExit::CollectorHealth,
+        () = wait_for_optional_worker(&mut screen_worker) => CloudWorkerExit::Screen,
+        () = wait_for_optional_worker(&mut apple_worker) => CloudWorkerExit::AppleMessages,
+        () = wait_for_optional_worker(&mut photo_worker) => CloudWorkerExit::Photos,
+    };
+    let media_completed = matches!(worker_exit, CloudWorkerExit::Media);
+    let collector_health_completed = matches!(worker_exit, CloudWorkerExit::CollectorHealth);
+    let screen_completed = matches!(worker_exit, CloudWorkerExit::Screen);
+    let apple_completed = matches!(worker_exit, CloudWorkerExit::AppleMessages);
+    let photo_completed = matches!(worker_exit, CloudWorkerExit::Photos);
+    let control_result = match worker_exit {
+        CloudWorkerExit::Control(result) => result,
+        _ => Err(CloudControlRuntimeError::WorkerStopped),
+    };
     media_shutdown.send_replace(true);
     media_worker.abort();
     collector_health_worker.abort();
@@ -1191,20 +1219,30 @@ async fn run_cloud_workers(
     if let Some(worker) = &photo_worker {
         worker.abort();
     }
-    let media_result = match media_worker.await {
-        Ok(result) => result,
-        Err(error) if error.is_cancelled() => Ok(()),
-        Err(_) => Err(CloudControlRuntimeError::WorkerStopped),
+    let media_result = if media_completed {
+        Ok(())
+    } else {
+        match media_worker.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(_) => Err(CloudControlRuntimeError::WorkerStopped),
+        }
     };
-    let collector_health_result = match collector_health_worker.await {
-        Ok(result) => result,
-        Err(error) if error.is_cancelled() => Ok(()),
-        Err(_) => Err(CloudControlRuntimeError::WorkerStopped),
+    let collector_health_result = if collector_health_completed {
+        Ok(())
+    } else {
+        match collector_health_worker.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(_) => Err(CloudControlRuntimeError::WorkerStopped),
+        }
     };
     control_result?;
     media_result?;
     collector_health_result?;
-    let screen_result = if let Some(worker) = screen_worker {
+    let screen_result = if screen_completed {
+        Ok(())
+    } else if let Some(worker) = screen_worker {
         match worker.await {
             Ok(result) => result,
             Err(error) if error.is_cancelled() => Ok(()),
@@ -1213,16 +1251,35 @@ async fn run_cloud_workers(
     } else {
         Ok(())
     };
-    if let Some(worker) = apple_worker {
-        let _ = worker.await;
+    if !apple_completed {
+        if let Some(worker) = apple_worker {
+            let _ = worker.await;
+        }
     }
-    if let Some(worker) = photo_worker {
-        let _ = worker.await;
+    if !photo_completed {
+        if let Some(worker) = photo_worker {
+            let _ = worker.await;
+        }
     }
     screen_result
 }
 
+async fn wait_for_optional_worker<T>(worker: &mut Option<JoinHandle<T>>) {
+    if let Some(worker) = worker {
+        let _ = worker.await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 impl CloudControlOwner {
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
     #[must_use]
     pub fn start(
         database: Arc<DbActorHandle>,
@@ -1973,8 +2030,7 @@ async fn apply_control_snapshot(
         }
         publication.publish(owner_epoch, applied.clone()).await;
     }
-    sync_pending_system_events(database, &credentials.credential, client).await?;
-    sync_pending_communication_events(database, &credentials.credential, client).await?;
+    let control_changed = applied.is_some();
     if let Some(applied) = applied {
         persist_network_collector_state(database, &applied).await?;
         client.set_network_enabled(applied.network_enabled);
@@ -2006,9 +2062,11 @@ async fn apply_control_snapshot(
     if let Some(request) = snapshot.local_media_cleanup {
         handle_local_media_cleanup(database, state, request).await?;
     }
-    publication
-        .publish(owner_epoch, Some(observed_control))
-        .await;
+    if control_changed {
+        publication
+            .publish(owner_epoch, Some(observed_control))
+            .await;
+    }
     Ok(())
 }
 
@@ -2156,6 +2214,8 @@ async fn run_media_loop(
             return Ok(());
         }
         let credential = credentials.borrow().clone();
+        let _ = sync_pending_system_events(&database, &credential, client.as_ref()).await;
+        let _ = sync_pending_communication_events(&database, &credential, client.as_ref()).await;
         let completed_media =
             sync_pending_communication_attachments(&database, &credential, client.as_ref())
                 .await
@@ -2168,6 +2228,7 @@ async fn run_media_loop(
 async fn run_collector_health_loop(
     database: Arc<DbActorHandle>,
     credentials: watch::Receiver<DeviceCredential>,
+    controls: watch::Receiver<Option<AppliedControl>>,
     client: Arc<dyn ControlClient>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CloudControlRuntimeError> {
@@ -2177,12 +2238,10 @@ async fn run_collector_health_loop(
             return Ok(());
         }
         if let Some(network_available) = client.network_observation_available() {
-            if let Ok(states) = database.load_collector_states().await {
-                if let Some(network) = states
-                    .into_iter()
-                    .find(|state| state.collector_key == "network")
-                {
-                    let enabled = network.status != CollectorStatus::Disabled;
+            for _ in 0..3 {
+                let applied = controls.borrow().clone();
+                if let Some(applied) = applied.as_ref() {
+                    let enabled = applied.network_enabled;
                     let error_code = if enabled && !network_available {
                         Some("NETWORK_OBSERVATION_UNAVAILABLE")
                     } else {
@@ -2192,11 +2251,14 @@ async fn run_collector_health_loop(
                         &database,
                         "network",
                         enabled,
-                        network.desired_config_revision,
+                        applied.configuration_revision,
                         false,
                         error_code,
                     )
                     .await;
+                }
+                if controls.borrow().as_ref() == applied.as_ref() {
+                    break;
                 }
             }
         }
@@ -2494,25 +2556,11 @@ async fn upload_pending_screenshots(
     handled_requests: &mut HashSet<String>,
 ) -> Result<(), ControlError> {
     let spool_root = screenshot_spool_root()?;
-    let mut entries = match tokio::fs::read_dir(&spool_root).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(ControlError::Transient),
-    };
-    let mut processed = 0_u8;
-    while processed < 4 {
-        let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|_| ControlError::Transient)?
-        else {
-            break;
-        };
-        let path = entry.path();
-        if path.extension().is_none_or(|value| value != "json") {
-            continue;
-        }
-        processed = processed.saturating_add(1);
+    for path in pending_manifest_paths(&spool_root)
+        .await?
+        .into_iter()
+        .take(4)
+    {
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|_| ControlError::Transient)?;
@@ -2543,6 +2591,7 @@ async fn upload_pending_screenshots(
             .await
             .is_err()
         {
+            rotate_manifest(&path, &bytes).await?;
             continue;
         }
         remove_uploaded_media_file(&image_path).await?;
@@ -2694,25 +2743,7 @@ async fn upload_pending_photos(
     credentials: &DeviceCredential,
 ) -> Result<(), ControlError> {
     let root = photo_spool_root()?;
-    let mut entries = match tokio::fs::read_dir(&root).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(ControlError::Transient),
-    };
-    let mut processed = 0_u8;
-    while processed < 4 {
-        let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|_| ControlError::Transient)?
-        else {
-            break;
-        };
-        let path = entry.path();
-        if path.extension().is_none_or(|value| value != "json") {
-            continue;
-        }
-        processed = processed.saturating_add(1);
+    for path in pending_manifest_paths(&root).await?.into_iter().take(4) {
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|_| ControlError::Transient)?;
@@ -2751,6 +2782,7 @@ async fn upload_pending_photos(
             continue;
         }
         if client.sync_photo(credentials, &photo).await.is_err() {
+            rotate_manifest(&path, &bytes).await?;
             continue;
         }
         let media_path = root.join(
@@ -2769,6 +2801,47 @@ async fn upload_pending_photos(
             .map_err(|_| ControlError::Transient)?;
     }
     Ok(())
+}
+
+async fn pending_manifest_paths(root: &Path) -> Result<Vec<PathBuf>, ControlError> {
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(ControlError::Transient),
+    };
+    let mut paths = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| ControlError::Transient)?
+    {
+        let path = entry.path();
+        if path.extension().is_some_and(|value| value == "json") {
+            let modified = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            paths.push((modified, path));
+        }
+    }
+    paths.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(paths.into_iter().map(|(_, path)| path).collect())
+}
+
+async fn rotate_manifest(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
+    let parent = path.parent().ok_or(ControlError::Contract)?;
+    let temporary = parent.join(format!(".retry-{}.tmp", Uuid::new_v4()));
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    tokio::fs::rename(temporary, path)
+        .await
+        .map_err(|_| ControlError::Transient)
 }
 
 async fn remove_uploaded_media_file(path: &Path) -> Result<(), ControlError> {
@@ -2810,20 +2883,35 @@ async fn sync_pending_system_events(
         .chain(response.duplicates.iter())
         .map(String::as_str)
         .collect();
-    if !response.rejected.is_empty()
-        || response.accepted.len() + response.duplicates.len() != expected.len()
-        || acknowledged != expected
+    let rejected: std::collections::BTreeSet<_> = response
+        .rejected
+        .iter()
+        .map(|rejection| rejection.event_id.as_str())
+        .collect();
+    if acknowledged.len() != response.accepted.len() + response.duplicates.len()
+        || rejected.len() != response.rejected.len()
+        || !acknowledged.is_disjoint(&rejected)
+        || acknowledged
+            .union(&rejected)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            != expected
     {
         return Err(ControlError::Transient);
     }
-    let event_ids = events
+    let event_ids = acknowledged
         .into_iter()
-        .map(|event| event.event_id)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     database
         .acknowledge_system_events(&event_ids)
         .await
-        .map_err(|_| ControlError::Transient)
+        .map_err(|_| ControlError::Transient)?;
+    if rejected.is_empty() {
+        Ok(())
+    } else {
+        Err(ControlError::Transient)
+    }
 }
 
 async fn sync_pending_communication_events(
@@ -2850,20 +2938,35 @@ async fn sync_pending_communication_events(
         .chain(response.duplicates.iter())
         .map(String::as_str)
         .collect();
-    if !response.rejected.is_empty()
-        || response.accepted.len() + response.duplicates.len() != expected.len()
-        || acknowledged != expected
+    let rejected: std::collections::BTreeSet<_> = response
+        .rejected
+        .iter()
+        .map(|rejection| rejection.event_id.as_str())
+        .collect();
+    if acknowledged.len() != response.accepted.len() + response.duplicates.len()
+        || rejected.len() != response.rejected.len()
+        || !acknowledged.is_disjoint(&rejected)
+        || acknowledged
+            .union(&rejected)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            != expected
     {
         return Err(ControlError::Transient);
     }
-    let event_ids = events
+    let event_ids = acknowledged
         .into_iter()
-        .map(|event| event.event_id)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     database
         .acknowledge_communication_events(&event_ids)
         .await
-        .map_err(|_| ControlError::Transient)
+        .map_err(|_| ControlError::Transient)?;
+    if rejected.is_empty() {
+        Ok(())
+    } else {
+        Err(ControlError::Transient)
+    }
 }
 
 fn isolate_data_plane_error(error: ControlError) -> ControlError {
@@ -3965,11 +4068,13 @@ mod tests {
         )
         .expect("valid credential");
         let (_, credential_receiver) = watch::channel(credential);
+        let (_, control_receiver) = watch::channel(None);
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let client = Arc::new(CollectorHealthCountingClient(AtomicUsize::new(0)));
         let worker = tokio::spawn(run_collector_health_loop(
             Arc::clone(&database),
             credential_receiver,
+            control_receiver,
             Arc::clone(&client) as Arc<dyn ControlClient>,
             shutdown_receiver,
         ));
@@ -4453,6 +4558,7 @@ mod tests {
                     attachment_refs: Vec::new(),
                     idempotency_key: Some("source-key-1".to_owned()),
                 },
+                metadata_events: Vec::new(),
                 message,
                 attachment_spool: Vec::new(),
             })

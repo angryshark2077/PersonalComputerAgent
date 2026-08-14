@@ -476,6 +476,11 @@ impl RuntimeResources {
                 _ = interrupt.recv() => return Ok(()),
                 _ = terminate.recv() => return Ok(()),
                 _ = heartbeat_timer.tick() => {
+                    if let Err(stage) = self.ensure_owner_workers_alive() {
+                        let _ = self.persist_status().await;
+                        return Err(stage);
+                    }
+                    self.restart_system_collector_if_finished(config).await?;
                     self.restart_communication_collector_if_finished(
                         config,
                         &communication_authorization,
@@ -588,6 +593,55 @@ impl RuntimeResources {
         self.start_system_collector(config, paired).await
     }
 
+    async fn restart_system_collector_if_finished(
+        &mut self,
+        config: &RunConfig,
+    ) -> Result<(), FailureStage> {
+        if !self
+            .system_runtime
+            .as_ref()
+            .is_some_and(SystemRuntimeHandle::is_finished)
+        {
+            return Ok(());
+        }
+        let paired = self
+            .database()
+            .load_pairing_state()
+            .await
+            .map_err(|_| FailureStage::SystemCollector)?
+            .is_some();
+        self.restart_system_collector(config, paired).await
+    }
+
+    fn ensure_owner_workers_alive(&self) -> Result<(), FailureStage> {
+        if self
+            .bridge_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(FailureStage::BridgeCleanup);
+        }
+        if self
+            .pairing_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(FailureStage::PairingCleanup);
+        }
+        if self
+            .control
+            .as_ref()
+            .is_some_and(CloudControlOwner::is_finished)
+            || self
+                .control_bootstrap_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            return Err(FailureStage::ControlCleanup);
+        }
+        Ok(())
+    }
+
     async fn restart_communication_collector_if_finished(
         &mut self,
         config: &RunConfig,
@@ -600,9 +654,22 @@ impl RuntimeResources {
         {
             return Ok(());
         }
+        let _ = self.persist_status().await;
         if let Some(runtime) = self.communication_runtime.take() {
-            let _ = runtime.shutdown().await;
+            runtime
+                .shutdown()
+                .await
+                .map_err(|_| FailureStage::CommunicationCollector)?;
         }
+        self.start_communication_collector(config, authorization)
+            .await
+    }
+
+    async fn start_communication_collector(
+        &mut self,
+        config: &RunConfig,
+        authorization: &CommunicationAuthorization,
+    ) -> Result<(), FailureStage> {
         self.communication_runtime = Some(
             CommunicationRuntime::start_authorized(
                 Arc::clone(
@@ -623,9 +690,35 @@ impl RuntimeResources {
     async fn persist_status(&self) -> Result<(), FailureStage> {
         let heartbeat = self.heartbeat.as_ref().ok_or(FailureStage::Heartbeat)?;
         let schema_version = self.schema_version.ok_or(FailureStage::Heartbeat)?;
-        persist_runtime_status(self.database(), heartbeat, self.state, schema_version)
-            .await
-            .map_err(|_| FailureStage::Heartbeat)
+        let local_healthy = !self
+            .system_runtime
+            .as_ref()
+            .is_some_and(SystemRuntimeHandle::is_finished)
+            && !self
+                .communication_runtime
+                .as_ref()
+                .is_some_and(CommunicationRuntime::is_finished)
+            && !self
+                .control
+                .as_ref()
+                .is_some_and(CloudControlOwner::is_finished)
+            && !self
+                .bridge_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            && !self
+                .pairing_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished);
+        persist_runtime_status(
+            self.database(),
+            heartbeat,
+            self.state,
+            schema_version,
+            local_healthy,
+        )
+        .await
+        .map_err(|_| FailureStage::Heartbeat)
     }
 
     async fn cleanup(mut self, clean_shutdown: bool) -> Vec<FailureStage> {
@@ -987,6 +1080,7 @@ async fn persist_runtime_status(
     heartbeat: &LocalHeartbeatWriter,
     state: RuntimeStateMachine,
     schema_version: u32,
+    local_healthy: bool,
 ) -> Result<(), FailureStage> {
     let now = OffsetDateTime::now_utc();
     let heartbeat_at = now.format(&Rfc3339).map_err(|_| FailureStage::Heartbeat)?;
@@ -996,7 +1090,7 @@ async fn persist_runtime_status(
         .set_agent_state(
             state.agent_status(),
             state.bridge_status(),
-            true,
+            local_healthy,
             updated_at_ms,
         )
         .await
@@ -1005,7 +1099,7 @@ async fn persist_runtime_status(
         .write(&RuntimeStatusEnvelope {
             agent_status: state.agent_status(),
             bridge_status: state.bridge_status(),
-            local_healthy: true,
+            local_healthy,
             heartbeat_at,
             process_id: std::process::id(),
             app_version: app_version().to_owned(),

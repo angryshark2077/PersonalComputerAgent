@@ -955,7 +955,7 @@ async fn persisted_enabled_revision_is_restored_even_when_published_before_subsc
 }
 
 #[tokio::test(start_paused = true)]
-async fn valid_disable_gates_communication_before_blocked_system_sync() {
+async fn valid_disable_applies_while_system_sync_is_blocked() {
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -1000,10 +1000,15 @@ async fn valid_disable_gates_communication_before_blocked_system_sync() {
     tokio::pin!(sync_entered);
     tokio::time::advance(Duration::from_secs(30)).await;
     sync_entered.as_mut().await;
+    wait_for_calls(&client.calls, 2).await;
+    controls.changed().await.unwrap();
 
-    assert!(controls.borrow().as_ref().is_some_and(|control| {
-        control.configuration_revision == 2 && !control.communication_wechat_enabled
-    }));
+    assert!(controls
+        .borrow_and_update()
+        .as_ref()
+        .is_some_and(|control| {
+            control.configuration_revision == 2 && !control.communication_wechat_enabled
+        }));
 
     client.sync_release.notify_waiters();
     runtime.shutdown().await.unwrap();

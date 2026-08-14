@@ -56,6 +56,13 @@ impl fmt::Display for SystemRuntimeError {
 impl std::error::Error for SystemRuntimeError {}
 
 impl SystemRuntimeHandle {
+    #[must_use]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
     pub(crate) async fn start(
         database: Arc<DbActorHandle>,
         identity: Option<CollectorIdentity>,
