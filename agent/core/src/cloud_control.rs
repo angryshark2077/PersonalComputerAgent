@@ -45,6 +45,9 @@ const COLLECTOR_HEALTH_INTERVAL: Duration = Duration::from_mins(30);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_UPLOAD_TIMEOUT: Duration = Duration::from_mins(5);
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOUD_WORKER_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+const MEDIA_CYCLE_TIMEOUT: Duration = Duration::from_mins(45);
+const SCREEN_UPLOAD_BATCH_TIMEOUT: Duration = Duration::from_mins(25);
 const MEDIA_BATCH_SIZE: u16 = 4;
 const MAX_BACKOFF: Duration = CONTROL_INTERVAL;
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
@@ -1421,6 +1424,8 @@ async fn run_control_owner(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut current = None;
+    let mut watchdog = time::interval(CLOUD_WORKER_WATCHDOG_INTERVAL);
+    watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -1472,6 +1477,12 @@ async fn run_control_owner(
                         .await;
                         let _ = response.send(result);
                     }
+                }
+            }
+            _ = watchdog.tick() => {
+                if current.as_ref().is_some_and(CloudControlHandle::is_finished) {
+                    let worker = current.take().expect("finished Cloud worker exists");
+                    worker.shutdown().await?;
                 }
             }
         }
@@ -2240,13 +2251,20 @@ async fn run_media_loop(
             return Ok(());
         }
         let credential = credentials.borrow().clone();
-        let _ = sync_pending_system_events(&database, &credential, client.as_ref()).await;
-        let _ = sync_pending_communication_events(&database, &credential, client.as_ref()).await;
-        let completed_media =
-            sync_pending_communication_attachments(&database, &credential, client.as_ref())
-                .await
-                .unwrap_or(0);
-        let _ = upload_pending_photos(client.as_ref(), &credential).await;
+        let cycle = async {
+            let _ = sync_pending_system_events(&database, &credential, client.as_ref()).await;
+            let _ =
+                sync_pending_communication_events(&database, &credential, client.as_ref()).await;
+            let completed_media =
+                sync_pending_communication_attachments(&database, &credential, client.as_ref())
+                    .await
+                    .unwrap_or(0);
+            let _ = upload_pending_photos(client.as_ref(), &credential).await;
+            completed_media
+        };
+        let completed_media = time::timeout(MEDIA_CYCLE_TIMEOUT, cycle)
+            .await
+            .map_err(|_| CloudControlRuntimeError::WorkerStopped)?;
         wait = next_media_wait(completed_media);
     }
 }
@@ -2254,20 +2272,30 @@ async fn run_media_loop(
 async fn run_collector_health_loop(
     database: Arc<DbActorHandle>,
     credentials: watch::Receiver<DeviceCredential>,
-    controls: watch::Receiver<Option<AppliedControl>>,
+    mut controls: watch::Receiver<Option<AppliedControl>>,
     client: Arc<dyn ControlClient>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut wait = Duration::from_secs(10);
     loop {
-        if wait_or_shutdown(wait, &mut shutdown).await {
-            return Ok(());
+        if wait != Duration::ZERO {
+            tokio::select! {
+                () = time::sleep(wait) => {}
+                changed = controls.changed() => {
+                    if changed.is_err() { return Ok(()); }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() { return Ok(()); }
+                }
+            }
         }
+        let mut network_observation_pending = false;
         if let Some(network_available) = client.network_observation_available() {
             for _ in 0..3 {
                 let applied = controls.borrow().clone();
                 if let Some(applied) = applied.as_ref() {
                     let enabled = applied.network_enabled;
+                    network_observation_pending = enabled && !network_available;
                     let error_code = if enabled && !network_available {
                         Some("NETWORK_OBSERVATION_UNAVAILABLE")
                     } else {
@@ -2298,7 +2326,11 @@ async fn run_collector_health_loop(
             .await
             .is_ok()
         {
-            COLLECTOR_HEALTH_INTERVAL
+            if network_observation_pending {
+                CONTROL_INTERVAL
+            } else {
+                COLLECTOR_HEALTH_INTERVAL
+            }
         } else {
             CONTROL_INTERVAL
         };
@@ -2342,8 +2374,15 @@ async fn run_screenshot_loop(
             return Ok(());
         }
         let credential = credentials.borrow().clone();
-        let _ =
-            upload_pending_screenshots(client.as_ref(), &credential, &mut handled_requests).await;
+        if time::timeout(
+            SCREEN_UPLOAD_BATCH_TIMEOUT,
+            upload_pending_screenshots(client.as_ref(), &credential, &mut handled_requests),
+        )
+        .await
+        .is_err()
+        {
+            return Err(CloudControlRuntimeError::WorkerStopped);
+        }
         let Some(control) = controls.borrow().clone() else {
             continue;
         };
@@ -4005,10 +4044,10 @@ mod tests {
         communication_attachment_is_missing, next_media_wait, photo_marker_path,
         quarantine_manifest, remember_screenshot_request, remove_uploaded_media_file, retry_delay,
         run_collector_health_loop, screenshot_prepare_payload, sync_pending_communication_events,
-        sync_pending_system_events, AgentControlSnapshot, ControlClient, ControlError,
-        ControlFuture, DeviceCredential, HttpControlClient, MediaUploadFailure,
+        sync_pending_system_events, AgentControlSnapshot, AppliedControl, ControlClient,
+        ControlError, ControlFuture, DeviceCredential, HttpControlClient, MediaUploadFailure,
         MediaUploadFailureStage, PairingCallbackHandoff, PairingExchangeRequest, PendingScreenshot,
-        PhotoMarker, ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL,
+        PhotoMarker, ScreenCaptureControl, ScreenshotTrigger, SyncEventsResponse, CONTROL_INTERVAL,
         CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT,
         PRODUCTION_CLOUD_API_ORIGIN,
     };
@@ -4023,7 +4062,7 @@ mod tests {
     use std::{
         env,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
         time::Duration,
@@ -4038,6 +4077,11 @@ mod tests {
     static PROXY_ENVIRONMENT_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
     struct CollectorHealthCountingClient(AtomicUsize);
+
+    struct NetworkCollectorHealthClient {
+        reports: AtomicUsize,
+        available: AtomicBool,
+    }
 
     impl ControlClient for CollectorHealthCountingClient {
         fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
@@ -4059,6 +4103,33 @@ mod tests {
         ) -> ControlFuture<'a, ()> {
             assert_eq!(states.len(), 1);
             self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ControlClient for NetworkCollectorHealthClient {
+        fn network_observation_available(&self) -> Option<bool> {
+            Some(self.available.load(Ordering::SeqCst))
+        }
+
+        fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn heartbeat_and_control<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: u64,
+        ) -> ControlFuture<'a, AgentControlSnapshot> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn report_collector_health<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: &'a [CollectorState],
+        ) -> ControlFuture<'a, ()> {
+            self.reports.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
     }
@@ -4094,7 +4165,7 @@ mod tests {
         )
         .expect("valid credential");
         let (_, credential_receiver) = watch::channel(credential);
-        let (_, control_receiver) = watch::channel(None);
+        let (_control, control_receiver) = watch::channel(None);
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let client = Arc::new(CollectorHealthCountingClient(AtomicUsize::new(0)));
         let worker = tokio::spawn(run_collector_health_loop(
@@ -4136,6 +4207,76 @@ mod tests {
                 panic!("database released");
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_network_health_rechecks_after_thirty_seconds() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = Arc::new(
+            DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+                .await
+                .expect("open database"),
+        );
+        let credential = DeviceCredential::new(
+            "01985555-7555-8555-8555-555555555555".to_owned(),
+            "01982222-7222-8222-8222-222222222222".to_owned(),
+            "access-credential-for-network-health-test",
+            "refresh-credential-for-network-health-test",
+        )
+        .expect("valid credential");
+        let (_credential, credential_receiver) = watch::channel(credential);
+        let (_control, control_receiver) = watch::channel(Some(AppliedControl {
+            configuration_revision: 1,
+            network_enabled: true,
+            communication_wechat_enabled: false,
+            communication_messages_enabled: false,
+            photos_library_enabled: false,
+            screen_capture: ScreenCaptureControl::default(),
+            screenshot_request_id: None,
+        }));
+        let (shutdown, shutdown_receiver) = watch::channel(false);
+        let client = Arc::new(NetworkCollectorHealthClient {
+            reports: AtomicUsize::new(0),
+            available: AtomicBool::new(false),
+        });
+        let worker = tokio::spawn(run_collector_health_loop(
+            Arc::clone(&database),
+            credential_receiver,
+            control_receiver,
+            Arc::clone(&client) as Arc<dyn ControlClient>,
+            shutdown_receiver,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(client.reports.load(Ordering::SeqCst), 1);
+        client.available.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(client.reports.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(client.reports.load(Ordering::SeqCst), 2);
+
+        shutdown.send_replace(true);
+        worker
+            .await
+            .expect("join health worker")
+            .expect("health worker");
+        drop(client);
+        Arc::try_unwrap(database)
+            .unwrap_or_else(|database| {
+                drop(database);
+                panic!("database released");
+            })
+            .shutdown()
+            .await
+            .expect("shutdown database");
     }
 
     #[test]

@@ -18,7 +18,13 @@ use crate::{paths::reject_symlink, RuntimeError};
 /// boundary before the runtime creates this guard.
 #[derive(Debug)]
 pub struct SingleInstanceGuard {
-    _lock_file: File,
+    lock_file: File,
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
 }
 
 impl SingleInstanceGuard {
@@ -44,7 +50,7 @@ impl SingleInstanceGuard {
         match file.try_lock_exclusive() {
             Ok(()) => {
                 verify_lock_file_identity(lock_file, &file)?;
-                Ok(Self { _lock_file: file })
+                Ok(Self { lock_file: file })
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 Err(RuntimeError::AlreadyRunning)

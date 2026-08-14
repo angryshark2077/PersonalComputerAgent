@@ -312,28 +312,53 @@ where
     T: Send + 'static,
 {
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    source_worker()?
-        .try_send(Box::new(move || {
-            if !sender.is_closed() {
-                let _ = sender.send(operation());
-            }
-        }))
-        .map_err(|_| capability_unavailable())?;
+    source_worker().enqueue(Box::new(move || {
+        if !sender.is_closed() {
+            let _ = sender.send(operation());
+        }
+    }))?;
     receiver.await.map_err(|_| capability_unavailable())?
 }
 
 type SourceJob = Box<dyn FnOnce() + Send + 'static>;
 
-static SOURCE_WORKER: OnceLock<Result<mpsc::SyncSender<SourceJob>, ()>> = OnceLock::new();
-
-fn source_worker() -> Result<&'static mpsc::SyncSender<SourceJob>, DomainError> {
-    SOURCE_WORKER
-        .get_or_init(|| start_source_worker("pca-wechat-source"))
-        .as_ref()
-        .map_err(|()| capability_unavailable())
+#[derive(Default)]
+struct SourceWorker {
+    sender: Mutex<Option<mpsc::SyncSender<SourceJob>>>,
 }
 
-fn start_source_worker(name: &str) -> Result<mpsc::SyncSender<SourceJob>, ()> {
+impl SourceWorker {
+    fn enqueue(&self, job: SourceJob) -> Result<(), DomainError> {
+        let mut sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sender.is_none() {
+            *sender = Some(start_source_worker("pca-wechat-source")?);
+        }
+        let current = sender.as_ref().ok_or_else(capability_unavailable)?;
+        match current.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(capability_unavailable()),
+            Err(mpsc::TrySendError::Disconnected(job)) => {
+                let replacement = start_source_worker("pca-wechat-source")?;
+                replacement
+                    .try_send(job)
+                    .map_err(|_| capability_unavailable())?;
+                *sender = Some(replacement);
+                Ok(())
+            }
+        }
+    }
+}
+
+static SOURCE_WORKER: OnceLock<SourceWorker> = OnceLock::new();
+
+fn source_worker() -> &'static SourceWorker {
+    SOURCE_WORKER.get_or_init(SourceWorker::default)
+}
+
+fn start_source_worker(name: &str) -> Result<mpsc::SyncSender<SourceJob>, DomainError> {
     let (sender, receiver) = mpsc::sync_channel::<SourceJob>(1);
     thread::Builder::new()
         .name(name.to_owned())
@@ -343,7 +368,7 @@ fn start_source_worker(name: &str) -> Result<mpsc::SyncSender<SourceJob>, ()> {
             }
         })
         .map(|_| sender)
-        .map_err(|_| ())
+        .map_err(|_| capability_unavailable())
 }
 
 fn claim_pending_media_retry(last_retry_at: &mut Option<Instant>, now: Instant) -> bool {
@@ -5605,7 +5630,7 @@ mod tests {
         should_retire_failed_full_image_retry, should_scan_message_source, source_access_error,
         source_instance_id, stage_decrypted_image, start_source_worker, video_attachment,
         voice_same_time_index, ContactCardProfile, ConversationMetadata, ImageKeys,
-        MessageSourceSnapshot, Session, SourceFileStamp, SourcePaths, SourcePayload,
+        MessageSourceSnapshot, Session, SourceFileStamp, SourcePaths, SourcePayload, SourceWorker,
         TextReadContext, WechatAppDataAccess, SESSION_DATABASE,
     };
 
@@ -5663,6 +5688,26 @@ mod tests {
         assert!(worker.try_send(Box::new(|| {})).is_err());
 
         release_sender.send(()).expect("release active job");
+    }
+
+    #[test]
+    fn source_worker_replaces_a_disconnected_thread() {
+        let (dead_sender, dead_receiver) = std::sync::mpsc::sync_channel(1);
+        drop(dead_receiver);
+        let worker = SourceWorker {
+            sender: std::sync::Mutex::new(Some(dead_sender)),
+        };
+        let (completed_sender, completed_receiver) = std::sync::mpsc::channel();
+
+        worker
+            .enqueue(Box::new(move || {
+                completed_sender.send(()).expect("report replacement job");
+            }))
+            .expect("replace disconnected worker");
+
+        completed_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("replacement worker completed job");
     }
 
     #[test]

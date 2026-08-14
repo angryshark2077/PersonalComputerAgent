@@ -420,8 +420,17 @@ async fn await_unpaired(runtime: &pca_agentd::cloud_control::CloudControlHandle)
     panic!("control runtime did not process revocation");
 }
 
+fn prevent_virtual_time_auto_advance() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    })
+}
+
 #[tokio::test(start_paused = true)]
 async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
+    let time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let credentials = credentials(Arc::clone(&store));
@@ -458,6 +467,7 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
         .unwrap()
         .is_none());
     runtime.shutdown().await.unwrap();
+    time_guard.abort();
     assert_sensitive_disabled(&database).await;
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
@@ -470,6 +480,7 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
 
 #[tokio::test(start_paused = true)]
 async fn revocation_notifies_the_agent_runtime_after_local_cleanup() {
+    let time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let credentials = credentials(Arc::clone(&store));
@@ -509,6 +520,7 @@ async fn revocation_notifies_the_agent_runtime_after_local_cleanup() {
     assert!(database.load_pairing_state().await.unwrap().is_none());
     assert_sensitive_disabled(&database).await;
     runtime.shutdown().await.unwrap();
+    time_guard.abort();
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
         Err(error) => {
@@ -564,6 +576,7 @@ async fn corrupt_startup_credential_clears_pairing_and_disables_sensitive_collec
 
 #[tokio::test(start_paused = true)]
 async fn failed_keychain_delete_still_disables_sensitive_collectors() {
+    let time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let credentials = credentials(Arc::clone(&store));
@@ -603,6 +616,7 @@ async fn failed_keychain_delete_still_disables_sensitive_collectors() {
             CredentialError::OperationFailed
         ))
     ));
+    time_guard.abort();
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
         Err(error) => {
@@ -708,6 +722,7 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
 
 #[tokio::test(start_paused = true)]
 async fn communication_revision_notifications_are_monotonic_and_invalid_control_fails_closed() {
+    let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -787,6 +802,7 @@ async fn communication_revision_notifications_are_monotonic_and_invalid_control_
 
 #[tokio::test(start_paused = true)]
 async fn same_enabled_revision_recovers_after_a_contract_failure() {
+    let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -837,6 +853,7 @@ async fn same_enabled_revision_recovers_after_a_contract_failure() {
 
 #[tokio::test(start_paused = true)]
 async fn same_revision_reasserts_network_enabled_after_in_memory_state_drift() {
+    let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -872,6 +889,7 @@ async fn same_revision_reasserts_network_enabled_after_in_memory_state_drift() {
 
 #[tokio::test(start_paused = true)]
 async fn persisted_enabled_revision_is_restored_even_when_published_before_subscription() {
+    let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -956,6 +974,7 @@ async fn persisted_enabled_revision_is_restored_even_when_published_before_subsc
 
 #[tokio::test(start_paused = true)]
 async fn valid_disable_applies_while_system_sync_is_blocked() {
+    let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -1022,7 +1041,8 @@ async fn valid_disable_applies_while_system_sync_is_blocked() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn blocked_media_upload_does_not_delay_control_heartbeats() {
+async fn blocked_media_upload_keeps_heartbeats_alive_then_fails_the_worker_deadline() {
+    let time_guard = prevent_virtual_time_auto_advance();
     let (temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -1094,8 +1114,15 @@ async fn blocked_media_upload_does_not_delay_control_heartbeats() {
     tokio::time::advance(Duration::from_secs(30)).await;
     wait_for_calls(&client.calls, 2).await;
 
-    client.media_release.notify_one();
-    runtime.shutdown().await.unwrap();
+    tokio::time::advance(Duration::from_mins(45)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        runtime.shutdown().await,
+        Err(CloudControlRuntimeError::WorkerStopped)
+    ));
+    time_guard.abort();
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
         Err(error) => {
@@ -1107,6 +1134,7 @@ async fn blocked_media_upload_does_not_delay_control_heartbeats() {
 
 #[tokio::test(start_paused = true)]
 async fn refreshed_credential_persistence_retries_without_stopping_cloud_control() {
+    let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
@@ -1480,6 +1508,7 @@ async fn cloud_owner_stale_worker_cannot_publish_or_reauthorize_after_epoch_hand
 
 #[tokio::test(start_paused = true)]
 async fn cloud_owner_closed_command_and_worker_shutdown_channels_terminate_without_busy_loop() {
+    let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let loaded = credentials(Arc::clone(&store));
