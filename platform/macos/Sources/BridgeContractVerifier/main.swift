@@ -24,8 +24,8 @@ do {
     let fixtureData = try Data(contentsOf: fixtureURL)
     let envelope = try JSONDecoder().decode(BridgeEnvelope.self, from: fixtureData)
 
-    guard envelope.protocolVersion == 1 else {
-        fail("expected protocol_version 1")
+    guard envelope.protocolVersion == 2 else {
+        fail("expected protocol_version 2")
     }
     guard envelope.deadlineMilliseconds == 1_000 else {
         fail("expected deadline_ms 1000")
@@ -70,7 +70,7 @@ do {
     let challengeEnvelope = try JSONDecoder().decode(BridgeEnvelope.self, from: challengeData)
     let challengePayload = try JSONEncoder().encode(challengeEnvelope.payload)
     let challenge = try JSONDecoder().decode(HandshakeChallenge.self, from: challengePayload)
-    guard challengeEnvelope.protocolVersion == 1,
+    guard challengeEnvelope.protocolVersion == 2,
           challengeEnvelope.messageKind == .request,
           challengeEnvelope.capability == "bridge.handshake",
           challengeEnvelope.deadlineMilliseconds == 1_000,
@@ -85,7 +85,7 @@ do {
     let responseEnvelope = try JSONDecoder().decode(BridgeEnvelope.self, from: responseData)
     let responsePayload = try JSONEncoder().encode(responseEnvelope.payload)
     let response = try JSONDecoder().decode(HandshakeResponse.self, from: responsePayload)
-    guard responseEnvelope.protocolVersion == 1,
+    guard responseEnvelope.protocolVersion == 2,
           responseEnvelope.messageKind == .response,
           responseEnvelope.capability == "bridge.handshake",
           responseEnvelope.deadlineMilliseconds == 1_000,

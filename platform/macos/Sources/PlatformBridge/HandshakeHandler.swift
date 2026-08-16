@@ -195,7 +195,8 @@ struct ValidatedHandshakeChallenge: Sendable {
 }
 
 struct HandshakeHandler: Sendable {
-    static let protocolVersion: UInt32 = 1
+    static let protocolVersion: UInt32 = 2
+    static let minimumProtocolVersion: UInt32 = 1
     private static let envelopeKeys: Set<String> = [
         "protocol_version", "request_id", "message_kind", "capability", "deadline_ms", "payload", "error",
     ]
@@ -264,7 +265,11 @@ struct HandshakeHandler: Sendable {
             throw BridgeHandshakeError.proofFailure
         }
 
-        let responseVersion = Self.protocolVersion
+        let protocolCompatible = (Self.minimumProtocolVersion...Self.protocolVersion)
+            .contains(challenge.protocolVersion)
+        let responseVersion = protocolCompatible
+            ? challenge.protocolVersion
+            : Self.protocolVersion
         let proof = try BridgeProof.make(
             secret: secret,
             nonce: challenge.nonce,
@@ -286,7 +291,7 @@ struct HandshakeHandler: Sendable {
         )
         return HandshakeResult(
             responseJSON: try JSONEncoder().encode(response),
-            protocolCompatible: challenge.protocolVersion == Self.protocolVersion,
+            protocolCompatible: protocolCompatible,
             deadlineMilliseconds: challenge.deadlineMilliseconds
         )
     }

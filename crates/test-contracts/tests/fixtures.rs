@@ -9,7 +9,7 @@ fn bridge_fixture_decodes_snake_case_and_object_payload() {
     let raw = include_str!("../../../packages/contracts/fixtures/bridge-request.valid.json");
     let envelope: BridgeEnvelope = serde_json::from_str(raw).expect("valid bridge fixture");
 
-    assert_eq!(envelope.protocol_version, 1);
+    assert_eq!(envelope.protocol_version, 2);
     assert_eq!(envelope.deadline_ms, 1_000);
     assert_eq!(envelope.payload["include_permissions"], true);
 }
@@ -51,7 +51,7 @@ fn handshake_fixtures_decode_every_canonical_field() {
     ))
     .expect("valid handshake challenge payload");
 
-    assert_eq!(challenge_envelope.protocol_version, 1);
+    assert_eq!(challenge_envelope.protocol_version, 2);
     assert_eq!(
         challenge_envelope.request_id.to_string(),
         "018f3f4a-2d9b-7d21-a310-2c49d9b43c12"
@@ -76,7 +76,7 @@ fn handshake_fixtures_decode_every_canonical_field() {
         serde_json::from_value(serde_json::Value::Object(response_envelope.payload.clone()))
             .expect("valid handshake response payload");
 
-    assert_eq!(response_envelope.protocol_version, 1);
+    assert_eq!(response_envelope.protocol_version, 2);
     assert_eq!(
         response_envelope.request_id.to_string(),
         "018f3f4a-2d9b-7d21-a310-2c49d9b43c12"

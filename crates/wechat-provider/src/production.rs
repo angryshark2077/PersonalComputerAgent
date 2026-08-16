@@ -1107,7 +1107,7 @@ fn read_database_text(
                 row.status,
             ) {
                 MessageRowDisposition::OutgoingPending => {
-                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    pending_ceiling = Some(pending_cursor_ceiling(pending_ceiling, row.local_id));
                     continue;
                 }
                 MessageRowDisposition::OutgoingFailed => {
@@ -1371,7 +1371,7 @@ fn read_database_images(
                 row.status,
             ) {
                 MessageRowDisposition::OutgoingPending => {
-                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    pending_ceiling = Some(pending_cursor_ceiling(pending_ceiling, row.local_id));
                     continue;
                 }
                 MessageRowDisposition::OutgoingFailed => {
@@ -1831,7 +1831,7 @@ fn read_database_emoticons(
                 row.status,
             ) {
                 MessageRowDisposition::OutgoingPending => {
-                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    pending_ceiling = Some(pending_cursor_ceiling(pending_ceiling, row.local_id));
                     continue;
                 }
                 MessageRowDisposition::OutgoingFailed => {
@@ -2135,7 +2135,7 @@ fn read_database_files(
                 row.status,
             ) {
                 MessageRowDisposition::OutgoingPending => {
-                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    pending_ceiling = Some(pending_cursor_ceiling(pending_ceiling, row.local_id));
                     continue;
                 }
                 MessageRowDisposition::OutgoingFailed => {
@@ -2428,7 +2428,7 @@ fn read_database_videos(
                 row.status,
             ) {
                 MessageRowDisposition::OutgoingPending => {
-                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    pending_ceiling = Some(pending_cursor_ceiling(pending_ceiling, row.local_id));
                     continue;
                 }
                 MessageRowDisposition::OutgoingFailed => {
@@ -2706,7 +2706,7 @@ fn read_database_audio(
             let direction =
                 match message_row_disposition(real_sender_id, my_rowid, server_id, status) {
                     MessageRowDisposition::OutgoingPending => {
-                        pending_ceiling = Some(cursor_before_pending(local_id));
+                        pending_ceiling = Some(pending_cursor_ceiling(pending_ceiling, local_id));
                         continue;
                     }
                     MessageRowDisposition::OutgoingFailed => {
@@ -4517,6 +4517,13 @@ enum MessageRowDisposition {
 
 fn cursor_before_pending(local_id: i64) -> i64 {
     local_id.saturating_sub(1)
+}
+
+fn pending_cursor_ceiling(current: Option<i64>, local_id: i64) -> i64 {
+    current.map_or_else(
+        || cursor_before_pending(local_id),
+        |ceiling| ceiling.min(cursor_before_pending(local_id)),
+    )
 }
 
 fn durable_cursor_sequence(
@@ -6681,8 +6688,9 @@ mod tests {
                     real_sender_id INTEGER, status INTEGER, local_type INTEGER,\
                     message_content TEXT, compress_content BLOB\
                  );\
-                 INSERT INTO \"{table_name}\" VALUES (7, 0, 1000, 1, 0, 1, 'sending', NULL);\
-                 INSERT INTO \"{table_name}\" VALUES (8, 108, 1001, 2, 0, 1, 'incoming', NULL);"
+                 INSERT INTO \"{table_name}\" VALUES (7, 0, 1000, 1, 0, 1, 'sending first', NULL);\
+                 INSERT INTO \"{table_name}\" VALUES (8, 0, 1001, 1, 0, 1, 'sending second', NULL);\
+                 INSERT INTO \"{table_name}\" VALUES (9, 109, 1002, 2, 0, 1, 'incoming', NULL);"
             ))
             .expect("create outbound fixture schema");
         let metadata = std::collections::BTreeMap::from([(
@@ -6726,7 +6734,7 @@ mod tests {
             "the durable cursor stays before the pending row"
         );
         let incoming = sending[0].2.as_ref().expect("incoming record");
-        assert_eq!(incoming.source_sequence, 8);
+        assert_eq!(incoming.source_sequence, 9);
         assert_eq!(incoming.cursor_sequence, 6);
 
         connection

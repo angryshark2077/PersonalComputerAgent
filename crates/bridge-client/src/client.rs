@@ -23,7 +23,8 @@ use crate::{
     framing::{read_frame_bytes, write_frame, FrameError},
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+const LEGACY_PROTOCOL_VERSION: u32 = 1;
 const HANDSHAKE_CAPABILITY: &str = "bridge.handshake";
 const NETWORK_OBSERVE_CAPABILITY: &str = "network.observe";
 const LIFECYCLE_POLL_CAPABILITY: &str = "system.lifecycle.poll";
@@ -140,6 +141,7 @@ impl Eq for BridgeClientError {}
 pub struct BridgeClient {
     stream: Option<UnixStream>,
     operation_timeout: Duration,
+    protocol_version: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
@@ -258,7 +260,8 @@ impl std::fmt::Debug for BridgeClient {
 }
 
 impl BridgeClient {
-    /// Connects and completes the authenticated protocol-v1 handshake.
+    /// Connects and completes the authenticated handshake, falling back one protocol version
+    /// only after the Bridge returns an authenticated incompatibility response.
     ///
     /// # Errors
     ///
@@ -267,6 +270,28 @@ impl BridgeClient {
     pub async fn connect_and_handshake(
         config: BridgeClientConfig,
         credential_store: Arc<dyn CredentialStore>,
+    ) -> Result<Self, BridgeClientError> {
+        match Self::connect_with_protocol(
+            config.clone(),
+            Arc::clone(&credential_store),
+            PROTOCOL_VERSION,
+        )
+        .await
+        {
+            Err(BridgeClientError::IncompatibleProtocol {
+                actual: LEGACY_PROTOCOL_VERSION,
+                ..
+            }) => {
+                Self::connect_with_protocol(config, credential_store, LEGACY_PROTOCOL_VERSION).await
+            }
+            result => result,
+        }
+    }
+
+    async fn connect_with_protocol(
+        config: BridgeClientConfig,
+        credential_store: Arc<dyn CredentialStore>,
+        protocol_version: u32,
     ) -> Result<Self, BridgeClientError> {
         let secret = load_secret(credential_store.as_ref())?;
         let mut stream = timeout(config.timeout, UnixStream::connect(&config.socket_path))
@@ -286,12 +311,12 @@ impl BridgeClient {
             client_proof: create_agent_proof(
                 &secret,
                 &nonce,
-                PROTOCOL_VERSION,
+                protocol_version,
                 &config.agent_version,
             ),
         })?;
         let challenge = BridgeEnvelope {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version,
             request_id,
             message_kind: BridgeMessageKind::Request,
             capability: HANDSHAKE_CAPABILITY.to_owned(),
@@ -334,9 +359,9 @@ impl BridgeClient {
             &handshake.proof,
         )
         .map_err(|_| BridgeClientError::AuthenticationFailed)?;
-        if response.protocol_version != PROTOCOL_VERSION {
+        if response.protocol_version != protocol_version {
             return Err(BridgeClientError::IncompatibleProtocol {
-                expected: PROTOCOL_VERSION,
+                expected: protocol_version,
                 actual: response.protocol_version,
             });
         }
@@ -344,6 +369,7 @@ impl BridgeClient {
         Ok(Self {
             stream: Some(stream),
             operation_timeout: config.timeout,
+            protocol_version,
         })
     }
 
@@ -357,7 +383,7 @@ impl BridgeClient {
         &mut self,
         request: BridgeEnvelope,
     ) -> Result<BridgeEnvelope, BridgeClientError> {
-        validate_request(&request)?;
+        validate_request(&request, self.protocol_version)?;
         let mut stream = self.stream.take().ok_or(BridgeClientError::Disconnected)?;
         let wire_deadline = Duration::from_millis(request.deadline_ms);
         let operation_timeout = self.operation_timeout.min(wire_deadline);
@@ -374,9 +400,9 @@ impl BridgeClient {
             &response.capability,
             response.deadline_ms,
         )?;
-        if response.protocol_version != PROTOCOL_VERSION {
+        if response.protocol_version != self.protocol_version {
             return Err(BridgeClientError::IncompatibleProtocol {
-                expected: PROTOCOL_VERSION,
+                expected: self.protocol_version,
                 actual: response.protocol_version,
             });
         }
@@ -391,7 +417,7 @@ impl BridgeClient {
     /// Rejects malformed interface, Wi-Fi identity, or local address fields.
     pub async fn observe_network(&mut self) -> Result<NetworkObservation, BridgeClientError> {
         let request = BridgeEnvelope {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.protocol_version,
             request_id: Uuid::new_v4(),
             message_kind: BridgeMessageKind::Request,
             capability: NETWORK_OBSERVE_CAPABILITY.to_owned(),
@@ -421,7 +447,7 @@ impl BridgeClient {
         after_sequence: u64,
     ) -> Result<(Vec<PlatformLifecycleEvent>, u64), BridgeClientError> {
         let request = BridgeEnvelope {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.protocol_version,
             request_id: Uuid::new_v4(),
             message_kind: BridgeMessageKind::Request,
             capability: LIFECYCLE_POLL_CAPABILITY.to_owned(),
@@ -446,7 +472,7 @@ impl BridgeClient {
     /// Returns a typed Bridge transport, timeout, or strict response-validation error.
     pub async fn screen_context(&mut self) -> Result<ScreenContext, BridgeClientError> {
         let request = BridgeEnvelope {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.protocol_version,
             request_id: Uuid::new_v4(),
             message_kind: BridgeMessageKind::Request,
             capability: SCREEN_CONTEXT_CAPABILITY.to_owned(),
@@ -481,7 +507,7 @@ impl BridgeClient {
             return Err(BridgeClientError::InvalidConfiguration);
         }
         let request = BridgeEnvelope {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.protocol_version,
             request_id: Uuid::new_v4(),
             message_kind: BridgeMessageKind::Request,
             capability: SCREEN_CAPTURE_CAPABILITY.to_owned(),
@@ -515,7 +541,7 @@ impl BridgeClient {
         }
         let response = self
             .request(BridgeEnvelope {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: self.protocol_version,
                 request_id: Uuid::new_v4(),
                 message_kind: BridgeMessageKind::Request,
                 capability: MESSAGE_DECODE_CAPABILITY.to_owned(),
@@ -540,7 +566,7 @@ impl BridgeClient {
     pub async fn photo_authorization(&mut self) -> Result<String, BridgeClientError> {
         let response = self
             .request(BridgeEnvelope {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: self.protocol_version,
                 request_id: Uuid::new_v4(),
                 message_kind: BridgeMessageKind::Request,
                 capability: PHOTO_AUTHORIZATION_CAPABILITY.to_owned(),
@@ -579,7 +605,7 @@ impl BridgeClient {
         }
         let response = self
             .request(BridgeEnvelope {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: self.protocol_version,
                 request_id: Uuid::new_v4(),
                 message_kind: BridgeMessageKind::Request,
                 capability: PHOTO_LIST_CAPABILITY.to_owned(),
@@ -621,7 +647,7 @@ impl BridgeClient {
         }
         let response = self
             .request(BridgeEnvelope {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: self.protocol_version,
                 request_id: Uuid::new_v4(),
                 message_kind: BridgeMessageKind::Request,
                 capability: PHOTO_EXPORT_CAPABILITY.to_owned(),
@@ -824,8 +850,11 @@ fn load_secret(store: &dyn CredentialStore) -> Result<[u8; 32], BridgeClientErro
         .ok_or(BridgeClientError::CredentialMissing)
 }
 
-fn validate_request(request: &BridgeEnvelope) -> Result<(), BridgeClientError> {
-    if request.protocol_version != PROTOCOL_VERSION
+fn validate_request(
+    request: &BridgeEnvelope,
+    protocol_version: u32,
+) -> Result<(), BridgeClientError> {
+    if request.protocol_version != protocol_version
         || request.message_kind != BridgeMessageKind::Request
         || request.capability.is_empty()
         || request.deadline_ms == 0

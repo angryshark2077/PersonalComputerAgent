@@ -58,7 +58,10 @@ final class HandshakeTests: XCTestCase {
 
     func testChallengeProducesStrictCorrelatedAuthenticatedResponse() throws {
         let requestID = UUID(uuidString: "018f3f4a-2d9b-7d21-a310-2c49d9b43c12")!
-        let challenge = try challengeData(protocolVersion: 1, requestID: requestID)
+        let challenge = try challengeData(
+            protocolVersion: Int(HandshakeHandler.protocolVersion),
+            requestID: requestID
+        )
         let handler = HandshakeHandler(bridgeVersion: "0.0.0-s1a")
 
         let result = try handler.respond(to: challenge, secret: secret)
@@ -67,7 +70,7 @@ final class HandshakeTests: XCTestCase {
         let payload = try JSONDecoder().decode(HandshakeResponse.self, from: payloadData)
 
         XCTAssertTrue(result.protocolCompatible)
-        XCTAssertEqual(response.protocolVersion, 1)
+        XCTAssertEqual(response.protocolVersion, Int(HandshakeHandler.protocolVersion))
         XCTAssertEqual(response.requestID, requestID)
         XCTAssertEqual(response.messageKind, .response)
         XCTAssertEqual(response.capability, "bridge.handshake")
@@ -80,12 +83,32 @@ final class HandshakeTests: XCTestCase {
             payload.proof,
             secret: secret,
             nonce: nonce,
+            protocolVersion: HandshakeHandler.protocolVersion,
+            agentVersion: "v1.β"
+        ))
+    }
+
+    func testLegacyV1ChallengeRemainsAuthenticatedDuringCompatibilityWindow() throws {
+        let challenge = try challengeData(protocolVersion: 1, requestID: UUID())
+        let handler = HandshakeHandler(bridgeVersion: "0.0.0-s1a")
+
+        let result = try handler.respond(to: challenge, secret: secret)
+        let response = try JSONDecoder().decode(BridgeEnvelope.self, from: result.responseJSON)
+        let payloadData = try JSONEncoder().encode(response.payload)
+        let payload = try JSONDecoder().decode(HandshakeResponse.self, from: payloadData)
+
+        XCTAssertTrue(result.protocolCompatible)
+        XCTAssertEqual(response.protocolVersion, 1)
+        XCTAssertTrue(BridgeProof.verify(
+            payload.proof,
+            secret: secret,
+            nonce: nonce,
             protocolVersion: 1,
             agentVersion: "v1.β"
         ))
     }
 
-    func testUnsupportedInboundVersionReturnsAuthenticatedV1ThenRequiresClose() throws {
+    func testUnsupportedInboundVersionReturnsAuthenticatedCurrentVersionThenRequiresClose() throws {
         let challenge = try challengeData(protocolVersion: 999, requestID: UUID())
         let handler = HandshakeHandler(bridgeVersion: "0.0.0-s1a")
 
@@ -95,12 +118,12 @@ final class HandshakeTests: XCTestCase {
         let payload = try JSONDecoder().decode(HandshakeResponse.self, from: payloadData)
 
         XCTAssertFalse(result.protocolCompatible)
-        XCTAssertEqual(response.protocolVersion, 1)
+        XCTAssertEqual(response.protocolVersion, Int(HandshakeHandler.protocolVersion))
         XCTAssertTrue(BridgeProof.verify(
             payload.proof,
             secret: secret,
             nonce: nonce,
-            protocolVersion: 1,
+            protocolVersion: HandshakeHandler.protocolVersion,
             agentVersion: "v1.β"
         ))
         XCTAssertFalse(BridgeProof.verify(
@@ -482,6 +505,19 @@ final class HandshakeTests: XCTestCase {
         }
     }
 
+    func testCapabilityRequestCannotSwitchProtocolAfterHandshake() throws {
+        let request = try replacing(
+            capabilityRequest(requestID: UUID(), deadline: 1_000),
+            key: "protocol_version",
+            with: 2
+        )
+
+        XCTAssertThrowsError(try CapabilityRequestHandler.respond(
+            to: request,
+            negotiatedProtocolVersion: 1
+        ))
+    }
+
     func testLifecyclePollReturnsOnlyEventsAfterTheAuthenticatedCursor() throws {
         let source = PlatformLifecycleEventBuffer()
         source.record(.systemSleep, at: Date(timeIntervalSince1970: 1))
@@ -679,7 +715,7 @@ final class HandshakeTests: XCTestCase {
         try assertAuthenticatedHandshake(
             incompatibleResponse,
             requestID: incompatibleID,
-            expectedCompatibleVersion: 1
+            expectedCompatibleVersion: Int(HandshakeHandler.protocolVersion)
         )
         let incompatibleClosed = try await waitForEOF(from: incompatible)
         XCTAssertTrue(incompatibleClosed)

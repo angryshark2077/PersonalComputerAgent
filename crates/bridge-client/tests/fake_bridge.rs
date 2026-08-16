@@ -11,7 +11,7 @@ use pca_bridge_client::{
     auth::{create_agent_proof, create_proof, verify_agent_proof, verify_proof},
     framing::{read_frame, write_frame, FrameError, MAX_FRAME_BYTES},
     supervisor::{BridgeSupervisor, BridgeSupervisorConfig},
-    BridgeClient, BridgeClientConfig, BridgeClientError,
+    BridgeClient, BridgeClientConfig, BridgeClientError, PROTOCOL_VERSION,
 };
 use pca_domain::{
     BridgeEnvelope, BridgeMessageKind, BridgeStatus, HandshakeResponse, HandshakeResponsePhase,
@@ -197,10 +197,33 @@ async fn version_mismatch_is_terminal_only_after_authenticating_the_declared_ver
         )
         .await,
         Err(BridgeClientError::IncompatibleProtocol {
-            expected: 1,
+            expected: 2,
             actual: 999
         })
     ));
+}
+
+#[tokio::test]
+async fn current_client_falls_back_to_authenticated_v1_bridge() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let socket = directory.path().join("legacy-bridge.sock");
+    let listener = UnixListener::bind(&socket).expect("bind legacy bridge");
+    let server = tokio::spawn(async move {
+        let (mut current_attempt, _) = listener.accept().await.expect("accept v2 attempt");
+        assert_eq!(serve_valid_handshake(&mut current_attempt, 1).await, 2);
+        drop(current_attempt);
+
+        let (mut legacy_attempt, _) = listener.accept().await.expect("accept v1 fallback");
+        assert_eq!(serve_valid_handshake(&mut legacy_attempt, 1).await, 1);
+    });
+
+    BridgeClient::connect_and_handshake(
+        BridgeClientConfig::new(&socket, "0.0.0-s1a").expect("client config"),
+        Arc::new(TestStore::with_secret(Some(SECRET.to_vec()))),
+    )
+    .await
+    .expect("connect through v1 compatibility window");
+    server.await.expect("legacy bridge server");
 }
 
 #[tokio::test]
@@ -321,7 +344,7 @@ async fn request_enforces_wire_deadline_and_correlates_every_response_field() {
         (
             RequestBehavior::WrongVersion,
             BridgeClientError::IncompatibleProtocol {
-                expected: 1,
+                expected: PROTOCOL_VERSION,
                 actual: 999,
             },
         ),
@@ -405,7 +428,7 @@ async fn request_timeout_poisons_stream_reuse_and_a_new_connection_succeeds() {
     let listener = UnixListener::bind(&socket).expect("bind timeout fake");
     let server = tokio::spawn(async move {
         let (mut first, _) = listener.accept().await.expect("first connection");
-        serve_valid_handshake(&mut first, 1).await;
+        let _ = serve_valid_handshake(&mut first, PROTOCOL_VERSION).await;
         let _: BridgeEnvelope =
             serde_json::from_value(read_frame(&mut first).await.expect("first timed request"))
                 .expect("first request envelope");
@@ -416,7 +439,7 @@ async fn request_timeout_poisons_stream_reuse_and_a_new_connection_succeeds() {
         ));
 
         let (mut second, _) = listener.accept().await.expect("replacement connection");
-        serve_valid_handshake(&mut second, 1).await;
+        let _ = serve_valid_handshake(&mut second, PROTOCOL_VERSION).await;
         let request: BridgeEnvelope =
             serde_json::from_value(read_frame(&mut second).await.expect("replacement request"))
                 .expect("replacement request envelope");
@@ -671,7 +694,7 @@ async fn connect_to_fake_observing(
         ) {
             999
         } else {
-            1
+            challenge.protocol_version
         };
         let proof = if matches!(behavior, ServerBehavior::WrongProof) {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32])
@@ -682,7 +705,7 @@ async fn connect_to_fake_observing(
                 if matches!(behavior, ServerBehavior::AuthenticatedIncompatible) {
                     response_version
                 } else {
-                    1
+                    challenge.protocol_version
                 },
                 "0.0.0-s1a",
             )
@@ -765,10 +788,11 @@ async fn connect_for_request(
             .expect("base64 nonce");
         let mut nonce_bytes = [0_u8; 32];
         nonce_bytes.copy_from_slice(&decoded);
+        let protocol_version = challenge.protocol_version;
         let handshake_payload = serde_json::to_value(HandshakeResponse {
             phase: HandshakeResponsePhase::Response,
             nonce: nonce.to_owned(),
-            proof: create_proof(&SECRET, &nonce_bytes, 1, "0.0.0-s1a"),
+            proof: create_proof(&SECRET, &nonce_bytes, protocol_version, "0.0.0-s1a"),
             bridge_version: "0.0.0-s1a".to_owned(),
         })
         .expect("handshake payload")
@@ -776,7 +800,7 @@ async fn connect_for_request(
         .expect("object payload")
         .clone();
         let handshake = BridgeEnvelope {
-            protocol_version: 1,
+            protocol_version,
             request_id: challenge.request_id,
             message_kind: BridgeMessageKind::Response,
             capability: challenge.capability,
@@ -802,7 +826,7 @@ async fn connect_for_request(
             protocol_version: if matches!(behavior, RequestBehavior::WrongVersion) {
                 999
             } else {
-                1
+                request.protocol_version
             },
             request_id: if matches!(behavior, RequestBehavior::WrongRequestId) {
                 Uuid::new_v4()
@@ -868,7 +892,7 @@ fn with_length(length: u32, bytes: &[u8]) -> Vec<u8> {
 #[allow(dead_code)]
 fn request(payload: Map<String, Value>) -> BridgeEnvelope {
     BridgeEnvelope {
-        protocol_version: 1,
+        protocol_version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4(),
         message_kind: BridgeMessageKind::Request,
         capability: "system.capabilities".to_owned(),
@@ -889,7 +913,7 @@ fn contains_ordered(actual: &[BridgeStatus], expected: &[BridgeStatus]) -> bool 
     next.is_none()
 }
 
-async fn serve_valid_handshake(stream: &mut tokio::net::UnixStream, response_version: u32) {
+async fn serve_valid_handshake(stream: &mut tokio::net::UnixStream, response_version: u32) -> u32 {
     let challenge: BridgeEnvelope =
         serde_json::from_value(read_frame(stream).await.expect("challenge frame"))
             .expect("challenge envelope");
@@ -923,6 +947,7 @@ async fn serve_valid_handshake(stream: &mut tokio::net::UnixStream, response_ver
     )
     .await
     .expect("response frame");
+    challenge.protocol_version
 }
 
 async fn send_valid_response(stream: &mut tokio::net::UnixStream, request: &BridgeEnvelope) {
@@ -956,7 +981,7 @@ async fn write_raw_frame(stream: &mut tokio::net::UnixStream, payload: &[u8]) {
 }
 
 fn fake_bridge_script(incompatible: bool) -> String {
-    let protocol_version = if incompatible { 999 } else { 1 };
+    let protocol_version = if incompatible { 999 } else { PROTOCOL_VERSION };
     format!(
         r"#!/usr/bin/python3
 import base64, hashlib, hmac, json, os, socket, struct, sys, time

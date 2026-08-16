@@ -372,6 +372,7 @@ actor BridgeServer {
             )
             let response = try CapabilityRequestHandler.respond(
                 to: request,
+                negotiatedProtocolVersion: challenge.protocolVersion,
                 capabilityProbe: capabilityProbe,
                 networkSource: networkSource,
                 lifecycleSource: lifecycleSource,
@@ -521,6 +522,7 @@ enum CapabilityRequestHandler {
 
     static func respond(
         to requestJSON: Data,
+        negotiatedProtocolVersion: UInt32? = nil,
         capabilityProbe: CapabilityProbe = CapabilityProbe(),
         networkSource: NetworkObservationSource = NetworkObservationSource(),
         lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer(),
@@ -566,7 +568,9 @@ enum CapabilityRequestHandler {
         } catch {
             throw BridgeServerError.invalidRequest
         }
-        guard request.protocolVersion == HandshakeHandler.protocolVersion,
+        guard (HandshakeHandler.minimumProtocolVersion...HandshakeHandler.protocolVersion)
+                  .contains(request.protocolVersion),
+              negotiatedProtocolVersion.map({ $0 == request.protocolVersion }) ?? true,
               request.messageKind == .request,
               request.capability == capability,
               request.deadlineMilliseconds > 0,
@@ -642,7 +646,7 @@ enum CapabilityRequestHandler {
             ]
         }
         let response = BridgeEnvelope(
-            protocolVersion: Int(HandshakeHandler.protocolVersion),
+            protocolVersion: Int(request.protocolVersion),
             requestID: request.requestID,
             messageKind: .response,
             capability: request.capability,

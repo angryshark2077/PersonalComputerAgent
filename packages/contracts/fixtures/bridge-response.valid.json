@@ -1,5 +1,5 @@
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "request_id": "018f3f4a-2d9b-7d21-a310-2c49d9b43c11",
   "message_kind": "response",
   "capability": "system.capabilities",
