@@ -212,12 +212,15 @@ async fn supervise(
         )
     })?;
     let shutdown_result = sampler.shutdown().await;
+    supervisor_result(task_error, shutdown_result)
+}
 
-    if let Some(error) = task_error {
-        Err(error)
-    } else {
-        shutdown_result
-    }
+fn supervisor_result(
+    task_error: Option<SystemSampleError>,
+    shutdown_result: Result<(), SystemSampleError>,
+) -> Result<(), SystemSampleError> {
+    shutdown_result?;
+    task_error.map_or(Ok(()), Err)
 }
 
 fn group_task_error(
@@ -469,7 +472,9 @@ mod tests {
 
     use crate::{start_sampler, SystemMetricsSource};
 
-    use super::{start_system_collector, SystemObservation, SAMPLE_OPERATION_TIMEOUT};
+    use super::{
+        start_system_collector, supervisor_result, SystemObservation, SAMPLE_OPERATION_TIMEOUT,
+    };
 
     struct BlockingSource {
         entered: Option<mpsc::Sender<()>>,
@@ -527,5 +532,23 @@ mod tests {
             .await
             .expect_err("fatal timeout must stop the collector");
         assert_eq!(error.code, "SYSTEM_SAMPLE_TIMEOUT");
+    }
+
+    #[test]
+    fn sampler_shutdown_timeout_overrides_the_error_that_started_shutdown() {
+        let sample_timeout = crate::SystemSampleError::new(
+            crate::SystemSampleErrorKind::Fatal,
+            "SYSTEM_SAMPLE_TIMEOUT",
+            "sample blocked",
+        );
+        let stop_timeout = crate::SystemSampleError::new(
+            crate::SystemSampleErrorKind::Fatal,
+            "SYSTEM_SAMPLER_STOP_TIMEOUT",
+            "owner remained blocked",
+        );
+
+        let error = supervisor_result(Some(sample_timeout), Err(stop_timeout))
+            .expect_err("sampler shutdown failure must win");
+        assert_eq!(error.code, "SYSTEM_SAMPLER_STOP_TIMEOUT");
     }
 }

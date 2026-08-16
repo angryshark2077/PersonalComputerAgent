@@ -59,28 +59,6 @@ enum WechatRepairRunnerError: LocalizedError, Equatable {
     }
 }
 
-private final class ProcessCancellationState: @unchecked Sendable {
-    private let lock = NSLock()
-    private var requested = false
-
-    func request() {
-        lock.withLock { requested = true }
-    }
-
-    var isRequested: Bool {
-        lock.withLock { requested }
-    }
-}
-
-private func terminateProcessGroup(_ process: Process) {
-    guard process.isRunning else { return }
-    let processIdentifier = process.processIdentifier
-    if processIdentifier > 0 {
-        _ = Darwin.kill(-processIdentifier, SIGTERM)
-    }
-    process.terminate()
-}
-
 @MainActor
 final class ProcessWechatRepairRunner: WechatRepairRunning {
     private let executableURL: URL
@@ -95,53 +73,36 @@ final class ProcessWechatRepairRunner: WechatRepairRunning {
 
     func prepareAutomaticRecovery() async throws {
         guard isAvailable else { throw WechatRepairRunnerError.unavailable }
-        let output = Pipe()
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = ["prepare-automatic"]
-        process.environment = ProcessInfo.processInfo.environment.merging([
+        let environment = ProcessInfo.processInfo.environment.merging([
             "PCA_INSTALLER_PID": String(ProcessInfo.processInfo.processIdentifier),
         ]) { _, current in current }
-        process.standardOutput = output
-        process.standardError = output
-        let cancellationState = ProcessCancellationState()
-        try Task.checkCancellation()
-        let status = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
-                guard !cancellationState.isRequested else {
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                process.terminationHandler = { process in
-                    continuation.resume(returning: process.terminationStatus)
-                }
-                do {
-                    try process.run()
-                    if cancellationState.isRequested {
-                        terminateProcessGroup(process)
-                    }
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        } onCancel: {
-            cancellationState.request()
-            terminateProcessGroup(process)
+        let result: InstallerProcessResult
+        do {
+            result = try await runInstallerProcess(
+                executableURL: executableURL,
+                arguments: ["prepare-automatic"],
+                timeout: .seconds(600),
+                captureOutput: true,
+                environment: environment,
+                terminateProcessGroup: true
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw WechatRepairRunnerError.failed(message: "WeChat key recovery timed out or failed to start safely.")
         }
-        try Task.checkCancellation()
-        let data = try output.fileHandleForReading.readToEnd() ?? Data()
-        let message = String(decoding: data, as: UTF8.self)
+        let message = String(decoding: result.output, as: UTF8.self)
             .split(whereSeparator: \.isNewline)
             .last
             .map(String.init)
             ?? "WeChat key recovery failed safely."
-        if [3, 4, 6].contains(status) {
+        if [3, 4, 6].contains(result.status) {
             throw WechatRepairRunnerError.notApplicable
         }
-        if status == 9 {
+        if result.status == 9 {
             throw WechatRepairRunnerError.requiresUserAction(message: message)
         }
-        guard status == 0 else {
+        guard result.status == 0 else {
             throw WechatRepairRunnerError.failed(message: message)
         }
     }

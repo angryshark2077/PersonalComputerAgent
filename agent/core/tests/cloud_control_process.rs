@@ -1376,7 +1376,7 @@ async fn blocked_communication_upload_degrades_only_its_collectors_without_stopp
              );
              INSERT INTO communication_messages VALUES (
                 1, 'media-event', 'account-1', 'conversation-1', 1, 'source-1',
-                'incoming', 'image', 1, NULL, 1
+                'incoming', 'image', 1, NULL, 1, 1
              );
              INSERT INTO attachment_spool (
                 attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,

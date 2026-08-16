@@ -442,6 +442,69 @@ test("communication sync accepts valid events while rejecting one unsupported ev
   assert.equal(Number.isNaN(Date.parse(body.server_time)), false);
 });
 
+test("communication projection conflict rejects only that event and accepts the rest of the batch", async () => {
+  const { api, credentials } = await pairedApi();
+  const headers = {
+    authorization: `Bearer ${credentials.device_access_token}`,
+    "content-type": "application/json",
+  };
+  const seed = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777760",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationConversation(credentials.device_id)],
+    }),
+  });
+  assert.equal(seed.status, 200);
+
+  const conflicting = communicationConversation(credentials.device_id);
+  conflicting.event_id = "01986666-7666-8666-8666-666666666675";
+  conflicting.idempotency_key = "conversation-observed-conflicting-scope";
+  (conflicting.payload as { conversation: { scope: string; member_count?: number } }).conversation = {
+    scope: "group",
+    member_count: 2,
+  };
+  const valid = appleMessagesText(credentials.device_id);
+  const response = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777761",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [conflicting, valid],
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  const body = await response.json() as {
+    batch_id: string;
+    accepted: string[];
+    duplicates: string[];
+    rejected: Array<{ event_id: string; error_code: string; retryable: boolean }>;
+    server_time: string;
+  };
+  assert.deepEqual({
+    batch_id: body.batch_id,
+    accepted: body.accepted,
+    duplicates: body.duplicates,
+    rejected: body.rejected,
+  }, {
+    batch_id: "01987777-7777-8777-8777-777777777761",
+    accepted: [valid.event_id],
+    duplicates: [],
+    rejected: [{
+      event_id: conflicting.event_id,
+      error_code: "SYNC_PAYLOAD_REJECTED",
+      retryable: false,
+    }],
+  });
+  assert.equal(Number.isNaN(Date.parse(body.server_time)), false);
+});
+
 test("a later media projection replaces the earlier projection for the same message", async () => {
   const { api, credentials } = await pairedApi();
   const lateThumbnail = communicationImage(credentials.device_id);

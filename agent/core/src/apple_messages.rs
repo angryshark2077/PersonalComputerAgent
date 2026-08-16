@@ -160,8 +160,14 @@ async fn collect_once(
             let row_id = source_message.row_id;
             let text = resolved_message_text(&source_message, &mut decoded)?;
             if let Some(text) = text {
-                let commit = message_commit(&source_message, text, workspace_id, device_id)?;
-                event_observed |= commit_message_or_accept_replay(database, &commit).await?;
+                event_observed |= commit_message_or_record_invalid(
+                    database,
+                    &source_message,
+                    text,
+                    workspace_id,
+                    device_id,
+                )
+                .await?;
             }
             persist_cursor(workspace_id, device_id, row_id).await?;
             cursor = Some(row_id);
@@ -171,6 +177,23 @@ async fn collect_once(
         }
     }
     Ok(event_observed)
+}
+
+async fn commit_message_or_record_invalid(
+    database: &DbActorHandle,
+    source: &SourceMessage,
+    text: String,
+    workspace_id: &str,
+    device_id: &str,
+) -> Result<bool, ()> {
+    let Ok(commit) = message_commit(source, text, workspace_id, device_id) else {
+        database
+            .record_apple_message_invalid_record(&source.guid)
+            .await
+            .map_err(|_| ())?;
+        return Ok(false);
+    };
+    commit_message_or_accept_replay(database, &commit).await
 }
 
 async fn commit_message_or_accept_replay(
@@ -488,9 +511,9 @@ async fn persist_cursor(workspace_id: &str, device_id: &str, row_id: i64) -> Res
 #[cfg(test)]
 mod tests {
     use super::{
-        apple_date_to_rfc3339, commit_message_or_accept_replay, load_recent_messages,
-        message_commit, message_events, migrate_established_cursor, resolved_message_text,
-        stable_uuid, SourceMessage, MESSAGE_PAGE_SIZE,
+        apple_date_to_rfc3339, commit_message_or_accept_replay, commit_message_or_record_invalid,
+        load_recent_messages, message_commit, message_events, migrate_established_cursor,
+        resolved_message_text, stable_uuid, SourceMessage, MESSAGE_PAGE_SIZE,
     };
     use pca_db_local::DbActorHandle;
     use rusqlite::{params, Connection};
@@ -624,6 +647,51 @@ mod tests {
         };
 
         assert!(message_commit(&message, "hello".to_owned(), "workspace", "device").is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_source_message_is_diagnosed_without_blocking_cursor_progress() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_path = directory.path().join("agent.sqlite3");
+        let database = DbActorHandle::open(&database_path, "test")
+            .await
+            .expect("open database");
+        let message = SourceMessage {
+            row_id: 7,
+            guid: "message-guid".to_owned(),
+            chat_guid: "chat-guid".to_owned(),
+            display_name: "Chat".to_owned(),
+            sender_id: "sender".to_owned(),
+            sender_display_name: "invalid\nname".to_owned(),
+            is_from_me: false,
+            apple_date: 0,
+            member_count: 1,
+            text: Some("hello".to_owned()),
+            attributed_body: None,
+        };
+
+        assert!(!commit_message_or_record_invalid(
+            &database,
+            &message,
+            "hello".to_owned(),
+            "workspace",
+            "device",
+        )
+        .await
+        .expect("skip malformed source message"));
+        database.shutdown().await.expect("shutdown database");
+
+        let connection = Connection::open(&database_path).expect("reopen database");
+        let (code, redacted_json): (String, String) = connection
+            .query_row(
+                "SELECT code, redacted_json FROM diagnostic_events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load invalid-message diagnostic");
+        assert_eq!(code, "APPLE_MESSAGE_INVALID_RECORD");
+        assert!(!redacted_json.contains("message-guid"));
+        assert!(!redacted_json.contains("hello"));
     }
 
     #[test]

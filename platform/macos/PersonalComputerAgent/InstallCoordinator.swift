@@ -545,6 +545,70 @@ enum InstallResult: Equatable, Sendable {
     case success(version: String)
 }
 
+enum InstallerProcessError: Error {
+    case timedOut
+}
+
+struct InstallerProcessResult: Sendable {
+    let status: Int32
+    let output: Data
+}
+
+@MainActor
+func runInstallerProcess(
+    executableURL: URL,
+    arguments: [String],
+    timeout: Duration,
+    captureOutput: Bool = false,
+    environment: [String: String]? = nil,
+    terminateProcessGroup: Bool = false
+) async throws -> InstallerProcessResult {
+    let process = Process()
+    process.executableURL = executableURL
+    process.arguments = arguments
+    process.environment = environment
+    let output = captureOutput ? Pipe() : nil
+    process.standardOutput = output
+    process.standardError = output
+    try process.run()
+    let outputTask = output.map { pipe in
+        Task.detached { try pipe.fileHandleForReading.readToEnd() ?? Data() }
+    }
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    do {
+        while process.isRunning, clock.now < deadline {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        guard !process.isRunning else { throw InstallerProcessError.timedOut }
+    } catch {
+        if process.isRunning {
+            if terminateProcessGroup, process.processIdentifier > 0 {
+                _ = Darwin.kill(-process.processIdentifier, SIGTERM)
+            }
+            process.terminate()
+            let terminationDeadline = clock.now.advanced(by: .seconds(2))
+            while process.isRunning, clock.now < terminationDeadline {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if process.processIdentifier > 0 {
+                if terminateProcessGroup {
+                    _ = Darwin.kill(-process.processIdentifier, SIGKILL)
+                }
+                if process.isRunning {
+                    _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                }
+            }
+        }
+        throw error
+    }
+    return InstallerProcessResult(
+        status: process.terminationStatus,
+        output: try await outputTask?.value ?? Data()
+    )
+}
+
 @MainActor
 protocol InstallCoordinating: AnyObject {
     func installOrFinish(from sourceBundle: URL, onState: @escaping @MainActor (InstallerState) -> Void) async throws -> InstallResult
@@ -569,26 +633,22 @@ final class WechatAppDataAccessController: WechatAppDataAccessControlling {
         }
         onWaitingForAuthorization()
         try Task.checkCancellation()
-        let output = Pipe()
-        let process = Process()
-        process.executableURL = agentExecutableURL
-        process.arguments = ["probe-wechat-app-data"]
-        process.standardOutput = output
-        process.standardError = output
-        let status = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                process.terminationHandler = { process in
-                    continuation.resume(returning: process.terminationStatus)
-                }
-                do { try process.run() } catch { continuation.resume(throwing: error) }
-            }
-        } onCancel: {
-            if process.isRunning { process.terminate() }
+        let result: InstallerProcessResult
+        do {
+            result = try await runInstallerProcess(
+                executableURL: agentExecutableURL,
+                arguments: ["probe-wechat-app-data"],
+                timeout: .seconds(30),
+                captureOutput: true
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw InstallError.wechatAppDataProbeFailed
         }
-        try Task.checkCancellation()
-        let response = String(decoding: try output.fileHandleForReading.readToEnd() ?? Data(), as: UTF8.self)
+        let response = String(decoding: result.output, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        try validateProbeResult(status: status, response: response)
+        try validateProbeResult(status: result.status, response: response)
     }
 
     func validateProbeResult(status: Int32, response: String) throws {
@@ -635,19 +695,19 @@ final class PhotosAccessController: PhotosAccessControlling {
         }
         onWaitingForAuthorization()
         try Task.checkCancellation()
-        let process = Process()
-        process.executableURL = helperExecutableURL
-        process.arguments = ["--authorize-photos"]
-        let status = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                process.terminationHandler = { process in continuation.resume(returning: process.terminationStatus) }
-                do { try process.run() } catch { continuation.resume(throwing: error) }
-            }
-        } onCancel: {
-            if process.isRunning { process.terminate() }
+        let result: InstallerProcessResult
+        do {
+            result = try await runInstallerProcess(
+                executableURL: helperExecutableURL,
+                arguments: ["--authorize-photos"],
+                timeout: .seconds(360)
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw InstallError.photosAccessRequired
         }
-        try Task.checkCancellation()
-        guard status == 0 else {
+        guard result.status == 0 else {
             if let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
                 NSWorkspace.shared.open(settings)
             }
@@ -667,21 +727,19 @@ final class ScreenCaptureAccessController: ScreenCaptureAccessControlling {
         }
         onWaitingForAuthorization()
         try Task.checkCancellation()
-        let process = Process()
-        process.executableURL = helperExecutableURL
-        process.arguments = ["--authorize-screen-capture"]
-        let status = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                process.terminationHandler = { process in
-                    continuation.resume(returning: process.terminationStatus)
-                }
-                do { try process.run() } catch { continuation.resume(throwing: error) }
-            }
-        } onCancel: {
-            if process.isRunning { process.terminate() }
+        let result: InstallerProcessResult
+        do {
+            result = try await runInstallerProcess(
+                executableURL: helperExecutableURL,
+                arguments: ["--authorize-screen-capture"],
+                timeout: .seconds(360)
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw InstallError.screenCaptureAccessRequired
         }
-        try Task.checkCancellation()
-        guard status == 0 else {
+        guard result.status == 0 else {
             if let settings = URL(
                 string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
             ) { NSWorkspace.shared.open(settings) }
@@ -701,21 +759,19 @@ final class LocationAccessController: LocationAccessControlling {
         }
         onWaitingForAuthorization()
         try Task.checkCancellation()
-        let process = Process()
-        process.executableURL = helperExecutableURL
-        process.arguments = ["--authorize-location"]
-        let status = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                process.terminationHandler = { process in
-                    continuation.resume(returning: process.terminationStatus)
-                }
-                do { try process.run() } catch { continuation.resume(throwing: error) }
-            }
-        } onCancel: {
-            if process.isRunning { process.terminate() }
+        let result: InstallerProcessResult
+        do {
+            result = try await runInstallerProcess(
+                executableURL: helperExecutableURL,
+                arguments: ["--authorize-location"],
+                timeout: .seconds(360)
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw InstallError.locationAccessRequired
         }
-        try Task.checkCancellation()
-        guard status == 0 else {
+        guard result.status == 0 else {
             if let settings = URL(
                 string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices"
             ) { NSWorkspace.shared.open(settings) }

@@ -189,6 +189,10 @@ enum Request {
         response: oneshot::Sender<Result<(), DbError>>,
     },
     RecordCommunicationSourceConflict {
+        commit: Box<CommunicationMessageCommit>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    RecordAppleMessageInvalidRecord {
         source_key: String,
         response: oneshot::Sender<Result<(), DbError>>,
     },
@@ -255,6 +259,14 @@ enum Request {
         code: String,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    RememberHandledScreenshot {
+        request_id: String,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    WasScreenshotHandled {
+        request_id: String,
+        response: oneshot::Sender<Result<bool, DbError>>,
+    },
     CleanupCompletedCommunicationAttachments {
         cutoff_ms: i64,
         after_file_name: Option<String>,
@@ -282,6 +294,7 @@ impl Request {
             | Self::DeadLetterRejectedSystemEvents { response, .. }
             | Self::CommitCommunicationMessage { response, .. }
             | Self::RecordCommunicationSourceConflict { response, .. }
+            | Self::RecordAppleMessageInvalidRecord { response, .. }
             | Self::CommitPhotoUpload { response, .. }
             | Self::CompletePhotoUpload { response, .. }
             | Self::QuarantineInvalidPhotoUpload { response, .. }
@@ -291,7 +304,8 @@ impl Request {
             | Self::DeferCommunicationAttachment { response, .. }
             | Self::QuarantineUnsupportedCommunicationAttachment { response, .. }
             | Self::QuarantineInvalidCommunicationAttachment { response, .. }
-            | Self::RecordTerminalMediaDiagnostic { response, .. } => response.is_closed(),
+            | Self::RecordTerminalMediaDiagnostic { response, .. }
+            | Self::RememberHandledScreenshot { response, .. } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
             Self::LoadPairingState { response } => response.is_closed(),
             Self::LoadAppliedCollectorControl { response } => response.is_closed(),
@@ -304,7 +318,8 @@ impl Request {
             Self::LoadPendingSystemEvents { response, .. }
             | Self::LoadPendingCommunicationEvents { response, .. } => response.is_closed(),
             Self::LoadPendingCommunicationAttachments { response, .. } => response.is_closed(),
-            Self::PhotoUploadExists { response, .. } => response.is_closed(),
+            Self::PhotoUploadExists { response, .. }
+            | Self::WasScreenshotHandled { response, .. } => response.is_closed(),
             Self::LoadPendingPhotoUploads { response, .. } => response.is_closed(),
         }
     }
@@ -829,12 +844,30 @@ impl DbActorHandle {
     /// # Errors
     ///
     /// Returns an actor or `SQLite` diagnostic-persistence error.
-    pub async fn record_communication_source_conflict(
+    pub async fn consume_communication_source_conflict(
+        &self,
+        commit: &CommunicationMessageCommit,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::RecordCommunicationSourceConflict {
+            commit: Box::new(commit.clone()),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Records one invalid Apple Messages source row without persisting private content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or `SQLite` diagnostic-persistence error.
+    pub async fn record_apple_message_invalid_record(
         &self,
         source_key: &str,
     ) -> Result<(), DbError> {
         let (response_sender, response_receiver) = oneshot::channel();
-        self.send(Request::RecordCommunicationSourceConflict {
+        self.send(Request::RecordAppleMessageInvalidRecord {
             source_key: source_key.to_owned(),
             response: response_sender,
         })
@@ -1144,6 +1177,36 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Persists a manual Screenshot request after capture or terminal acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, identifier-validation, transaction, or database error.
+    pub async fn remember_screenshot_request(&self, request_id: &str) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::RememberHandledScreenshot {
+            request_id: request_id.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Reports whether a manual Screenshot request was handled by an earlier Agent process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, identifier-validation, or database query error.
+    pub async fn screenshot_request_was_handled(&self, request_id: &str) -> Result<bool, DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::WasScreenshotHandled {
+            request_id: request_id.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Deletes Cloud-confirmed media bodies at or before the caller-provided retention cutoff.
     ///
     /// # Errors
@@ -1435,13 +1498,10 @@ fn run(
                     &commit,
                 ));
             }
-            Request::RecordCommunicationSourceConflict {
-                source_key,
-                response,
-            } => {
-                let _ = response.send(repository::record_communication_source_conflict(
-                    &connection,
-                    &source_key,
+            Request::RecordCommunicationSourceConflict { commit, response } => {
+                let _ = response.send(repository::consume_communication_source_conflict(
+                    &mut connection,
+                    &commit,
                 ));
             }
             Request::CommitPhotoUpload { commit, response } => {
@@ -1494,6 +1554,15 @@ fn run(
                 let _ = response.send(repository::dead_letter_rejected_communication_events(
                     &mut connection,
                     &event_ids,
+                ));
+            }
+            Request::RecordAppleMessageInvalidRecord {
+                source_key,
+                response,
+            } => {
+                let _ = response.send(repository::record_apple_message_invalid_record(
+                    &connection,
+                    &source_key,
                 ));
             }
             Request::LoadPendingCommunicationAttachments { limit, response } => {
@@ -1556,6 +1625,24 @@ fn run(
                     &connection,
                     &subject_id,
                     &code,
+                ));
+            }
+            Request::RememberHandledScreenshot {
+                request_id,
+                response,
+            } => {
+                let _ = response.send(repository::remember_screenshot_request(
+                    &connection,
+                    &request_id,
+                ));
+            }
+            Request::WasScreenshotHandled {
+                request_id,
+                response,
+            } => {
+                let _ = response.send(repository::screenshot_request_was_handled(
+                    &connection,
+                    &request_id,
                 ));
             }
             Request::CleanupCompletedCommunicationAttachments {

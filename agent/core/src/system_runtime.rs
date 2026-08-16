@@ -55,6 +55,23 @@ impl fmt::Display for SystemRuntimeError {
 
 impl std::error::Error for SystemRuntimeError {}
 
+impl SystemRuntimeError {
+    pub(crate) fn is_terminal_persistence_failure(&self) -> bool {
+        match self {
+            Self::Database(error) => !error.is_retryable(),
+            Self::Domain(error) => !error.retryable,
+            Self::Collector(_) | Self::Clock | Self::WorkerStopped => false,
+        }
+    }
+
+    pub(crate) fn requires_process_restart(&self) -> bool {
+        matches!(
+            self,
+            Self::Collector(error) if error.code == "SYSTEM_SAMPLER_STOP_TIMEOUT"
+        )
+    }
+}
+
 impl SystemRuntimeHandle {
     #[must_use]
     pub(crate) fn is_finished(&self) -> bool {
@@ -1226,6 +1243,40 @@ mod tests {
             Err(SystemRuntimeError::Domain(error)) if !error.retryable
         ));
         close_database(database).await;
+    }
+
+    #[test]
+    fn only_terminal_persistence_errors_open_the_restart_circuit() {
+        assert!(SystemRuntimeError::Domain(DomainError::new(
+            "SYSTEM_EVENT_INVALID",
+            "system event is invalid",
+            false,
+        ))
+        .is_terminal_persistence_failure());
+        assert!(!SystemRuntimeError::Domain(DomainError::new(
+            "SYSTEM_EVENT_TRANSIENT",
+            "system event is temporarily unavailable",
+            true,
+        ))
+        .is_terminal_persistence_failure());
+        assert!(!SystemRuntimeError::WorkerStopped.is_terminal_persistence_failure());
+    }
+
+    #[test]
+    fn detached_sampler_owner_requires_process_restart() {
+        let timeout = SystemRuntimeError::Collector(SystemSampleError {
+            kind: pca_system_collector::SystemSampleErrorKind::Fatal,
+            code: "SYSTEM_SAMPLER_STOP_TIMEOUT",
+            message: "blocked owner".to_owned(),
+        });
+        let ordinary = SystemRuntimeError::Collector(SystemSampleError {
+            kind: pca_system_collector::SystemSampleErrorKind::Fatal,
+            code: "SYSTEM_SAMPLE_UNAVAILABLE",
+            message: "ordinary source failure".to_owned(),
+        });
+
+        assert!(timeout.requires_process_restart());
+        assert!(!ordinary.requires_process_restart());
     }
 
     #[tokio::test(start_paused = true)]

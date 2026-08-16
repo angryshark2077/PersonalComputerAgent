@@ -116,6 +116,10 @@ async function assertHeartbeatPrivacyCleanup(pool: Pool) {
     cleanupResult: null,
     network: null,
   });
+  await repository.redactExpiredHeartbeatNetworkData(
+    new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+    1000,
+  );
   const sensitive = await pool.query<Record<string, string | null>>(
     `SELECT network_ssid, network_bssid, network_local_ipv4::text,
             network_local_ipv6::text, network_public_ip::text,

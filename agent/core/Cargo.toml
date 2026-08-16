@@ -46,7 +46,7 @@ pca-system-collector = { path = "../../crates/system-collector" }
 pca-wechat-provider = { path = "../../crates/wechat-provider" }
 reqwest = { version = "=0.11.27", default-features = false, features = ["__internal_proxy_sys_no_cache", "json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-rustix = { version = "=0.38.44", features = ["fs"] }
+rustix = { version = "=0.38.44", features = ["fs", "process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "=0.10.9"

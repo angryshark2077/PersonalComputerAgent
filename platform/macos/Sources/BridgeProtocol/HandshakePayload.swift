@@ -49,11 +49,13 @@ public struct HandshakeChallenge: Codable, Sendable, Equatable {
     public let phase: HandshakeChallengePhase
     public let nonce: String
     public let agentVersion: String
+    public let clientProof: String
 
     private enum CodingKeys: String, CodingKey {
         case phase
         case nonce
         case agentVersion = "agent_version"
+        case clientProof = "client_proof"
     }
 }
 

@@ -7,6 +7,7 @@ use pca_domain::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use uuid::Uuid;
 
 #[cfg(feature = "process-test-hooks")]
 use std::{
@@ -108,6 +109,12 @@ pub(crate) fn commit_communication_message(
             "source sequence exceeds SQLite integer range",
         )
     })?;
+    let cursor_sequence = i64::try_from(commit.cursor_sequence).map_err(|_| {
+        DbError::sqlite(
+            "validate communication cursor sequence",
+            "cursor sequence exceeds SQLite integer range",
+        )
+    })?;
 
     let transaction = connection
         .transaction()
@@ -122,12 +129,16 @@ pub(crate) fn commit_communication_message(
                 insert_event(&transaction, event)?;
                 insert_stable_outbox(&transaction, event)?;
             }
+            update_communication_message_cursor(&transaction, commit, cursor_sequence)?;
+            advance_communication_cursor(&transaction, commit, cursor_sequence)?;
             return transaction.commit().map_err(|error| {
                 DbError::sqlite("commit communication metadata transaction", error)
             });
         }
         ExistingCommunicationMessage::RepairedDeviceReplay => {
             validate_existing_attachment_spool(&transaction, commit)?;
+            update_communication_message_cursor(&transaction, commit, cursor_sequence)?;
+            advance_communication_cursor(&transaction, commit, cursor_sequence)?;
             return transaction.commit().map_err(|error| {
                 DbError::sqlite("commit repaired-device replay transaction", error)
             });
@@ -145,16 +156,26 @@ pub(crate) fn commit_communication_message(
         insert_attachment_spool(&transaction, local_message_id, spool_reference)?;
     }
     insert_stable_outbox(&transaction, &serialized)?;
-    advance_communication_cursor(&transaction, commit, source_sequence)?;
+    advance_communication_cursor(&transaction, commit, cursor_sequence)?;
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit communication message transaction", error))
 }
 
-pub(crate) fn record_communication_source_conflict(
-    connection: &Connection,
-    source_key: &str,
+pub(crate) fn consume_communication_source_conflict(
+    connection: &mut Connection,
+    commit: &CommunicationMessageCommit,
 ) -> Result<(), DbError> {
+    let cursor_sequence = i64::try_from(commit.cursor_sequence).map_err(|_| {
+        DbError::sqlite(
+            "consume communication source conflict",
+            "source sequence exceeds SQLite integer range",
+        )
+    })?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("begin communication conflict transaction", error))?;
+    let source_key = commit.message.source_key();
     let source_key_hash = format!("{:x}", Sha256::digest(source_key.as_bytes()));
     let occurred_at_ms = i64::try_from(
         OffsetDateTime::now_utc()
@@ -171,6 +192,45 @@ pub(crate) fn record_communication_source_conflict(
         "source_key_hash": source_key_hash,
     })
     .to_string();
+    transaction
+        .execute(
+            "INSERT INTO diagnostic_events (
+                diagnostic_id, occurred_at_ms, level, code, redacted_json
+             ) VALUES (?1, ?2, 'error', ?3, ?4)
+             ON CONFLICT(diagnostic_id) DO UPDATE SET
+                occurred_at_ms = excluded.occurred_at_ms,
+                level = excluded.level,
+                code = excluded.code,
+                redacted_json = excluded.redacted_json",
+            params![diagnostic_id, occurred_at_ms, code, redacted_json],
+        )
+        .map_err(|error| DbError::sqlite("record communication source conflict", error))?;
+    advance_communication_cursor(&transaction, commit, cursor_sequence)?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit communication conflict transaction", error))
+}
+
+pub(crate) fn record_apple_message_invalid_record(
+    connection: &Connection,
+    source_key: &str,
+) -> Result<(), DbError> {
+    let source_key_hash = format!("{:x}", Sha256::digest(source_key.as_bytes()));
+    let occurred_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    let code = "APPLE_MESSAGE_INVALID_RECORD";
+    let diagnostic_id = format!("{code}:{source_key_hash}");
+    let redacted_json = serde_json::json!({
+        "collector": "communication.messages",
+        "stage": "source_validation",
+        "category": "invalid_record",
+        "source_key_hash": source_key_hash,
+    })
+    .to_string();
     connection
         .execute(
             "INSERT INTO diagnostic_events (
@@ -184,7 +244,7 @@ pub(crate) fn record_communication_source_conflict(
             params![diagnostic_id, occurred_at_ms, code, redacted_json],
         )
         .map(|_| ())
-        .map_err(|error| DbError::sqlite("record communication source conflict", error))
+        .map_err(|error| DbError::sqlite("record Apple Messages invalid record", error))
 }
 
 pub(crate) fn commit_photo_upload(
@@ -729,21 +789,28 @@ fn insert_communication_message(
     commit: &CommunicationMessageCommit,
     source_sequence: i64,
 ) -> Result<i64, DbError> {
+    let cursor_sequence = i64::try_from(commit.cursor_sequence).map_err(|_| {
+        DbError::sqlite(
+            "insert communication message",
+            "cursor sequence exceeds SQLite integer range",
+        )
+    })?;
     transaction
         .execute(
             "INSERT INTO communication_messages (
-                event_id, account_id, external_conversation_id, source_sequence, source_key,
+                event_id, account_id, external_conversation_id, source_sequence, cursor_sequence, source_key,
                 direction, kind, occurred_at_ms, text_body, created_at_ms
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                CAST(unixepoch(?8, 'subsec') * 1000 AS INTEGER), ?9,
-                CAST(unixepoch(?10, 'subsec') * 1000 AS INTEGER)
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                CAST(unixepoch(?9, 'subsec') * 1000 AS INTEGER), ?10,
+                CAST(unixepoch(?11, 'subsec') * 1000 AS INTEGER)
              )",
             params![
                 commit.event.event_id,
                 commit.account_id,
                 commit.message.conversation_id(),
                 source_sequence,
+                cursor_sequence,
                 commit.message.source_key(),
                 direction_name(commit.message.direction()),
                 message_kind_name(commit.message.kind()),
@@ -754,6 +821,26 @@ fn insert_communication_message(
         )
         .map_err(|error| DbError::sqlite("insert communication message", error))?;
     Ok(transaction.last_insert_rowid())
+}
+
+fn update_communication_message_cursor(
+    transaction: &Transaction<'_>,
+    commit: &CommunicationMessageCommit,
+    cursor_sequence: i64,
+) -> Result<(), DbError> {
+    transaction
+        .execute(
+            "UPDATE communication_messages
+             SET cursor_sequence = MAX(COALESCE(cursor_sequence, 0), ?3)
+             WHERE account_id = ?1 AND source_key = ?2",
+            params![
+                commit.account_id,
+                commit.message.source_key(),
+                cursor_sequence,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("update communication message cursor", error))
 }
 
 fn insert_attachment_spool(
@@ -1705,7 +1792,7 @@ pub(crate) fn load_pending_system_events(
                     e.idempotency_key, e.sensitivity
              FROM sync_outbox AS o
              INNER JOIN events_local AS e ON e.event_id = o.event_id
-             WHERE o.state = 'pending'
+             WHERE o.state IN ('pending', 'sending')
                AND e.event_type IN (
                    'system.metric_sampled',
                    'system.health_changed',
@@ -1803,7 +1890,7 @@ pub(crate) fn dead_letter_mismatched_outbox_events(
         .execute(
             "UPDATE sync_outbox
              SET state = 'dead_letter'
-             WHERE state = 'pending'
+             WHERE state IN ('pending', 'sending')
                AND EXISTS (
                    SELECT 1 FROM events_local AS e
                    WHERE e.event_id = sync_outbox.event_id
@@ -1857,7 +1944,7 @@ pub(crate) fn acknowledge_system_events(
                 "UPDATE sync_outbox
                  SET state = 'acked'
                  WHERE event_id = ?1
-                   AND state = 'pending'
+                   AND state IN ('pending', 'sending')
                    AND EXISTS (
                        SELECT 1 FROM events_local
                        WHERE events_local.event_id = sync_outbox.event_id
@@ -1915,7 +2002,7 @@ pub(crate) fn load_pending_communication_events(
                     e.attachment_refs_json, e.idempotency_key
              FROM sync_outbox AS o
              INNER JOIN events_local AS e ON e.event_id = o.event_id
-             WHERE o.state = 'pending'
+             WHERE o.state IN ('pending', 'sending')
                AND e.event_type IN (
                    'communication.message_recorded',
                    'communication.conversation_observed',
@@ -1992,7 +2079,7 @@ pub(crate) fn acknowledge_communication_events(
                 "UPDATE sync_outbox
                  SET state = 'acked'
                  WHERE event_id = ?1
-                   AND state = 'pending'
+                   AND state IN ('pending', 'sending')
                    AND EXISTS (
                        SELECT 1 FROM events_local AS e
                        WHERE e.event_id = sync_outbox.event_id
@@ -2073,7 +2160,7 @@ fn dead_letter_rejected_events(
             .execute(
                 "UPDATE sync_outbox
                  SET state = 'dead_letter'
-                 WHERE event_id = ?1 AND state = 'pending'
+                 WHERE event_id = ?1 AND state IN ('pending', 'sending')
                    AND EXISTS (
                        SELECT 1 FROM events_local AS e
                        WHERE e.event_id = sync_outbox.event_id
@@ -2516,6 +2603,76 @@ pub(crate) fn record_terminal_media_diagnostic(
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit terminal media diagnostic", error))
+}
+
+pub(crate) fn remember_screenshot_request(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<(), DbError> {
+    validate_screenshot_request_id(request_id)?;
+    let handled_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| DbError::sqlite("start screenshot request history", error))?;
+    transaction
+        .execute(
+            "INSERT INTO handled_screenshot_requests (request_id, handled_at_ms)
+             VALUES (?1, ?2)
+             ON CONFLICT(request_id) DO NOTHING",
+            params![request_id, handled_at_ms],
+        )
+        .map_err(|error| DbError::sqlite("remember screenshot request", error))?;
+    transaction
+        .execute(
+            "DELETE FROM handled_screenshot_requests
+             WHERE request_id IN (
+                 SELECT request_id FROM handled_screenshot_requests
+                 ORDER BY handled_at_ms DESC, request_id DESC
+                 LIMIT -1 OFFSET 10000
+             )",
+            [],
+        )
+        .map_err(|error| DbError::sqlite("prune screenshot request history", error))?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit screenshot request history", error))
+}
+
+pub(crate) fn screenshot_request_was_handled(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<bool, DbError> {
+    validate_screenshot_request_id(request_id)?;
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM handled_screenshot_requests WHERE request_id = ?1
+             )",
+            [request_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| DbError::sqlite("read screenshot request history", error))
+}
+
+fn validate_screenshot_request_id(request_id: &str) -> Result<(), DbError> {
+    let parsed = Uuid::parse_str(request_id).map_err(|_| {
+        DbError::sqlite(
+            "validate screenshot request identifier",
+            "screenshot request identifier must be a UUID",
+        )
+    })?;
+    if parsed.hyphenated().to_string() != request_id {
+        return Err(DbError::sqlite(
+            "validate screenshot request identifier",
+            "screenshot request identifier must be a canonical lowercase UUID",
+        ));
+    }
+    Ok(())
 }
 
 fn communication_collector_key(source: &str) -> Option<&'static str> {

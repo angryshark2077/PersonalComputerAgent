@@ -71,6 +71,7 @@ fn valid_commit(database: &Path) -> CommunicationMessageCommit {
     CommunicationMessageCommit {
         account_id: "account-1".to_owned(),
         source_sequence: 1,
+        cursor_sequence: 1,
         event: EventEnvelope {
             event_id: "event-1".to_owned(),
             workspace_id: "workspace-1".to_owned(),
@@ -241,6 +242,37 @@ async fn source_key_creates_one_message_outbox_cursor_and_spool_reference() {
         .await
         .expect("load acknowledged communication events")
         .is_empty());
+}
+
+#[tokio::test]
+async fn replay_lifts_the_durable_cursor_checkpoint_without_rewriting_source_sequence() {
+    let (_directory, path) = database_path();
+    let store = DbActorHandle::open(&path, "0.2.2")
+        .await
+        .expect("open database");
+    let mut commit = valid_commit(&path);
+    commit.cursor_sequence = 0;
+    store
+        .commit_communication_message(&commit)
+        .await
+        .expect("commit behind a pending outbound row");
+
+    commit.cursor_sequence = 1;
+    store
+        .commit_communication_message(&commit)
+        .await
+        .expect("replay after the pending row becomes final");
+    store.shutdown().await.expect("close database");
+
+    let connection = Connection::open(&path).expect("reopen database");
+    let (source_sequence, cursor_sequence) = connection
+        .query_row(
+            "SELECT source_sequence, cursor_sequence FROM communication_messages",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("read persisted cursor checkpoint");
+    assert_eq!((source_sequence, cursor_sequence), (1, 1));
 }
 
 #[tokio::test]

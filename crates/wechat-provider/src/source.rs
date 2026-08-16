@@ -30,6 +30,7 @@ pub enum SourceRecord {
 pub struct SourceMessageRecord {
     pub account_id: String,
     pub source_sequence: u64,
+    pub cursor_sequence: u64,
     pub message_id: String,
     pub conversation_id: String,
     pub conversation_display_name: String,

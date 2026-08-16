@@ -98,6 +98,22 @@ final class CapabilityProbeTests: XCTestCase {
         XCTAssertEqual(probe.screenCapturePermission(), .restricted)
     }
 
+    func testPermissionSnapshotReportsEverySupportedCapability() {
+        let probe = CapabilityProbe(source: FixedCapabilityStatusSource(statuses: [
+            .screenCapture: .granted,
+            .accessibility: .denied,
+            .camera: .notDetermined,
+            .microphone: .restricted,
+        ]))
+
+        XCTAssertEqual(probe.permissionSnapshot(), [
+            "screen_capture": .granted,
+            "accessibility": .denied,
+            "camera": .notDetermined,
+            "microphone": .restricted,
+        ])
+    }
+
     func testAVFoundationAuthorizationStatusesMapWithoutRequestingAccess() {
         let cases: [(AVAuthorizationStatus, RawPermissionStatus)] = [
             (.notDetermined, .notDetermined),

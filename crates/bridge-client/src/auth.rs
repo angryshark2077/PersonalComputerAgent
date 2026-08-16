@@ -3,6 +3,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
+const AGENT_PROOF_CONTEXT: &[u8] = b"pca-agent-proof-v1\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidProof;
@@ -44,6 +45,44 @@ pub fn verify_proof(
 ) -> Result<(), InvalidProof> {
     let proof = STANDARD.decode(proof).map_err(|_| InvalidProof)?;
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| InvalidProof)?;
+    update_transcript(&mut mac, nonce, protocol_version, agent_version);
+    mac.verify_slice(&proof).map_err(|_| InvalidProof)
+}
+
+/// Computes the role-separated proof that authenticates the Agent to the Bridge.
+///
+/// # Panics
+///
+/// The HMAC implementation accepts keys of every length, so the fixed 32-byte key cannot trigger
+/// the guarded construction panic.
+#[must_use]
+pub fn create_agent_proof(
+    secret: &[u8; 32],
+    nonce: &[u8; 32],
+    protocol_version: u32,
+    agent_version: &str,
+) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts a 32-byte secret");
+    mac.update(AGENT_PROOF_CONTEXT);
+    update_transcript(&mut mac, nonce, protocol_version, agent_version);
+    STANDARD.encode(mac.finalize().into_bytes())
+}
+
+/// Verifies the role-separated Agent proof in constant time.
+///
+/// # Errors
+///
+/// Returns [`InvalidProof`] for malformed base64, a non-32-byte proof, or an HMAC mismatch.
+pub fn verify_agent_proof(
+    secret: &[u8; 32],
+    nonce: &[u8; 32],
+    protocol_version: u32,
+    agent_version: &str,
+    proof: &str,
+) -> Result<(), InvalidProof> {
+    let proof = STANDARD.decode(proof).map_err(|_| InvalidProof)?;
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| InvalidProof)?;
+    mac.update(AGENT_PROOF_CONTEXT);
     update_transcript(&mut mac, nonce, protocol_version, agent_version);
     mac.verify_slice(&proof).map_err(|_| InvalidProof)
 }

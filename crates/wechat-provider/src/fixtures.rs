@@ -186,6 +186,7 @@ fn message(
     SourceRecord::Message(Box::new(SourceMessageRecord {
         account_id: "wechat-account-1".to_owned(),
         source_sequence: 1,
+        cursor_sequence: 1,
         message_id: "message-1".to_owned(),
         conversation_id: "conversation-1".to_owned(),
         conversation_display_name: "Conversation One".to_owned(),

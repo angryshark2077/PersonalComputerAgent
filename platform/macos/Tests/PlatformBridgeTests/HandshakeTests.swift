@@ -28,6 +28,22 @@ final class HandshakeTests: XCTestCase {
             protocolVersion: 0x0102_0304,
             agentVersion: "v1.β"
         ))
+
+        let agentProof = try BridgeProof.makeAgentProof(
+            secret: secret,
+            nonce: nonce,
+            protocolVersion: 0x0102_0304,
+            agentVersion: "v1.β"
+        )
+        XCTAssertEqual(agentProof, "Y3Ir7sU+EoFbXlls5L2NdZoRmt1Chbn0Tj0AM/sbyS8=")
+        XCTAssertNotEqual(agentProof, proof)
+        XCTAssertTrue(BridgeProof.verifyAgentProof(
+            agentProof,
+            secret: secret,
+            nonce: nonce,
+            protocolVersion: 0x0102_0304,
+            agentVersion: "v1.β"
+        ))
     }
 
     func testInvalidProofIsRejectedBySharedVerifier() {
@@ -111,6 +127,21 @@ final class HandshakeTests: XCTestCase {
         XCTAssertThrowsError(try handler.respond(to: duplicate, secret: secret))
     }
 
+    func testStrictJSONRejectsExcessiveNestingBeforeFoundationParsing() throws {
+        func object(arrayDepth: Int) -> Data {
+            let nested = String(repeating: "[", count: arrayDepth)
+                + "null"
+                + String(repeating: "]", count: arrayDepth)
+            return Data("{\"value\":\(nested)}".utf8)
+        }
+
+        let allowedArrayDepth = StrictJSON.maximumNestingDepth - 1
+        XCTAssertNoThrow(try StrictJSON.object(object(arrayDepth: allowedArrayDepth)))
+        XCTAssertThrowsError(try StrictJSON.object(object(arrayDepth: allowedArrayDepth + 1))) {
+            XCTAssertEqual($0 as? BridgeHandshakeError, .malformedJSON)
+        }
+    }
+
     func testInvalidEnvelopeFieldsNonceAndCredentialAreRejected() throws {
         let valid = try challengeData(protocolVersion: 1, requestID: UUID())
         let handler = HandshakeHandler(bridgeVersion: "0.0.0-s1a")
@@ -118,8 +149,13 @@ final class HandshakeTests: XCTestCase {
         let zeroDeadline = try replacing(valid, key: "deadline_ms", with: 0)
         let badNonce = try replacingPayload(valid, key: "nonce", with: "AA==")
         let emptyAgent = try replacingPayload(valid, key: "agent_version", with: "")
+        let badClientProof = try replacingPayload(
+            valid,
+            key: "client_proof",
+            with: Data(repeating: 0, count: 32).base64EncodedString()
+        )
 
-        for invalid in [wrongKind, zeroDeadline, badNonce, emptyAgent] {
+        for invalid in [wrongKind, zeroDeadline, badNonce, emptyAgent, badClientProof] {
             XCTAssertThrowsError(try handler.respond(to: invalid, secret: secret))
         }
         XCTAssertThrowsError(try handler.respond(to: valid, secret: Data(repeating: 1, count: 31)))
@@ -425,7 +461,25 @@ final class HandshakeTests: XCTestCase {
         )
         let response = try JSONDecoder().decode(BridgeEnvelope.self, from: result.payload)
 
-        XCTAssertEqual(response.payload, ["screen_capture": .string("permission_required")])
+        XCTAssertEqual(response.payload, [
+            "screen_capture": .string("permission_required"),
+            "permissions": .object([
+                "screen_capture": .string("denied"),
+                "accessibility": .string("unavailable"),
+                "camera": .string("unavailable"),
+                "microphone": .string("unavailable"),
+            ]),
+        ])
+    }
+
+    func testCapabilityRequestRequiresPermissionSnapshotOptIn() {
+        let request = Data("""
+        {"protocol_version":1,"request_id":"\(UUID().uuidString)","message_kind":"request","capability":"system.capabilities","deadline_ms":1000,"payload":{"include_permissions":false}}
+        """.utf8)
+
+        XCTAssertThrowsError(try CapabilityRequestHandler.respond(to: request)) { error in
+            XCTAssertEqual(error as? BridgeServerError, .invalidRequest)
+        }
     }
 
     func testLifecyclePollReturnsOnlyEventsAfterTheAuthenticatedCursor() throws {
@@ -588,7 +642,11 @@ final class HandshakeTests: XCTestCase {
         XCTAssertEqual(capability.messageKind, .response)
         XCTAssertEqual(capability.capability, "system.capabilities")
         XCTAssertEqual(capability.deadlineMilliseconds, 1_000)
-        XCTAssertEqual(capability.payload, ["screen_capture": .string("available")])
+        XCTAssertEqual(capability.payload["screen_capture"], .string("available"))
+        guard case let .object(permissions)? = capability.payload["permissions"] else {
+            return XCTFail("capability response must include a permission snapshot")
+        }
+        XCTAssertEqual(Set(permissions.keys), ["screen_capture", "accessibility", "camera", "microphone"])
 
         let second = try connectUnixSocket(at: socket.path)
         let secondID = UUID()
@@ -715,6 +773,12 @@ final class HandshakeTests: XCTestCase {
     }
 
     private func challengeData(protocolVersion: Int, requestID: UUID) throws -> Data {
+        let clientProof = try BridgeProof.makeAgentProof(
+            secret: secret,
+            nonce: nonce,
+            protocolVersion: UInt32(protocolVersion),
+            agentVersion: "v1.β"
+        )
         let envelope = BridgeEnvelope(
             protocolVersion: protocolVersion,
             requestID: requestID,
@@ -725,6 +789,7 @@ final class HandshakeTests: XCTestCase {
                 "phase": .string("challenge"),
                 "nonce": .string(nonce.base64EncodedString()),
                 "agent_version": .string("v1.β"),
+                "client_proof": .string(clientProof),
             ]
         )
         return try JSONEncoder().encode(envelope)

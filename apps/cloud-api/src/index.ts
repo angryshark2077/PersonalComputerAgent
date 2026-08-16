@@ -2,12 +2,14 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { betterAuth } from "better-auth/minimal";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 
 import {
+  ControlRepositoryError,
   DrizzleControlRepository,
   type CommunicationObjectRecord,
   type CommunicationSource,
@@ -54,6 +56,7 @@ import {
 export type { OwnerPrincipal } from "./auth.js";
 
 const productionDashboardOrigin = "https://pca-dashboard-production.up.railway.app";
+const maximumRequestBodyBytes = 100 * 1024 * 1024;
 
 export interface CreateAppOptions {
   repository: ControlRepository;
@@ -67,6 +70,16 @@ export interface CreateAppOptions {
 export function createApp(options: CreateAppOptions): Hono {
   const pairingRateLimiter = options.pairingRateLimiter ?? new PairingRateLimiter();
   const app = new Hono();
+
+  app.use("*", bodyLimit({
+    maxSize: maximumRequestBodyBytes,
+    onError: (context) => errorResponse(
+      context,
+      413,
+      "REQUEST_TOO_LARGE",
+      "Request body exceeds the maximum allowed size.",
+    ),
+  }));
 
   app.get("/healthz", (context) => context.json({ status: "ok" }));
   app.get("/health", (context) => context.json({ ready: true, service: "pca-cloud-api" }));
@@ -312,15 +325,33 @@ export function createApp(options: CreateAppOptions): Hono {
       retryable: false,
     }] : []);
     try {
-      const result = await options.repository.appendCommunicationEvents(
-        device.workspaceId,
-        device.deviceId,
-        events,
-      );
+      const accepted: string[] = [];
+      const duplicates: string[] = [];
+      for (const event of events) {
+        try {
+          const result = await options.repository.appendCommunicationEvents(
+            device.workspaceId,
+            device.deviceId,
+            [event],
+          );
+          accepted.push(...result.acceptedEventIds);
+          duplicates.push(...result.duplicateEventIds);
+        } catch (error) {
+          if (error instanceof ControlRepositoryError && error.code === "CONFLICT") {
+            rejected.push({
+              event_id: event.eventId,
+              error_code: "SYNC_PAYLOAD_REJECTED",
+              retryable: false,
+            });
+            continue;
+          }
+          throw error;
+        }
+      }
       return context.json({
         batch_id: batch.batchId,
-        accepted: result.acceptedEventIds,
-        duplicates: result.duplicateEventIds,
+        accepted,
+        duplicates,
         rejected,
         server_time: new Date().toISOString(),
       });

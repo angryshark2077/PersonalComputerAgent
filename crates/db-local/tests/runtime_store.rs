@@ -304,7 +304,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 16);
+    assert_eq!(health.schema_version, 18);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -327,6 +327,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
             "communication_messages",
             "diagnostic_events",
             "events_local",
+            "handled_screenshot_requests",
             "local_meta",
             "local_tombstones",
             "pairing_state",
@@ -510,7 +511,7 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        16
+        18
     );
     db.shutdown().await.expect("close upgraded database");
 
@@ -1036,6 +1037,53 @@ async fn active_depth_excludes_every_terminal_outbox_state() {
 }
 
 #[tokio::test]
+async fn interrupted_sending_system_event_is_retried_and_acknowledged() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.2")
+        .await
+        .expect("open database");
+    let event = system_metric_event("interrupted-sending-event");
+    db.append_event_with_outbox(&event)
+        .await
+        .expect("seed Outbox row");
+    let connection = Connection::open(&path).expect("open Outbox setup connection");
+    connection
+        .execute(
+            "UPDATE sync_outbox SET state = 'sending' WHERE event_id = ?1",
+            [&event.event_id],
+        )
+        .expect("simulate interrupted send");
+    drop(connection);
+
+    let pending = db
+        .load_pending_system_events(20)
+        .await
+        .expect("reload interrupted send");
+    assert_eq!(
+        pending
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![event.event_id.as_str()]
+    );
+    db.acknowledge_system_events(std::slice::from_ref(&event.event_id))
+        .await
+        .expect("acknowledge retried send");
+    assert_eq!(db.active_outbox_depth().await.expect("active depth"), 0);
+    assert_eq!(
+        Connection::open(&path)
+            .expect("inspect recovered Outbox")
+            .query_row(
+                "SELECT state FROM sync_outbox WHERE event_id = ?1",
+                [&event.event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read recovered Outbox state"),
+        "acked"
+    );
+}
+
+#[tokio::test]
 async fn rejected_system_event_is_dead_lettered_with_a_redacted_diagnostic() {
     let (_directory, path) = database_path();
     let db = DbActorHandle::open(&path, "0.2.0")
@@ -1280,7 +1328,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0017', 'future', '17.0.0', 1, 1, 'completed')",
+             VALUES ('0019', 'future', '19.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -1291,8 +1339,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 17,
-            max_supported: 16
+            found: 19,
+            max_supported: 18
         })
     ));
 }
@@ -1315,7 +1363,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 16);
+    assert_eq!(health.schema_version, 18);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(
@@ -1666,7 +1714,7 @@ async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body
              );
              INSERT INTO communication_messages VALUES (
                 1, 'stream-event', 'account-1', 'conversation-1', 1, 'source-1',
-                'incoming', 'video', 1, NULL, 1
+                'incoming', 'video', 1, NULL, 1, 1
              );
              INSERT INTO attachment_spool (
                 attachment_id, local_message_id, kind, sha256, size_bytes, mime_type,
@@ -1746,7 +1794,7 @@ async fn failed_attachment_is_deferred_behind_unattempted_media() {
                 ('account-1', 'conversation-1', 'direct', NULL, 1, 1);
              INSERT INTO communication_messages VALUES
                 (1, 'defer-event', 'account-1', 'conversation-1', 1, 'source-1',
-                 'incoming', 'image', 1, NULL, 1);",
+                 'incoming', 'image', 1, NULL, 1, 1);",
         )
         .expect("insert attachment owner fixture");
     for (index, (name, sha256, size)) in manifests.iter().enumerate() {
@@ -1862,7 +1910,7 @@ async fn invalid_attachment_is_quarantined_without_blocking_later_media() {
                 ('account-1', 'conversation-1', 'direct', NULL, 1, 1);
              INSERT INTO communication_messages VALUES
                 (1, 'quarantine-event', 'account-1', 'conversation-1', 1, 'source-1',
-                 'incoming', 'image', 1, NULL, 1);",
+                 'incoming', 'image', 1, NULL, 1, 1);",
         )
         .expect("insert attachment owner fixture");
     for (attachment_id, sha256, size, created_at) in [
@@ -1958,4 +2006,38 @@ async fn assert_unsupported_attachment_is_terminal(db: &DbActorHandle, path: &Pa
             .expect("count unsupported source diagnostic"),
         1
     );
+}
+
+#[tokio::test]
+async fn screenshot_request_history_survives_database_reopen() {
+    let (_directory, path) = database_path();
+    let request_id = "01984444-7444-8444-8444-444444444444";
+    let db = DbActorHandle::open(&path, "0.2.2")
+        .await
+        .expect("open database");
+
+    assert!(!db
+        .screenshot_request_was_handled(request_id)
+        .await
+        .expect("read fresh screenshot request history"));
+    db.remember_screenshot_request(request_id)
+        .await
+        .expect("remember screenshot request");
+    db.remember_screenshot_request(request_id)
+        .await
+        .expect("remember screenshot request idempotently");
+    db.shutdown().await.expect("shutdown database");
+
+    let reopened = DbActorHandle::open(&path, "0.2.2")
+        .await
+        .expect("reopen database");
+    assert!(reopened
+        .screenshot_request_was_handled(request_id)
+        .await
+        .expect("read persisted screenshot request history"));
+    assert!(reopened
+        .remember_screenshot_request("not-a-uuid")
+        .await
+        .is_err());
+    reopened.shutdown().await.expect("shutdown database");
 }

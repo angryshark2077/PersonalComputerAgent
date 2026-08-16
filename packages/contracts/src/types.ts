@@ -57,6 +57,7 @@ export interface HandshakeChallenge {
   phase: "challenge";
   nonce: string;
   agent_version: string;
+  client_proof: string;
 }
 
 export interface HandshakeResponse {

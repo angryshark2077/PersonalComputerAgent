@@ -75,6 +75,12 @@ struct CapabilityProbe: Sendable {
         }
     }
 
+    func permissionSnapshot() -> [String: PermissionStatus] {
+        Dictionary(uniqueKeysWithValues: PlatformCapability.allCases.map { capability in
+            (capability.wireKey, permission(for: capability))
+        })
+    }
+
     func permission(for capability: PlatformCapability) -> PermissionStatus {
         Self.map(source.status(for: capability))
     }
@@ -86,6 +92,17 @@ struct CapabilityProbe: Sendable {
         case .denied: .denied
         case .restricted: .restricted
         case .unavailable: .unavailable
+        }
+    }
+}
+
+private extension PlatformCapability {
+    var wireKey: String {
+        switch self {
+        case .screenCapture: "screen_capture"
+        case .accessibility: "accessibility"
+        case .camera: "camera"
+        case .microphone: "microphone"
         }
     }
 }

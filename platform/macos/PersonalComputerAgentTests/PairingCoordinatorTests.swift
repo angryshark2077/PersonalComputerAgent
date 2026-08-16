@@ -4,6 +4,33 @@ import XCTest
 
 @MainActor
 final class PairingCoordinatorTests: XCTestCase {
+    func testCallbackListenerIgnoresInvalidLocalRequestBeforeValidCallback() async throws {
+        let state = String(repeating: "s", count: 43)
+        let server = try PairingCallbackServer(expectedState: state)
+        let callbackURL = try await server.start()
+        let waitTask = Task { try await server.waitForCallback() }
+
+        var invalid = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)!
+        invalid.path = "/favicon.ico"
+        let (_, invalidResponse) = try await URLSession.shared.data(from: invalid.url!)
+        XCTAssertEqual((invalidResponse as? HTTPURLResponse)?.statusCode, 400)
+        XCTAssertFalse(server.isClosed)
+
+        var valid = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)!
+        valid.queryItems = [
+            URLQueryItem(name: "code", value: "authorization-code"),
+            URLQueryItem(name: "state", value: state),
+        ]
+        let (_, validResponse) = try await URLSession.shared.data(from: valid.url!)
+        XCTAssertEqual((validResponse as? HTTPURLResponse)?.statusCode, 200)
+        let receivedURL = try await waitTask.value
+        XCTAssertEqual(
+            PairingCallback.parse(receivedURL),
+            PairingCallback(authorizationCode: "authorization-code", state: state)
+        )
+        XCTAssertTrue(server.isClosed)
+    }
+
     func testInstalledPairingConfigurationUsesFixedSocketAndCloudOrigin() throws {
         let root = URL(fileURLWithPath: "/Users/test/Library/Application Support/PersonalComputerAgent")
         let configuration = try PairingIPCConfiguration.production(rootURL: root)

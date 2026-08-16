@@ -85,6 +85,7 @@ pub(crate) fn eligible_message(record: SourceRecord) -> Option<NormalizedCommuni
     NormalizedCommunicationRecord::try_new(
         record.account_id,
         record.source_sequence,
+        record.cursor_sequence,
         record.conversation_display_name,
         message,
         completed_media,

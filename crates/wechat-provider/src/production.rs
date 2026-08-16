@@ -167,6 +167,7 @@ struct MacOSWechatSource {
 
 impl MacOSWechatSource {
     fn discover(local_database: Option<&Path>) -> Result<Self, DomainError> {
+        cleanup_staged_media();
         let paths = discover_source_paths()?;
         let cursors = local_database.map_or_else(BTreeMap::new, |database| {
             bootstrap_source_cursors(database, &paths.account_id, &paths.message_databases)
@@ -277,6 +278,7 @@ impl WechatSource for MacOSWechatSource {
                 claim_pending_media_retry(&mut last_retry_at, Instant::now())
             };
             run_source_thread(move || {
+                cleanup_staged_media();
                 let refreshed_paths = discover_source_paths()?;
                 if refreshed_paths.account_id != paths.account_id
                     || refreshed_paths.source_instance_id != paths.source_instance_id
@@ -294,12 +296,7 @@ impl WechatSource for MacOSWechatSource {
                         &refreshed_paths.message_databases,
                     );
                     let mut cursors = cursors.lock().map_err(|_| capability_unavailable())?;
-                    for (key, sequence) in restored {
-                        cursors
-                            .entry(key)
-                            .and_modify(|current| *current = (*current).max(sequence))
-                            .or_insert(sequence);
-                    }
+                    replace_with_durable_cursors(&mut cursors, restored);
                 }
                 read_message_batch(
                     &refreshed_paths,
@@ -831,10 +828,28 @@ fn read_message_batch(
             image_records
         );
     }
-    *last_message_snapshot
-        .lock()
-        .map_err(|_| capability_unavailable())? = Some(current_snapshot);
+    remember_message_snapshot_after_scan(last_message_snapshot, current_snapshot, records.len())?;
     Ok(records)
+}
+
+fn replace_with_durable_cursors(
+    cursors: &mut BTreeMap<String, i64>,
+    durable: BTreeMap<String, i64>,
+) {
+    *cursors = durable;
+}
+
+fn remember_message_snapshot_after_scan(
+    last_message_snapshot: &Mutex<Option<MessageSourceSnapshot>>,
+    current_snapshot: MessageSourceSnapshot,
+    record_count: usize,
+) -> Result<(), DomainError> {
+    if record_count == 0 {
+        *last_message_snapshot
+            .lock()
+            .map_err(|_| capability_unavailable())? = Some(current_snapshot);
+    }
+    Ok(())
 }
 
 #[allow(
@@ -1071,13 +1086,18 @@ fn read_database_text(
                 },
             )
             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
+        let mut pending_ceiling = None;
         for row in rows {
             let row = row.map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
             if row.local_id <= 0 {
                 continue;
             }
             if row.create_time <= 0 {
-                records.push((cursor_key.clone(), row.local_id, None));
+                records.push((
+                    cursor_key.clone(),
+                    row.local_id.min(pending_ceiling.unwrap_or(row.local_id)),
+                    None,
+                ));
                 continue;
             }
             let direction = match message_row_disposition(
@@ -1086,9 +1106,16 @@ fn read_database_text(
                 row.server_id,
                 row.status,
             ) {
-                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingPending => {
+                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    continue;
+                }
                 MessageRowDisposition::OutgoingFailed => {
-                    records.push((cursor_key.clone(), row.local_id, None));
+                    records.push((
+                        cursor_key.clone(),
+                        row.local_id.min(pending_ceiling.unwrap_or(row.local_id)),
+                        None,
+                    ));
                     continue;
                 }
                 MessageRowDisposition::OutgoingSent => SourceDirection::Outgoing,
@@ -1125,7 +1152,11 @@ fn read_database_text(
             };
             let Some(body) = decode_message_content(&row.compress_content, &row.message_content)
             else {
-                records.push((cursor_key.clone(), row.local_id, None));
+                records.push((
+                    cursor_key.clone(),
+                    row.local_id.min(pending_ceiling.unwrap_or(row.local_id)),
+                    None,
+                ));
                 continue;
             };
             let complete_forwarded_chat = ((row.local_type & 0xffff_ffff) == 49
@@ -1136,7 +1167,11 @@ fn read_database_text(
             let Some(body) = complete_forwarded_chat.or_else(|| {
                 display_text_message_with_contacts(row.local_type, &body, context.contact_cards)
             }) else {
-                records.push((cursor_key.clone(), row.local_id, None));
+                records.push((
+                    cursor_key.clone(),
+                    row.local_id.min(pending_ceiling.unwrap_or(row.local_id)),
+                    None,
+                ));
                 continue;
             };
             let occurred_at = OffsetDateTime::from_unix_timestamp(row.create_time)
@@ -1157,11 +1192,12 @@ fn read_database_text(
             }
             records.push((
                 cursor_key.clone(),
-                row.local_id,
+                row.local_id.min(pending_ceiling.unwrap_or(row.local_id)),
                 Some(SourceMessageRecord {
                     account_id: context.account_id.to_owned(),
                     source_sequence: u64::try_from(row.local_id)
                         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                    cursor_sequence: durable_cursor_sequence(row.local_id, pending_ceiling)?,
                     message_id,
                     conversation_id: session.username.clone(),
                     conversation_display_name: metadata.display_name.clone(),
@@ -1316,6 +1352,7 @@ fn read_database_images(
             })
             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
         let mut scanned_through = after;
+        let mut pending_ceiling = None;
         let records_before_session = records.len();
         for row in rows {
             if records.len() - records_before_session >= per_conversation {
@@ -1333,7 +1370,10 @@ fn read_database_images(
                 row.server_id,
                 row.status,
             ) {
-                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingPending => {
+                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    continue;
+                }
                 MessageRowDisposition::OutgoingFailed => {
                     if is_retry {
                         cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
@@ -1569,6 +1609,7 @@ fn read_database_images(
                 account_id: context.account_id.to_owned(),
                 source_sequence: u64::try_from(row.local_id)
                     .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                cursor_sequence: durable_cursor_sequence(row.local_id, pending_ceiling)?,
                 message_id,
                 conversation_id: session.username.clone(),
                 conversation_display_name: metadata.display_name.clone(),
@@ -1596,6 +1637,7 @@ fn read_database_images(
                 },
             });
         }
+        scanned_through = scanned_through.min(pending_ceiling.unwrap_or(scanned_through));
         if scanned_through > after {
             cursor_updates.push((cursor_key, scanned_through));
         }
@@ -1771,6 +1813,7 @@ fn read_database_emoticons(
             })
             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
         let mut scanned_through = after;
+        let mut pending_ceiling = None;
         let records_before_session = records.len();
         for row in rows {
             if records.len() - records_before_session >= per_conversation {
@@ -1787,7 +1830,10 @@ fn read_database_emoticons(
                 row.server_id,
                 row.status,
             ) {
-                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingPending => {
+                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    continue;
+                }
                 MessageRowDisposition::OutgoingFailed => {
                     if is_retry {
                         cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
@@ -1869,6 +1915,7 @@ fn read_database_emoticons(
                         account_id: context.account_id.to_owned(),
                         source_sequence: u64::try_from(row.local_id)
                             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                        cursor_sequence: durable_cursor_sequence(row.local_id, pending_ceiling)?,
                         message_id,
                         conversation_id: session.username.clone(),
                         conversation_display_name: metadata.display_name.clone(),
@@ -1901,6 +1948,7 @@ fn read_database_emoticons(
                 account_id: context.account_id.to_owned(),
                 source_sequence: u64::try_from(row.local_id)
                     .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                cursor_sequence: durable_cursor_sequence(row.local_id, pending_ceiling)?,
                 message_id,
                 conversation_id: session.username.clone(),
                 conversation_display_name: metadata.display_name.clone(),
@@ -1927,6 +1975,7 @@ fn read_database_emoticons(
                 },
             });
         }
+        scanned_through = scanned_through.min(pending_ceiling.unwrap_or(scanned_through));
         if scanned_through > after {
             cursor_updates.push((cursor_key, scanned_through));
         }
@@ -2068,6 +2117,7 @@ fn read_database_files(
             })
             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
         let mut scanned_through = after;
+        let mut pending_ceiling = None;
         let records_before_session = records.len();
         for row in rows {
             if records.len() - records_before_session >= per_conversation {
@@ -2084,7 +2134,10 @@ fn read_database_files(
                 row.server_id,
                 row.status,
             ) {
-                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingPending => {
+                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    continue;
+                }
                 MessageRowDisposition::OutgoingFailed => {
                     if is_retry {
                         cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
@@ -2174,6 +2227,7 @@ fn read_database_files(
                         account_id: read_context.account_id.to_owned(),
                         source_sequence: u64::try_from(row.local_id)
                             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                        cursor_sequence: durable_cursor_sequence(row.local_id, pending_ceiling)?,
                         message_id,
                         conversation_id: session.username.clone(),
                         conversation_display_name: metadata.display_name.clone(),
@@ -2206,6 +2260,7 @@ fn read_database_files(
                 account_id: read_context.account_id.to_owned(),
                 source_sequence: u64::try_from(row.local_id)
                     .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                cursor_sequence: durable_cursor_sequence(row.local_id, pending_ceiling)?,
                 message_id,
                 conversation_id: session.username.clone(),
                 conversation_display_name: metadata.display_name.clone(),
@@ -2232,6 +2287,7 @@ fn read_database_files(
                 },
             });
         }
+        scanned_through = scanned_through.min(pending_ceiling.unwrap_or(scanned_through));
         if scanned_through > after {
             cursor_updates.push((cursor_key, scanned_through));
         }
@@ -2354,6 +2410,7 @@ fn read_database_videos(
             })
             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
         let mut scanned_through = after;
+        let mut pending_ceiling = None;
         let records_before_session = records.len();
         for row in rows {
             if records.len() - records_before_session >= per_conversation {
@@ -2370,7 +2427,10 @@ fn read_database_videos(
                 row.server_id,
                 row.status,
             ) {
-                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingPending => {
+                    pending_ceiling = Some(cursor_before_pending(row.local_id));
+                    continue;
+                }
                 MessageRowDisposition::OutgoingFailed => {
                     if is_retry {
                         cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
@@ -2444,6 +2504,7 @@ fn read_database_videos(
                         account_id: context.account_id.to_owned(),
                         source_sequence: u64::try_from(row.local_id)
                             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                        cursor_sequence: durable_cursor_sequence(row.local_id, pending_ceiling)?,
                         message_id,
                         conversation_id: session.username.clone(),
                         conversation_display_name: metadata.display_name.clone(),
@@ -2478,6 +2539,7 @@ fn read_database_videos(
                 account_id: context.account_id.to_owned(),
                 source_sequence: u64::try_from(row.local_id)
                     .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                cursor_sequence: durable_cursor_sequence(row.local_id, pending_ceiling)?,
                 message_id,
                 conversation_id: session.username.clone(),
                 conversation_display_name: metadata.display_name.clone(),
@@ -2504,6 +2566,7 @@ fn read_database_videos(
                 },
             });
         }
+        scanned_through = scanned_through.min(pending_ceiling.unwrap_or(scanned_through));
         if scanned_through > after {
             cursor_updates.push((cursor_key, scanned_through));
         }
@@ -2632,6 +2695,7 @@ fn read_database_audio(
             )
             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
         let mut scanned_through = after;
+        let mut pending_ceiling = None;
         for row in rows {
             let (local_id, server_id, create_time, real_sender_id, status) =
                 row.map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
@@ -2641,7 +2705,10 @@ fn read_database_audio(
             let is_retry = local_id <= after && retry_ids.contains(&local_id);
             let direction =
                 match message_row_disposition(real_sender_id, my_rowid, server_id, status) {
-                    MessageRowDisposition::OutgoingPending => break,
+                    MessageRowDisposition::OutgoingPending => {
+                        pending_ceiling = Some(cursor_before_pending(local_id));
+                        continue;
+                    }
                     MessageRowDisposition::OutgoingFailed => {
                         if is_retry {
                             cursor_removals.push(format!("{retry_prefix}{local_id}"));
@@ -2718,6 +2785,7 @@ fn read_database_audio(
                         account_id: context.account_id.to_owned(),
                         source_sequence: u64::try_from(local_id)
                             .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                        cursor_sequence: durable_cursor_sequence(local_id, pending_ceiling)?,
                         message_id,
                         conversation_id: session.username.clone(),
                         conversation_display_name: metadata.display_name.clone(),
@@ -2752,6 +2820,7 @@ fn read_database_audio(
                 account_id: context.account_id.to_owned(),
                 source_sequence: u64::try_from(local_id)
                     .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                cursor_sequence: durable_cursor_sequence(local_id, pending_ceiling)?,
                 message_id,
                 conversation_id: session.username.clone(),
                 conversation_display_name: metadata.display_name.clone(),
@@ -2778,6 +2847,7 @@ fn read_database_audio(
                 },
             });
         }
+        scanned_through = scanned_through.min(pending_ceiling.unwrap_or(scanned_through));
         if scanned_through > after {
             cursor_updates.push((cursor_key, scanned_through));
         }
@@ -3693,9 +3763,7 @@ fn stage_decrypted_image(bytes: &[u8], sha256: &str, mime_type: &str) -> Option<
 }
 
 fn stage_media(bytes: &[u8], sha256: &str, mime_type: &str) -> Option<PathBuf> {
-    let root = fs::canonicalize(env::temp_dir())
-        .ok()?
-        .join("pca-wechat-media");
+    let root = staged_media_root()?;
     match root.symlink_metadata() {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3704,7 +3772,7 @@ fn stage_media(bytes: &[u8], sha256: &str, mime_type: &str) -> Option<PathBuf> {
         Ok(_) | Err(_) => return None,
     }
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).ok()?;
-    cleanup_staged_images(&root);
+    cleanup_staged_media_in(&root);
     let extension = match mime_type {
         "image/jpeg" => "jpg",
         "image/png" => "png",
@@ -3781,7 +3849,27 @@ fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Option<Vec<u8>> {
     Some(wav)
 }
 
-fn cleanup_staged_images(root: &Path) {
+fn staged_media_root() -> Option<PathBuf> {
+    Some(
+        fs::canonicalize(env::temp_dir())
+            .ok()?
+            .join("pca-wechat-media"),
+    )
+}
+
+fn cleanup_staged_media() {
+    let Some(root) = staged_media_root() else {
+        return;
+    };
+    let Ok(metadata) = root.symlink_metadata() else {
+        return;
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        cleanup_staged_media_in(&root);
+    }
+}
+
+fn cleanup_staged_media_in(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -4425,6 +4513,18 @@ enum MessageRowDisposition {
     OutgoingSent,
     OutgoingPending,
     OutgoingFailed,
+}
+
+fn cursor_before_pending(local_id: i64) -> i64 {
+    local_id.saturating_sub(1)
+}
+
+fn durable_cursor_sequence(
+    local_id: i64,
+    pending_ceiling: Option<i64>,
+) -> Result<u64, SqlcipherProbeFailure> {
+    u64::try_from(local_id.min(pending_ceiling.unwrap_or(local_id)))
+        .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)
 }
 
 fn message_row_disposition(
@@ -5768,12 +5868,20 @@ fn bootstrap_source_cursors(
         .iter()
         .filter_map(|database| database.file_name()?.to_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    let Ok(mut statement) = connection.prepare(
-        "SELECT message.external_conversation_id, message.source_sequence, \
+    let cursor_sequence = if table_columns(&connection, "communication_messages")
+        .is_ok_and(|columns| columns.iter().any(|column| column == "cursor_sequence"))
+    {
+        "COALESCE(message.cursor_sequence, message.source_sequence)"
+    } else {
+        "message.source_sequence"
+    };
+    let query = format!(
+        "SELECT message.external_conversation_id, {cursor_sequence}, \
                 message.source_key, message.occurred_at_ms, message.text_body \
          FROM communication_messages AS message \
-         WHERE message.account_id = ?1",
-    ) else {
+         WHERE message.account_id = ?1"
+    );
+    let Ok(mut statement) = connection.prepare(&query) else {
         return BTreeMap::new();
     };
     let Ok(rows) = statement.query_map([account_id], |row| {
@@ -5984,17 +6092,19 @@ fn capability_unavailable() -> DomainError {
 mod tests {
     use super::{
         bootstrap_source_cursors, claim_pending_media_retry, clean_account_directory_name,
-        decode_value, decode_voice_attachment, decode_zstd_text, decoded_image_attachment,
-        decrypt_emoticon, decrypt_v4_image, derive_image_keys, display_text_message,
-        extend_message_database_routes, extract_hevc_nalu_units, file_attachment,
-        image_attachment_id, image_mime_type, index_decoded_images, index_message_files,
-        index_video_files, is_direct_conversation, is_message_database, kvcomm_codes_from_filename,
-        message_table_name, normalize_decrypted_image, parse_group_nicknames, parse_image_dat_name,
-        parse_image_md5_candidates, parse_video_file_key, parse_video_length,
-        parse_video_md5_candidates, probe_wechat_app_data_root, read_contact_cards,
-        read_conversation_metadata, read_database_audio, read_database_emoticons,
-        read_database_files, read_database_images, read_database_text, read_database_videos,
-        read_voice_blob, resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
+        cleanup_staged_media_in, decode_value, decode_voice_attachment, decode_zstd_text,
+        decoded_image_attachment, decrypt_emoticon, decrypt_v4_image, derive_image_keys,
+        display_text_message, extend_message_database_routes, extract_hevc_nalu_units,
+        file_attachment, image_attachment_id, image_mime_type, index_decoded_images,
+        index_message_files, index_video_files, is_direct_conversation, is_message_database,
+        kvcomm_codes_from_filename, message_table_name, normalize_decrypted_image,
+        parse_group_nicknames, parse_image_dat_name, parse_image_md5_candidates,
+        parse_video_file_key, parse_video_length, parse_video_md5_candidates,
+        probe_wechat_app_data_root, read_contact_cards, read_conversation_metadata,
+        read_database_audio, read_database_emoticons, read_database_files, read_database_images,
+        read_database_text, read_database_videos, read_voice_blob,
+        remember_message_snapshot_after_scan, replace_with_durable_cursors,
+        resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
         resolve_message_file, resolve_video_path, retention_cutoff_from, select_image_candidate,
         should_retire_failed_full_image_retry, should_scan_message_source, source_access_error,
         source_instance_id, stage_decrypted_image, start_source_worker, video_attachment,
@@ -6110,6 +6220,54 @@ mod tests {
         ));
         assert!(should_scan_message_source(Some(&snapshot), &changed, false));
         assert!(should_scan_message_source(Some(&snapshot), &snapshot, true));
+    }
+
+    #[test]
+    fn durable_cursors_replace_uncommitted_scan_progress() {
+        let mut cursors = std::collections::BTreeMap::from([
+            ("message_0.db:wxid_friend:display-text-v3".to_owned(), 12),
+            (
+                "message_0.db:wxid_friend:image:full-pending:11".to_owned(),
+                11,
+            ),
+        ]);
+        let durable = std::collections::BTreeMap::from([(
+            "message_0.db:wxid_friend:display-text-v3".to_owned(),
+            10,
+        )]);
+
+        replace_with_durable_cursors(&mut cursors, durable);
+
+        assert_eq!(
+            cursors,
+            std::collections::BTreeMap::from([(
+                "message_0.db:wxid_friend:display-text-v3".to_owned(),
+                10,
+            )])
+        );
+    }
+
+    #[test]
+    fn source_snapshot_waits_until_scan_has_no_uncommitted_records() {
+        let snapshot = MessageSourceSnapshot(vec![(
+            (SourceFileStamp {
+                length: 100,
+                modified: None,
+            }),
+            (SourceFileStamp {
+                length: 200,
+                modified: None,
+            }),
+        )]);
+        let remembered = std::sync::Mutex::new(None);
+
+        remember_message_snapshot_after_scan(&remembered, snapshot.clone(), 1)
+            .expect("leave uncommitted scan retryable");
+        assert_eq!(*remembered.lock().expect("lock snapshot"), None);
+
+        remember_message_snapshot_after_scan(&remembered, snapshot.clone(), 0)
+            .expect("remember completed scan");
+        assert_eq!(*remembered.lock().expect("lock snapshot"), Some(snapshot));
     }
 
     #[test]
@@ -6523,7 +6681,8 @@ mod tests {
                     real_sender_id INTEGER, status INTEGER, local_type INTEGER,\
                     message_content TEXT, compress_content BLOB\
                  );\
-                 INSERT INTO \"{table_name}\" VALUES (7, 0, 1000, 1, 0, 1, 'sending', NULL);"
+                 INSERT INTO \"{table_name}\" VALUES (7, 0, 1000, 1, 0, 1, 'sending', NULL);\
+                 INSERT INTO \"{table_name}\" VALUES (8, 108, 1001, 2, 0, 1, 'incoming', NULL);"
             ))
             .expect("create outbound fixture schema");
         let metadata = std::collections::BTreeMap::from([(
@@ -6557,10 +6716,18 @@ mod tests {
             20,
         )
         .expect("read sending message");
-        assert!(
-            sending.is_empty(),
-            "sending row must remain behind the cursor"
+        assert_eq!(
+            sending.len(),
+            1,
+            "later incoming messages remain collectible"
         );
+        assert_eq!(
+            sending[0].1, 6,
+            "the durable cursor stays before the pending row"
+        );
+        let incoming = sending[0].2.as_ref().expect("incoming record");
+        assert_eq!(incoming.source_sequence, 8);
+        assert_eq!(incoming.cursor_sequence, 6);
 
         connection
             .execute(
@@ -6577,8 +6744,10 @@ mod tests {
             20,
         )
         .expect("read completed outbound message");
-        assert_eq!(sent.len(), 1);
-        assert!(sent[0].2.is_some());
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|(_, _, record)| record.is_some()));
+        assert_eq!(sent[0].2.as_ref().unwrap().source_sequence, 7);
+        assert_eq!(sent[0].2.as_ref().unwrap().cursor_sequence, 7);
     }
 
     #[test]
@@ -7859,6 +8028,33 @@ mod tests {
             path
         );
         fs::remove_file(path).expect("remove staged image fixture");
+    }
+
+    #[test]
+    fn staged_media_cleanup_removes_only_expired_regular_files() {
+        let root = tempfile::tempdir().expect("create staged media fixture");
+        let expired = root.path().join("expired.jpg");
+        let fresh = root.path().join("fresh.jpg");
+        let directory = root.path().join("nested");
+        std::fs::write(&expired, b"expired").expect("write expired fixture");
+        std::fs::write(&fresh, b"fresh").expect("write fresh fixture");
+        std::fs::create_dir(&directory).expect("create nested fixture");
+        std::fs::File::options()
+            .write(true)
+            .open(&expired)
+            .expect("open expired fixture")
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_hours(2),
+                ),
+            )
+            .expect("age expired fixture");
+
+        cleanup_staged_media_in(root.path());
+
+        assert!(!expired.exists());
+        assert!(fresh.exists());
+        assert!(directory.exists());
     }
 
     #[test]

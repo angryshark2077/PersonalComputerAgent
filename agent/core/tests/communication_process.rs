@@ -372,6 +372,7 @@ fn text_record_with_body(sequence: u64, body: &str) -> NormalizedCommunicationRe
     NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
         sequence,
+        sequence,
         "Conversation One".to_owned(),
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
             message_id: format!("message-{sequence}"),
@@ -415,6 +416,7 @@ fn media_record(path: &Path, declared: &[u8], sequence: u64) -> NormalizedCommun
             .expect("valid completed source descriptor");
     NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
+        sequence,
         sequence,
         "Conversation One".to_owned(),
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
@@ -463,6 +465,7 @@ fn multi_media_record(
         .collect();
     NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
+        sequence,
         sequence,
         "Conversation One".to_owned(),
         CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
@@ -1231,13 +1234,12 @@ async fn repaired_device_source_conflict_is_diagnosed_without_blocking_later_mes
     wait_for_message_count(&harness.database_path, 2).await;
     wait_for_collector_code(&harness.database, "COMMUNICATION_SOURCE_IDENTITY_CONFLICT").await;
     let factory_calls_after_conflict = harness.state.factory_calls.load(Ordering::SeqCst);
-    wait_for(&harness.state.stop_calls, 2).await;
     tokio::time::advance(Duration::from_secs(30)).await;
     settle().await;
     assert_eq!(
         harness.state.factory_calls.load(Ordering::SeqCst),
-        factory_calls_after_conflict + 1,
-        "a non-retryable commit conflict must rebuild the Provider from persisted cursors"
+        factory_calls_after_conflict,
+        "a consumed source conflict must not rebuild the Provider forever"
     );
     runtime.shutdown().await.unwrap();
 
@@ -1608,6 +1610,7 @@ async fn incomplete_media_envelope_is_rejected_before_runtime_and_cannot_advance
     .unwrap();
     assert!(NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
+        1,
         1,
         "Conversation One".to_owned(),
         message,

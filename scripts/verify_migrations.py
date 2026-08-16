@@ -32,6 +32,8 @@ EXPECTED_MIGRATIONS = {
         "0014_terminal_media_failures.sql",
         "0015_manual_unpair_state.sql",
         "0016_applied_collector_control.sql",
+        "0017_communication_cursor_checkpoint.sql",
+        "0018_screenshot_request_history.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",

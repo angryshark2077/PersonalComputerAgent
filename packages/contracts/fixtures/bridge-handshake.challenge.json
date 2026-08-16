@@ -7,6 +7,7 @@
   "payload": {
     "phase": "challenge",
     "nonce": "c2VjcmV0LWZyZWUtbm9uY2UtMDE=",
-    "agent_version": "0.0.0-s1a"
+    "agent_version": "0.0.0-s1a",
+    "client_proof": "c3ludGhldGljLWFnZW50LWhtYWMtcHJvb2Y="
   }
 }

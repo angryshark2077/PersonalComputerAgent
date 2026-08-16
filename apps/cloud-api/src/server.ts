@@ -2,6 +2,7 @@ import { serve } from "@hono/node-server";
 
 import { createProductionRuntime } from "./index.js";
 import { startCommunicationObjectRecovery } from "./communication-object-recovery.js";
+import { startHeartbeatPrivacyRetentionWorker } from "./heartbeat-privacy-retention.js";
 import { startScreenshotRetentionWorker } from "./screenshot-retention.js";
 
 export function parseListenPort(value: string | undefined): number {
@@ -20,10 +21,14 @@ export function startProductionServer(environment = process.env) {
   const retention = runtime.objectStore === undefined
     ? null
     : startScreenshotRetentionWorker(runtime.repository, runtime.objectStore);
+  const heartbeatPrivacyRetention = startHeartbeatPrivacyRetentionWorker(runtime.repository);
   if (runtime.objectStore !== undefined) {
     startCommunicationObjectRecovery(runtime.repository, runtime.objectStore);
   }
-  server.once("close", () => retention?.stop());
+  server.once("close", () => {
+    retention?.stop();
+    heartbeatPrivacyRetention.stop();
+  });
   return server;
 }
 

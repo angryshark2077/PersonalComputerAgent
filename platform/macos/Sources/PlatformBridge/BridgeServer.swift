@@ -537,6 +537,9 @@ enum CapabilityRequestHandler {
         }
         if capability == "system.capabilities" {
             try StrictJSON.requireExactKeys(payloadObject, expected: capabilityPayloadKeys)
+            guard payloadObject["include_permissions"] as? Bool == true else {
+                throw BridgeServerError.invalidRequest
+            }
         } else if capability == "network.observe" {
             try StrictJSON.requireExactKeys(payloadObject, expected: networkPayloadKeys)
         } else if capability == "system.lifecycle.poll" {
@@ -630,8 +633,12 @@ enum CapabilityRequestHandler {
             }
             responsePayload = photoSource.export(localIdentifier: localIdentifier, fileName: fileName)
         } else {
+            let permissions = capabilityProbe.permissionSnapshot().mapValues { status in
+                JSONValue.string(status.rawValue)
+            }
             responsePayload = [
                 "screen_capture": .string(capabilityProbe.screenCaptureAvailability()),
+                "permissions": .object(permissions),
             ]
         }
         let response = BridgeEnvelope(

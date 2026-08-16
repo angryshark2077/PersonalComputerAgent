@@ -78,6 +78,12 @@ pub const MANUAL_UNPAIR_STATE_MIGRATION: &str =
 /// bootstrap at revision zero until the first complete Cloud control snapshot is applied.
 pub const APPLIED_COLLECTOR_CONTROL_MIGRATION: &str =
     include_str!("../migrations/0016_applied_collector_control.sql");
+/// Persists the safe provider checkpoint separately from the immutable source message sequence.
+pub const COMMUNICATION_CURSOR_CHECKPOINT_MIGRATION: &str =
+    include_str!("../migrations/0017_communication_cursor_checkpoint.sql");
+/// Remembers completed manual Screenshot requests across Agent restarts.
+pub const SCREENSHOT_REQUEST_HISTORY_MIGRATION: &str =
+    include_str!("../migrations/0018_screenshot_request_history.sql");
 
 /// Non-secret local Collector control that remains authoritative while Cloud is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +197,7 @@ impl PendingCommunicationAttachment {
 pub struct CommunicationMessageCommit {
     pub account_id: String,
     pub source_sequence: u64,
+    pub cursor_sequence: u64,
     pub event: EventEnvelope,
     pub metadata_events: Vec<EventEnvelope>,
     pub message: CommunicationMessageRecorded,

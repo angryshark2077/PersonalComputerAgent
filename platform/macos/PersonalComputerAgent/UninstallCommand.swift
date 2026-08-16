@@ -5,7 +5,9 @@ import Security
 struct UninstallCommand {
     static let confirmationToken = "DELETE PCA DATA"
     static let credentialScopes = [
-        KeychainScope(service: "com.pca.bridge", account: "shared-secret-v1")
+        KeychainScope(service: "com.pca.bridge", account: "shared-secret-v1"),
+        KeychainScope(service: "com.pca.device", account: "current-v1"),
+        KeychainScope(service: "com.pca.wechat", account: "current-v1")
     ]
 
     let paths: InstallPaths
@@ -47,16 +49,29 @@ struct UninstallCommand {
         }
 
         try await service.stopAndUnregister()
-        guard InstallPaths.entryExists(paths.rootURL) else { return }
-        let capturedIdentity = try rootIdentity ?? InstallPaths.identity(of: paths.rootURL)
-        try paths.revalidateRoot(capturedIdentity)
+        if InstallPaths.entryExists(paths.rootURL) {
+            let capturedIdentity = try rootIdentity ?? InstallPaths.identity(of: paths.rootURL)
+            try paths.revalidateRoot(capturedIdentity)
 
-        try removeIfPresent(paths.appDirectoryURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
-        try removeIfPresent(paths.runURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
+            try removeIfPresent(paths.appDirectoryURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
+            try removeIfPresent(paths.runURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
+            if deleteData {
+                try removeIfPresent(paths.dataURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
+            }
+        }
         if deleteData {
-            try removeIfPresent(paths.dataURL, directChildOf: paths.rootURL, rootIdentity: capturedIdentity)
+            var firstDeletionError: (any Error)?
             for scope in Self.credentialScopes {
-                try deleteCredential(scope)
+                do {
+                    try deleteCredential(scope)
+                } catch {
+                    if firstDeletionError == nil {
+                        firstDeletionError = error
+                    }
+                }
+            }
+            if let firstDeletionError {
+                throw firstDeletionError
             }
         }
     }

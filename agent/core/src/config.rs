@@ -324,14 +324,26 @@ fn canonical_test_root(root: &Path, production_root: &Path) -> Result<PathBuf, S
     if !canonical_root.is_dir() {
         return Err("--runtime-root must name an existing non-production directory".to_owned());
     }
-    if let Ok(canonical_production) = std::fs::canonicalize(production_root) {
-        if canonical_root == canonical_production
-            || canonical_root.starts_with(canonical_production)
-        {
-            return Err(
-                "--runtime-root cannot equal or descend from the production root".to_owned(),
-            );
-        }
+    let canonical_production = if let Ok(path) = std::fs::canonicalize(production_root) {
+        path
+    } else {
+        let parent = production_root
+            .parent()
+            .ok_or("production root unavailable")?;
+        let name = production_root
+            .file_name()
+            .ok_or("production root unavailable")?;
+        std::fs::canonicalize(parent)
+            .map_err(|_| "production root unavailable")?
+            .join(name)
+    };
+    if canonical_root == canonical_production
+        || canonical_root.starts_with(&canonical_production)
+        || canonical_production.starts_with(&canonical_root)
+    {
+        return Err(
+            "--runtime-root cannot equal, contain, or descend from the production root".to_owned(),
+        );
     }
     Ok(canonical_root)
 }
@@ -523,5 +535,33 @@ mod tests {
 
         assert!(canonical_test_root(&descendant, &production).is_err());
         assert!(canonical_test_root(&alias, &production).is_err());
+    }
+
+    #[test]
+    fn explicit_root_rejects_production_ancestors_and_their_aliases() {
+        let directory = tempfile::tempdir().expect("temporary root parent");
+        let ancestor = directory.path().join("home");
+        let direct_ancestor = ancestor.join("Library/Application Support");
+        let production = direct_ancestor.join("PersonalComputerAgent");
+        let alias = directory.path().join("application-support-alias");
+        std::fs::create_dir_all(&production).expect("create synthetic production root");
+        symlink(&direct_ancestor, &alias).expect("create ancestor alias");
+
+        assert!(canonical_test_root(&direct_ancestor, &production).is_err());
+        assert!(canonical_test_root(&ancestor, &production).is_err());
+        assert!(canonical_test_root(&alias, &production).is_err());
+    }
+
+    #[test]
+    fn explicit_root_rejects_an_ancestor_before_the_production_leaf_exists() {
+        let directory = tempfile::tempdir().expect("temporary root parent");
+        let ancestor = directory.path().join("home");
+        let production_parent = ancestor.join("Library/Application Support");
+        let production = production_parent.join("PersonalComputerAgent");
+        std::fs::create_dir_all(&production_parent).expect("create production parent only");
+
+        assert!(!production.exists());
+        assert!(canonical_test_root(&ancestor, &production).is_err());
+        assert!(canonical_test_root(&production_parent, &production).is_err());
     }
 }

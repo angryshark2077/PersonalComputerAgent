@@ -8,7 +8,7 @@ use std::{
 };
 
 use pca_bridge_client::{
-    auth::{create_proof, verify_proof},
+    auth::{create_agent_proof, create_proof, verify_agent_proof, verify_proof},
     framing::{read_frame, write_frame, FrameError, MAX_FRAME_BYTES},
     supervisor::{BridgeSupervisor, BridgeSupervisorConfig},
     BridgeClient, BridgeClientConfig, BridgeClientError,
@@ -130,6 +130,12 @@ fn hmac_transcript_is_raw_nonce_then_u32_be_then_exact_agent_version_utf8() {
     assert_eq!(proof, "ZzHI3PgX7xuVBQpbtbnGsqP8Tvcu9WBICkuw1YUGwmc=");
     verify_proof(&SECRET, &nonce, 0x0102_0304, "v1.β", &proof).expect("valid proof");
     assert!(verify_proof(&SECRET, &nonce, 0x0102_0305, "v1.β", &proof).is_err());
+
+    let agent_proof = create_agent_proof(&SECRET, &nonce, 0x0102_0304, "v1.β");
+    assert_eq!(agent_proof, "Y3Ir7sU+EoFbXlls5L2NdZoRmt1Chbn0Tj0AM/sbyS8=");
+    assert_ne!(agent_proof, proof);
+    verify_agent_proof(&SECRET, &nonce, 0x0102_0304, "v1.β", &agent_proof)
+        .expect("valid role-separated Agent proof");
 }
 
 #[tokio::test]
@@ -640,6 +646,20 @@ async fn connect_to_fake_observing(
         }
         let mut nonce_bytes = [0_u8; 32];
         nonce_bytes.copy_from_slice(&decoded);
+        let agent_version = challenge.payload["agent_version"]
+            .as_str()
+            .expect("agent version");
+        let client_proof = challenge.payload["client_proof"]
+            .as_str()
+            .expect("client proof");
+        verify_agent_proof(
+            &SECRET,
+            &nonce_bytes,
+            challenge.protocol_version,
+            agent_version,
+            client_proof,
+        )
+        .expect("client authenticates to fake Bridge");
         let response_nonce = if matches!(behavior, ServerBehavior::WrongNonce) {
             base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0_u8; 32])
         } else {

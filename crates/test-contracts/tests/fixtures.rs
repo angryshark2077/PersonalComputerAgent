@@ -63,6 +63,10 @@ fn handshake_fixtures_decode_every_canonical_field() {
     assert_eq!(challenge.phase, HandshakeChallengePhase::Challenge);
     assert_eq!(challenge.nonce, "c2VjcmV0LWZyZWUtbm9uY2UtMDE=");
     assert_eq!(challenge.agent_version, "0.0.0-s1a");
+    assert_eq!(
+        challenge.client_proof,
+        "c3ludGhldGljLWFnZW50LWhtYWMtcHJvb2Y="
+    );
 
     let response_raw =
         include_str!("../../../packages/contracts/fixtures/bridge-handshake.response.json");

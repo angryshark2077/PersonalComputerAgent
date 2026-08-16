@@ -234,27 +234,21 @@ fn production_credential_adapters_have_no_plaintext_fallback_channel() {
 }
 
 #[test]
-fn production_swift_store_recreates_secrets_and_replaces_migrated_access() {
+fn production_swift_store_updates_secrets_without_deleting_the_existing_item() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path =
         manifest.join("../../platform/macos/Sources/BridgeProtocol/KeychainCredentialStore.swift");
     let source = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to scan {}: {error}", path.display()));
 
-    let replacement_delete = source
-        .find("let replacementDeleteStatus = SecItemDelete(query as CFDictionary)")
-        .expect("store must remove the existing PCA credential before recreating its ACL");
-    let replacement_add = source
-        .find("let addStatus = SecItemAdd(item as CFDictionary, nil)")
-        .expect("store must recreate the PCA credential with the complete ACL");
-
     assert!(
-        replacement_delete < replacement_add,
-        "replacement delete must happen before the credential is recreated"
+        !source.contains("let replacementDeleteStatus = SecItemDelete(query as CFDictionary)"),
+        "credential replacement must not delete the existing item before its successor is durable"
     );
     assert!(
-        source.contains("let status = SecItemUpdate("),
-        "migration must replace kSecAttrAccess without reading or rewriting the secret"
+        source.contains("if addStatus == errSecDuplicateItem")
+            && source.contains("let updateStatus = SecItemUpdate("),
+        "duplicate credentials must be replaced with one atomic Keychain update"
     );
     assert!(
         !source.contains("SecKeychainItemSetAccess"),

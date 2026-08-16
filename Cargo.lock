@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "pca-agent-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "fs2",
  "libc",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "pca-agentd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "pca-agent-runtime",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "pca-bridge-client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "pca-db-local"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "pca-domain",
  "rusqlite",
@@ -858,11 +858,12 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
 name = "pca-domain"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -871,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "pca-keychain"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "security-framework",
  "serde",
@@ -881,14 +882,14 @@ dependencies = [
 
 [[package]]
 name = "pca-provider-contracts"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "pca-domain",
 ]
 
 [[package]]
 name = "pca-system-collector"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "pca-domain",
  "serde_json",
@@ -899,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "pca-test-contracts"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "pca-domain",
  "serde_json",
@@ -907,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "pca-wechat-provider"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "cipher",
@@ -928,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "pca-wechat-repair"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
  "pca-domain",
@@ -936,6 +937,8 @@ dependencies = [
  "pca-provider-contracts",
  "pca-wechat-provider",
  "sha2",
+ "sysinfo",
+ "tempfile",
  "tokio",
 ]
 

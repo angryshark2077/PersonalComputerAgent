@@ -58,19 +58,25 @@ public struct KeychainCredentialStore: Sendable {
         let access = try Self.makeAccess(trustedApplicationURLs: trustedApplicationURLs)
 
         let query = Self.baseQuery()
-        let replacementDeleteStatus = SecItemDelete(query as CFDictionary)
-        guard replacementDeleteStatus == errSecSuccess || replacementDeleteStatus == errSecItemNotFound else {
-            throw Self.error(for: replacementDeleteStatus)
-        }
-
         var item = query
         item[kSecValueData as String] = secret
         item[kSecAttrAccess as String] = access
         let addStatus = SecItemAdd(item as CFDictionary, nil)
-
-        guard addStatus == errSecSuccess else {
-            throw Self.error(for: addStatus)
+        if addStatus == errSecSuccess { return }
+        if addStatus == errSecDuplicateItem {
+            let updateStatus = SecItemUpdate(
+                query as CFDictionary,
+                [
+                    kSecValueData as String: secret,
+                    kSecAttrAccess as String: access,
+                ] as CFDictionary
+            )
+            guard updateStatus == errSecSuccess else {
+                throw Self.error(for: updateStatus)
+            }
+            return
         }
+        throw Self.error(for: addStatus)
     }
 
     public func delete() throws {

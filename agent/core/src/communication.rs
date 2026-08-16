@@ -835,6 +835,7 @@ async fn run_supervisor(
                     records.sort_by_key(|record| !record.completed_media().is_empty());
                     let batch_deadline = time::Instant::now() + PROVIDER_OPERATION_TIMEOUT;
                     let mut persistence_failure = None;
+                    let mut source_conflict_observed = false;
                     let mut batch_paused = false;
                     let mut event_observed = false;
                     for record in records {
@@ -1036,9 +1037,8 @@ async fn run_supervisor(
                             Ok(Err(DbError::CommunicationSourceConflict)) => {
                                 let diagnostic = time::timeout(
                                     batch_deadline.saturating_duration_since(time::Instant::now()),
-                                    database.record_communication_source_conflict(
-                                        prepared.commit.message.source_key(),
-                                    ),
+                                    database
+                                        .consume_communication_source_conflict(&prepared.commit),
                                 )
                                 .await;
                                 match diagnostic {
@@ -1052,9 +1052,7 @@ async fn run_supervisor(
                                         .await);
                                     }
                                 }
-                                persistence_failure.get_or_insert(LocalPersistenceError::Database(
-                                    DbError::CommunicationSourceConflict,
-                                ));
+                                source_conflict_observed = true;
                             }
                             Ok(Err(error)) => {
                                 persistence_failure = Some(LocalPersistenceError::Database(error));
@@ -1116,7 +1114,17 @@ async fn run_supervisor(
                         }
                         return Ok(());
                     }
-                    let status_persisted = if event_observed {
+                    let status_persisted = if source_conflict_observed {
+                        time::timeout(
+                            batch_deadline.saturating_duration_since(time::Instant::now()),
+                            persist_collector_code(
+                                &database,
+                                control,
+                                "COMMUNICATION_SOURCE_IDENTITY_CONFLICT",
+                            ),
+                        )
+                        .await
+                    } else if event_observed {
                         time::timeout(
                             batch_deadline.saturating_duration_since(time::Instant::now()),
                             persist_collector_event(
@@ -1519,8 +1527,14 @@ async fn prepare_record(
         .ok_or(LocalPersistenceError::InvalidRecord)?;
     let conversation_avatar_url = record.conversation_avatar_url().map(str::to_owned);
     let sender_avatar_url = record.sender_avatar_url().map(str::to_owned);
-    let (account_id, source_sequence, conversation_display_name, message, completed_media) =
-        record.into_parts();
+    let (
+        account_id,
+        source_sequence,
+        cursor_sequence,
+        conversation_display_name,
+        message,
+        completed_media,
+    ) = record.into_parts();
     let prepared_media = copy_completed_media(
         database_path,
         message.attachments(),
@@ -1636,6 +1650,7 @@ async fn prepare_record(
         commit: CommunicationMessageCommit {
             account_id,
             source_sequence,
+            cursor_sequence,
             event,
             metadata_events: vec![conversation_event, sender_event],
             message,
@@ -2177,6 +2192,17 @@ async fn persist_collector(
         .map_err(CommunicationRuntimeError::Database)?
         .into_iter()
         .find(|state| state.collector_key == COLLECTOR_KEY);
+    if !control.active()
+        && prior.as_ref().is_some_and(|state| {
+            crate::cloud_control::disabled_collector_state_is_current(
+                state,
+                env!("CARGO_PKG_VERSION"),
+                revision,
+            )
+        })
+    {
+        return Ok(());
+    }
     let preserve_media_upload_failure = control.active()
         && error_code.is_none()
         && prior.as_ref().is_some_and(|state| {
@@ -2506,6 +2532,51 @@ mod tests {
             .expect("collector exists");
         assert_eq!(state.status, CollectorStatus::Disabled);
         assert_eq!(state.last_error_code, None);
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn repeated_disabled_control_does_not_refresh_collector_updated_at() {
+        let directory = tempfile::tempdir().expect("create database fixture");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.1.0")
+            .await
+            .expect("open database");
+        let identity = CommunicationIdentity {
+            workspace_id: Uuid::new_v4(),
+            device_id: Uuid::new_v4(),
+        };
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "communication.wechat".to_owned(),
+                collector_version: env!("CARGO_PKG_VERSION").to_owned(),
+                status: CollectorStatus::Disabled,
+                desired_config_revision: 2,
+                applied_config_revision: 2,
+                last_event_at_ms: Some(1),
+                last_health_at_ms: Some(2),
+                last_error_code: None,
+                created_at_ms: 1,
+                updated_at_ms: 7,
+            })
+            .await
+            .expect("seed disabled collector");
+
+        persist_collector_state(
+            &database,
+            CommunicationControl::paired(identity, 2, false).expect("valid disabled control"),
+            None,
+        )
+        .await
+        .expect("observe repeated disabled state");
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("load collector")
+            .into_iter()
+            .find(|state| state.collector_key == "communication.wechat")
+            .expect("collector exists");
+        assert_eq!(state.updated_at_ms, 7);
+        assert_eq!(state.last_health_at_ms, Some(2));
         database.shutdown().await.expect("shutdown database");
     }
 }

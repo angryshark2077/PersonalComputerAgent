@@ -56,7 +56,6 @@ final class PairingCallbackServer {
     private func receive(_ connection: NWConnection) {
         guard connection.endpoint.isLoopbackEndpoint else {
             respond(connection, status: "400 Bad Request", body: "Invalid callback.")
-            close(with: PairingError.invalidCallback)
             return
         }
         connection.start(queue: .main)
@@ -68,7 +67,6 @@ final class PairingCallbackServer {
                 }
                 guard let url = Self.callbackURL(from: data), self.validate(url) else {
                     self.respond(connection, status: "400 Bad Request", body: "Invalid callback.")
-                    self.close(with: PairingError.invalidCallback)
                     return
                 }
                 self.respond(

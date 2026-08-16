@@ -34,7 +34,9 @@ use pca_provider_contracts::CommunicationProviderFactory;
 use pca_wechat_provider::sqlcipher_source::{inspect_recovered_schema, validate_recovered_key};
 use pca_wechat_provider::MacOSWechatProviderFactory;
 use sha2::{Digest, Sha256};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
+const WECHAT_EXECUTABLE_PATH: &str = "/Applications/WeChat.app/Contents/MacOS/WeChat";
 const WECHAT_DYLIB_PATH: &str = "/Applications/WeChat.app/Contents/Resources/wechat.dylib";
 const WECHAT_INFO_PATH: &str = "/Applications/WeChat.app/Contents/Info.plist";
 
@@ -481,11 +483,37 @@ fn running_wechat_pid() -> Result<libc::pid_t, RepairError> {
     if !output.status.success() {
         return Err(RepairError::WeChatUnavailable);
     }
-    std::str::from_utf8(&output.stdout)
+    let pid = std::str::from_utf8(&output.stdout)
         .ok()
         .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
         .filter(|pid| *pid > 0)
-        .ok_or(RepairError::WeChatUnavailable)
+        .ok_or(RepairError::WeChatUnavailable)?;
+    let pid_u32 = u32::try_from(pid).map_err(|_| RepairError::WeChatUnavailable)?;
+    let sysinfo_pid = Pid::from_u32(pid_u32);
+    let mut system = System::new();
+    if system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sysinfo_pid]),
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    ) == 0
+    {
+        return Err(RepairError::WeChatUnavailable);
+    }
+    let executable = system
+        .process(sysinfo_pid)
+        .and_then(|process| process.exe())
+        .ok_or(RepairError::WeChatUnavailable)?;
+    if !executable_matches_official(executable, Path::new(WECHAT_EXECUTABLE_PATH)) {
+        return Err(RepairError::WeChatUnavailable);
+    }
+    Ok(pid)
+}
+
+fn executable_matches_official(actual: &Path, official: &Path) -> bool {
+    fs::canonicalize(actual)
+        .ok()
+        .zip(fs::canonicalize(official).ok())
+        .is_some_and(|(actual, official)| actual == official)
 }
 
 const fn map_capture_error(error: lldb_capture::CaptureError) -> RepairError {
@@ -703,5 +731,28 @@ mod tests {
             Some("gui/501/com.pca.agentd")
         );
         assert_eq!(current_user_launch_agent_target(b"root\n"), None);
+    }
+
+    #[test]
+    fn process_identity_requires_the_canonical_official_wechat_executable() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let official = temporary
+            .path()
+            .join("Applications/WeChat.app/Contents/MacOS/WeChat");
+        fs::create_dir_all(official.parent().expect("official parent"))
+            .expect("create official parent");
+        fs::write(&official, b"official").expect("write official executable");
+        let alias = temporary.path().join("wechat-alias");
+        std::os::unix::fs::symlink(&official, &alias).expect("create official alias");
+        let impostor = temporary.path().join("WeChat");
+        fs::write(&impostor, b"impostor").expect("write impostor executable");
+
+        assert!(executable_matches_official(&official, &official));
+        assert!(executable_matches_official(&alias, &official));
+        assert!(!executable_matches_official(&impostor, &official));
+        assert!(!executable_matches_official(
+            &temporary.path().join("missing"),
+            &official
+        ));
     }
 }

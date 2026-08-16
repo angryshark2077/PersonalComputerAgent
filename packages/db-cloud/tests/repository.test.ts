@@ -448,6 +448,32 @@ test("device presence becomes stale and offline when its Agent stops checking in
   assert.equal(device?.status?.presence, "offline");
 });
 
+test("fresh device presence is never upgraded above the Agent-reported state", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  const receivedAt = new Date();
+  const reported = ["sleeping", "stale", "offline"] as const;
+
+  for (const [index, presence] of reported.entries()) {
+    await repository.recordHeartbeat({
+      heartbeatId: `01986666-7666-8666-8666-66666666667${index}`,
+      workspaceId,
+      deviceId,
+      receivedAt,
+      agentVersion: "0.3.0",
+      presence,
+      outboxDepth: 0,
+      localMedia: { completedFileCount: 0, completedBytes: 0, protectedFileCount: 0, protectedBytes: 0 },
+      cleanupResult: null,
+      network: null,
+    });
+
+    const [device] = await repository.listOwnerDevices(workspaceId, ownerUserId);
+    assert.equal(device?.status?.presence, presence);
+  }
+});
+
 test("network history records identity changes only and retains the latest five", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);

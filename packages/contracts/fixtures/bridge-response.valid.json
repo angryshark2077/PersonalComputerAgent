@@ -4,6 +4,14 @@
   "message_kind": "response",
   "capability": "system.capabilities",
   "deadline_ms": 1000,
-  "payload": {"screen_capture": "available"},
+  "payload": {
+    "screen_capture": "available",
+    "permissions": {
+      "screen_capture": "granted",
+      "accessibility": "granted",
+      "camera": "not_determined",
+      "microphone": "denied"
+    }
+  },
   "error": null
 }

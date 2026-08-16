@@ -376,6 +376,30 @@ fn run_writes_fresh_local_health_when_bridge_is_missing_and_stops_cleanly() {
 }
 
 #[test]
+fn health_rejects_a_fresh_status_after_its_agent_process_exits() {
+    let root = tempfile::tempdir().expect("temporary runtime root");
+    let paths = RuntimePaths::under(root.path());
+    let mut child = spawn_run(root.path());
+    let status = wait_for_status(&paths.status_file);
+    assert!(status.local_healthy);
+
+    signal(&child, "KILL");
+    assert!(!child.wait_bounded().success());
+
+    let health = Command::new(binary())
+        .arg("health")
+        .arg("--runtime-root")
+        .arg(root.path())
+        .output()
+        .expect("run health command after agent exit");
+    assert_eq!(health.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&health.stderr),
+        "pca-agentd: local health stale or unhealthy\n"
+    );
+}
+
+#[test]
 fn final_heartbeat_cannot_be_overwritten_by_the_periodic_timer() {
     let root = tempfile::tempdir().expect("temporary runtime root");
     let paths = RuntimePaths::under(root.path());

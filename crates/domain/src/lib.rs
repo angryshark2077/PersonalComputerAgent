@@ -1073,6 +1073,7 @@ pub struct HandshakeChallenge {
     pub phase: HandshakeChallengePhase,
     pub nonce: String,
     pub agent_version: String,
+    pub client_proof: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

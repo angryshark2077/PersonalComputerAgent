@@ -6,6 +6,32 @@ import XCTest
 
 @MainActor
 final class InstallCoordinatorTests: XCTestCase {
+    func testInstallerProcessDrainsOutputBeforeWaitingForExit() async throws {
+        let result = try await runInstallerProcess(
+            executableURL: URL(fileURLWithPath: "/bin/dd"),
+            arguments: ["if=/dev/zero", "bs=1048576", "count=2"],
+            timeout: .seconds(3),
+            captureOutput: true
+        )
+
+        XCTAssertEqual(result.status, 0)
+        XCTAssertGreaterThanOrEqual(result.output.count, 2 * 1_024 * 1_024)
+    }
+
+    func testInstallerProcessHasAHardTimeout() async {
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+
+        await XCTAssertThrowsErrorAsync(try await runInstallerProcess(
+            executableURL: URL(fileURLWithPath: "/bin/sleep"),
+            arguments: ["60"],
+            timeout: .milliseconds(50)
+        )) { error in
+            XCTAssertTrue(error is InstallerProcessError)
+        }
+        XCTAssertLessThan(startedAt.duration(to: clock.now), .seconds(3))
+    }
+
     func testFirstInstallStagesBundlePreservesDataAndRelaunchesInstalledExecutable() async throws {
         let fixture = try Fixture(installedVersion: nil, candidateVersion: "1.0.0")
         try FileManager.default.createDirectory(at: fixture.paths.dataURL, withIntermediateDirectories: false)
@@ -1396,6 +1422,27 @@ final class InstallerViewModelTests: XCTestCase {
         }
     }
 
+    func testWechatRecoveryDrainsLargeDiagnosticOutputWithoutDeadlock() async throws {
+        let executable = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: executable) }
+        try Data("""
+        #!/bin/sh
+        /bin/dd if=/dev/zero bs=1048576 count=2 2>/dev/null
+        echo >&2
+        echo 'large diagnostic completed' >&2
+        exit 9
+        """.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let runner = ProcessWechatRepairRunner(executableURL: executable)
+
+        do {
+            try await runner.prepareAutomaticRecovery()
+            XCTFail("exit 9 must require user action")
+        } catch let error as WechatRepairRunnerError {
+            XCTAssertEqual(error, .requiresUserAction(message: "large diagnostic completed"))
+        }
+    }
+
     func testWechatRecoveryNonApplicableExitCodesDoNotFailInstallation() async throws {
         for status in [3, 4, 6] {
             let executable = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1571,6 +1618,43 @@ private func waitUntil(
 
 @MainActor
 final class UninstallCommandTests: XCTestCase {
+    func testOrdinaryUninstallPreservesAllCredentials() async throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        let paths = try InstallPaths(rootURL: temporary.appendingPathComponent("root", isDirectory: true))
+        _ = try paths.prepareInstallLayout()
+        var deletedScopes: [KeychainScope] = []
+        let command = UninstallCommand(
+            paths: paths,
+            service: FakeServiceController(),
+            deleteCredential: { deletedScopes.append($0) }
+        )
+
+        try await command.execute(deleteData: false)
+
+        XCTAssertTrue(deletedScopes.isEmpty)
+    }
+
+    func testCompleteUninstallDeletesAllCredentialsWhenInstallRootIsAlreadyAbsent() async throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        let paths = try InstallPaths(rootURL: temporary.appendingPathComponent("missing-root", isDirectory: true))
+        var deletedScopes: [KeychainScope] = []
+        let command = UninstallCommand(
+            paths: paths,
+            service: FakeServiceController(),
+            readConfirmation: { UninstallCommand.confirmationToken },
+            writeLine: { _ in },
+            deleteCredential: { deletedScopes.append($0) }
+        )
+
+        try await command.execute(deleteData: true)
+
+        XCTAssertEqual(deletedScopes, UninstallCommand.credentialScopes)
+    }
+
     func testDeleteDataConfirmationFailureDoesNotStopServiceOrChangeFiles() async throws {
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -1605,18 +1689,25 @@ final class UninstallCommandTests: XCTestCase {
         _ = try paths.prepareInstallLayout()
         try FileManager.default.createDirectory(at: paths.dataURL, withIntermediateDirectories: false)
         let service = FakeServiceController()
+        var deletedScopes: [KeychainScope] = []
         let command = UninstallCommand(
             paths: paths,
             service: service,
             readConfirmation: { UninstallCommand.confirmationToken },
             writeLine: { _ in },
-            deleteCredential: { _ in throw InstallError.keychainDeletionFailed }
+            deleteCredential: { scope in
+                deletedScopes.append(scope)
+                if scope == UninstallCommand.credentialScopes[0] {
+                    throw InstallError.keychainDeletionFailed
+                }
+            }
         )
 
         await XCTAssertThrowsErrorAsync(try await command.execute(deleteData: true)) { error in
             XCTAssertEqual(error as? InstallError, .keychainDeletionFailed)
             XCTAssertFalse((error as? InstallError)?.recoveryAction.contains("Login Items") ?? true)
         }
+        XCTAssertEqual(deletedScopes, UninstallCommand.credentialScopes)
     }
 
     func testRootReplacementBeforeDeleteFailsClosedWithoutTouchingOutside() async throws {

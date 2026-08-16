@@ -19,7 +19,7 @@ use tokio::{net::UnixStream, time::timeout};
 use uuid::Uuid;
 
 use crate::{
-    auth::verify_proof,
+    auth::{create_agent_proof, verify_proof},
     framing::{read_frame_bytes, write_frame, FrameError},
 };
 
@@ -283,6 +283,12 @@ impl BridgeClient {
             phase: HandshakeChallengePhase::Challenge,
             nonce: encoded_nonce.clone(),
             agent_version: config.agent_version.clone(),
+            client_proof: create_agent_proof(
+                &secret,
+                &nonce,
+                PROTOCOL_VERSION,
+                &config.agent_version,
+            ),
         })?;
         let challenge = BridgeEnvelope {
             protocol_version: PROTOCOL_VERSION,

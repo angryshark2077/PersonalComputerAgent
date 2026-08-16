@@ -327,46 +327,59 @@ impl PairingIpcServer {
             PairingIpcOperation::Begin => {
                 let payload = request.begin_payload().map_err(|_| ())?;
                 if payload.cloud_api_origin != PRODUCTION_CLOUD_API_ORIGIN {
-                    error_response("REQUEST_INVALID")
-                } else if self.pending.lock().await.is_some() {
-                    error_response("PAIRING_IN_PROGRESS")
-                } else {
-                    let client = Url::parse(&payload.cloud_api_origin)
-                        .ok()
-                        .and_then(|origin| {
-                            pairing_control_client(origin, Arc::clone(&self.network_observations))
-                                .ok()
-                                .map(Arc::new)
+                    return timeout(
+                        Duration::from_secs(5),
+                        write_frame(&mut stream, &error_response("REQUEST_INVALID")),
+                    )
+                    .await
+                    .map_err(|_| ())?
+                    .map_err(|_| ());
+                }
+                let mut pending = self.pending.lock().await;
+                if pending.is_some() {
+                    return timeout(
+                        Duration::from_secs(5),
+                        write_frame(&mut stream, &error_response("PAIRING_IN_PROGRESS")),
+                    )
+                    .await
+                    .map_err(|_| ())?
+                    .map_err(|_| ());
+                }
+                let client = Url::parse(&payload.cloud_api_origin)
+                    .ok()
+                    .and_then(|origin| {
+                        pairing_control_client(origin, Arc::clone(&self.network_observations))
+                            .ok()
+                            .map(Arc::new)
+                    });
+                let Some(client) = client else {
+                    return Err(());
+                };
+                let pairing_client: Arc<dyn PairingClient> = client.clone();
+                let service = Arc::new(AgentPairingService::new(
+                    Arc::clone(&self.database),
+                    Arc::clone(&self.store),
+                    pairing_client,
+                ));
+                match service
+                    .begin(PairingStartHandoff {
+                        callback_uri: payload.callback_uri,
+                    })
+                    .await
+                {
+                    Ok(session) => {
+                        *pending = Some(PendingPairing {
+                            session_id: session.session_id.clone(),
+                            service,
+                            client,
                         });
-                    let Some(client) = client else {
-                        return Err(());
-                    };
-                    let pairing_client: Arc<dyn PairingClient> = client.clone();
-                    let service = Arc::new(AgentPairingService::new(
-                        Arc::clone(&self.database),
-                        Arc::clone(&self.store),
-                        pairing_client,
-                    ));
-                    match service
-                        .begin(PairingStartHandoff {
-                            callback_uri: payload.callback_uri,
+                        json!({
+                            "session_id": session.session_id,
+                            "authorization_url": session.authorization_url,
+                            "callback_state": session.callback_state,
                         })
-                        .await
-                    {
-                        Ok(session) => {
-                            *self.pending.lock().await = Some(PendingPairing {
-                                session_id: session.session_id.clone(),
-                                service,
-                                client,
-                            });
-                            json!({
-                                "session_id": session.session_id,
-                                "authorization_url": session.authorization_url,
-                                "callback_state": session.callback_state,
-                            })
-                        }
-                        Err(_) => error_response("PAIRING_UNAVAILABLE"),
                     }
+                    Err(_) => error_response("PAIRING_UNAVAILABLE"),
                 }
             }
             PairingIpcOperation::Complete => {

@@ -597,6 +597,7 @@ export interface ControlRepository {
   ): Promise<DeviceCredentialAuthentication>;
   loadControlSnapshot(deviceId: string, workspaceId: string): Promise<AgentControlSnapshot>;
   recordHeartbeat(input: HeartbeatInput): Promise<void>;
+  redactExpiredHeartbeatNetworkData(capturedBefore: Date, limit: number): Promise<number>;
   recordCollectorHealth(input: CollectorHealthReportInput): Promise<void>;
   requestLocalMediaCleanup(input: LocalMediaCleanupRequestInput): Promise<LocalMediaCleanupRecord>;
   loadLatestOwnerLocalMediaCleanup(
@@ -1070,6 +1071,10 @@ export class MemoryControlRepository implements ControlRepository {
       observedAt: input.receivedAt,
       collectorHealth: [...(this.#collectorHealth.get(input.deviceId)?.values() ?? [])],
     });
+  }
+
+  async redactExpiredHeartbeatNetworkData(_capturedBefore: Date, _limit: number): Promise<number> {
+    return 0;
   }
 
   async recordCollectorHealth(input: CollectorHealthReportInput): Promise<void> {
@@ -2800,49 +2805,58 @@ export class DrizzleControlRepository implements ControlRepository {
             }
           }
         }
-        const privacyCutoff = new Date(input.receivedAt.getTime() - 30 * 24 * 60 * 60 * 1000);
-        await transaction.execute(sql`
-          WITH expired AS (
-            SELECT ${deviceHeartbeats.id} AS id
-            FROM ${deviceHeartbeats}
-            WHERE ${deviceHeartbeats.receivedAt} < ${privacyCutoff}
-              AND (
-                ${deviceHeartbeats.networkSsid} IS NOT NULL
-                OR ${deviceHeartbeats.networkBssid} IS NOT NULL
-                OR ${deviceHeartbeats.networkLocalIpv4} IS NOT NULL
-                OR ${deviceHeartbeats.networkLocalIpv6} IS NOT NULL
-                OR ${deviceHeartbeats.networkPublicIp} IS NOT NULL
-                OR ${deviceHeartbeats.networkIpCountry} IS NOT NULL
-                OR ${deviceHeartbeats.networkIpRegion} IS NOT NULL
-                OR ${deviceHeartbeats.networkIpCity} IS NOT NULL
-                OR ${deviceHeartbeats.networkIpAccuracy} IS NOT NULL
-                OR ${deviceHeartbeats.networkLocationLatitude} IS NOT NULL
-                OR ${deviceHeartbeats.networkLocationLongitude} IS NOT NULL
-                OR ${deviceHeartbeats.networkLocationHorizontalAccuracyMeters} IS NOT NULL
-                OR ${deviceHeartbeats.networkLocationObservedAt} IS NOT NULL
-              )
-            ORDER BY ${deviceHeartbeats.receivedAt}
-            LIMIT 1000
-            FOR UPDATE SKIP LOCKED
-          )
-          UPDATE ${deviceHeartbeats}
-          SET network_ssid = NULL,
-              network_bssid = NULL,
-              network_local_ipv4 = NULL,
-              network_local_ipv6 = NULL,
-              network_public_ip = NULL,
-              network_ip_country = NULL,
-              network_ip_region = NULL,
-              network_ip_city = NULL,
-              network_ip_accuracy = NULL,
-              network_location_latitude = NULL,
-              network_location_longitude = NULL,
-              network_location_horizontal_accuracy_meters = NULL,
-              network_location_observed_at = NULL
-          FROM expired
-          WHERE ${deviceHeartbeats.id} = expired.id
-        `);
       });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async redactExpiredHeartbeatNetworkData(capturedBefore: Date, limit: number): Promise<number> {
+    if (!Number.isInteger(limit) || limit < 1) throw new RangeError("limit must be a positive integer");
+    try {
+      const result = await this.database.execute(sql`
+        WITH expired AS (
+          SELECT ${deviceHeartbeats.id} AS id
+          FROM ${deviceHeartbeats}
+          WHERE ${deviceHeartbeats.receivedAt} < ${capturedBefore}
+            AND (
+              ${deviceHeartbeats.networkSsid} IS NOT NULL
+              OR ${deviceHeartbeats.networkBssid} IS NOT NULL
+              OR ${deviceHeartbeats.networkLocalIpv4} IS NOT NULL
+              OR ${deviceHeartbeats.networkLocalIpv6} IS NOT NULL
+              OR ${deviceHeartbeats.networkPublicIp} IS NOT NULL
+              OR ${deviceHeartbeats.networkIpCountry} IS NOT NULL
+              OR ${deviceHeartbeats.networkIpRegion} IS NOT NULL
+              OR ${deviceHeartbeats.networkIpCity} IS NOT NULL
+              OR ${deviceHeartbeats.networkIpAccuracy} IS NOT NULL
+              OR ${deviceHeartbeats.networkLocationLatitude} IS NOT NULL
+              OR ${deviceHeartbeats.networkLocationLongitude} IS NOT NULL
+              OR ${deviceHeartbeats.networkLocationHorizontalAccuracyMeters} IS NOT NULL
+              OR ${deviceHeartbeats.networkLocationObservedAt} IS NOT NULL
+            )
+          ORDER BY ${deviceHeartbeats.receivedAt}
+          LIMIT ${limit}
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE ${deviceHeartbeats}
+        SET network_ssid = NULL,
+            network_bssid = NULL,
+            network_local_ipv4 = NULL,
+            network_local_ipv6 = NULL,
+            network_public_ip = NULL,
+            network_ip_country = NULL,
+            network_ip_region = NULL,
+            network_ip_city = NULL,
+            network_ip_accuracy = NULL,
+            network_location_latitude = NULL,
+            network_location_longitude = NULL,
+            network_location_horizontal_accuracy_meters = NULL,
+            network_location_observed_at = NULL
+        FROM expired
+        WHERE ${deviceHeartbeats.id} = expired.id
+        RETURNING ${deviceHeartbeats.id}
+      `);
+      return result.rows.length;
     } catch (error) {
       throw repositoryError(error);
     }
@@ -4274,9 +4288,9 @@ function currentPresence(
   now: Date,
 ): HeartbeatInput["presence"] {
   const ageMilliseconds = Math.max(0, now.getTime() - observedAt.getTime());
-  if (ageMilliseconds > 180_000) return "offline";
-  if (ageMilliseconds > 45_000) return "stale";
-  return reported === "sleeping" ? "sleeping" : "online";
+  if (ageMilliseconds > 180_000 || reported === "offline") return "offline";
+  if (ageMilliseconds > 45_000 || reported === "stale") return "stale";
+  return reported;
 }
 
 function networkHistoryValues(input: HeartbeatInput) {

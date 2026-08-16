@@ -255,6 +255,7 @@ struct RuntimeResources {
     database: Option<Arc<DbActorHandle>>,
     lifecycle: Option<LifecycleRuntime>,
     system_runtime: Option<SystemRuntimeHandle>,
+    system_restart_blocked: bool,
     communication_runtime: Option<CommunicationRuntime>,
     bridge_shutdown: Option<watch::Sender<bool>>,
     bridge_task: Option<JoinHandle<Result<(), BridgeSupervisorError>>>,
@@ -290,6 +291,7 @@ impl RuntimeResources {
             database: Some(Arc::new(database)),
             lifecycle: None,
             system_runtime: None,
+            system_restart_blocked: false,
             communication_runtime: None,
             bridge_shutdown: None,
             bridge_task: None,
@@ -668,6 +670,7 @@ impl RuntimeResources {
             .await
             .map_err(|_| FailureStage::SystemCollector)?,
         );
+        self.system_restart_blocked = false;
         Ok(())
     }
 
@@ -689,23 +692,35 @@ impl RuntimeResources {
         &mut self,
         config: &RunConfig,
     ) -> Result<(), FailureStage> {
-        if !collector_needs_restart(
-            self.collectors_suspended_for_sleep,
-            self.system_runtime
-                .as_ref()
-                .is_some_and(SystemRuntimeHandle::is_finished),
-            self.system_runtime.is_some(),
-        ) {
+        if self.system_restart_blocked
+            || !collector_needs_restart(
+                self.collectors_suspended_for_sleep,
+                self.system_runtime
+                    .as_ref()
+                    .is_some_and(SystemRuntimeHandle::is_finished),
+                self.system_runtime.is_some(),
+            )
+        {
             return Ok(());
+        }
+        if let Some(runtime) = self.system_runtime.take() {
+            match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, runtime.shutdown()).await {
+                Ok(Err(error)) if error.is_terminal_persistence_failure() => {
+                    self.system_restart_blocked = true;
+                    return Ok(());
+                }
+                Ok(Err(error)) if error.requires_process_restart() => {
+                    return Err(FailureStage::SystemCollectorCleanup);
+                }
+                Ok(Ok(()) | Err(_)) => {}
+                Err(_) => return Err(FailureStage::SystemCollectorCleanup),
+            }
         }
         let paired = self
             .load_pairing_state(FailureStage::SystemCollector)
             .await?
             .as_ref()
             .is_some_and(PairingState::is_paired);
-        if let Some(runtime) = self.system_runtime.take() {
-            let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, runtime.shutdown()).await;
-        }
         self.start_system_collector(config, paired).await
     }
 
@@ -788,9 +803,9 @@ impl RuntimeResources {
         self.collectors_suspended_for_sleep = true;
         self.sleep_prepared_at = Some(tokio::time::Instant::now());
         let deadline = tokio::time::Instant::now() + SLEEP_PREPARE_TIMEOUT;
-        let result = async {
-            let system = self.system_runtime.take();
-            let communication = self.communication_runtime.take();
+        let system = self.system_runtime.take();
+        let communication = self.communication_runtime.take();
+        let result = finish_sleep_before_deadline(deadline, async {
             finish_sleep_collector_shutdowns(
                 async move {
                     match system {
@@ -812,11 +827,11 @@ impl RuntimeResources {
                 },
             )
             .await?;
-            tokio::time::timeout_at(deadline, lifecycle.prepare_sleep())
+            lifecycle
+                .prepare_sleep()
                 .await
-                .map_err(|_| FailureStage::Lifecycle)?
                 .map_err(|_| FailureStage::Lifecycle)
-        }
+        })
         .await;
         match result {
             Ok(()) => Ok(()),
@@ -845,7 +860,13 @@ impl RuntimeResources {
             self.system_runtime.is_some(),
         ) {
             if let Some(runtime) = self.system_runtime.take() {
-                let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, runtime.shutdown()).await;
+                match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, runtime.shutdown()).await {
+                    Ok(Err(error)) if error.requires_process_restart() => {
+                        return Err(FailureStage::SystemCollectorCleanup);
+                    }
+                    Ok(Ok(()) | Err(_)) => {}
+                    Err(_) => return Err(FailureStage::SystemCollectorCleanup),
+                }
             }
             self.start_system_collector(config, paired).await?;
         }
@@ -1058,6 +1079,18 @@ where
         tokio::join!(system_shutdown, communication_shutdown);
     system_result?;
     communication_result
+}
+
+async fn finish_sleep_before_deadline<Preparation>(
+    deadline: tokio::time::Instant,
+    preparation: Preparation,
+) -> Result<(), FailureStage>
+where
+    Preparation: Future<Output = Result<(), FailureStage>>,
+{
+    tokio::time::timeout_at(deadline, preparation)
+        .await
+        .map_err(|_| FailureStage::Lifecycle)?
 }
 
 fn sleep_recovery_due(suspended: bool, elapsed: Option<Duration>) -> bool {
@@ -1507,7 +1540,12 @@ fn health(paths: &RuntimePaths) -> u8 {
             | AgentStatus::Running
             | AgentStatus::Degraded
     );
-    if !status.local_healthy || !active || age < TimeDuration::ZERO || age > HEALTH_FRESHNESS {
+    if !status.local_healthy
+        || !active
+        || age < TimeDuration::ZERO
+        || age > HEALTH_FRESHNESS
+        || !process_is_alive(status.process_id)
+    {
         eprintln!("pca-agentd: local health stale or unhealthy");
         return EXIT_UNHEALTHY;
     }
@@ -1517,6 +1555,19 @@ fn health(paths: &RuntimePaths) -> u8 {
             0
         }
         Err(_) => EXIT_UNHEALTHY,
+    }
+}
+
+fn process_is_alive(process_id: u32) -> bool {
+    let Ok(process_id) = i32::try_from(process_id) else {
+        return false;
+    };
+    let Some(process_id) = rustix::process::Pid::from_raw(process_id) else {
+        return false;
+    };
+    match rustix::process::test_kill_process(process_id) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => true,
+        Err(_) => false,
     }
 }
 
@@ -1696,11 +1747,41 @@ mod tests {
             "network.changed",
             &unpaired
         ));
+
+        let unknown: Result<Option<String>, LifecycleError> =
+            Err(LifecycleError::UnsupportedPlatformEvent);
+        assert!(platform_lifecycle_failure_is_fatal(
+            "system.future",
+            &unknown
+        ));
     }
 
     #[test]
     fn sleep_prepare_budget_finishes_before_the_bridge_request_timeout() {
         assert!(SLEEP_PREPARE_TIMEOUT < Duration::from_secs(25));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleep_prepare_deadline_includes_collector_shutdown() {
+        let preparation = tokio::spawn(finish_sleep_before_deadline(
+            tokio::time::Instant::now() + SLEEP_PREPARE_TIMEOUT,
+            std::future::pending(),
+        ));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(
+            SLEEP_PREPARE_TIMEOUT
+                .checked_sub(Duration::from_secs(1))
+                .expect("sleep preparation timeout exceeds one second"),
+        )
+        .await;
+        assert!(!preparation.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            preparation.await.expect("join sleep preparation"),
+            Err(FailureStage::Lifecycle)
+        ));
     }
 
     #[tokio::test]

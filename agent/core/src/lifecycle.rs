@@ -55,6 +55,7 @@ pub(crate) enum LifecycleError {
     TimedOut,
     CapabilityRefresh,
     IdentityUnavailable,
+    UnsupportedPlatformEvent,
     Clock,
 }
 
@@ -69,6 +70,9 @@ impl fmt::Display for LifecycleError {
             Self::CapabilityRefresh => formatter.write_str("capability refresh failed"),
             Self::IdentityUnavailable => {
                 formatter.write_str("paired lifecycle identity unavailable")
+            }
+            Self::UnsupportedPlatformEvent => {
+                formatter.write_str("unsupported platform lifecycle event")
             }
             Self::Clock => formatter.write_str("system time cannot be formatted"),
         }
@@ -193,7 +197,7 @@ impl LifecycleRuntime {
                 drop(gate);
                 Ok(Some(event_id))
             }
-            _ => Err(LifecycleError::IdentityUnavailable),
+            _ => Err(LifecycleError::UnsupportedPlatformEvent),
         }
     }
 
@@ -796,6 +800,41 @@ mod tests {
             .await
             .expect("record network event after pairing");
         assert!(recorded.is_some());
+        runtime.abort_and_drain().await.expect("drain lifecycle");
+    }
+
+    #[tokio::test]
+    async fn unknown_platform_event_is_not_misclassified_as_missing_identity() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = Arc::new(
+            DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.0.0")
+                .await
+                .expect("open database"),
+        );
+        let runtime = LifecycleRuntime::start(
+            database,
+            None,
+            2,
+            Arc::new(RecordingRefresher {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                database_path: None,
+                fail: false,
+            }),
+        );
+
+        let result = runtime
+            .record_platform_event(&PlatformLifecycleEvent {
+                sequence: 1,
+                event_id: Uuid::new_v4(),
+                event_type: "system.future".to_owned(),
+                occurred_at: "2026-08-17T00:00:00Z".to_owned(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(LifecycleError::UnsupportedPlatformEvent)
+        ));
         runtime.abort_and_drain().await.expect("drain lifecycle");
     }
 
