@@ -1183,6 +1183,27 @@ test("Photo originals remain private, become readable only after completion, and
   });
   assert.equal(prepared.status, 200);
   assert.equal((await prepared.json() as { state: string }).state, "prepared");
+  const replayed = await api.request("/v1/agent/photos/prepare", {
+    method: "POST",
+    headers: { authorization: `Bearer ${credentials.device_access_token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      photo_id: photoId,
+      event_id: "01986666-7666-8666-8666-666666666691",
+      asset_id: "photo-local-1",
+      captured_at: "2026-08-05T12:00:00Z",
+      media_type: "image",
+      original_filename: "IMG_0001.HEIC",
+      mime_type: "image/heic",
+      pixel_width: 4032,
+      pixel_height: 3024,
+      duration_seconds: 0,
+      album_names: ["Favorites", "Recent"],
+      sha256: "d".repeat(64),
+      size_bytes: 8192,
+    }),
+  });
+  assert.equal(replayed.status, 200);
+  assert.equal((await replayed.json() as { state: string }).state, "prepared");
   assert.deepEqual(await (await api.request(`/v1/devices/${credentials.device_id}/photos`)).json(), {
     photos: [],
     pagination: { page: 1, page_size: 50, total_count: 0, total_pages: 0 },

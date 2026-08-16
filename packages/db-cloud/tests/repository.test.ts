@@ -621,6 +621,62 @@ test("photo library pages expose every completed asset", async () => {
   assert.deepEqual(second.photos.map((photo) => photo.assetId), ["asset-1"]);
 });
 
+test("photo prepare replay tolerates mutable album membership but not content changes", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  const eventId = "01988888-8888-8888-8888-000000000001";
+  const photoId = "01989999-9999-8999-8999-000000000001";
+  await repository.appendSystemEvents(workspaceId, deviceId, [{
+    eventId,
+    workspaceId,
+    deviceId,
+    eventType: "photos.asset_recorded",
+    source: "photos.library",
+    schemaVersion: 1,
+    occurredAt: now,
+    createdAt: now,
+    sensitivity: "high",
+    payload: {},
+    idempotencyKey: "photos:asset:mutable-albums",
+  }]);
+  const input = {
+    photoId,
+    eventId,
+    assetId: "asset-mutable-albums",
+    capturedAt: now,
+    mediaType: "image" as const,
+    originalFilename: "IMG_0001.HEIC",
+    expectedMimeType: "image/heic",
+    pixelWidth: 100,
+    pixelHeight: 100,
+    durationSeconds: 0,
+    albumNames: ["Recents"],
+    objectKey: `photos/${photoId}`,
+    expectedSha256: hash("a"),
+    expectedSizeBytes: 100,
+    now,
+  };
+  await repository.preparePhotoLibraryAsset(workspaceId, deviceId, input);
+
+  const replay = await repository.preparePhotoLibraryAsset(workspaceId, deviceId, {
+    ...input,
+    albumNames: ["Favorites", "Recents"],
+    now: later,
+  });
+  assert.equal(replay.photoId, photoId);
+  assert.equal(replay.state, "prepared");
+
+  await assert.rejects(
+    repository.preparePhotoLibraryAsset(workspaceId, deviceId, {
+      ...input,
+      expectedSha256: hash("b"),
+      now: later,
+    }),
+    (error) => error instanceof ControlRepositoryError && error.code === "CONFLICT",
+  );
+});
+
 test("screenshot retention selects and deletes only expired completed captures", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);

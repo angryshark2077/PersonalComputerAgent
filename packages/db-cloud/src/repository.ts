@@ -4433,7 +4433,8 @@ function samePhotoLibraryAsset(
     && record.pixelWidth === input.pixelWidth
     && record.pixelHeight === input.pixelHeight
     && record.durationSeconds === input.durationSeconds
-    && JSON.stringify(record.albumNames) === JSON.stringify(input.albumNames)
+    // PhotoKit album membership is mutable and its ordering is not a stable part of the asset.
+    // Keep upload replay bound to the durable event and exact media content instead.
     && record.objectKey === input.objectKey
     && record.expectedSha256 === input.expectedSha256
     && record.expectedSizeBytes === input.expectedSizeBytes;
