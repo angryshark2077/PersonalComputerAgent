@@ -89,15 +89,23 @@ enum Command {
         checkpoint: bool,
         response: oneshot::Sender<Result<String, LifecycleError>>,
     },
+    Checkpoint {
+        response: oneshot::Sender<Result<(), LifecycleError>>,
+    },
     Stop {
         event: Option<EventEnvelope>,
         response: oneshot::Sender<Result<Option<String>, LifecycleError>>,
     },
 }
 
+struct LifecycleGate {
+    accepting: bool,
+    sleep_preparing: bool,
+}
+
 pub(crate) struct LifecycleRuntime {
     sender: mpsc::Sender<Command>,
-    accepting: Arc<Mutex<bool>>,
+    gate: Arc<Mutex<LifecycleGate>>,
     identity: Arc<RwLock<Option<RuntimeIdentity>>>,
     capability_refresher: Arc<dyn CapabilityRefresher>,
     worker: JoinHandle<()>,
@@ -114,7 +122,10 @@ impl LifecycleRuntime {
         let worker = tokio::spawn(run_worker(database, receiver));
         Self {
             sender,
-            accepting: Arc::new(Mutex::new(true)),
+            gate: Arc::new(Mutex::new(LifecycleGate {
+                accepting: true,
+                sleep_preparing: false,
+            })),
             identity: Arc::new(RwLock::new(identity)),
             capability_refresher,
             worker,
@@ -144,58 +155,77 @@ impl LifecycleRuntime {
         match event.event_type.as_str() {
             "system.sleep" => {
                 let identity = self.current_identity().await?;
-                let mut accepting = self.accepting.lock().await;
-                if !*accepting {
+                let mut gate = self.gate.lock().await;
+                if !gate.accepting {
                     return Ok(None);
                 }
-                *accepting = false;
+                gate.accepting = false;
+                gate.sleep_preparing = false;
                 let envelope = lifecycle_event_at(&identity, event)?;
                 let result = send_persist(&self.sender, envelope, true).await?;
-                drop(accepting);
+                drop(gate);
                 Ok(Some(result))
             }
             "system.wake" => {
                 let identity = self.current_identity().await?;
-                let mut accepting = self.accepting.lock().await;
-                let envelope = lifecycle_event_at(&identity, event)?;
-                let event_id = send_persist(&self.sender, envelope, false).await?;
-                self.capability_refresher
-                    .refresh()
-                    .map_err(|_| LifecycleError::CapabilityRefresh)?;
-                *accepting = true;
-                Ok(Some(event_id))
+                let mut gate = self.gate.lock().await;
+                let result = async {
+                    let envelope = lifecycle_event_at(&identity, event)?;
+                    let event_id = send_persist(&self.sender, envelope, false).await?;
+                    self.capability_refresher
+                        .refresh()
+                        .map_err(|_| LifecycleError::CapabilityRefresh)?;
+                    Ok(event_id)
+                }
+                .await;
+                gate.accepting = true;
+                gate.sleep_preparing = false;
+                result.map(Some)
             }
             "network.offline" | "network.online" | "network.changed" => {
-                let accepting = self.accepting.lock().await;
-                if !*accepting {
+                let gate = self.gate.lock().await;
+                if !gate.accepting || gate.sleep_preparing {
                     return Ok(None);
                 }
                 let identity = self.current_identity().await?;
                 let envelope = lifecycle_event_at(&identity, event)?;
                 let event_id = send_persist(&self.sender, envelope, false).await?;
-                drop(accepting);
+                drop(gate);
                 Ok(Some(event_id))
             }
             _ => Err(LifecycleError::IdentityUnavailable),
         }
     }
 
-    /// Stops new lifecycle side effects, drains earlier queue items, records sleep, and checkpoints.
+    /// Stops new lifecycle side effects, drains earlier queue items, and checkpoints.
+    ///
+    /// The Bridge remains the sole source of the durable `system.sleep` event.  Keeping the
+    /// prepare phase event-free prevents a timed-out request from committing a second sleep after
+    /// the Bridge records its original power notification.
     #[allow(
         dead_code,
         reason = "typed boundary awaits a frozen authenticated sleep wire"
     )]
-    pub(crate) async fn prepare_sleep(&self) -> Result<String, LifecycleError> {
-        let identity = self.current_identity().await?;
-        let mut accepting = self.accepting.lock().await;
-        if !*accepting {
+    pub(crate) async fn prepare_sleep(&self) -> Result<(), LifecycleError> {
+        let _ = self.current_identity().await?;
+        let mut gate = self.gate.lock().await;
+        if !gate.accepting || gate.sleep_preparing {
             return Err(LifecycleError::NotAccepting);
         }
-        *accepting = false;
-        let event = lifecycle_event(&identity, "system.sleep")?;
-        let result = send_persist(&self.sender, event, true).await;
-        drop(accepting);
+        gate.sleep_preparing = true;
+        let result = send_checkpoint(&self.sender).await;
+        if result.is_err() {
+            gate.sleep_preparing = false;
+        }
+        drop(gate);
         result
+    }
+
+    /// Reopens lifecycle side effects when the Agent could not finish its bounded sleep prepare.
+    pub(crate) async fn abort_sleep_preparation(&self) {
+        let mut gate = self.gate.lock().await;
+        gate.accepting = true;
+        gate.sleep_preparing = false;
     }
 
     /// Records a wake after an internal sleep preparation and resumes lifecycle side effects.
@@ -204,19 +234,23 @@ impl LifecycleRuntime {
         reason = "typed boundary awaits a frozen authenticated wake wire"
     )]
     pub(crate) async fn wake(&self) -> Result<String, LifecycleError> {
-        let mut accepting = self.accepting.lock().await;
-        if *accepting {
+        let mut gate = self.gate.lock().await;
+        if gate.accepting && !gate.sleep_preparing {
             return Err(LifecycleError::NotAccepting);
         }
         let identity = self.current_identity().await?;
-        let event = lifecycle_event(&identity, "system.wake")?;
-        let result = send_persist(&self.sender, event, false).await;
-        let event_id = result?;
-        self.capability_refresher
-            .refresh()
-            .map_err(|_| LifecycleError::CapabilityRefresh)?;
-        *accepting = true;
-        Ok(event_id)
+        let result = async {
+            let event = lifecycle_event(&identity, "system.wake")?;
+            let event_id = send_persist(&self.sender, event, false).await?;
+            self.capability_refresher
+                .refresh()
+                .map_err(|_| LifecycleError::CapabilityRefresh)?;
+            Ok(event_id)
+        }
+        .await;
+        gate.accepting = true;
+        gate.sleep_preparing = false;
+        result
     }
 
     /// Rejects new producers, drains queued work, and records clean stop when paired.
@@ -233,8 +267,9 @@ impl LifecycleRuntime {
         event_type: Option<&'static str>,
     ) -> Result<Option<String>, LifecycleError> {
         {
-            let mut accepting = self.accepting.lock().await;
-            *accepting = false;
+            let mut gate = self.gate.lock().await;
+            gate.accepting = false;
+            gate.sleep_preparing = false;
         }
         let mut first_error = None;
         let identity = self.identity.read().await.clone();
@@ -296,14 +331,14 @@ impl LifecycleRuntime {
         event_type: &'static str,
         checkpoint: bool,
     ) -> Result<String, LifecycleError> {
-        let accepting = self.accepting.lock().await;
-        if !*accepting {
+        let gate = self.gate.lock().await;
+        if !gate.accepting || gate.sleep_preparing {
             return Err(LifecycleError::NotAccepting);
         }
         let identity = self.current_identity().await?;
         let event = lifecycle_event(&identity, event_type)?;
         let response = send_persist(&self.sender, event, checkpoint).await;
-        drop(accepting);
+        drop(gate);
         response
     }
 
@@ -339,6 +374,23 @@ async fn send_persist(
     .unwrap_or(Err(LifecycleError::TimedOut))
 }
 
+async fn send_checkpoint(sender: &mpsc::Sender<Command>) -> Result<(), LifecycleError> {
+    let (response_sender, response_receiver) = oneshot::channel();
+    tokio_time::timeout(OPERATION_TIMEOUT, async {
+        sender
+            .send(Command::Checkpoint {
+                response: response_sender,
+            })
+            .await
+            .map_err(|_| LifecycleError::QueueClosed)?;
+        response_receiver
+            .await
+            .map_err(|_| LifecycleError::WorkerStopped)?
+    })
+    .await
+    .unwrap_or(Err(LifecycleError::TimedOut))
+}
+
 async fn run_worker(database: Arc<DbActorHandle>, mut receiver: mpsc::Receiver<Command>) {
     while let Some(command) = receiver.recv().await {
         match command {
@@ -349,6 +401,9 @@ async fn run_worker(database: Arc<DbActorHandle>, mut receiver: mpsc::Receiver<C
             } => {
                 let result = persist(&database, &event, checkpoint).await;
                 let _ = response.send(result.map(|()| event.event_id));
+            }
+            Command::Checkpoint { response } => {
+                let _ = response.send(database.checkpoint().await.map_err(LifecycleError::from));
             }
             Command::Stop { event, response } => {
                 receiver.close();
@@ -361,6 +416,10 @@ async fn run_worker(database: Arc<DbActorHandle>, mut receiver: mpsc::Receiver<C
                         } => {
                             let result = persist(&database, &event, checkpoint).await;
                             let _ = response.send(result.map(|()| event.event_id));
+                        }
+                        Command::Checkpoint { response } => {
+                            let _ = response
+                                .send(database.checkpoint().await.map_err(LifecycleError::from));
                         }
                         Command::Stop { response, .. } => {
                             let _ = response.send(Err(LifecycleError::QueueClosed));
@@ -485,7 +544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_prepare_sleep_and_wake_persist_atomic_lifecycle_pairs() {
+    async fn bridge_sleep_after_prepare_persists_one_atomic_lifecycle_pair() {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let database = Arc::new(
             DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.0.0")
@@ -504,12 +563,31 @@ mod tests {
         );
 
         runtime.record_startup().await.expect("record startup");
-        let sleep_id = runtime.prepare_sleep().await.expect("prepare sleep");
+        runtime.prepare_sleep().await.expect("prepare sleep");
         assert!(matches!(
             runtime.record_startup().await,
             Err(LifecycleError::NotAccepting)
         ));
-        let wake_id = runtime.wake().await.expect("record wake");
+        let sleep_id = runtime
+            .record_platform_event(&PlatformLifecycleEvent {
+                sequence: 1,
+                event_id: Uuid::new_v4(),
+                event_type: "system.sleep".to_owned(),
+                occurred_at: "2026-08-14T08:00:00Z".to_owned(),
+            })
+            .await
+            .expect("record bridge sleep")
+            .expect("sleep event is accepted after preparation");
+        let wake_id = runtime
+            .record_platform_event(&PlatformLifecycleEvent {
+                sequence: 2,
+                event_id: Uuid::new_v4(),
+                event_type: "system.wake".to_owned(),
+                occurred_at: "2026-08-14T09:00:00Z".to_owned(),
+            })
+            .await
+            .expect("record bridge wake")
+            .expect("wake event is accepted");
         runtime.stop_and_drain().await.expect("drain lifecycle");
 
         assert_eq!(
@@ -526,6 +604,63 @@ mod tests {
                 .expect("count wake pair"),
             (1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn aborted_sleep_preparation_accepts_the_bridge_sleep_and_wake_pair() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("agent.sqlite3");
+        let database = Arc::new(
+            DbActorHandle::open(&path, "0.0.0")
+                .await
+                .expect("open database"),
+        );
+        let runtime = LifecycleRuntime::start(
+            database,
+            Some(RuntimeIdentity::new("local-workspace", "local-device")),
+            2,
+            Arc::new(RecordingRefresher {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                database_path: None,
+                fail: false,
+            }),
+        );
+
+        runtime.prepare_sleep().await.expect("prepare sleep");
+        runtime.abort_sleep_preparation().await;
+        let sleep_id = runtime
+            .record_platform_event(&PlatformLifecycleEvent {
+                sequence: 1,
+                event_id: Uuid::new_v4(),
+                event_type: "system.sleep".to_owned(),
+                occurred_at: "2026-08-14T08:00:00Z".to_owned(),
+            })
+            .await
+            .expect("record bridge sleep after aborted preparation")
+            .expect("sleep event is accepted");
+        let wake_id = runtime
+            .record_platform_event(&PlatformLifecycleEvent {
+                sequence: 2,
+                event_id: Uuid::new_v4(),
+                event_type: "system.wake".to_owned(),
+                occurred_at: "2026-08-14T09:00:00Z".to_owned(),
+            })
+            .await
+            .expect("record bridge wake after aborted preparation")
+            .expect("wake event is accepted");
+        runtime.abort_and_drain().await.expect("drain lifecycle");
+
+        let connection = rusqlite::Connection::open(path).expect("inspect lifecycle pairs");
+        for event_id in [sleep_id, wake_id] {
+            let pair_count: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM events_local e JOIN sync_outbox o ON o.event_id = e.event_id WHERE e.event_id = ?1",
+                    [event_id],
+                    |row| row.get(0),
+                )
+                .expect("count durable lifecycle event and outbox pair");
+            assert_eq!(pair_count, 1);
+        }
     }
 
     #[tokio::test]
@@ -665,7 +800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wake_refreshes_capabilities_after_event_and_stays_paused_on_refresh_error() {
+    async fn wake_refreshes_capabilities_after_event_and_reopens_after_refresh_error() {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let path = directory.path().join("agent.sqlite3");
         let database = Arc::new(
@@ -693,10 +828,10 @@ mod tests {
             *calls.lock().expect("refresh calls"),
             vec!["refresh_after_wake_pair"]
         );
-        assert!(matches!(
-            runtime.record_startup().await,
-            Err(LifecycleError::NotAccepting)
-        ));
+        runtime
+            .record_startup()
+            .await
+            .expect("refresh failure must not leave lifecycle paused");
         let connection = rusqlite::Connection::open(&path).expect("inspect wake event ordering");
         let wake_pairs: u64 = connection
             .query_row(

@@ -75,7 +75,7 @@ export default function HomePage() {
 function deviceStatusLabel(device: Awaited<ReturnType<typeof getDevices>>[number]): string {
   if (device.revoked) return "Revoked";
   if (device.status === null) return "Agent has not checked in yet";
-  return `${device.status.presence[0]?.toUpperCase()}${device.status.presence.slice(1)} · Agent ${device.status.agent_version} · Last check-in ${new Date(device.status.observed_at).toLocaleString()}`;
+  return `${device.status.presence[0]?.toUpperCase()}${device.status.presence.slice(1)} · Agent ${device.status.agent_version} · Last successful check-in ${new Date(device.status.observed_at).toLocaleString()}`;
 }
 
 function messageFor(cause: unknown): string {

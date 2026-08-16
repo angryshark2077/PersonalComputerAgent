@@ -174,6 +174,7 @@ actor BridgeServer {
     private let pathValidator: SocketPathValidator
     private let handshakeHandler: HandshakeHandler
     private let credentialProvider: any BridgeCredentialProviding
+    private let capabilityProbe: CapabilityProbe
     private let networkSource: NetworkObservationSource
     private let lifecycleSource: PlatformLifecycleEventBuffer
     private let screenSource: ScreenCaptureSource
@@ -192,6 +193,7 @@ actor BridgeServer {
         pathValidator: SocketPathValidator = SocketPathValidator(),
         handshakeHandler: HandshakeHandler,
         credentialProvider: any BridgeCredentialProviding,
+        capabilityProbe: CapabilityProbe = CapabilityProbe(),
         networkSource: NetworkObservationSource? = nil,
         lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer(),
         screenSource: ScreenCaptureSource = ScreenCaptureSource(),
@@ -204,6 +206,7 @@ actor BridgeServer {
         self.pathValidator = pathValidator
         self.handshakeHandler = handshakeHandler
         self.credentialProvider = credentialProvider
+        self.capabilityProbe = capabilityProbe
         self.lifecycleSource = lifecycleSource
         self.screenSource = screenSource
         self.photoSource = photoSource
@@ -369,6 +372,7 @@ actor BridgeServer {
             )
             let response = try CapabilityRequestHandler.respond(
                 to: request,
+                capabilityProbe: capabilityProbe,
                 networkSource: networkSource,
                 lifecycleSource: lifecycleSource,
                 screenSource: screenSource,
@@ -517,6 +521,7 @@ enum CapabilityRequestHandler {
 
     static func respond(
         to requestJSON: Data,
+        capabilityProbe: CapabilityProbe = CapabilityProbe(),
         networkSource: NetworkObservationSource = NetworkObservationSource(),
         lifecycleSource: PlatformLifecycleEventBuffer = PlatformLifecycleEventBuffer(),
         screenSource: ScreenCaptureSource = ScreenCaptureSource(),
@@ -625,7 +630,9 @@ enum CapabilityRequestHandler {
             }
             responsePayload = photoSource.export(localIdentifier: localIdentifier, fileName: fileName)
         } else {
-            responsePayload = ["screen_capture": .string("available")]
+            responsePayload = [
+                "screen_capture": .string(capabilityProbe.screenCaptureAvailability()),
+            ]
         }
         let response = BridgeEnvelope(
             protocolVersion: Int(HandshakeHandler.protocolVersion),

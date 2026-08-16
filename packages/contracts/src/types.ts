@@ -141,6 +141,7 @@ export interface SystemHealthChangedPayload {
 
 export interface DevicePairingStart {
   device_public_key: string;
+  existing_device_id?: string | null;
   code_challenge: string;
   callback_uri: string;
   callback_state: string;

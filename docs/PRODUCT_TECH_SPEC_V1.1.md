@@ -495,11 +495,13 @@ Personal Computer Agent 不是员工监控 SaaS，也不是远程控制工具。
 
 ## 6.3 设备配对合同
 
-- Web 生成 pairing_code，TTL 默认 10 分钟，只能使用一次。
+- Agent 创建带 PKCE 和 callback state 的短期配对 Session；Owner 必须在已登录 Dashboard 中授权，授权码只能使用一次。
 
-- Agent 使用 pairing_code、device_public_key、platform、arch 和 agent_version 调用 /v1/devices/pair。
+- 首次配对不提供 existing_device_id；维修重配必须从本地非秘密 pairing_state 提交现有 device_id。Cloud 只允许 Owner 在同一 Workspace 内复用仍存在的设备，跨 Workspace 请求必须拒绝。若该设备已被 Cloud 物理清除而不存在，Owner 明确发起的维修重配可创建新的 device_id，不得把“记录不存在”解释为本地手动解除配对。
 
-- 服务端返回 device_id、device_access_token 与 refresh_secret；Agent 仅把秘密写入 Keychain。
+- 服务端返回 workspace_id、device_id、device_access_token 与 refresh_token，并在 Cloud 内部维护凭据代数；秘密仅写入 Keychain，SQLite 只保存 device_id、workspace_id、credential_ref、本地轮换标记和配对决定。
+
+- 维修重配复用原 devices 行并保留 Collector 配置、历史与审计，只撤销旧凭据并创建下一代凭据；不得生成第二个 Dashboard 设备或把 configuration_revision 重置为 0。
 
 - 配对完成后 pairing_code 立即失效；Dashboard 显示设备指纹、系统版本和最近 IP 粗略地区。
 
@@ -531,7 +533,7 @@ Personal Computer Agent 不是员工监控 SaaS，也不是远程控制工具。
 
 | **子模块**       | **详细功能**                                                    |
 |------------------|-----------------------------------------------------------------|
-| 设备状态         | 在线/离线/睡眠、Agent 版本、最后同步、权限缺失、同步积压。      |
+| 设备状态         | 在线/离线/睡眠、Agent 版本、最后成功 check-in、权限缺失、同步积压。 |
 | 今日活跃         | 活跃时长、空闲时长、首次/最后活动、应用切换次数。               |
 | Top Applications | 按活跃秒数排序；排除空闲和锁屏。                                |
 | 采集覆盖         | 各 Collector 开关、健康、最后事件、错误码；缺失数据不显示为 0。 |
@@ -841,7 +843,7 @@ AND extension_reports_active_tab</th>
 
 | **状态**           | **进入条件**                        | **允许动作**                                                | **退出条件**             |
 |--------------------|-------------------------------------|-------------------------------------------------------------|--------------------------|
-| unpaired           | 无设备凭据或被撤销                  | 本地诊断、打开配对 UI；不得启动云同步                       | 成功配对                 |
+| unpaired           | 从未配对，或 Owner 明确手动解除配对 | 本地诊断、打开配对 UI；不得启动云同步                       | 成功配对                 |
 | initializing       | Rust agentd 启动                    | 日志、Keychain、SQLite/Migration、Bridge 握手、Registry     | running/degraded/repair  |
 | waiting_permission | 已启用 Collector 缺少 TCC           | 其他 Collector 继续；静默等待权限变化；仅主动设置页显示状态 | 权限满足或关闭 Collector |
 | running            | Core/DB/Bridge/身份正常             | 采集、Provider、同步、命令、心跳                            | sleep/update/fatal       |
@@ -855,13 +857,13 @@ AND extension_reports_active_tab</th>
 
 1.  Rust agentd 初始化 tracing、Crash Marker、instance lock 和 runtime version。
 
-2.  从 Keychain 读取 device token、Provider KeyMaterial 引用和 Bridge shared secret；缺失设备凭据则进入 unpaired。
+2.  先读取 SQLite 的持久配对决定，再从 Keychain 读取 device token、Provider KeyMaterial 引用和 Bridge shared secret；缺失或损坏的设备凭据只使 Cloud 连接 degraded，不改变配对决定。
 
 3.  启动专用 DbActor，打开 SQLite，设置 WAL/foreign_keys/busy_timeout，执行不可变 Rust Migration 链。
 
 4.  执行 integrity_check/foreign_key_check 和关键查询 Smoke Test；异常进入 repair。
 
-5.  加载 Rust Collector/Provider Registry、云端 desired config 与本地 capability probe；启动并握手 Swift PlatformBridge。
+5.  加载 Rust Collector/Provider Registry、本地已应用的 WeChat/Screenshot 配置与 capability probe；Cloud 不可用时继续使用相同 Workspace/Device 身份和本地配置，启动并握手 Swift PlatformBridge。
 
 6.  启动 Event Bus、Projection、Outbox、Sync Worker、Command Worker、Heartbeat 和 Provider Supervisor。
 
@@ -1002,6 +1004,8 @@ Apple Messages 固定采集全部会话的文本，不读取或上传附件；�
 | 去重     | SHA-256 完全去重；可选 pHash 近似去重。                                       |
 | 排除     | Bundle ID、窗口标题正则、显示器、隐私时段。                                   |
 | 上传     | 创建 Attachment Outbox，先拿 signed URL，再上传，再提交 Event。               |
+
+周期截图采集由进程级本地 owner 持续持有，不依赖 Cloud worker 或设备 access token 的当前可用性。已验证的周期配置与配对身份、revision 原子写入 SQLite；一次性远程截图 request_id 不持久化。Cloud 暂时离线或 Keychain 暂时不可读时继续写入私有 ScreenshotSpool，凭据恢复后由独立上传循环补传。旧 schema 升级时若本地没有完整截图策略，Screenshot 必须保持关闭，直到成功取得并持久化一份完整 Cloud 配置；迁移只能恢复旧库可证明的 WeChat enabled 状态，不得推断截图排除项或隐私策略。只有 Owner 明确手动撤销设备时才清除本地已应用配置并停止采集。
 
 ## 14.2 Screenshot Payload
 
@@ -1298,7 +1302,8 @@ Agent BrowserCollector<br />
 | **错误**         | **重试** | **策略**                                  |
 |------------------|----------|-------------------------------------------|
 | 网络超时/5xx/429 | 是       | 指数退避 + jitter；尊重 Retry-After。     |
-| 401/设备撤销     | 否       | 刷新一次；失败进入 unpaired。             |
+| 401/凭据失效     | 是       | 保持 paired 和本地采集；后台退避恢复凭据。|
+| Owner 手动撤销   | 否       | 先持久写入 manually_unpaired，再删除 Keychain 凭据并进入 unpaired；持久化失败时保留凭据并重试。 |
 | Schema 不兼容    | 否       | 提示升级 Agent。                          |
 | Payload 字段错误 | 否       | dead_letter + 诊断。                      |
 | 对象上传中断     | 是       | 重新 prepare；不假设 signed URL 仍有效。  |
@@ -1350,7 +1355,8 @@ Agent BrowserCollector<br />
 
 | **数据对象**                  | **Cloud**      | **Local**                  | **规则**                  |
 |-------------------------------|----------------|----------------------------|---------------------------|
-| 用户/Workspace/设备撤销       | 权威           | 缓存                       | 云端最终裁决。            |
+| Owner 手动解除设备配对        | 权威           | 持久缓存                   | 只有明确人工操作可解除。  |
+| Device/Workspace 配对身份     | Workspace 设备行为权威 | 非秘密连续性缓存     | 重配优先复用原设备；原设备已物理清除时创建新 device_id；跨 Workspace 拒绝。 |
 | 原始 Event                    | 跨设备权威     | 创建源与短期缓存           | 本地 ACK 后可按策略清理。 |
 | Activity/Browser/Message 投影 | Dashboard 权威 | 本地工作集                 | 可由 Event 重建。         |
 | 截图文件                      | 已上传对象权威 | 上传前本地事实             | hash 关联；可选择只本地。 |
@@ -1990,7 +1996,9 @@ rustfmt、clippy -D warnings、cargo nextest、Rust/Swift/TypeScript 编译、Br
 | 认证/设备   | AUTH_REQUIRED, DEVICE_UNPAIRED, DEVICE_REVOKED, DEVICE_TOKEN_EXPIRED                                                                                                                                       |
 | 权限/Bridge | PERMISSION_REQUIRED, PERMISSION_DENIED, BACKGROUND_ITEM_DISABLED, BRIDGE_UNAVAILABLE, BRIDGE_PROTOCOL_INCOMPATIBLE, BRIDGE_TIMEOUT                                                                         |
 | Collector   | COLLECTOR_INIT_FAILED, COLLECTOR_TIMEOUT, COLLECTOR_UNSUPPORTED, COLLECTOR_DEGRADED                                                                                                                        |
+| 通信本地处理 | COMMUNICATION_SOURCE_IDENTITY_CONFLICT, COMMUNICATION_LOCAL_DATABASE_FAILED, COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE, COMMUNICATION_INVALID_RECORD                                                          |
 | 截图        | SCREEN_CAPTURE_FAILED, SCREEN_SOURCE_UNAVAILABLE, SCREEN_PRIVACY_BLOCKED                                                                                                                                   |
+| 媒体上传    | COMMUNICATION_MEDIA_UPLOAD_FAILED, MEDIA_LOCAL_BODY_INVALID, MEDIA_SOURCE_UNSUPPORTED, MEDIA_CYCLE_TIMEOUT, PHOTOS_LOCAL_MANIFEST_INVALID, PHOTOS_UPLOAD_FAILED, SCREEN_UPLOAD_FAILED, SCREEN_UPLOAD_TIMEOUT |
 | 活动        | ACCESSIBILITY_UNAVAILABLE, WINDOW_TITLE_UNAVAILABLE                                                                                                                                                        |
 | 浏览器      | BROWSER_EXTENSION_MISSING, NATIVE_HOST_UNAUTHORIZED, BROWSER_SCHEMA_UNSUPPORTED                                                                                                                            |
 | 微信        | WECHAT_WAITING_SOURCE, WECHAT_CAPABILITY_UNAVAILABLE, WECHAT_VERSION_UNSUPPORTED, WECHAT_PASSIVE_SCAN_FAILED, WECHAT_KEY_INVALID, WECHAT_DATABASE_UNREADABLE, WECHAT_SCHEMA_UNSUPPORTED, WECHAT_CURSOR_GAP |
@@ -2284,10 +2292,13 @@ rustfmt、clippy -D warnings、cargo nextest、Rust/Swift/TypeScript 编译、Br
 | event_id        | TEXT     | UNIQUE NOT NULL，FK → events_local        | 对应 `photos.asset_recorded` Event        |
 | manifest_json   | TEXT     | NOT NULL，json_valid                      | 私有照片元数据与本地媒体文件名            |
 | transfer_state  | TEXT     | pending/completed，DEFAULT 'pending'      | 云端媒体上传终态                          |
+| terminal_failure_code | TEXT | NULL 或 PHOTOS_LOCAL_MANIFEST_INVALID | 本地任务损坏后的保留隔离状态；非 NULL 时不再重试 |
 | created_at_ms   | INTEGER  | NOT NULL                                  | 任务落盘时间，UTC epoch ms                |
 | completed_at_ms | INTEGER  | NULL                                      | Cloud 确认媒体后写入，UTC epoch ms        |
 
 新照片的 Event、对应 `sync_outbox` 行和 `photo_upload_spool` 行必须在同一 DbActor SQLite 事务中提交。媒体文件继续仅保存于私有 PhotoSpool 目录；升级时遗留 JSON manifest 仅兼容读取，不能作为新任务的事实源。
+
+`attachment_spool.terminal_failure_code` 仅允许 `MEDIA_LOCAL_BODY_INVALID` 或 `MEDIA_SOURCE_UNSUPPORTED`。非 NULL 的附件仍保留本地数据库行和媒体文件用于诊断，但不得再次进入上传重试批次；可重试 Cloud 失败继续使用 `transfer_state=failed` 且该字段为 NULL。
 
 **agent_commands_local · 公共字段：LOCAL_ROW**
 

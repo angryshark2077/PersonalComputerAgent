@@ -13,8 +13,9 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    migrations, repository, CommunicationMediaStorageStats, CommunicationMessageCommit, DbError,
-    DbHealth, PairingState, PendingCommunicationAttachment, PendingPhotoUpload, PhotoUploadCommit,
+    migrations, repository, AppliedCollectorControl, CommunicationMediaStorageStats,
+    CommunicationMessageCommit, DbError, DbHealth, PairingState, PendingCommunicationAttachment,
+    PendingPhotoUpload, PhotoUploadCommit,
 };
 
 const REQUEST_CAPACITY: usize = 64;
@@ -128,6 +129,10 @@ enum Request {
         state: Box<CollectorState>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    UpsertCollectorStatePreservingMediaFailure {
+        state: Box<CollectorState>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     LoadPairingState {
         response: oneshot::Sender<Result<Option<PairingState>, DbError>>,
     },
@@ -139,10 +144,14 @@ enum Request {
         applied_control_revision: u64,
         response: oneshot::Sender<Result<(), DbError>>,
     },
-    ClearPairingState {
+    LoadAppliedCollectorControl {
+        response: oneshot::Sender<Result<Option<AppliedCollectorControl>, DbError>>,
+    },
+    SaveAppliedCollectorControl {
+        control: Box<AppliedCollectorControl>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
-    ClearPairingStateAndDisableSensitiveCollectors {
+    MarkPairingManuallyUnpairedAndDisableSensitiveCollectors {
         response: oneshot::Sender<Result<(), DbError>>,
     },
     Health {
@@ -162,7 +171,7 @@ enum Request {
         limit: u16,
         response: oneshot::Sender<Result<Vec<EventEnvelope>, DbError>>,
     },
-    AcknowledgeMismatchedLifecycleEvents {
+    DeadLetterMismatchedOutboxEvents {
         workspace_id: String,
         device_id: String,
         response: oneshot::Sender<Result<u64, DbError>>,
@@ -179,6 +188,10 @@ enum Request {
         commit: Box<CommunicationMessageCommit>,
         response: oneshot::Sender<Result<(), DbError>>,
     },
+    RecordCommunicationSourceConflict {
+        source_key: String,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     CommitPhotoUpload {
         commit: Box<PhotoUploadCommit>,
         response: oneshot::Sender<Result<(), DbError>>,
@@ -189,9 +202,15 @@ enum Request {
     },
     LoadPendingPhotoUploads {
         limit: u16,
+        workspace_id: String,
+        device_id: String,
         response: oneshot::Sender<Result<Vec<PendingPhotoUpload>, DbError>>,
     },
     CompletePhotoUpload {
+        photo_id: String,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    QuarantineInvalidPhotoUpload {
         photo_id: String,
         response: oneshot::Sender<Result<(), DbError>>,
     },
@@ -211,6 +230,11 @@ enum Request {
         limit: u16,
         response: oneshot::Sender<Result<Vec<PendingCommunicationAttachment>, DbError>>,
     },
+    QuarantineInvalidCommunicationAttachment {
+        attachment_id: String,
+        source: String,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
     CompleteCommunicationAttachment {
         attachment_id: String,
         response: oneshot::Sender<Result<(), DbError>>,
@@ -220,6 +244,15 @@ enum Request {
         failure_stage: String,
         failure_category: String,
         fallback_from: Option<String>,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    QuarantineUnsupportedCommunicationAttachment {
+        attachment_id: String,
+        response: oneshot::Sender<Result<(), DbError>>,
+    },
+    RecordTerminalMediaDiagnostic {
+        subject_id: String,
+        code: String,
         response: oneshot::Sender<Result<(), DbError>>,
     },
     CleanupCompletedCommunicationAttachments {
@@ -239,26 +272,33 @@ impl Request {
             | Self::CommitEvents { response, .. }
             | Self::SetAgentState { response, .. }
             | Self::UpsertCollectorState { response, .. }
+            | Self::UpsertCollectorStatePreservingMediaFailure { response, .. }
             | Self::SavePairingState { response, .. }
             | Self::SaveControlRevision { response, .. }
-            | Self::ClearPairingState { response }
-            | Self::ClearPairingStateAndDisableSensitiveCollectors { response }
+            | Self::SaveAppliedCollectorControl { response, .. }
+            | Self::MarkPairingManuallyUnpairedAndDisableSensitiveCollectors { response }
             | Self::Checkpoint { response }
             | Self::AcknowledgeSystemEvents { response, .. }
             | Self::DeadLetterRejectedSystemEvents { response, .. }
             | Self::CommitCommunicationMessage { response, .. }
+            | Self::RecordCommunicationSourceConflict { response, .. }
             | Self::CommitPhotoUpload { response, .. }
             | Self::CompletePhotoUpload { response, .. }
+            | Self::QuarantineInvalidPhotoUpload { response, .. }
             | Self::AcknowledgeCommunicationEvents { response, .. }
             | Self::DeadLetterRejectedCommunicationEvents { response, .. }
             | Self::CompleteCommunicationAttachment { response, .. }
-            | Self::DeferCommunicationAttachment { response, .. } => response.is_closed(),
+            | Self::DeferCommunicationAttachment { response, .. }
+            | Self::QuarantineUnsupportedCommunicationAttachment { response, .. }
+            | Self::QuarantineInvalidCommunicationAttachment { response, .. }
+            | Self::RecordTerminalMediaDiagnostic { response, .. } => response.is_closed(),
             Self::LoadCollectorStates { response } => response.is_closed(),
             Self::LoadPairingState { response } => response.is_closed(),
+            Self::LoadAppliedCollectorControl { response } => response.is_closed(),
             Self::Health { response } => response.is_closed(),
             Self::CountEventAndOutbox { response, .. } => response.is_closed(),
             Self::ActiveOutboxDepth { response }
-            | Self::AcknowledgeMismatchedLifecycleEvents { response, .. } => response.is_closed(),
+            | Self::DeadLetterMismatchedOutboxEvents { response, .. } => response.is_closed(),
             Self::CleanupCompletedCommunicationAttachments { response, .. } => response.is_closed(),
             Self::CommunicationMediaStorageStats { response } => response.is_closed(),
             Self::LoadPendingSystemEvents { response, .. }
@@ -468,6 +508,25 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Inserts or updates one Collector row without allowing a concurrent healthy observation to
+    /// clear a media-upload failure. Explicit media recovery must use [`Self::upsert_collector_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, conversion, constraint, or `SQLite` write error.
+    pub async fn upsert_collector_state_preserving_media_failure(
+        &self,
+        state: &CollectorState,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::UpsertCollectorStatePreservingMediaFailure {
+            state: Box::new(state.clone()),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Loads the non-secret pairing pointer, or `None` while unpaired.
     ///
     /// # Errors
@@ -515,21 +574,44 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
-    /// Deletes the local pairing pointer while leaving all credential deletion to Keychain.
+    /// Loads local `WeChat` and Screenshot control for offline recovery.
+    ///
+    /// A migrated revision-zero row is a legacy `WeChat` bootstrap, not a complete screenshot
+    /// policy, and must be replaced by the next complete Cloud control snapshot.
     ///
     /// # Errors
     ///
-    /// Returns an actor or `SQLite` write error.
-    pub async fn clear_pairing_state(&self) -> Result<(), DbError> {
+    /// Returns an actor, decoding, or `SQLite` query error.
+    pub async fn load_applied_collector_control(
+        &self,
+    ) -> Result<Option<AppliedCollectorControl>, DbError> {
         let (response_sender, response_receiver) = oneshot::channel();
-        self.send(Request::ClearPairingState {
+        self.send(Request::LoadAppliedCollectorControl {
             response: response_sender,
         })
         .await?;
         receive(response_receiver).await
     }
 
-    /// Atomically removes pairing and durably keeps future sensitive Collector sources disabled.
+    /// Atomically saves a complete local Collector control and its pairing revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, identity, validation, transaction, or `SQLite` write error.
+    pub async fn save_applied_collector_control(
+        &self,
+        control: &AppliedCollectorControl,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::SaveAppliedCollectorControl {
+            control: Box::new(control.clone()),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Atomically records an explicit Owner unpair and disables sensitive Collector sources.
     ///
     /// S1B has no Network or `WeChat` source implementation; these rows prevent a later runtime
     /// from treating a revoked pairing as an authorization to start either source.
@@ -537,13 +619,15 @@ impl DbActorHandle {
     /// # Errors
     ///
     /// Returns an actor, transaction, or `SQLite` write error.
-    pub async fn clear_pairing_state_and_disable_sensitive_collectors(
+    pub async fn mark_pairing_manually_unpaired_and_disable_sensitive_collectors(
         &self,
     ) -> Result<(), DbError> {
         let (response_sender, response_receiver) = oneshot::channel();
-        self.send(Request::ClearPairingStateAndDisableSensitiveCollectors {
-            response: response_sender,
-        })
+        self.send(
+            Request::MarkPairingManuallyUnpairedAndDisableSensitiveCollectors {
+                response: response_sender,
+            },
+        )
         .await?;
         receive(response_receiver).await
     }
@@ -631,7 +715,7 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
-    /// Acknowledges lifecycle rows that cannot belong to the currently paired Cloud identity.
+    /// Dead-letters Outbox rows that cannot belong to the currently paired Cloud identity.
     ///
     /// The immutable local Event remains available for diagnostics; only its upload attempt is
     /// terminated so a pre-pairing or previously paired identity cannot block later System data.
@@ -639,13 +723,13 @@ impl DbActorHandle {
     /// # Errors
     ///
     /// Returns an actor, transaction, or `SQLite` write error.
-    pub async fn acknowledge_mismatched_lifecycle_events(
+    pub async fn dead_letter_mismatched_outbox_events(
         &self,
         workspace_id: &str,
         device_id: &str,
     ) -> Result<u64, DbError> {
         let (response_sender, response_receiver) = oneshot::channel();
-        self.send(Request::AcknowledgeMismatchedLifecycleEvents {
+        self.send(Request::DeadLetterMismatchedOutboxEvents {
             workspace_id: workspace_id.to_owned(),
             device_id: device_id.to_owned(),
             response: response_sender,
@@ -740,6 +824,24 @@ impl DbActorHandle {
         receive(response_receiver).await
     }
 
+    /// Records one immutable communication source conflict without persisting private content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor or `SQLite` diagnostic-persistence error.
+    pub async fn record_communication_source_conflict(
+        &self,
+        source_key: &str,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::RecordCommunicationSourceConflict {
+            source_key: source_key.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
     /// Atomically stores one photo Event, stable Outbox intent, and its private upload task.
     ///
     /// # Errors
@@ -779,11 +881,15 @@ impl DbActorHandle {
     pub async fn load_pending_photo_uploads(
         &self,
         limit: u16,
+        workspace_id: &str,
+        device_id: &str,
     ) -> Result<Vec<PendingPhotoUpload>, DbError> {
         validate_photo_limit(limit)?;
         let (response_sender, response_receiver) = oneshot::channel();
         self.send(Request::LoadPendingPhotoUploads {
             limit,
+            workspace_id: workspace_id.to_owned(),
+            device_id: device_id.to_owned(),
             response: response_sender,
         })
         .await?;
@@ -798,6 +904,21 @@ impl DbActorHandle {
     pub async fn complete_photo_upload(&self, photo_id: &str) -> Result<(), DbError> {
         let (response_sender, response_receiver) = oneshot::channel();
         self.send(Request::CompletePhotoUpload {
+            photo_id: photo_id.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Preserves one structurally invalid local photo task while removing it from retry batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, transaction, or database error.
+    pub async fn quarantine_invalid_photo_upload(&self, photo_id: &str) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::QuarantineInvalidPhotoUpload {
             photo_id: photo_id.to_owned(),
             response: response_sender,
         })
@@ -878,9 +999,65 @@ impl DbActorHandle {
         limit: u16,
     ) -> Result<Vec<PendingCommunicationAttachment>, DbError> {
         validate_communication_limit("load pending communication attachments", limit)?;
+        let mut validated = Vec::with_capacity(usize::from(limit));
+        while validated.len() < usize::from(limit) {
+            let remaining = u16::try_from(usize::from(limit) - validated.len()).map_err(|_| {
+                DbError::sqlite("load pending communication attachments", "invalid limit")
+            })?;
+            let candidates = self
+                .load_pending_communication_attachment_candidates(remaining)
+                .await?;
+            if candidates.is_empty() {
+                break;
+            }
+            let mut quarantined = false;
+            for attachment in candidates {
+                let attachment_id = attachment.attachment_id.clone();
+                let source = attachment.source.clone();
+                match tokio::task::spawn_blocking(move || attachment.verify_body()).await {
+                    Ok(Ok(attachment)) => validated.push(attachment),
+                    Ok(Err(_)) => {
+                        self.quarantine_invalid_communication_attachment(&attachment_id, &source)
+                            .await?;
+                        quarantined = true;
+                    }
+                    Err(_) => {
+                        return Err(DbError::sqlite(
+                            "validate pending attachment body",
+                            "validation worker stopped",
+                        ));
+                    }
+                }
+            }
+            if !quarantined {
+                break;
+            }
+        }
+        Ok(validated)
+    }
+
+    async fn load_pending_communication_attachment_candidates(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<PendingCommunicationAttachment>, DbError> {
         let (response_sender, response_receiver) = oneshot::channel();
         self.send(Request::LoadPendingCommunicationAttachments {
             limit,
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    async fn quarantine_invalid_communication_attachment(
+        &self,
+        attachment_id: &str,
+        source: &str,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::QuarantineInvalidCommunicationAttachment {
+            attachment_id: attachment_id.to_owned(),
+            source: source.to_owned(),
             response: response_sender,
         })
         .await?;
@@ -923,6 +1100,44 @@ impl DbActorHandle {
             failure_stage: failure_stage.to_owned(),
             failure_category: failure_category.to_owned(),
             fallback_from: fallback_from.map(str::to_owned),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Preserves an attachment with an unsupported immutable source without retrying it forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, transaction, or database error.
+    pub async fn quarantine_unsupported_communication_attachment(
+        &self,
+        attachment_id: &str,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::QuarantineUnsupportedCommunicationAttachment {
+            attachment_id: attachment_id.to_owned(),
+            response: response_sender,
+        })
+        .await?;
+        receive(response_receiver).await
+    }
+
+    /// Persists one redacted diagnostic for filesystem media that was terminally quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Returns an actor, validation, transaction, or database error.
+    pub async fn record_terminal_media_diagnostic(
+        &self,
+        subject_id: &str,
+        code: &str,
+    ) -> Result<(), DbError> {
+        let (response_sender, response_receiver) = oneshot::channel();
+        self.send(Request::RecordTerminalMediaDiagnostic {
+            subject_id: subject_id.to_owned(),
+            code: code.to_owned(),
             response: response_sender,
         })
         .await?;
@@ -1130,11 +1345,19 @@ fn run(
             Request::UpsertCollectorState { state, response } => {
                 let _ = response.send(repository::upsert_collector_state_in(&connection, &state));
             }
+            Request::UpsertCollectorStatePreservingMediaFailure { state, response } => {
+                let _ = response.send(
+                    repository::upsert_collector_state_preserving_media_failure_in(
+                        &connection,
+                        &state,
+                    ),
+                );
+            }
             Request::LoadPairingState { response } => {
                 let _ = response.send(repository::load_pairing_state(&connection));
             }
             Request::SavePairingState { state, response } => {
-                let _ = response.send(repository::save_pairing_state(&connection, &state));
+                let _ = response.send(repository::save_pairing_state(&mut connection, &state));
             }
             Request::SaveControlRevision {
                 applied_control_revision,
@@ -1145,12 +1368,18 @@ fn run(
                     applied_control_revision,
                 ));
             }
-            Request::ClearPairingState { response } => {
-                let _ = response.send(repository::clear_pairing_state(&connection));
+            Request::LoadAppliedCollectorControl { response } => {
+                let _ = response.send(repository::load_applied_collector_control(&connection));
             }
-            Request::ClearPairingStateAndDisableSensitiveCollectors { response } => {
+            Request::SaveAppliedCollectorControl { control, response } => {
+                let _ = response.send(repository::save_applied_collector_control(
+                    &mut connection,
+                    &control,
+                ));
+            }
+            Request::MarkPairingManuallyUnpairedAndDisableSensitiveCollectors { response } => {
                 let _ = response.send(
-                    repository::clear_pairing_state_and_disable_sensitive_collectors(
+                    repository::mark_pairing_manually_unpaired_and_disable_sensitive_collectors(
                         &mut connection,
                     ),
                 );
@@ -1170,12 +1399,12 @@ fn run(
             Request::LoadPendingSystemEvents { limit, response } => {
                 let _ = response.send(repository::load_pending_system_events(&connection, limit));
             }
-            Request::AcknowledgeMismatchedLifecycleEvents {
+            Request::DeadLetterMismatchedOutboxEvents {
                 workspace_id,
                 device_id,
                 response,
             } => {
-                let _ = response.send(repository::acknowledge_mismatched_lifecycle_events(
+                let _ = response.send(repository::dead_letter_mismatched_outbox_events(
                     &mut connection,
                     &workspace_id,
                     &device_id,
@@ -1206,17 +1435,42 @@ fn run(
                     &commit,
                 ));
             }
+            Request::RecordCommunicationSourceConflict {
+                source_key,
+                response,
+            } => {
+                let _ = response.send(repository::record_communication_source_conflict(
+                    &connection,
+                    &source_key,
+                ));
+            }
             Request::CommitPhotoUpload { commit, response } => {
                 let _ = response.send(repository::commit_photo_upload(&mut connection, &commit));
             }
             Request::PhotoUploadExists { photo_id, response } => {
                 let _ = response.send(repository::photo_upload_exists(&connection, &photo_id));
             }
-            Request::LoadPendingPhotoUploads { limit, response } => {
-                let _ = response.send(repository::load_pending_photo_uploads(&connection, limit));
+            Request::LoadPendingPhotoUploads {
+                limit,
+                workspace_id,
+                device_id,
+                response,
+            } => {
+                let _ = response.send(repository::load_pending_photo_uploads(
+                    &connection,
+                    limit,
+                    &workspace_id,
+                    &device_id,
+                ));
             }
             Request::CompletePhotoUpload { photo_id, response } => {
                 let _ = response.send(repository::complete_photo_upload(&connection, &photo_id));
+            }
+            Request::QuarantineInvalidPhotoUpload { photo_id, response } => {
+                let _ = response.send(repository::quarantine_invalid_photo_upload(
+                    &connection,
+                    &photo_id,
+                ));
             }
             Request::LoadPendingCommunicationEvents { limit, response } => {
                 let _ = response.send(repository::load_pending_communication_events(
@@ -1249,6 +1503,17 @@ fn run(
                     limit,
                 ));
             }
+            Request::QuarantineInvalidCommunicationAttachment {
+                attachment_id,
+                source,
+                response,
+            } => {
+                let _ = response.send(repository::quarantine_invalid_attachment(
+                    &connection,
+                    &attachment_id,
+                    &source,
+                ));
+            }
             Request::CompleteCommunicationAttachment {
                 attachment_id,
                 response,
@@ -1271,6 +1536,26 @@ fn run(
                     &failure_stage,
                     &failure_category,
                     fallback_from.as_deref(),
+                ));
+            }
+            Request::QuarantineUnsupportedCommunicationAttachment {
+                attachment_id,
+                response,
+            } => {
+                let _ = response.send(repository::quarantine_unsupported_communication_attachment(
+                    &connection,
+                    &attachment_id,
+                ));
+            }
+            Request::RecordTerminalMediaDiagnostic {
+                subject_id,
+                code,
+                response,
+            } => {
+                let _ = response.send(repository::record_terminal_media_diagnostic(
+                    &connection,
+                    &subject_id,
+                    &code,
                 ));
             }
             Request::CleanupCompletedCommunicationAttachments {

@@ -538,21 +538,43 @@ async fn supervisor_emits_incompatible_once_and_does_not_restart() {
     let config = BridgeSupervisorConfig::new(&executable, &socket, "0.0.0-s1a")
         .expect("valid supervisor config")
         .with_operation_timeout(Duration::from_secs(3));
-    let (status_tx, status_rx) = watch::channel(BridgeStatus::Disconnected);
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    BridgeSupervisor::new(
-        config,
-        Arc::new(TestStore::with_secret(Some(SECRET.to_vec()))),
-        status_tx,
-    )
-    .run(shutdown_rx)
+    let (status_tx, mut status_rx) = watch::channel(BridgeStatus::Disconnected);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let supervisor = tokio::spawn(
+        BridgeSupervisor::new(
+            config,
+            Arc::new(TestStore::with_secret(Some(SECRET.to_vec()))),
+            status_tx,
+        )
+        .run(shutdown_rx),
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while *status_rx.borrow_and_update() != BridgeStatus::Incompatible {
+            status_rx
+                .changed()
+                .await
+                .expect("status sender remains alive");
+        }
+    })
     .await
-    .expect("incompatible is a terminal supervised state");
+    .expect("supervisor reports incompatible");
 
     assert_eq!(*status_rx.borrow(), BridgeStatus::Incompatible);
+    assert!(
+        !supervisor.is_finished(),
+        "incompatible Bridge must not terminate the Agent-owned supervisor"
+    );
     let runs = fs::read_to_string(directory.path().join("runs")).expect("run count");
     assert_eq!(runs.trim(), "1");
     assert!(!socket.exists());
+
+    shutdown_tx.send(true).expect("request supervisor shutdown");
+    tokio::time::timeout(Duration::from_secs(3), supervisor)
+        .await
+        .expect("supervisor stops after shutdown")
+        .expect("join supervisor")
+        .expect("clean supervisor shutdown");
 }
 
 #[derive(Clone, Copy)]

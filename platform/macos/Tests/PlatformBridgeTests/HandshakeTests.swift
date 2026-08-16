@@ -415,6 +415,19 @@ final class HandshakeTests: XCTestCase {
         }
     }
 
+    func testCapabilityRequestReportsInjectedScreenCapturePermission() throws {
+        let requestID = UUID()
+        let result = try CapabilityRequestHandler.respond(
+            to: capabilityRequest(requestID: requestID, deadline: 1_000),
+            capabilityProbe: CapabilityProbe(
+                source: HandshakeCapabilityStatusSource(screenCapture: .denied)
+            )
+        )
+        let response = try JSONDecoder().decode(BridgeEnvelope.self, from: result.payload)
+
+        XCTAssertEqual(response.payload, ["screen_capture": .string("permission_required")])
+    }
+
     func testLifecyclePollReturnsOnlyEventsAfterTheAuthenticatedCursor() throws {
         let source = PlatformLifecycleEventBuffer()
         source.record(.systemSleep, at: Date(timeIntervalSince1970: 1))
@@ -548,6 +561,9 @@ final class HandshakeTests: XCTestCase {
             pathValidator: SocketPathValidator(approvedRunRoot: runRoot),
             handshakeHandler: HandshakeHandler(bridgeVersion: "0.0.0-s1a"),
             credentialProvider: FixedCredentialProvider(secret: secret),
+            capabilityProbe: CapabilityProbe(
+                source: HandshakeCapabilityStatusSource(screenCapture: .granted)
+            ),
             idleTimeoutMilliseconds: 60_000
         )
         try await server.start()
@@ -910,6 +926,14 @@ private struct SlowCredentialProvider: BridgeCredentialProviding {
     func loadSecret() throws -> Data? {
         usleep(delayMicroseconds)
         return secret
+    }
+}
+
+private struct HandshakeCapabilityStatusSource: CapabilityStatusSource {
+    let screenCapture: RawPermissionStatus
+
+    func status(for capability: PlatformCapability) -> RawPermissionStatus {
+        capability == .screenCapture ? screenCapture : .unavailable
     }
 }
 

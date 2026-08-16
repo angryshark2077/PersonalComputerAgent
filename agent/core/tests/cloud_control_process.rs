@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pca_agentd::cloud_control::{
@@ -16,7 +16,8 @@ use pca_agentd::communication::{
     CommunicationAuthorization, CommunicationControl, CommunicationIdentity, CommunicationRuntime,
     CommunicationRuntimeError, UnavailableCommunicationProviderFactory,
 };
-use pca_db_local::{DbActorHandle, PairingState};
+use pca_bridge_client::screen_capture_command_channel;
+use pca_db_local::{AppliedCollectorControl, DbActorHandle, PairingState};
 use pca_domain::{CollectorState, CollectorStatus, EventEnvelope, Sensitivity};
 use pca_keychain::{
     load_device_credential, CredentialError, CredentialStore, DeviceCredential,
@@ -177,6 +178,28 @@ struct TransientCountingClient {
     calls: AtomicUsize,
 }
 
+#[derive(Default)]
+struct InvalidCredentialClient {
+    calls: AtomicUsize,
+    refresh_calls: AtomicUsize,
+}
+
+impl ControlClient for InvalidCredentialClient {
+    fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(ControlError::InvalidCredential) })
+    }
+
+    fn heartbeat_and_control<'a>(
+        &'a self,
+        _: &'a DeviceCredential,
+        _: u64,
+    ) -> ControlFuture<'a, AgentControlSnapshot> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(ControlError::InvalidCredential) })
+    }
+}
+
 struct RefreshingClient {
     calls: AtomicUsize,
     refresh_calls: AtomicUsize,
@@ -275,7 +298,7 @@ impl ControlClient for BlockingSyncClient {
         _: &'a [EventEnvelope],
     ) -> ControlFuture<'a, pca_agentd::cloud_control::SyncEventsResponse> {
         Box::pin(async move {
-            self.sync_entered.notify_waiters();
+            self.sync_entered.notify_one();
             self.sync_release.notified().await;
             Err(ControlError::Transient)
         })
@@ -377,7 +400,7 @@ async fn db() -> (TempDir, Arc<DbActorHandle>) {
 }
 
 async fn save_sensitive_enabled(database: &DbActorHandle) {
-    for collector_key in ["network", "communication.wechat"] {
+    for collector_key in ["network", "communication.wechat", "screen.capture"] {
         database
             .upsert_collector_state(&CollectorState {
                 collector_key: collector_key.to_owned(),
@@ -406,18 +429,22 @@ async fn assert_sensitive_disabled(database: &DbActorHandle) {
         vec![
             ("communication.wechat", CollectorStatus::Disabled),
             ("network", CollectorStatus::Disabled),
+            ("screen.capture", CollectorStatus::Disabled),
         ]
     );
 }
 
-async fn await_unpaired(runtime: &pca_agentd::cloud_control::CloudControlHandle) {
-    for _ in 0..100 {
-        if runtime.is_unpaired().await {
-            return;
-        }
-        tokio::task::yield_now().await;
+async fn await_unpaired(
+    runtime: &pca_agentd::cloud_control::CloudControlHandle,
+    pairing_state: &mut watch::Receiver<bool>,
+) {
+    while *pairing_state.borrow_and_update() {
+        pairing_state
+            .changed()
+            .await
+            .expect("Cloud control retains the pairing-state sender");
     }
-    panic!("control runtime did not process revocation");
+    assert!(runtime.is_unpaired().await);
 }
 
 fn prevent_virtual_time_auto_advance() -> tokio::task::JoinHandle<()> {
@@ -429,7 +456,7 @@ fn prevent_virtual_time_auto_advance() -> tokio::task::JoinHandle<()> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
+async fn owner_revocation_marks_manual_unpair_and_disables_sensitive_collectors() {
     let time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
@@ -453,13 +480,22 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
         )
         .unwrap();
 
-    let runtime =
-        CloudControlRuntime::start(Arc::clone(&database), credentials, Arc::new(RevokedClient))
-            .await
-            .unwrap();
-    await_unpaired(&runtime).await;
+    let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
+    let runtime = CloudControlRuntime::start_with_pairing_state(
+        Arc::clone(&database),
+        credentials,
+        Arc::new(RevokedClient),
+        pairing_state_sender,
+    )
+    .await
+    .unwrap();
+    await_unpaired(&runtime, &mut pairing_state_receiver).await;
 
-    assert!(database.load_pairing_state().await.unwrap().is_none());
+    assert!(database
+        .load_pairing_state()
+        .await
+        .unwrap()
+        .is_some_and(|state| state.manually_unpaired));
     assert!(runtime.is_unpaired().await);
     assert_eq!(runtime.applied_revision().await, None);
     assert!(store
@@ -474,6 +510,86 @@ async fn revocation_clears_pairing_and_disables_sensitive_collectors() {
         Err(error) => {
             drop(error);
             panic!("runtime released database after shutdown");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn invalid_credentials_never_change_the_manual_pairing_decision() {
+    let time_guard = prevent_virtual_time_auto_advance();
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let credentials = credentials(Arc::clone(&store));
+    database
+        .save_pairing_state(&PairingState::paired(
+            credentials.credential().device_id(),
+            credentials.credential().workspace_id(),
+            "keychain://pca/device/current",
+            1,
+            "https://pca-cloud-api-production.up.railway.app",
+        ))
+        .await
+        .unwrap();
+    save_sensitive_enabled(&database).await;
+    store
+        .store(
+            DEVICE_CREDENTIAL_SERVICE,
+            DEVICE_CREDENTIAL_ACCOUNT,
+            &credentials.credential().encode().unwrap(),
+        )
+        .unwrap();
+    let client = Arc::new(InvalidCredentialClient::default());
+    let runtime = CloudControlRuntime::start(
+        Arc::clone(&database),
+        credentials,
+        Arc::clone(&client) as Arc<dyn ControlClient>,
+    )
+    .await
+    .unwrap();
+
+    wait_for_calls(&client.calls, 1).await;
+    for _ in 0..100 {
+        if client.refresh_calls.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(client.refresh_calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    wait_for_calls(&client.calls, 2).await;
+
+    assert!(client.calls.load(Ordering::SeqCst) >= 2);
+    for _ in 0..100 {
+        if client.refresh_calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(client.refresh_calls.load(Ordering::SeqCst) >= 2);
+    assert!(!runtime.is_unpaired().await);
+    assert!(database
+        .load_pairing_state()
+        .await
+        .unwrap()
+        .is_some_and(|state| state.is_paired()));
+    assert!(store
+        .load(DEVICE_CREDENTIAL_SERVICE, DEVICE_CREDENTIAL_ACCOUNT)
+        .unwrap()
+        .is_some());
+    assert!(database
+        .load_collector_states()
+        .await
+        .unwrap()
+        .iter()
+        .all(|state| state.status == CollectorStatus::Running));
+
+    runtime.shutdown().await.unwrap();
+    time_guard.abort();
+    match Arc::try_unwrap(database) {
+        Ok(database) => database.shutdown().await.unwrap(),
+        Err(error) => {
+            drop(error);
+            panic!("runtime released database after invalid credential retry");
         }
     }
 }
@@ -513,11 +629,14 @@ async fn revocation_notifies_the_agent_runtime_after_local_cleanup() {
     .await
     .unwrap();
     assert!(*pairing_state_receiver.borrow_and_update());
-    await_unpaired(&runtime).await;
-    pairing_state_receiver.changed().await.unwrap();
+    await_unpaired(&runtime, &mut pairing_state_receiver).await;
 
     assert!(!*pairing_state_receiver.borrow_and_update());
-    assert!(database.load_pairing_state().await.unwrap().is_none());
+    assert!(database
+        .load_pairing_state()
+        .await
+        .unwrap()
+        .is_some_and(|state| state.manually_unpaired));
     assert_sensitive_disabled(&database).await;
     runtime.shutdown().await.unwrap();
     time_guard.abort();
@@ -531,7 +650,7 @@ async fn revocation_notifies_the_agent_runtime_after_local_cleanup() {
 }
 
 #[tokio::test]
-async fn corrupt_startup_credential_clears_pairing_and_disables_sensitive_collectors() {
+async fn corrupt_startup_credential_preserves_pairing_and_sensitive_collectors() {
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
     let credential = credentials(Arc::clone(&store));
@@ -554,17 +673,29 @@ async fn corrupt_startup_credential_clears_pairing_and_disables_sensitive_collec
         )
         .unwrap();
 
-    let runtime = CloudControlRuntime::start_from_keychain(
+    let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
+    let runtime = CloudControlRuntime::start_from_keychain_with_pairing_state(
         Arc::clone(&database),
         store,
         Arc::new(RevokedClient),
+        pairing_state_sender,
     )
     .await
     .unwrap();
 
     assert!(runtime.is_none());
-    assert!(database.load_pairing_state().await.unwrap().is_none());
-    assert_sensitive_disabled(&database).await;
+    assert!(*pairing_state_receiver.borrow_and_update());
+    assert!(database
+        .load_pairing_state()
+        .await
+        .unwrap()
+        .is_some_and(|state| state.is_paired()));
+    assert!(database
+        .load_collector_states()
+        .await
+        .unwrap()
+        .iter()
+        .all(|state| state.status == CollectorStatus::Running));
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
         Err(error) => {
@@ -600,14 +731,23 @@ async fn failed_keychain_delete_still_disables_sensitive_collectors() {
         .unwrap();
     store.fail_delete.store(true, Ordering::Relaxed);
 
-    let runtime =
-        CloudControlRuntime::start(Arc::clone(&database), credentials, Arc::new(RevokedClient))
-            .await
-            .unwrap();
-    await_unpaired(&runtime).await;
+    let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(false);
+    let runtime = CloudControlRuntime::start_with_pairing_state(
+        Arc::clone(&database),
+        credentials,
+        Arc::new(RevokedClient),
+        pairing_state_sender,
+    )
+    .await
+    .unwrap();
+    await_unpaired(&runtime, &mut pairing_state_receiver).await;
 
     assert!(runtime.is_unpaired().await);
-    assert!(database.load_pairing_state().await.unwrap().is_none());
+    assert!(database
+        .load_pairing_state()
+        .await
+        .unwrap()
+        .is_some_and(|state| state.manually_unpaired));
     assert_sensitive_disabled(&database).await;
     assert_eq!(store.delete_attempts.load(Ordering::Relaxed), 1);
     assert!(matches!(
@@ -721,7 +861,7 @@ fn exact_v2_wechat_scope_is_required_before_a_revision_can_enable_collection() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn communication_revision_notifications_are_monotonic_and_invalid_control_fails_closed() {
+async fn communication_revision_notifications_are_monotonic_and_invalid_control_keeps_last_good() {
     let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
@@ -787,8 +927,8 @@ async fn communication_revision_notifications_are_monotonic_and_invalid_control_
         }
     }
     wait_for_calls(&client.calls, 3).await;
-    controls.changed().await.unwrap();
-    assert!(controls.borrow_and_update().is_none());
+    assert!(!controls.has_changed().unwrap());
+    assert_eq!(controls.borrow().as_ref(), Some(&first));
 
     runtime.shutdown().await.unwrap();
     match Arc::try_unwrap(database) {
@@ -801,7 +941,7 @@ async fn communication_revision_notifications_are_monotonic_and_invalid_control_
 }
 
 #[tokio::test(start_paused = true)]
-async fn same_enabled_revision_recovers_after_a_contract_failure() {
+async fn same_enabled_revision_remains_active_across_a_contract_failure() {
     let _time_guard = prevent_virtual_time_auto_advance();
     let (_temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
@@ -828,8 +968,8 @@ async fn same_enabled_revision_recovers_after_a_contract_failure() {
     assert!(controls.borrow_and_update().is_some());
     tokio::time::advance(Duration::from_secs(30)).await;
     wait_for_calls(&client.calls, 2).await;
-    controls.changed().await.unwrap();
-    assert!(controls.borrow_and_update().is_none());
+    assert!(!controls.has_changed().unwrap());
+    assert!(controls.borrow().is_some());
 
     for _ in 0..10 {
         if client.calls.load(Ordering::SeqCst) >= 3 {
@@ -839,11 +979,10 @@ async fn same_enabled_revision_recovers_after_a_contract_failure() {
         tokio::task::yield_now().await;
     }
     wait_for_calls(&client.calls, 3).await;
-    controls.changed().await.unwrap();
     let restored = controls
-        .borrow_and_update()
+        .borrow()
         .clone()
-        .expect("same enabled revision is restored");
+        .expect("same enabled revision stays active");
     assert_eq!(restored.configuration_revision, 5);
     assert!(restored.communication_wechat_enabled);
 
@@ -879,7 +1018,15 @@ async fn same_revision_reasserts_network_enabled_after_in_memory_state_drift() {
     }
     client.network_enabled.store(false, Ordering::SeqCst);
 
-    tokio::time::advance(Duration::from_secs(30)).await;
+    for _ in 0..3 {
+        if client.calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(30)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+    }
     wait_for_calls(&client.calls, 2).await;
     wait_for_enabled(&client.network_enabled).await;
 
@@ -972,6 +1119,159 @@ async fn persisted_enabled_revision_is_restored_even_when_published_before_subsc
     }
 }
 
+#[tokio::test]
+async fn owner_restores_local_wechat_and_screenshot_control_without_cloud_credentials() {
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(store);
+    database
+        .save_pairing_state(&PairingState::paired(
+            loaded.credential().device_id(),
+            loaded.credential().workspace_id(),
+            "keychain://pca/device/current",
+            7,
+            "https://pca-cloud-api-production.up.railway.app",
+        ))
+        .await
+        .unwrap();
+    database
+        .save_applied_collector_control(&AppliedCollectorControl {
+            device_id: loaded.credential().device_id().to_owned(),
+            workspace_id: loaded.credential().workspace_id().to_owned(),
+            configuration_revision: 7,
+            communication_wechat_enabled: true,
+            screen_capture_enabled: true,
+            screen_capture_scheduled_enabled: true,
+            screen_capture_interval_seconds: 600,
+            screen_capture_activity_enabled: false,
+            screen_capture_activity_min_interval_seconds: 45,
+            screen_capture_excluded_bundle_ids: vec!["com.example.private".to_owned()],
+            updated_at_ms: 7,
+        })
+        .await
+        .unwrap();
+
+    let (pairing_state_sender, _) = watch::channel(true);
+    let (owner, _commands) = CloudControlOwner::start(
+        Arc::clone(&database),
+        pairing_state_sender,
+        CommunicationAuthorization::new(),
+    );
+    let mut controls = owner.communication_controls();
+    if controls.borrow().is_none() {
+        controls.changed().await.unwrap();
+    }
+    let restored = controls.borrow_and_update().clone().unwrap();
+    assert_eq!(restored.configuration_revision, 7);
+    assert!(restored.communication_wechat_enabled);
+    assert!(restored.screen_capture.enabled);
+    assert_eq!(restored.screen_capture.interval_seconds, 600);
+    assert!(!restored.screen_capture.activity_enabled);
+    assert_eq!(
+        restored.screen_capture.excluded_bundle_ids,
+        vec!["com.example.private"]
+    );
+    assert!(!restored.network_enabled);
+    assert!(!restored.communication_messages_enabled);
+    assert!(!restored.photos_library_enabled);
+    assert_eq!(restored.screenshot_request_id, None);
+
+    owner.shutdown().await.unwrap();
+    shutdown_database(database).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn persisted_screenshot_schedule_runs_without_a_cloud_worker() {
+    let _time_guard = prevent_virtual_time_auto_advance();
+    let (_temp, database) = db().await;
+    let store = Arc::new(MemoryStore::default());
+    let loaded = credentials(store);
+    database
+        .save_pairing_state(&PairingState::paired(
+            loaded.credential().device_id(),
+            loaded.credential().workspace_id(),
+            "keychain://pca/device/current",
+            7,
+            "https://pca-cloud-api-production.up.railway.app",
+        ))
+        .await
+        .unwrap();
+    database
+        .save_applied_collector_control(&AppliedCollectorControl {
+            device_id: loaded.credential().device_id().to_owned(),
+            workspace_id: loaded.credential().workspace_id().to_owned(),
+            configuration_revision: 7,
+            communication_wechat_enabled: true,
+            screen_capture_enabled: true,
+            screen_capture_scheduled_enabled: true,
+            screen_capture_interval_seconds: 60,
+            screen_capture_activity_enabled: false,
+            screen_capture_activity_min_interval_seconds: 30,
+            screen_capture_excluded_bundle_ids: Vec::new(),
+            updated_at_ms: 7,
+        })
+        .await
+        .unwrap();
+    let (screen_capture, receiver) = screen_capture_command_channel();
+    drop(receiver);
+    let (pairing_state_sender, _) = watch::channel(true);
+    let (owner, _commands) = CloudControlOwner::start_with_screen_capture(
+        Arc::clone(&database),
+        pairing_state_sender,
+        CommunicationAuthorization::new(),
+        screen_capture,
+    );
+    let mut controls = owner.communication_controls();
+    if controls.borrow().is_none() {
+        controls.changed().await.unwrap();
+    }
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if database
+            .load_collector_states()
+            .await
+            .unwrap()
+            .iter()
+            .any(|state| state.collector_key == "screen.capture")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "local screenshot loop did not initialize"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(Duration::from_secs(65)).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let state = loop {
+        if let Some(state) = database
+            .load_collector_states()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|state| state.collector_key == "screen.capture")
+            .filter(|state| state.last_error_code.as_deref() == Some("SCREEN_CAPTURE_FAILED"))
+        {
+            break state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "local screenshot loop did not run"
+        );
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(state.status, CollectorStatus::Degraded);
+    assert_eq!(
+        state.last_error_code.as_deref(),
+        Some("SCREEN_CAPTURE_FAILED")
+    );
+
+    owner.shutdown().await.unwrap();
+    shutdown_database(database).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn valid_disable_applies_while_system_sync_is_blocked() {
     let _time_guard = prevent_virtual_time_auto_advance();
@@ -986,6 +1286,10 @@ async fn valid_disable_applies_while_system_sync_is_blocked() {
             1,
             "https://pca-cloud-api-production.up.railway.app",
         ))
+        .await
+        .unwrap();
+    database
+        .append_event_with_outbox(&system_event("system-before-disable"))
         .await
         .unwrap();
     let client = Arc::new(BlockingSyncClient {
@@ -1011,14 +1315,10 @@ async fn valid_disable_applies_while_system_sync_is_blocked() {
         .as_ref()
         .is_some_and(|control| control.communication_wechat_enabled));
 
-    database
-        .append_event_with_outbox(&system_event("system-before-disable"))
-        .await
-        .unwrap();
     let sync_entered = client.sync_entered.notified();
     tokio::pin!(sync_entered);
-    tokio::time::advance(Duration::from_secs(30)).await;
     sync_entered.as_mut().await;
+    tokio::time::advance(Duration::from_secs(30)).await;
     wait_for_calls(&client.calls, 2).await;
     controls.changed().await.unwrap();
 
@@ -1041,7 +1341,7 @@ async fn valid_disable_applies_while_system_sync_is_blocked() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn blocked_media_upload_keeps_heartbeats_alive_then_fails_the_worker_deadline() {
+async fn blocked_communication_upload_degrades_only_its_collectors_without_stopping_control() {
     let time_guard = prevent_virtual_time_auto_advance();
     let (temp, database) = db().await;
     let store = Arc::new(MemoryStore::default());
@@ -1056,6 +1356,7 @@ async fn blocked_media_upload_keeps_heartbeats_alive_then_fails_the_worker_deadl
         ))
         .await
         .unwrap();
+    seed_media_collectors(&database).await;
 
     let body = b"blocked media fixture";
     let sha256 = format!("{:x}", Sha256::digest(body));
@@ -1114,14 +1415,28 @@ async fn blocked_media_upload_keeps_heartbeats_alive_then_fails_the_worker_deadl
     tokio::time::advance(Duration::from_secs(30)).await;
     wait_for_calls(&client.calls, 2).await;
 
-    tokio::time::advance(Duration::from_mins(45)).await;
-    for _ in 0..100 {
+    for _ in 0..89 {
+        tokio::time::advance(Duration::from_secs(30)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let calls_after_timeout = client.calls.load(Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    wait_for_calls(&client.calls, calls_after_timeout + 1).await;
+    for _ in 0..1_000 {
+        if communication_media_cycle_timed_out(database.as_ref()).await {
+            break;
+        }
         tokio::task::yield_now().await;
     }
-    assert!(matches!(
-        runtime.shutdown().await,
-        Err(CloudControlRuntimeError::WorkerStopped)
-    ));
+    assert_communication_media_cycle_timeout(&database).await;
+    assert!(
+        !runtime.is_finished(),
+        "heartbeats must continue after a media cycle timeout"
+    );
+
+    runtime.shutdown().await.unwrap();
     time_guard.abort();
     match Arc::try_unwrap(database) {
         Ok(database) => database.shutdown().await.unwrap(),
@@ -1130,6 +1445,69 @@ async fn blocked_media_upload_keeps_heartbeats_alive_then_fails_the_worker_deadl
             panic!("control and media workers released database after shutdown");
         }
     }
+}
+
+async fn seed_media_collectors(database: &DbActorHandle) {
+    for collector_key in [
+        "communication.wechat",
+        "communication.messages",
+        "photos.library",
+    ] {
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: collector_key.to_owned(),
+                collector_version: "test".to_owned(),
+                status: CollectorStatus::Running,
+                desired_config_revision: 1,
+                applied_config_revision: 1,
+                last_event_at_ms: None,
+                last_health_at_ms: Some(1),
+                last_error_code: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .unwrap();
+    }
+}
+
+async fn assert_communication_media_cycle_timeout(database: &DbActorHandle) {
+    let states = database.load_collector_states().await.unwrap();
+    for collector_key in ["communication.wechat", "communication.messages"] {
+        let state = states
+            .iter()
+            .find(|state| state.collector_key == collector_key)
+            .unwrap();
+        assert_eq!(
+            state.status,
+            CollectorStatus::Degraded,
+            "{collector_key} must remain degraded after media cycle timeout"
+        );
+        assert_eq!(
+            state.last_error_code.as_deref(),
+            Some("MEDIA_CYCLE_TIMEOUT"),
+            "{collector_key} must retain the media cycle timeout error"
+        );
+    }
+    let photos = states
+        .iter()
+        .find(|state| state.collector_key == "photos.library")
+        .unwrap();
+    assert_eq!(photos.status, CollectorStatus::Running);
+    assert_eq!(photos.last_error_code, None);
+}
+
+async fn communication_media_cycle_timed_out(database: &DbActorHandle) -> bool {
+    let states = database.load_collector_states().await.unwrap();
+    ["communication.wechat", "communication.messages"]
+        .into_iter()
+        .all(|collector_key| {
+            states.iter().any(|state| {
+                state.collector_key == collector_key
+                    && state.status == CollectorStatus::Degraded
+                    && state.last_error_code.as_deref() == Some("MEDIA_CYCLE_TIMEOUT")
+            })
+        })
 }
 
 #[tokio::test(start_paused = true)]

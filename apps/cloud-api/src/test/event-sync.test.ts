@@ -380,7 +380,66 @@ test("paired device syncs a private communication event only through its dedicat
   );
 
   const wrongEndpoint = await api.request("/v1/agent/sync/events", request);
-  assert.equal(wrongEndpoint.status, 400);
+  assert.equal(wrongEndpoint.status, 200);
+  assert.deepEqual(
+    (await wrongEndpoint.json() as {
+      rejected: Array<{ event_id: string; error_code: string; retryable: boolean }>;
+    }).rejected,
+    [
+      "01986666-7666-8666-8666-666666666670",
+      "01986666-7666-8666-8666-666666666667",
+      "01986666-7666-8666-8666-666666666671",
+    ].map((event_id) => ({
+      event_id,
+      error_code: "SYNC_PAYLOAD_REJECTED",
+      retryable: false,
+    })),
+  );
+});
+
+test("communication sync accepts valid events while rejecting one unsupported event", async () => {
+  const { api, credentials } = await pairedApi();
+  const unsupported = communicationText(credentials.device_id);
+  unsupported.event_type = "communication.future_recorded";
+
+  const response = await api.request("/v1/agent/sync/communication/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-77777777776f",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [communicationConversation(credentials.device_id), unsupported],
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  const body = await response.json() as {
+    batch_id: string;
+    accepted: string[];
+    duplicates: string[];
+    rejected: Array<{ event_id: string; error_code: string; retryable: boolean }>;
+    server_time: string;
+  };
+  assert.deepEqual({
+    batch_id: body.batch_id,
+    accepted: body.accepted,
+    duplicates: body.duplicates,
+    rejected: body.rejected,
+  }, {
+    batch_id: "01987777-7777-8777-8777-77777777776f",
+    accepted: ["01986666-7666-8666-8666-666666666670"],
+    duplicates: [],
+    rejected: [{
+      event_id: "01986666-7666-8666-8666-666666666667",
+      error_code: "SYNC_PAYLOAD_REJECTED",
+      retryable: false,
+    }],
+  });
+  assert.equal(Number.isNaN(Date.parse(body.server_time)), false);
 });
 
 test("a later media projection replaces the earlier projection for the same message", async () => {
@@ -430,6 +489,53 @@ test("a later media projection replaces the earlier projection for the same mess
     mime_type: "image/jpeg",
     object_id: null,
     object_state: null,
+  }]);
+});
+
+test("a complete forwarded chat record replaces its earlier WeChat preview", async () => {
+  const { api, credentials } = await pairedApi();
+  const preview = communicationText(credentials.device_id);
+  preview.payload.text = "[聊天记录] 群聊的聊天记录 · 只有预览";
+  const complete = communicationText(credentials.device_id);
+  complete.event_id = "01986666-7666-8666-8666-666666666675";
+  complete.created_at = "2026-08-02T00:01:00Z";
+  complete.payload.source_key = "opaque-source-key-1:shared-chat-v2";
+  complete.payload.text = "[聊天记录] 群聊的聊天记录\n[完整记录 · 1 条]\n── Sender One · 2026-08-02 08:00 ──\n完整内容";
+  complete.idempotency_key = complete.payload.source_key;
+
+  for (const event of [preview, complete]) {
+    const response = await api.request("/v1/agent/sync/communication/events", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${credentials.device_access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        batch_id: crypto.randomUUID(),
+        device_id: credentials.device_id,
+        protocol_version: 1,
+        events: [event],
+      }),
+    });
+    assert.equal(response.status, 200);
+  }
+
+  const response = await api.request(
+    `/v1/devices/${credentials.device_id}/communication/conversations/conversation-1/messages`,
+  );
+  assert.equal(response.status, 200);
+  const body = await response.json() as { messages: Array<{ event_id: string; text: string }> };
+  assert.deepEqual(body.messages, [{
+    event_id: complete.event_id,
+    message_id: "message-1",
+    sender_id: "wxid_sender",
+    sender_display_name: "Sender One",
+    sender_avatar_url: null,
+    occurred_at: "2026-08-02T00:00:00.000Z",
+    direction: "incoming",
+    kind: "text",
+    text: complete.payload.text,
+    attachments: [],
   }]);
 });
 
@@ -753,7 +859,7 @@ test("a missing communication attachment has a dedicated prepare error", async (
   });
 });
 
-test("communication sync rejects an idempotency key that is not the opaque source key", async () => {
+test("communication sync returns a terminal rejection for a mismatched idempotency key", async () => {
   const { api, credentials } = await pairedApi();
   const event = communicationText(credentials.device_id);
   event.idempotency_key = "different-key";
@@ -770,7 +876,17 @@ test("communication sync rejects an idempotency key that is not the opaque sourc
       events: [event],
     }),
   });
-  assert.equal(response.status, 400);
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    (await response.json() as {
+      rejected: Array<{ event_id: string; error_code: string; retryable: boolean }>;
+    }).rejected,
+    [{
+      event_id: event.event_id,
+      error_code: "SYNC_PAYLOAD_REJECTED",
+      retryable: false,
+    }],
+  );
 });
 
 test("only a completed attachment receives a short Owner read URL", async () => {
@@ -1118,7 +1234,7 @@ test("paired device uploads strict agent and network lifecycle events", async ()
 
   const broadened = agentStarted(credentials.device_id);
   broadened.payload = { reason: "must remain local" };
-  const rejected = await api.request("/v1/agent/sync/events", {
+  const mixed = await api.request("/v1/agent/sync/events", {
     method: "POST",
     headers: {
       authorization: `Bearer ${credentials.device_access_token}`,
@@ -1128,10 +1244,39 @@ test("paired device uploads strict agent and network lifecycle events", async ()
       batch_id: "01987777-7777-8777-8777-777777777775",
       device_id: credentials.device_id,
       protocol_version: 1,
-      events: [broadened],
+      events: [systemMetric(credentials.device_id), broadened],
     }),
   });
-  assert.equal(rejected.status, 400);
+  assert.equal(mixed.status, 200);
+  const mixedBody = await mixed.json() as {
+    accepted: string[];
+    duplicates: string[];
+    rejected: Array<{ event_id: string; error_code: string; retryable: boolean }>;
+  };
+  assert.deepEqual(mixedBody.accepted, ["01986666-7666-8666-8666-666666666666"]);
+  assert.deepEqual(mixedBody.duplicates, []);
+  assert.deepEqual(mixedBody.rejected, [{
+    event_id: "01986666-7666-8666-8666-666666666669",
+    error_code: "SYNC_PAYLOAD_REJECTED",
+    retryable: false,
+  }]);
+
+  const malformed: Record<string, unknown> = { ...systemMetric(credentials.device_id) };
+  delete malformed.event_id;
+  const malformedResponse = await api.request("/v1/agent/sync/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777774",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [malformed],
+    }),
+  });
+  assert.equal(malformedResponse.status, 400);
 });
 
 test("paired device uploads one strict system metric idempotently and its owner can read it", async () => {

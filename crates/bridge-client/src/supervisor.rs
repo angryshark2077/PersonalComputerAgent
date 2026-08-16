@@ -390,7 +390,7 @@ impl BridgeSupervisor {
         self
     }
 
-    /// Runs the Bridge child lifecycle until cancellation or protocol incompatibility.
+    /// Runs the Bridge child lifecycle until cancellation.
     ///
     /// The signed helper executable is started directly with its Bridge socket and, when enabled,
     /// its Agent-owned sleep-control socket;
@@ -441,6 +441,7 @@ impl BridgeSupervisor {
                 ConnectOutcome::Incompatible => {
                     cleanup_child(&mut child, self.config.client_config.socket_path()).await?;
                     status.emit(BridgeStatus::Incompatible);
+                    wait_for_shutdown(&mut shutdown).await;
                     return Ok(());
                 }
                 ConnectOutcome::Failed => {
@@ -784,6 +785,14 @@ async fn wait_or_cancel(duration: Duration, shutdown: &mut watch::Receiver<bool>
             true
         }
         () = sleep(duration) => false,
+    }
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
     }
 }
 

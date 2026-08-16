@@ -415,6 +415,11 @@ enum PersistOutcome {
     Shutdown,
 }
 
+enum PendingWriteError {
+    Retryable,
+    Terminal(SystemRuntimeError),
+}
+
 async fn persist_pending(
     database: &DbActorHandle,
     identity: &CollectorIdentity,
@@ -430,26 +435,34 @@ async fn persist_pending(
         if *shutdown.borrow() {
             return Ok(PersistOutcome::Shutdown);
         }
-        if write_pending(database, sink, pending.clone()).await.is_ok() {
-            if registry.persistence_failed() {
-                let recovery = registry.record_persistence_recovery(clock_now_ms()?);
-                if let Some(collector) = collector {
-                    if recovery.sampling_suppressed {
-                        collector.set_suppressed(true);
+        match write_pending(database, sink, pending.clone()).await {
+            Ok(()) => {
+                if registry.persistence_failed() {
+                    let recovery = registry.record_persistence_recovery(clock_now_ms()?);
+                    if let Some(collector) = collector {
+                        if recovery.sampling_suppressed {
+                            collector.set_suppressed(true);
+                        }
+                    }
+                    pending = pending_from_update(
+                        identity,
+                        &recovery,
+                        None,
+                        recovery.state.updated_at_ms,
+                    )?;
+                    retry_index = 0;
+                    release_after_success = !recovery.sampling_suppressed;
+                    continue;
+                }
+                if release_after_success {
+                    if let Some(collector) = collector {
+                        collector.set_suppressed(false);
                     }
                 }
-                pending =
-                    pending_from_update(identity, &recovery, None, recovery.state.updated_at_ms)?;
-                retry_index = 0;
-                release_after_success = !recovery.sampling_suppressed;
-                continue;
+                return Ok(PersistOutcome::Persisted);
             }
-            if release_after_success {
-                if let Some(collector) = collector {
-                    collector.set_suppressed(false);
-                }
-            }
-            return Ok(PersistOutcome::Persisted);
+            Err(PendingWriteError::Terminal(error)) => return Err(error),
+            Err(PendingWriteError::Retryable) => {}
         }
 
         release_after_success = false;
@@ -480,14 +493,26 @@ async fn write_pending(
     database: &DbActorHandle,
     sink: &dyn EventSink,
     pending: PendingWrite,
-) -> Result<(), ()> {
+) -> Result<(), PendingWriteError> {
     match pending {
-        PendingWrite::Events(commit) => sink.commit(commit).await.map_err(|_| ()),
+        PendingWrite::Events(commit) => sink.commit(commit).await.map_err(|error| {
+            if error.retryable {
+                PendingWriteError::Retryable
+            } else {
+                PendingWriteError::Terminal(SystemRuntimeError::Domain(error))
+            }
+        }),
         PendingWrite::State(state) => {
             time::timeout(DATABASE_DEADLINE, database.upsert_collector_state(&state))
                 .await
-                .map_err(|_| ())?
-                .map_err(|_| ())
+                .map_err(|_| PendingWriteError::Retryable)?
+                .map_err(|error| {
+                    if error.is_retryable() {
+                        PendingWriteError::Retryable
+                    } else {
+                        PendingWriteError::Terminal(SystemRuntimeError::Database(error))
+                    }
+                })
         }
     }
 }
@@ -587,7 +612,7 @@ fn time_from_ms(milliseconds: i64) -> Result<OffsetDateTime, SystemRuntimeError>
 
 #[cfg(test)]
 mod tests {
-    use super::SystemRuntimeHandle;
+    use super::{SystemRuntimeError, SystemRuntimeHandle};
     use crate::collector_registry::CollectorIdentity;
     use pca_db_local::DbActorHandle;
     use pca_domain::{
@@ -708,6 +733,24 @@ mod tests {
         recovery_failed: AtomicBool,
         recovery_entered: AtomicBool,
         release_recovery: Notify,
+    }
+
+    #[derive(Default)]
+    struct TerminalSink {
+        attempts: AtomicUsize,
+    }
+
+    impl EventSink for TerminalSink {
+        fn commit(&self, _commit: EventCommit) -> EventSinkFuture<'_> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(DomainError::new(
+                    "COLLECTOR_DEGRADED",
+                    "fixture permanent persistence failure",
+                    false,
+                ))
+            })
+        }
     }
 
     impl RecoveryBlockingSink {
@@ -1138,6 +1181,35 @@ mod tests {
         yield_until(|| controls.cpu_calls() >= 1 && controls.disk_calls() >= 1).await;
 
         runtime.shutdown().await.expect("shutdown runtime");
+        close_database(database).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_persistence_failure_stops_without_retrying_forever() {
+        let (_directory, database) = open_database().await;
+        let controls = FakeControls::new();
+        let sink = Arc::new(TerminalSink::default());
+        let runtime = SystemRuntimeHandle::start_with_source_and_sink(
+            Arc::clone(&database),
+            Some(identity()),
+            controls.source(),
+            sink.clone(),
+        )
+        .await
+        .expect("start paired runtime");
+
+        yield_until(|| sink.attempts.load(Ordering::SeqCst) == 1).await;
+        tokio::time::advance(Duration::from_hours(1)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(sink.attempts.load(Ordering::SeqCst), 1);
+        assert!(runtime.is_finished());
+        assert!(matches!(
+            runtime.shutdown().await,
+            Err(SystemRuntimeError::Domain(error)) if !error.retryable
+        ));
         close_database(database).await;
     }
 

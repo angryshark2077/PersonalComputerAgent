@@ -53,6 +53,7 @@ export class ControlRepositoryError extends Error {
 export interface PairingSessionInput {
   sessionIdHash: string;
   devicePublicKeyHash: string;
+  requestedDeviceId?: string | null;
   codeChallenge: string;
   callbackUri: string;
   callbackStateHash: string;
@@ -846,38 +847,70 @@ export class MemoryControlRepository implements ControlRepository {
     if (!secureEqual(session.codeChallenge, input.codeChallenge)) {
       throw new ControlRepositoryError("PKCE_INVALID");
     }
-    if (this.#devices.has(input.deviceId)) {
-      throw new ControlRepositoryError("CONFLICT");
-    }
     if (
-      this.#devicePublicKeyHashes.has(session.devicePublicKeyHash) ||
       this.#accessTokenHashes.has(input.accessTokenHash) ||
       this.#refreshTokenHashes.has(input.refreshTokenHash)
     ) {
       throw new ControlRepositoryError("CONFLICT");
     }
 
+    const requestedDeviceId = session.requestedDeviceId ?? null;
+    const existing = requestedDeviceId === null
+      ? undefined
+      : this.#devices.get(requestedDeviceId);
+    if (existing !== undefined && existing.workspaceId !== code.workspaceId) {
+      throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+    }
+    if (
+      this.#devicePublicKeyHashes.has(session.devicePublicKeyHash)
+      && existing?.devicePublicKeyHash !== session.devicePublicKeyHash
+    ) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    if (existing === undefined && this.#devices.has(input.deviceId)) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+
+    const deviceId = existing?.id ?? input.deviceId;
+    const priorCredentials = existing === undefined
+      ? []
+      : (this.#credentials.get(deviceId) ?? []);
+    const credentialGeneration = priorCredentials.reduce(
+      (maximum, record) => Math.max(maximum, record.credentialGeneration),
+      0,
+    ) + 1;
+
     const grant: DeviceCredentialGrant = {
       workspaceId: code.workspaceId,
-      deviceId: input.deviceId,
-      credentialGeneration: 1,
+      deviceId,
+      credentialGeneration,
       accessExpiresAt: input.accessExpiresAt,
       refreshExpiresAt: input.refreshExpiresAt,
     };
     code.consumedAt = input.now;
-    this.#devices.set(input.deviceId, {
-      id: input.deviceId,
-      workspaceId: code.workspaceId,
-      ownerUserId: code.ownerUserId,
-      devicePublicKeyHash: session.devicePublicKeyHash,
-      platform: "macos",
-      createdAt: input.now,
-      revokedAt: null,
-    });
+    if (existing === undefined) {
+      this.#devices.set(deviceId, {
+        id: deviceId,
+        workspaceId: code.workspaceId,
+        ownerUserId: code.ownerUserId,
+        devicePublicKeyHash: session.devicePublicKeyHash,
+        platform: "macos",
+        createdAt: input.now,
+        revokedAt: null,
+      });
+    } else {
+      this.#devicePublicKeyHashes.delete(existing.devicePublicKeyHash);
+      existing.devicePublicKeyHash = session.devicePublicKeyHash;
+      existing.revokedAt = null;
+      for (const credential of priorCredentials) {
+        if (credential.revokedAt === null) credential.revokedAt = input.now;
+      }
+    }
     this.#devicePublicKeyHashes.add(session.devicePublicKeyHash);
     this.#accessTokenHashes.add(input.accessTokenHash);
     this.#refreshTokenHashes.add(input.refreshTokenHash);
-    this.#credentials.set(input.deviceId, [
+    this.#credentials.set(deviceId, [
+      ...priorCredentials,
       {
         ...grant,
         accessTokenHash: input.accessTokenHash,
@@ -888,10 +921,12 @@ export class MemoryControlRepository implements ControlRepository {
         rotationReplayExpiresAt: null,
       },
     ]);
-    this.#configs.set(configKey(code.workspaceId, input.deviceId), {
-      configurationRevision: 0,
-      ...defaultCollectorConfig(),
-    });
+    if (existing === undefined) {
+      this.#configs.set(configKey(code.workspaceId, deviceId), {
+        configurationRevision: 0,
+        ...defaultCollectorConfig(),
+      });
+    }
     return grant;
   }
 
@@ -2372,6 +2407,7 @@ export class DrizzleControlRepository implements ControlRepository {
             sessionExpiresAt: pairingSessions.expiresAt,
             codeChallenge: pairingSessions.codeChallenge,
             devicePublicKeyHash: pairingSessions.devicePublicKeyHash,
+            requestedDeviceId: pairingSessions.requestedDeviceId,
           })
           .from(pairingAuthorizationCodes)
           .innerJoin(
@@ -2413,19 +2449,79 @@ export class DrizzleControlRepository implements ControlRepository {
           throw new ControlRepositoryError("PAIRING_REPLAYED");
         }
 
-        await transaction.insert(devices).values({
-          id: input.deviceId,
-          workspaceId: binding.workspaceId,
-          ownerUserId: binding.ownerUserId,
-          devicePublicKeyHash: binding.devicePublicKeyHash,
-          platform: "macos",
-          createdAt: input.now,
-          revokedAt: null,
-        });
+        let deviceId = input.deviceId;
+        let credentialGeneration = 1;
+        const existing = binding.requestedDeviceId === null
+          ? undefined
+          : (await transaction
+            .select({
+              id: devices.id,
+              workspaceId: devices.workspaceId,
+            })
+            .from(devices)
+            .where(eq(devices.id, binding.requestedDeviceId))
+            .limit(1))[0];
+        if (existing === undefined) {
+          await transaction.insert(devices).values({
+            id: deviceId,
+            workspaceId: binding.workspaceId,
+            ownerUserId: binding.ownerUserId,
+            devicePublicKeyHash: binding.devicePublicKeyHash,
+            platform: "macos",
+            createdAt: input.now,
+            revokedAt: null,
+          });
+          await transaction.insert(collectorConfigs).values({
+            workspaceId: binding.workspaceId,
+            deviceId,
+            configurationRevision: 0,
+            ...defaultCollectorConfig(),
+            updatedAt: input.now,
+          });
+        } else {
+          if (existing.workspaceId !== binding.workspaceId) {
+            throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+          }
+          deviceId = existing.id;
+          const [latestCredential] = await transaction
+            .select({ generation: deviceCredentialGenerations.generation })
+            .from(deviceCredentialGenerations)
+            .where(
+              and(
+                eq(deviceCredentialGenerations.workspaceId, binding.workspaceId),
+                eq(deviceCredentialGenerations.deviceId, deviceId),
+              ),
+            )
+            .orderBy(desc(deviceCredentialGenerations.generation))
+            .limit(1);
+          credentialGeneration = (latestCredential?.generation ?? 0) + 1;
+          await transaction
+            .update(deviceCredentialGenerations)
+            .set({ revokedAt: input.now })
+            .where(
+              and(
+                eq(deviceCredentialGenerations.workspaceId, binding.workspaceId),
+                eq(deviceCredentialGenerations.deviceId, deviceId),
+                isNull(deviceCredentialGenerations.revokedAt),
+              ),
+            );
+          await transaction
+            .update(devices)
+            .set({
+              devicePublicKeyHash: binding.devicePublicKeyHash,
+              revokedAt: null,
+            })
+            .where(
+              and(
+                eq(devices.id, deviceId),
+                eq(devices.workspaceId, binding.workspaceId),
+              ),
+            );
+        }
         await transaction.insert(deviceCredentialGenerations).values({
           workspaceId: binding.workspaceId,
-          deviceId: input.deviceId,
-          generation: 1,
+          deviceId,
+          generation: credentialGeneration,
           accessTokenHash: input.accessTokenHash,
           refreshTokenHash: input.refreshTokenHash,
           accessExpiresAt: input.accessExpiresAt,
@@ -2433,17 +2529,10 @@ export class DrizzleControlRepository implements ControlRepository {
           createdAt: input.now,
           revokedAt: null,
         });
-        await transaction.insert(collectorConfigs).values({
-          workspaceId: binding.workspaceId,
-          deviceId: input.deviceId,
-          configurationRevision: 0,
-          ...defaultCollectorConfig(),
-          updatedAt: input.now,
-        });
         return {
           workspaceId: binding.workspaceId,
-          deviceId: input.deviceId,
-          credentialGeneration: 1,
+          deviceId,
+          credentialGeneration,
           accessExpiresAt: input.accessExpiresAt,
           refreshExpiresAt: input.refreshExpiresAt,
         };
@@ -2711,23 +2800,48 @@ export class DrizzleControlRepository implements ControlRepository {
             }
           }
         }
-        await transaction
-          .update(deviceHeartbeats)
-          .set({
-            networkSsid: null,
-            networkBssid: null,
-            networkLocalIpv4: null,
-            networkLocalIpv6: null,
-            networkPublicIp: null,
-            networkLocationLatitude: null,
-            networkLocationLongitude: null,
-            networkLocationHorizontalAccuracyMeters: null,
-            networkLocationObservedAt: null,
-          })
-          .where(lt(
-            deviceHeartbeats.receivedAt,
-            new Date(input.receivedAt.getTime() - 30 * 24 * 60 * 60 * 1000),
-          ));
+        const privacyCutoff = new Date(input.receivedAt.getTime() - 30 * 24 * 60 * 60 * 1000);
+        await transaction.execute(sql`
+          WITH expired AS (
+            SELECT ${deviceHeartbeats.id} AS id
+            FROM ${deviceHeartbeats}
+            WHERE ${deviceHeartbeats.receivedAt} < ${privacyCutoff}
+              AND (
+                ${deviceHeartbeats.networkSsid} IS NOT NULL
+                OR ${deviceHeartbeats.networkBssid} IS NOT NULL
+                OR ${deviceHeartbeats.networkLocalIpv4} IS NOT NULL
+                OR ${deviceHeartbeats.networkLocalIpv6} IS NOT NULL
+                OR ${deviceHeartbeats.networkPublicIp} IS NOT NULL
+                OR ${deviceHeartbeats.networkIpCountry} IS NOT NULL
+                OR ${deviceHeartbeats.networkIpRegion} IS NOT NULL
+                OR ${deviceHeartbeats.networkIpCity} IS NOT NULL
+                OR ${deviceHeartbeats.networkIpAccuracy} IS NOT NULL
+                OR ${deviceHeartbeats.networkLocationLatitude} IS NOT NULL
+                OR ${deviceHeartbeats.networkLocationLongitude} IS NOT NULL
+                OR ${deviceHeartbeats.networkLocationHorizontalAccuracyMeters} IS NOT NULL
+                OR ${deviceHeartbeats.networkLocationObservedAt} IS NOT NULL
+              )
+            ORDER BY ${deviceHeartbeats.receivedAt}
+            LIMIT 1000
+            FOR UPDATE SKIP LOCKED
+          )
+          UPDATE ${deviceHeartbeats}
+          SET network_ssid = NULL,
+              network_bssid = NULL,
+              network_local_ipv4 = NULL,
+              network_local_ipv6 = NULL,
+              network_public_ip = NULL,
+              network_ip_country = NULL,
+              network_ip_region = NULL,
+              network_ip_city = NULL,
+              network_ip_accuracy = NULL,
+              network_location_latitude = NULL,
+              network_location_longitude = NULL,
+              network_location_horizontal_accuracy_meters = NULL,
+              network_location_observed_at = NULL
+          FROM expired
+          WHERE ${deviceHeartbeats.id} = expired.id
+        `);
       });
     } catch (error) {
       throw repositoryError(error);

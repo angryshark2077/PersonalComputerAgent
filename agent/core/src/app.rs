@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{fs, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 #[cfg(feature = "process-test-hooks")]
 use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
@@ -14,7 +14,10 @@ use pca_agentd::{
         CloudControlCommands, CloudControlOwner, ControlClient, HttpControlClient,
         PRODUCTION_CLOUD_API_ORIGIN,
     },
-    communication::{CommunicationAuthorization, CommunicationRuntime},
+    communication::{
+        CommunicationAuthorization, CommunicationControl, CommunicationIdentity,
+        CommunicationRuntime,
+    },
     pairing_ipc::{PairingIpcServer, PairingIpcServerError, PairingSocket},
     sleep_ipc::{
         SleepControlCommand, SleepControlIpcServer, SleepControlIpcServerError, SleepControlSocket,
@@ -72,7 +75,9 @@ const LIFECYCLE_CAPACITY: usize = 32;
 const CONTROL_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_PERSIST_TIMEOUT: Duration = Duration::from_secs(15);
+// This remains below the Bridge's 25-second IPC timeout, including collector shutdown.
 const SLEEP_PREPARE_TIMEOUT: Duration = Duration::from_secs(20);
+const MISSING_WAKE_RECOVERY_DELAY: Duration = Duration::from_secs(30);
 
 fn production_communication_factory(
     local_database: PathBuf,
@@ -258,6 +263,7 @@ struct RuntimeResources {
     sleep_control_shutdown: Option<watch::Sender<bool>>,
     sleep_control_task: Option<JoinHandle<Result<(), SleepControlIpcServerError>>>,
     collectors_suspended_for_sleep: bool,
+    sleep_prepared_at: Option<tokio::time::Instant>,
     control: Option<CloudControlOwner>,
     control_bootstrap_task: Option<JoinHandle<()>>,
     heartbeat: Option<LocalHeartbeatWriter>,
@@ -292,6 +298,7 @@ impl RuntimeResources {
             sleep_control_shutdown: None,
             sleep_control_task: None,
             collectors_suspended_for_sleep: false,
+            sleep_prepared_at: None,
             control: None,
             control_bootstrap_task: None,
             heartbeat: None,
@@ -335,9 +342,18 @@ impl RuntimeResources {
         let credential_store: Arc<dyn CredentialStore> = Arc::new(ProcessTestCredentialStore);
         let (bridge_status_sender, mut bridge_status_receiver) =
             watch::channel(BridgeStatus::Disconnected);
-        let pairing_valid = false;
+        let pairing_state = self
+            .load_pairing_state(FailureStage::PairingConfiguration)
+            .await?;
+        let pairing_valid = pairing_state.as_ref().is_some_and(PairingState::is_paired);
         let (pairing_state_sender, mut pairing_state_receiver) = watch::channel(pairing_valid);
         let communication_authorization = CommunicationAuthorization::new();
+        restore_persisted_communication_authorization(
+            self.database(),
+            pairing_state.as_ref(),
+            &communication_authorization,
+        )
+        .await?;
         let network_observations = Arc::new(NetworkObservationState::default());
         let (screen_capture, screen_capture_receiver) = screen_capture_command_channel();
         let (control, control_commands) = CloudControlOwner::start_with_screen_capture(
@@ -426,12 +442,15 @@ impl RuntimeResources {
             bridge_status_sender.send_replace(BridgeStatus::Degraded);
         }
 
-        let lifecycle_identity = config.collector_identity().map(|identity| {
-            RuntimeIdentity::new(
-                identity.workspace_id.hyphenated().to_string(),
-                identity.device_id.hyphenated().to_string(),
-            )
-        });
+        let lifecycle_identity = lifecycle_identity_from_pairing_state(pairing_state.as_ref())
+            .or_else(|| {
+                config.collector_identity().map(|identity| {
+                    RuntimeIdentity::new(
+                        identity.workspace_id.hyphenated().to_string(),
+                        identity.device_id.hyphenated().to_string(),
+                    )
+                })
+            });
         let capability_refresher: Arc<dyn CapabilityRefresher> = wake_refresh_sender.map_or_else(
             || Arc::new(NoopCapabilityRefresher) as Arc<dyn CapabilityRefresher>,
             |sender| Arc::new(ControlCapabilityRefresher { sender }),
@@ -522,6 +541,19 @@ impl RuntimeResources {
                         let _ = self.persist_status().await;
                         return Err(stage);
                     }
+                    if sleep_recovery_due(
+                        self.collectors_suspended_for_sleep,
+                        self.sleep_prepared_at.map(|prepared_at| prepared_at.elapsed()),
+                    ) {
+                        if let Some(lifecycle) = self.lifecycle.as_ref() {
+                            lifecycle.abort_sleep_preparation().await;
+                        }
+                        self.resume_collectors_after_wake(
+                            config,
+                            &communication_authorization,
+                            *pairing_state_receiver.borrow(),
+                        ).await?;
+                    }
                     self.restart_system_collector_if_finished(config).await?;
                     self.restart_communication_collector_if_finished(
                         config,
@@ -577,18 +609,23 @@ impl RuntimeResources {
                 }
                 Some(event) = platform_event_receiver.recv() => {
                     if let Some(lifecycle) = self.lifecycle.as_ref() {
-                        match lifecycle.record_platform_event(&event).await {
-                            Ok(_) => {
-                                if event.event_type == "system.wake" {
-                                    self.resume_collectors_after_wake(
-                                        config,
-                                        &communication_authorization,
-                                        *pairing_state_receiver.borrow(),
-                                    ).await?;
-                                }
+                        let lifecycle_result = lifecycle.record_platform_event(&event).await;
+                        if event.event_type == "system.wake" {
+                            if lifecycle_result.is_err() {
+                                eprintln!(
+                                    "pca-agentd: wake lifecycle side effect failed; resuming collectors"
+                                );
                             }
-                            Err(LifecycleError::IdentityUnavailable) => {}
-                            Err(_) => return Err(FailureStage::Lifecycle),
+                            self.resume_collectors_after_wake(
+                                config,
+                                &communication_authorization,
+                                *pairing_state_receiver.borrow(),
+                            ).await?;
+                        } else if platform_lifecycle_failure_is_fatal(
+                            &event.event_type,
+                            &lifecycle_result,
+                        ) {
+                            return Err(FailureStage::Lifecycle);
                         }
                     }
                 }
@@ -648,17 +685,20 @@ impl RuntimeResources {
         &mut self,
         config: &RunConfig,
     ) -> Result<(), FailureStage> {
-        if !self
-            .system_runtime
-            .as_ref()
-            .is_some_and(SystemRuntimeHandle::is_finished)
-        {
+        if !collector_needs_restart(
+            self.collectors_suspended_for_sleep,
+            self.system_runtime
+                .as_ref()
+                .is_some_and(SystemRuntimeHandle::is_finished),
+            self.system_runtime.is_some(),
+        ) {
             return Ok(());
         }
         let paired = self
             .load_pairing_state(FailureStage::SystemCollector)
             .await?
-            .is_some();
+            .as_ref()
+            .is_some_and(PairingState::is_paired);
         self.restart_system_collector(config, paired).await
     }
 
@@ -703,11 +743,13 @@ impl RuntimeResources {
         config: &RunConfig,
         authorization: &CommunicationAuthorization,
     ) -> Result<(), FailureStage> {
-        if !self
-            .communication_runtime
-            .as_ref()
-            .is_some_and(CommunicationRuntime::is_finished)
-        {
+        if !collector_needs_restart(
+            self.collectors_suspended_for_sleep,
+            self.communication_runtime
+                .as_ref()
+                .is_some_and(CommunicationRuntime::is_finished),
+            self.communication_runtime.is_some(),
+        ) {
             return Ok(());
         }
         let _ = self.persist_status().await;
@@ -725,28 +767,52 @@ impl RuntimeResources {
         if self.collectors_suspended_for_sleep {
             return Ok(());
         }
-        let lifecycle = self.lifecycle.as_ref().ok_or(FailureStage::Lifecycle)?;
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return Err(FailureStage::Lifecycle);
+        };
         if !lifecycle.has_identity().await {
             return Err(FailureStage::Lifecycle);
         }
-        if let Some(runtime) = self.system_runtime.take() {
-            tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
-                .await
-                .map_err(|_| FailureStage::SystemCollectorCleanup)?
-                .map_err(|_| FailureStage::SystemCollectorCleanup)?;
-        }
-        if let Some(runtime) = self.communication_runtime.take() {
-            tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
-                .await
-                .map_err(|_| FailureStage::CommunicationCollectorCleanup)?
-                .map_err(|_| FailureStage::CommunicationCollectorCleanup)?;
-        }
-        tokio::time::timeout(SLEEP_PREPARE_TIMEOUT, lifecycle.prepare_sleep())
-            .await
-            .map_err(|_| FailureStage::Lifecycle)?
-            .map_err(|_| FailureStage::Lifecycle)?;
         self.collectors_suspended_for_sleep = true;
-        Ok(())
+        self.sleep_prepared_at = Some(tokio::time::Instant::now());
+        let deadline = tokio::time::Instant::now() + SLEEP_PREPARE_TIMEOUT;
+        let result = async {
+            let system = self.system_runtime.take();
+            let communication = self.communication_runtime.take();
+            finish_sleep_collector_shutdowns(
+                async move {
+                    match system {
+                        Some(runtime) => runtime
+                            .shutdown()
+                            .await
+                            .map_err(|_| FailureStage::SystemCollectorCleanup),
+                        None => Ok(()),
+                    }
+                },
+                async move {
+                    match communication {
+                        Some(runtime) => runtime
+                            .shutdown()
+                            .await
+                            .map_err(|_| FailureStage::CommunicationCollectorCleanup),
+                        None => Ok(()),
+                    }
+                },
+            )
+            .await?;
+            tokio::time::timeout_at(deadline, lifecycle.prepare_sleep())
+                .await
+                .map_err(|_| FailureStage::Lifecycle)?
+                .map_err(|_| FailureStage::Lifecycle)
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(stage) => {
+                lifecycle.abort_sleep_preparation().await;
+                Err(stage)
+            }
+        }
     }
 
     async fn resume_collectors_after_wake(
@@ -758,10 +824,31 @@ impl RuntimeResources {
         if !self.collectors_suspended_for_sleep {
             return Ok(());
         }
-        self.start_system_collector(config, paired).await?;
-        self.start_communication_collector(config, authorization)
-            .await?;
+        if collector_needs_resume(
+            self.system_runtime
+                .as_ref()
+                .is_some_and(SystemRuntimeHandle::is_finished),
+            self.system_runtime.is_some(),
+        ) {
+            if let Some(runtime) = self.system_runtime.take() {
+                let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, runtime.shutdown()).await;
+            }
+            self.start_system_collector(config, paired).await?;
+        }
+        if collector_needs_resume(
+            self.communication_runtime
+                .as_ref()
+                .is_some_and(CommunicationRuntime::is_finished),
+            self.communication_runtime.is_some(),
+        ) {
+            if let Some(runtime) = self.communication_runtime.take() {
+                let _ = runtime.shutdown().await;
+            }
+            self.start_communication_collector(config, authorization)
+                .await?;
+        }
         self.collectors_suspended_for_sleep = false;
+        self.sleep_prepared_at = None;
         Ok(())
     }
 
@@ -790,14 +877,15 @@ impl RuntimeResources {
     async fn persist_status(&self) -> Result<(), FailureStage> {
         let heartbeat = self.heartbeat.as_ref().ok_or(FailureStage::Heartbeat)?;
         let schema_version = self.schema_version.ok_or(FailureStage::Heartbeat)?;
-        let local_healthy = !self
-            .system_runtime
-            .as_ref()
-            .is_some_and(SystemRuntimeHandle::is_finished)
-            && !self
+        let local_healthy = !self.collectors_suspended_for_sleep
+            && self
+                .system_runtime
+                .as_ref()
+                .is_some_and(|runtime| !runtime.is_finished())
+            && self
                 .communication_runtime
                 .as_ref()
-                .is_some_and(CommunicationRuntime::is_finished)
+                .is_some_and(|runtime| !runtime.is_finished())
             && !self
                 .control
                 .as_ref()
@@ -922,6 +1010,44 @@ impl RuntimeResources {
         }
         failures
     }
+}
+
+fn platform_lifecycle_failure_is_fatal(
+    event_type: &str,
+    result: &Result<Option<String>, LifecycleError>,
+) -> bool {
+    event_type != "system.wake"
+        && !matches!(result, Ok(_) | Err(LifecycleError::IdentityUnavailable))
+}
+
+const fn collector_needs_restart(
+    suspended_for_sleep: bool,
+    is_finished: bool,
+    is_present: bool,
+) -> bool {
+    !suspended_for_sleep && (!is_present || is_finished)
+}
+
+const fn collector_needs_resume(is_finished: bool, is_present: bool) -> bool {
+    !is_present || is_finished
+}
+
+async fn finish_sleep_collector_shutdowns<SystemShutdown, CommunicationShutdown>(
+    system_shutdown: SystemShutdown,
+    communication_shutdown: CommunicationShutdown,
+) -> Result<(), FailureStage>
+where
+    SystemShutdown: Future<Output = Result<(), FailureStage>>,
+    CommunicationShutdown: Future<Output = Result<(), FailureStage>>,
+{
+    let (system_result, communication_result) =
+        tokio::join!(system_shutdown, communication_shutdown);
+    system_result?;
+    communication_result
+}
+
+fn sleep_recovery_due(suspended: bool, elapsed: Option<Duration>) -> bool {
+    suspended && elapsed.is_some_and(|elapsed| elapsed >= MISSING_WAKE_RECOVERY_DELAY)
 }
 
 async fn run(config: &RunConfig) -> Result<(), AppError> {
@@ -1160,10 +1286,50 @@ async fn start_paired_control(
         .map_err(|_| FailureStage::ControlConfiguration)
 }
 
+async fn restore_persisted_communication_authorization(
+    database: &DbActorHandle,
+    pairing: Option<&PairingState>,
+    authorization: &CommunicationAuthorization,
+) -> Result<(), FailureStage> {
+    let Some(pairing) = pairing.filter(|state| state.is_paired()) else {
+        return Ok(());
+    };
+    if pairing.applied_control_revision == 0 {
+        return Ok(());
+    }
+    let control = database
+        .load_applied_collector_control()
+        .await
+        .map_err(|_| FailureStage::CommunicationCollector)?;
+    let Some(control) = control.filter(|control| {
+        control.device_id == pairing.device_id
+            && control.workspace_id == pairing.workspace_id
+            && (control.configuration_revision == pairing.applied_control_revision
+                || control.is_legacy_bootstrap())
+    }) else {
+        return Ok(());
+    };
+    let identity = CommunicationIdentity::try_new(&pairing.workspace_id, &pairing.device_id)
+        .map_err(|_| FailureStage::CommunicationCollector)?;
+    let control = CommunicationControl::paired(
+        identity,
+        pairing.applied_control_revision,
+        control.communication_wechat_enabled,
+    )
+    .map_err(|_| FailureStage::CommunicationCollector)?;
+    authorization
+        .apply_persisted(control)
+        .await
+        .map_err(|_| FailureStage::CommunicationCollector)
+}
+
 fn collector_identity_from_pairing_state(
     state: Option<&PairingState>,
 ) -> Option<CollectorIdentity> {
     let state = state?;
+    if !state.is_paired() {
+        return None;
+    }
     let workspace_id = Uuid::parse_str(&state.workspace_id).ok()?;
     let device_id = Uuid::parse_str(&state.device_id).ok()?;
     if workspace_id.is_nil() || device_id.is_nil() {
@@ -1343,11 +1509,8 @@ fn health(paths: &RuntimePaths) -> u8 {
 #[cfg(feature = "process-test-hooks")]
 async fn await_fatal_cleanup_release(
     hook: &ProcessTestFatalCleanupConfig,
-    statuses: &mut watch::Receiver<BridgeStatus>,
+    _statuses: &mut watch::Receiver<BridgeStatus>,
 ) -> Result<(), FailureStage> {
-    wait_for_bridge_spawn(statuses)
-        .await
-        .map_err(|()| FailureStage::InjectedHeartbeat)?;
     wait_for_process_test_file(&hook.bridge_pid_ready)
         .await
         .map_err(|()| FailureStage::InjectedHeartbeat)?;
@@ -1356,20 +1519,6 @@ async fn await_fatal_cleanup_release(
     wait_for_process_test_file(&hook.release)
         .await
         .map_err(|()| FailureStage::InjectedHeartbeat)
-}
-
-#[cfg(feature = "process-test-hooks")]
-async fn wait_for_bridge_spawn(statuses: &mut watch::Receiver<BridgeStatus>) -> Result<(), ()> {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if *statuses.borrow_and_update() == BridgeStatus::Handshaking {
-                return Ok(());
-            }
-            statuses.changed().await.map_err(|_| ())?;
-        }
-    })
-    .await
-    .map_err(|_| ())?
 }
 
 #[cfg(feature = "process-test-hooks")]
@@ -1472,11 +1621,102 @@ mod tests {
             }),
         );
 
+        let manually_unpaired = PairingState {
+            manually_unpaired: true,
+            ..paired.clone()
+        };
+        assert_eq!(
+            collector_identity_from_pairing_state(Some(&manually_unpaired)),
+            None
+        );
+
         let invalid = PairingState {
             device_id: Uuid::nil().to_string(),
             ..paired
         };
         assert_eq!(collector_identity_from_pairing_state(Some(&invalid)), None);
         assert_eq!(collector_identity_from_pairing_state(None), None);
+    }
+
+    #[test]
+    fn missing_collector_is_restarted_unless_sleep_preparation_succeeded() {
+        assert!(collector_needs_restart(false, false, false));
+        assert!(collector_needs_restart(false, true, true));
+        assert!(!collector_needs_restart(false, false, true));
+        assert!(!collector_needs_restart(true, false, false));
+    }
+
+    #[test]
+    fn wake_rebuilds_every_missing_or_finished_collector() {
+        assert!(collector_needs_resume(false, false));
+        assert!(collector_needs_resume(true, true));
+        assert!(!collector_needs_resume(false, true));
+    }
+
+    #[test]
+    fn missing_wake_event_cannot_suspend_wechat_forever() {
+        assert!(!sleep_recovery_due(true, Some(Duration::from_secs(29))));
+        assert!(sleep_recovery_due(true, Some(MISSING_WAKE_RECOVERY_DELAY)));
+        assert!(!sleep_recovery_due(
+            false,
+            Some(MISSING_WAKE_RECOVERY_DELAY)
+        ));
+    }
+
+    #[test]
+    fn wake_side_effect_failure_does_not_stop_the_agent() {
+        let refresh_failure: Result<Option<String>, LifecycleError> =
+            Err(LifecycleError::CapabilityRefresh);
+        assert!(!platform_lifecycle_failure_is_fatal(
+            "system.wake",
+            &refresh_failure
+        ));
+        assert!(platform_lifecycle_failure_is_fatal(
+            "system.sleep",
+            &refresh_failure
+        ));
+
+        let unpaired: Result<Option<String>, LifecycleError> =
+            Err(LifecycleError::IdentityUnavailable);
+        assert!(!platform_lifecycle_failure_is_fatal(
+            "network.changed",
+            &unpaired
+        ));
+    }
+
+    #[test]
+    fn sleep_prepare_budget_finishes_before_the_bridge_request_timeout() {
+        assert!(SLEEP_PREPARE_TIMEOUT < Duration::from_secs(25));
+    }
+
+    #[tokio::test]
+    async fn sleep_shutdown_waits_for_both_collectors_before_returning_failure() {
+        let (system_release, system_shutdown) = tokio::sync::oneshot::channel::<()>();
+        let (communication_release, communication_shutdown) = tokio::sync::oneshot::channel::<()>();
+
+        let shutdown = tokio::spawn(finish_sleep_collector_shutdowns(
+            async move {
+                system_shutdown.await.expect("release system shutdown");
+                Err(FailureStage::SystemCollectorCleanup)
+            },
+            async move {
+                communication_shutdown
+                    .await
+                    .expect("release communication shutdown");
+                Ok(())
+            },
+        ));
+
+        system_release.send(()).expect("release system shutdown");
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+
+        communication_release
+            .send(())
+            .expect("release communication shutdown");
+        assert!(matches!(
+            shutdown.await.expect("join shutdown task"),
+            Err(FailureStage::SystemCollectorCleanup)
+        ));
     }
 }

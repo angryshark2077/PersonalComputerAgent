@@ -10,6 +10,7 @@
       "required": ["device_public_key", "code_challenge", "callback_uri", "callback_state"],
       "properties": {
         "device_public_key": { "type": "string", "minLength": 1 },
+        "existing_device_id": { "type": ["string", "null"], "format": "uuid" },
         "code_challenge": { "type": "string", "minLength": 1 },
         "callback_state": {
           "type": "string",

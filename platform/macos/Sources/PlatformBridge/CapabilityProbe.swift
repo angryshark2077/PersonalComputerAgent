@@ -66,6 +66,15 @@ struct CapabilityProbe: Sendable {
         permission(for: .screenCapture)
     }
 
+    func screenCaptureAvailability() -> String {
+        switch screenCapturePermission() {
+        case .granted: "available"
+        case .notDetermined: "not_determined"
+        case .denied, .restricted: "permission_required"
+        case .unavailable: "unavailable"
+        }
+    }
+
     func permission(for capability: PlatformCapability) -> PermissionStatus {
         Self.map(source.status(for: capability))
     }

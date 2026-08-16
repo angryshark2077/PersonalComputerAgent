@@ -36,7 +36,7 @@ fn map_database_error(error: &DbError) -> DomainError {
     DomainError::new(
         "COLLECTOR_DEGRADED",
         "collector persistence unavailable",
-        true,
+        error.is_retryable(),
     )
 }
 
@@ -44,6 +44,8 @@ fn database_error_kind(error: &DbError) -> &'static str {
     match error {
         DbError::Sqlite { .. } => "sqlite",
         DbError::Serialization(_) => "serialization",
+        DbError::CommunicationSourceConflict => "communication_source_conflict",
+        DbError::CommunicationSpoolUnavailable => "communication_spool_unavailable",
         DbError::MigrationChecksumMismatch { .. } => "migration_checksum",
         DbError::IncompleteMigration { .. } => "incomplete_migration",
         DbError::UnsupportedSchemaVersion { .. } => "unsupported_schema",
@@ -79,12 +81,13 @@ mod tests {
     }
 
     #[test]
-    fn every_database_error_maps_to_one_redacted_retryable_error() {
+    fn database_errors_keep_redaction_without_retrying_permanent_failures() {
         let variants = [
-            (DbError::ActorUnavailable, "actor_unavailable"),
+            (DbError::ActorUnavailable, "actor_unavailable", false),
             (
                 DbError::Serialization("secret database detail".to_owned()),
                 "serialization",
+                false,
             ),
             (
                 DbError::UnsupportedSchemaVersion {
@@ -92,15 +95,23 @@ mod tests {
                     max_supported: 2,
                 },
                 "unsupported_schema",
+                false,
+            ),
+            (
+                DbError::IntegrityCheck {
+                    details: vec!["secret corrupt page".to_owned()],
+                },
+                "integrity_check",
+                false,
             ),
         ];
 
-        for (database_error, expected_kind) in variants {
+        for (database_error, expected_kind, expected_retryable) in variants {
             assert_eq!(database_error_kind(&database_error), expected_kind);
             let mapped = map_database_error(&database_error);
             assert_eq!(mapped.code, "COLLECTOR_DEGRADED");
             assert_eq!(mapped.message, "collector persistence unavailable");
-            assert!(mapped.retryable);
+            assert_eq!(mapped.retryable, expected_retryable);
             assert!(!mapped.message.contains("secret"));
             assert!(!mapped.message.contains("99"));
         }

@@ -29,6 +29,9 @@ EXPECTED_MIGRATIONS = {
         "0011_repair_apple_message_idempotency.sql",
         "0012_normalize_apple_message_timestamps.sql",
         "0013_photo_upload_spool.sql",
+        "0014_terminal_media_failures.sql",
+        "0015_manual_unpair_state.sql",
+        "0016_applied_collector_control.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",
@@ -59,6 +62,8 @@ EXPECTED_MIGRATIONS = {
         "0025_device_network_history.sql",
         "0026_refresh_credential_replay.sql",
         "0027_device_collector_health.sql",
+        "0028_repair_existing_device_pairing.sql",
+        "0029_heartbeat_privacy_retention.sql",
     ],
 }
 
@@ -143,10 +148,32 @@ def replay_local_chain(files: list[Path]) -> str | None:
             "applied_control_revision",
             "paired_at_ms",
             "cloud_api_origin",
+            "manually_unpaired",
         ]:
             return f"unexpected pairing_state columns: {pairing_columns}"
         if connection.execute("SELECT COUNT(*) FROM pairing_state").fetchone() != (0,):
             return "pairing_state must remain empty after migration"
+        applied_control_columns = [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(applied_collector_control)"
+            ).fetchall()
+        ]
+        if applied_control_columns != [
+            "singleton_id",
+            "device_id",
+            "workspace_id",
+            "configuration_revision",
+            "communication_wechat_enabled",
+            "screen_capture_enabled",
+            "screen_capture_scheduled_enabled",
+            "screen_capture_interval_seconds",
+            "screen_capture_activity_enabled",
+            "screen_capture_activity_min_interval_seconds",
+            "screen_capture_excluded_bundle_ids_json",
+            "updated_at_ms",
+        ]:
+            return f"unexpected applied_collector_control columns: {applied_control_columns}"
     except (OSError, sqlite3.Error, UnicodeDecodeError) as error:
         return f"local migration replay failed: {error}"
     finally:

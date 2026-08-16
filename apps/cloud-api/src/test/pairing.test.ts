@@ -146,6 +146,65 @@ test("a pairing code is single use and PKCE bound", async () => {
   assert.equal((await successfulExchange()).status, 409);
 });
 
+test("repair pairing returns the existing device instead of creating a duplicate", async () => {
+  const repository = new MemoryControlRepository([
+    { workspaceId: owner.workspaceId, userId: owner.userId },
+  ]);
+  const api = createApp({ repository, ownerAuthenticator: async () => owner });
+  const pair = async (
+    devicePublicKey: string,
+    verifier: string,
+    existingDeviceId?: string,
+  ) => {
+    const sessionResponse = await api.request("/v1/device-pairing/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...start,
+        device_public_key: devicePublicKey,
+        existing_device_id: existingDeviceId,
+        code_challenge: pkceChallenge(verifier),
+      }),
+    });
+    assert.equal(sessionResponse.status, 201);
+    const { session_id: sessionId } = (await sessionResponse.json()) as {
+      session_id: string;
+    };
+    const authorized = await api.request(
+      `/v1/device-pairing/sessions/${sessionId}/authorize`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callback_state: start.callback_state }),
+      },
+    );
+    assert.equal(authorized.status, 302);
+    const authorizationCode = new URL(authorized.headers.get("location") ?? "")
+      .searchParams.get("code");
+    const exchanged = await api.request("/v1/device-pairing/exchange", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        authorization_code: authorizationCode,
+        code_verifier: verifier,
+      }),
+    });
+    assert.equal(exchanged.status, 200);
+    return await exchanged.json() as {
+      device_id: string;
+      workspace_id: string;
+    };
+  };
+
+  const original = await pair("original-device-key", "original-verifier");
+  const repaired = await pair("replacement-device-key", "repair-verifier", original.device_id);
+
+  assert.equal(repaired.device_id, original.device_id);
+  assert.equal(repaired.workspace_id, original.workspace_id);
+  assert.equal((await repository.listOwnerDevices(owner.workspaceId, owner.userId)).length, 1);
+});
+
 test("pairing authorization accepts a native Dashboard form submission", async () => {
   const api = app();
   const sessionResponse = await api.request("/v1/device-pairing/sessions", {

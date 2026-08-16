@@ -212,6 +212,7 @@ fn event_and_outbox_rows(connection: &Connection) -> (Vec<Vec<String>>, Vec<Vec<
 }
 
 type PairingSnapshot = (String, String, String, u64, String, u64, i64);
+type AppliedControlSnapshot = (String, String, u64, bool, bool, bool, bool, String);
 
 fn insert_previous_pairing_state(connection: &Connection) {
     connection
@@ -255,6 +256,31 @@ fn pairing_snapshot(connection: &Connection) -> PairingSnapshot {
         .expect("read pairing state")
 }
 
+fn applied_control_snapshot(connection: &Connection) -> AppliedControlSnapshot {
+    connection
+        .query_row(
+            "SELECT device_id, workspace_id, configuration_revision,
+                    communication_wechat_enabled, screen_capture_enabled,
+                    screen_capture_scheduled_enabled, screen_capture_activity_enabled,
+                    screen_capture_excluded_bundle_ids_json
+             FROM applied_collector_control WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .expect("read migrated applied Collector control")
+}
+
 fn schema(connection: &Connection) -> Vec<(String, String, String)> {
     let mut statement = connection
         .prepare(
@@ -278,7 +304,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         .expect("open empty database");
     let health = db.health().await.expect("database health");
 
-    assert_eq!(health.schema_version, 13);
+    assert_eq!(health.schema_version, 16);
     assert!(health.integrity_ok);
     assert!(health.foreign_keys_ok);
     let connection = Connection::open(&path).expect("inspect migrated database");
@@ -293,6 +319,7 @@ async fn empty_database_is_migrated_and_reports_healthy() {
         tables,
         vec![
             "agent_state",
+            "applied_collector_control",
             "attachment_spool",
             "collector_states",
             "communication_conversations",
@@ -399,6 +426,45 @@ async fn collector_state_survives_reopen_but_runtime_status_is_data_not_policy()
 }
 
 #[tokio::test]
+async fn healthy_collector_write_cannot_race_away_a_media_failure() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let mut failed = collector_state(CollectorStatus::Degraded);
+    failed.collector_key = "communication.wechat".to_owned();
+    failed.last_error_code = Some("MEDIA_CYCLE_TIMEOUT".to_owned());
+    failed.last_health_at_ms = Some(100);
+    db.upsert_collector_state(&failed)
+        .await
+        .expect("persist media failure");
+
+    let mut stale_healthy = failed.clone();
+    stale_healthy.status = CollectorStatus::Running;
+    stale_healthy.last_error_code = None;
+    stale_healthy.last_health_at_ms = Some(200);
+    db.upsert_collector_state_preserving_media_failure(&stale_healthy)
+        .await
+        .expect("persist concurrent healthy observation");
+    assert_eq!(
+        db.load_collector_states()
+            .await
+            .expect("load protected failure"),
+        vec![failed.clone()]
+    );
+
+    db.upsert_collector_state(&stale_healthy)
+        .await
+        .expect("persist explicit media recovery");
+    assert_eq!(
+        db.load_collector_states()
+            .await
+            .expect("load recovered state"),
+        vec![stale_healthy]
+    );
+}
+
+#[tokio::test]
 async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or_outbox() {
     let (_directory, path) = database_path();
     let connection = Connection::open(&path).expect("open previous database");
@@ -425,6 +491,16 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         )
         .expect("insert previous Outbox");
     insert_previous_pairing_state(&connection);
+    connection
+        .execute_batch(
+            "INSERT INTO collector_states (
+                collector_key, status, version, desired_revision, applied_revision,
+                created_at_ms, updated_at_ms
+             ) VALUES
+                ('communication.wechat', 'running', '0.2.0', 9, 9, 1, 1),
+                ('screen.capture', 'running', '0.2.0', 9, 9, 1, 1);",
+        )
+        .expect("insert previous sensitive Collector states");
     let pairing_before = pairing_snapshot(&connection);
     let before = event_and_outbox_rows(&connection);
     drop(connection);
@@ -434,7 +510,7 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
         .expect("upgrade previous database");
     assert_eq!(
         db.health().await.expect("upgraded health").schema_version,
-        13
+        16
     );
     db.shutdown().await.expect("close upgraded database");
 
@@ -442,6 +518,26 @@ async fn opening_previous_schema_adds_new_state_tables_without_changing_event_or
     assert_eq!(event_and_outbox_rows(&connection), before);
     let pairing_after = pairing_snapshot(&connection);
     assert_eq!(pairing_after, pairing_before);
+    assert!(!connection
+        .query_row(
+            "SELECT manually_unpaired FROM pairing_state WHERE singleton_id = 1",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("read migrated manual unpair state"));
+    assert_eq!(
+        applied_control_snapshot(&connection),
+        (
+            "01981111-7111-8111-8111-111111111111".to_owned(),
+            "01982222-7222-8222-8222-222222222222".to_owned(),
+            0,
+            true,
+            true,
+            true,
+            false,
+            "[]".to_owned(),
+        )
+    );
     assert_eq!(
         connection
             .query_row(
@@ -1013,7 +1109,7 @@ async fn photo_upload_commit_keeps_event_outbox_and_manifest_in_one_transaction(
         (1, 1)
     );
     let pending = db
-        .load_pending_photo_uploads(4)
+        .load_pending_photo_uploads(4, &event.workspace_id, &event.device_id)
         .await
         .expect("load pending photo upload");
     assert_eq!(pending.len(), 1);
@@ -1023,11 +1119,99 @@ async fn photo_upload_commit_keeps_event_outbox_and_manifest_in_one_transaction(
         .await
         .expect("complete photo upload");
     assert!(db
-        .load_pending_photo_uploads(4)
+        .load_pending_photo_uploads(4, &event.workspace_id, &event.device_id)
         .await
         .expect("load completed photo upload")
         .is_empty());
     db.shutdown().await.expect("close database");
+}
+
+#[tokio::test]
+async fn invalid_photo_manifest_is_preserved_but_removed_from_retry_batches() {
+    let (_directory, path) = database_path();
+    let db = DbActorHandle::open(&path, "0.2.0")
+        .await
+        .expect("open database");
+    let mut photos = collector_state(CollectorStatus::Running);
+    photos.collector_key = "photos.library".to_owned();
+    photos.last_error_code = None;
+    db.upsert_collector_state(&photos)
+        .await
+        .expect("seed photo Collector state");
+    let event = photo_event("01986666-7666-8666-8666-666666666681");
+    let photo_id = "01986666-7666-8666-8666-666666666682";
+    db.commit_photo_upload(&PhotoUploadCommit {
+        manifest_json: serde_json::json!({
+            "photo_id": photo_id,
+            "event_id": event.event_id.clone(),
+            "media_file_name": photo_id,
+        })
+        .to_string(),
+        event,
+        photo_id: photo_id.to_owned(),
+    })
+    .await
+    .expect("commit valid photo manifest fixture");
+    Connection::open(&path)
+        .expect("open corruption fixture")
+        .execute(
+            "UPDATE photo_upload_spool SET manifest_json = '{\"unexpected\":true}'
+             WHERE photo_id = ?1",
+            [photo_id],
+        )
+        .expect("simulate a structurally invalid persisted manifest");
+
+    db.quarantine_invalid_photo_upload(photo_id)
+        .await
+        .expect("quarantine invalid photo manifest");
+    assert!(db
+        .load_pending_photo_uploads(
+            4,
+            "01983333-7333-8333-8333-333333333333",
+            "01982222-7222-8222-2222-222222222222",
+        )
+        .await
+        .expect("load photo retry batch")
+        .is_empty());
+
+    let connection = Connection::open(&path).expect("inspect quarantined photo");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT transfer_state, terminal_failure_code
+                 FROM photo_upload_spool WHERE photo_id = ?1",
+                [photo_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("read quarantined photo state"),
+        (
+            "pending".to_owned(),
+            "PHOTOS_LOCAL_MANIFEST_INVALID".to_owned()
+        )
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostic_events
+                 WHERE code = 'PHOTOS_LOCAL_MANIFEST_INVALID'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("count invalid photo diagnostic"),
+        1
+    );
+    let state = db
+        .load_collector_states()
+        .await
+        .expect("load photo Collector state")
+        .into_iter()
+        .find(|state| state.collector_key == "photos.library")
+        .expect("photo Collector state");
+    assert_eq!(state.status, CollectorStatus::Degraded);
+    assert_eq!(
+        state.last_error_code.as_deref(),
+        Some("PHOTOS_LOCAL_MANIFEST_INVALID")
+    );
 }
 
 #[tokio::test]
@@ -1096,7 +1280,7 @@ async fn unsupported_future_schema_version_is_rejected() {
         .execute(
             "INSERT INTO schema_migrations \
              (id, checksum, app_version, started_at, completed_at, status) \
-             VALUES ('0014', 'future', '14.0.0', 1, 1, 'completed')",
+             VALUES ('0017', 'future', '17.0.0', 1, 1, 'completed')",
             [],
         )
         .expect("record future migration");
@@ -1107,8 +1291,8 @@ async fn unsupported_future_schema_version_is_rejected() {
     assert!(matches!(
         result,
         Err(DbError::UnsupportedSchemaVersion {
-            found: 14,
-            max_supported: 13
+            found: 17,
+            max_supported: 16
         })
     ));
 }
@@ -1131,7 +1315,7 @@ async fn agent_state_health_and_checkpoint_use_actor_requests() {
     db.checkpoint().await.expect("checkpoint WAL");
     let health = db.health().await.expect("health after checkpoint");
 
-    assert_eq!(health.schema_version, 13);
+    assert_eq!(health.schema_version, 16);
     let connection = Connection::open(&path).expect("inspect agent state");
     let state = connection
         .query_row(
@@ -1334,7 +1518,7 @@ async fn network_lifecycle_rows_load_and_ack_as_system_events() {
 }
 
 #[tokio::test]
-async fn mismatched_lifecycle_identity_is_acknowledged_without_rewriting_local_events() {
+async fn mismatched_outbox_identity_is_dead_lettered_without_rewriting_local_events() {
     let (_directory, path) = database_path();
     let db = DbActorHandle::open(&path, "0.1.0")
         .await
@@ -1348,20 +1532,37 @@ async fn mismatched_lifecycle_identity_is_acknowledged_without_rewriting_local_e
                 ('current-start', 'workspace-current', 'device-current', 'agent.started',
                  'runtime.lifecycle', 1, 2, 2, 'normal', '{}', '[]', 'current-start'),
                 ('prior-pairing', 'workspace-prior', 'device-prior', 'system.wake',
-                 'runtime.lifecycle', 1, 3, 3, 'normal', '{}', '[]', 'prior-pairing');
+                 'runtime.lifecycle', 1, 3, 3, 'normal', '{}', '[]', 'prior-pairing'),
+                ('prior-collector', 'workspace-prior', 'device-prior', 'collector.status_changed',
+                 'collector.registry', 1, 4, 4, 'normal', '{}', '[]', 'prior-collector'),
+                ('prior-metric', 'workspace-prior', 'device-prior', 'system.metric_sampled',
+                 'system', 1, 5, 5, 'normal', '{}', '[]', 'prior-metric'),
+                ('prior-photo', 'workspace-prior', 'device-prior', 'photos.asset_recorded',
+                 'photos.library', 1, 6, 6, 'high', '{}', '[]', 'prior-photo'),
+                ('prior-message', 'workspace-prior', 'device-prior', 'communication.message_recorded',
+                 'communication.wechat', 1, 7, 7, 'high', '{}', '[]', 'prior-message');
              INSERT INTO sync_outbox VALUES
                 ('event:legacy-unpaired', 'legacy-unpaired', 'pending', 1),
                 ('event:current-start', 'current-start', 'pending', 2),
-                ('event:prior-pairing', 'prior-pairing', 'pending', 3);",
+                ('event:prior-pairing', 'prior-pairing', 'pending', 3),
+                ('event:prior-collector', 'prior-collector', 'pending', 4),
+                ('event:prior-metric', 'prior-metric', 'pending', 5),
+                ('event:prior-photo', 'prior-photo', 'pending', 6),
+                ('event:prior-message', 'prior-message', 'pending', 7);
+             INSERT INTO photo_upload_spool (
+                 photo_id, event_id, manifest_json, transfer_state, created_at_ms
+             ) VALUES (
+                 '01986666-7666-8666-8666-666666666699', 'prior-photo', '{}', 'pending', 6
+             );",
         )
-        .expect("insert lifecycle fixtures");
+        .expect("insert system event fixtures");
     drop(connection);
 
     assert_eq!(
-        db.acknowledge_mismatched_lifecycle_events("workspace-current", "device-current")
+        db.dead_letter_mismatched_outbox_events("workspace-current", "device-current")
             .await
-            .expect("acknowledge mismatched lifecycle rows"),
-        2
+            .expect("terminate mismatched system rows"),
+        6
     );
     let pending = db
         .load_pending_system_events(20)
@@ -1370,21 +1571,52 @@ async fn mismatched_lifecycle_identity_is_acknowledged_without_rewriting_local_e
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].event_id, "current-start");
     assert_eq!(db.active_outbox_depth().await.expect("outbox depth"), 1);
+    assert!(db
+        .load_pending_photo_uploads(4, "workspace-current", "device-current")
+        .await
+        .expect("load current identity photo uploads")
+        .is_empty());
+    assert_eq!(
+        db.load_pending_photo_uploads(4, "workspace-prior", "device-prior")
+            .await
+            .expect("load prior identity photo uploads")
+            .len(),
+        1
+    );
 
-    let connection = Connection::open(&path).expect("inspect lifecycle quarantine");
+    let connection = Connection::open(&path).expect("inspect system identity quarantine");
     let preserved = connection
         .query_row(
             "SELECT COUNT(*) FROM events_local
-             WHERE event_id IN ('legacy-unpaired', 'prior-pairing')",
+             WHERE event_id IN (
+                 'legacy-unpaired', 'prior-pairing', 'prior-collector', 'prior-metric',
+                 'prior-photo', 'prior-message'
+             )",
             [],
             |row| row.get::<_, u64>(0),
         )
-        .expect("count preserved lifecycle events");
-    assert_eq!(preserved, 2);
+        .expect("count preserved system events");
+    assert_eq!(preserved, 6);
+    let terminal = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sync_outbox
+             WHERE event_id IN (
+                 'legacy-unpaired', 'prior-pairing', 'prior-collector', 'prior-metric',
+                 'prior-photo', 'prior-message'
+             ) AND state = 'dead_letter'",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .expect("count dead-lettered system events");
+    assert_eq!(terminal, 6);
+    assert_identity_mismatch_diagnostic(&connection);
+}
+
+fn assert_identity_mismatch_diagnostic(connection: &Connection) {
     let diagnostic = connection
         .query_row(
             "SELECT level, code, redacted_json FROM diagnostic_events
-             WHERE diagnostic_id = 'LIFECYCLE_IDENTITY_MISMATCH'",
+             WHERE diagnostic_id = 'OUTBOX_IDENTITY_MISMATCH'",
             [],
             |row| {
                 Ok((
@@ -1394,18 +1626,20 @@ async fn mismatched_lifecycle_identity_is_acknowledged_without_rewriting_local_e
                 ))
             },
         )
-        .expect("load lifecycle diagnostic");
+        .expect("load system identity diagnostic");
     assert_eq!(diagnostic.0, "warning");
-    assert_eq!(diagnostic.1, "LIFECYCLE_IDENTITY_MISMATCH");
-    assert_eq!(diagnostic.2, r#"{"discarded_event_count":2}"#);
+    assert_eq!(diagnostic.1, "OUTBOX_IDENTITY_MISMATCH");
+    assert_eq!(diagnostic.2, r#"{"dead_lettered_event_count":6}"#);
 }
 
 #[tokio::test]
 async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body() {
     let (directory, path) = database_path();
-    let db = DbActorHandle::open(&path, "0.1.0")
-        .await
-        .expect("open database");
+    let db = Arc::new(
+        DbActorHandle::open(&path, "0.1.0")
+            .await
+            .expect("open database"),
+    );
     let spool = directory.0.join("communication-spool");
     let temporary = spool.join("streaming-fixture");
     let mut file = std::fs::File::create(&temporary).expect("create large spool fixture");
@@ -1445,9 +1679,20 @@ async fn pending_attachment_keeps_a_validated_file_handle_instead_of_a_byte_body
         .expect("insert pending attachment fixture");
     drop(connection);
 
-    let pending = db
-        .load_pending_communication_attachments(1)
+    let load_database = Arc::clone(&db);
+    let load = tokio::spawn(async move {
+        load_database
+            .load_pending_communication_attachments(1)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tokio::time::timeout(Duration::from_millis(50), db.health())
         .await
+        .expect("large attachment validation must not block the database owner")
+        .expect("database stays healthy during attachment validation");
+    let pending = load
+        .await
+        .expect("join pending attachment load")
         .expect("load validated file handle");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].size_bytes, 128 * 1024 * 1024);
@@ -1594,6 +1839,12 @@ async fn invalid_attachment_is_quarantined_without_blocking_later_media() {
     let db = DbActorHandle::open(&path, "0.1.0")
         .await
         .expect("open database");
+    let mut wechat = collector_state(CollectorStatus::Running);
+    wechat.collector_key = "communication.wechat".to_owned();
+    wechat.last_error_code = None;
+    db.upsert_collector_state(&wechat)
+        .await
+        .expect("seed WeChat Collector state");
     let spool = directory.0.join("communication-spool");
     let valid_body = b"valid";
     let valid_sha256 = format!("{:x}", Sha256::digest(valid_body));
@@ -1641,12 +1892,13 @@ async fn invalid_attachment_is_quarantined_without_blocking_later_media() {
     assert_eq!(
         connection
             .query_row(
-                "SELECT transfer_state FROM attachment_spool WHERE attachment_id = 'missing'",
+                "SELECT transfer_state || ':' || terminal_failure_code
+                 FROM attachment_spool WHERE attachment_id = 'missing'",
                 [],
                 |row| row.get::<_, String>(0),
             )
             .expect("read quarantined state"),
-        "failed"
+        "failed:MEDIA_LOCAL_BODY_INVALID"
     );
     assert_eq!(
         connection
@@ -1656,6 +1908,54 @@ async fn invalid_attachment_is_quarantined_without_blocking_later_media() {
                 |row| row.get::<_, u64>(0),
             )
             .expect("count media diagnostic"),
+        1
+    );
+    drop(connection);
+
+    let state = db
+        .load_collector_states()
+        .await
+        .expect("load WeChat Collector state")
+        .into_iter()
+        .find(|state| state.collector_key == "communication.wechat")
+        .expect("WeChat Collector state");
+    assert_eq!(state.status, CollectorStatus::Degraded);
+    assert_eq!(
+        state.last_error_code.as_deref(),
+        Some("MEDIA_LOCAL_BODY_INVALID")
+    );
+
+    assert_eq!(
+        db.load_pending_communication_attachments(2)
+            .await
+            .expect("terminally quarantined attachment stays out of retry batches")
+            .into_iter()
+            .map(|attachment| attachment.attachment_id)
+            .collect::<Vec<_>>(),
+        vec!["valid"]
+    );
+    assert_unsupported_attachment_is_terminal(&db, &path).await;
+}
+
+async fn assert_unsupported_attachment_is_terminal(db: &DbActorHandle, path: &PathBuf) {
+    db.quarantine_unsupported_communication_attachment("valid")
+        .await
+        .expect("quarantine unsupported attachment source");
+    assert!(db
+        .load_pending_communication_attachments(2)
+        .await
+        .expect("all terminal attachments stay out of retry batches")
+        .is_empty());
+    assert_eq!(
+        Connection::open(path)
+            .expect("inspect unsupported source diagnostic")
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostic_events
+                 WHERE code = 'MEDIA_SOURCE_UNSUPPORTED'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("count unsupported source diagnostic"),
         1
     );
 }

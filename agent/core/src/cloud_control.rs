@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{mpsc as std_mpsc, Arc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -16,7 +16,7 @@ use pca_bridge_client::{
     NetworkObservation, NetworkObservationState, ScreenCaptureCommandHandle, ScreenCaptureStatus,
 };
 use pca_db_local::{
-    CommunicationMediaStorageStats, DbActorHandle, DbError, PairingState,
+    AppliedCollectorControl, CommunicationMediaStorageStats, DbActorHandle, DbError, PairingState,
     PendingCommunicationAttachment,
 };
 use pca_domain::{CollectorState, CollectorStatus, CommunicationScopeV2, EventEnvelope};
@@ -31,7 +31,7 @@ use tokio::{
     io::AsyncReadExt,
     sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
-    time,
+    time::{self, Instant},
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -53,15 +53,72 @@ const MEDIA_BATCH_SIZE: u16 = 4;
 const MAX_BACKOFF: Duration = CONTROL_INTERVAL;
 const CREDENTIAL_REF: &str = "keychain://pca/device/current";
 const CONTROL_OWNER_COMMAND_CAPACITY: usize = 8;
+const COMMUNICATION_MEDIA_UPLOAD_FAILED: &str = "COMMUNICATION_MEDIA_UPLOAD_FAILED";
+const PHOTOS_UPLOAD_FAILED: &str = "PHOTOS_UPLOAD_FAILED";
+const SCREEN_UPLOAD_FAILED: &str = "SCREEN_UPLOAD_FAILED";
+const SCREEN_UPLOAD_TIMEOUT: &str = "SCREEN_UPLOAD_TIMEOUT";
+const MEDIA_CYCLE_TIMEOUT_ERROR: &str = "MEDIA_CYCLE_TIMEOUT";
+const SCREEN_LOCAL_MANIFEST_INVALID: &str = "SCREEN_LOCAL_MANIFEST_INVALID";
+const MEDIA_SOURCE_UNSUPPORTED: &str = "MEDIA_SOURCE_UNSUPPORTED";
+const SYNC_PAYLOAD_REJECTED: &str = "SYNC_PAYLOAD_REJECTED";
 pub const PRODUCTION_CLOUD_API_ORIGIN: &str = "https://pca-cloud-api-production.up.railway.app";
+
+pub(crate) fn is_media_upload_error_code(error_code: Option<&str>) -> bool {
+    matches!(
+        error_code,
+        Some(
+            COMMUNICATION_MEDIA_UPLOAD_FAILED
+                | PHOTOS_UPLOAD_FAILED
+                | SCREEN_UPLOAD_FAILED
+                | SCREEN_UPLOAD_TIMEOUT
+                | MEDIA_CYCLE_TIMEOUT_ERROR
+        )
+    )
+}
+
+pub(crate) fn is_terminal_media_failure_code(error_code: Option<&str>) -> bool {
+    matches!(
+        error_code,
+        Some(
+            "MEDIA_LOCAL_BODY_INVALID"
+                | MEDIA_SOURCE_UNSUPPORTED
+                | "PHOTOS_LOCAL_MANIFEST_INVALID"
+                | SCREEN_LOCAL_MANIFEST_INVALID
+        )
+    )
+}
 
 enum CloudWorkerExit {
     Control(Result<(), CloudControlRuntimeError>),
     Media,
     CollectorHealth,
-    Screen,
     AppleMessages,
     Photos,
+}
+
+#[derive(Default)]
+struct MediaUploadOutcome {
+    completed: usize,
+    successful_collectors: HashSet<&'static str>,
+    failed_collectors: HashSet<&'static str>,
+}
+
+impl MediaUploadOutcome {
+    fn failed(collectors: impl IntoIterator<Item = &'static str>) -> Self {
+        Self {
+            failed_collectors: collectors.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
+    fn record_success(&mut self, collector_key: &'static str) {
+        self.completed = self.completed.saturating_add(1);
+        self.successful_collectors.insert(collector_key);
+    }
+
+    fn record_failure(&mut self, collector_key: &'static str) {
+        self.failed_collectors.insert(collector_key);
+    }
 }
 
 /// Future returned by the small Cloud-control port.
@@ -270,6 +327,8 @@ pub struct SyncEventsResponse {
 struct SyncEventRejection {
     #[serde(rename = "event_id")]
     event_id: String,
+    error_code: String,
+    retryable: bool,
 }
 
 #[derive(Deserialize)]
@@ -424,6 +483,7 @@ impl std::fmt::Debug for PairingCallbackHandoff {
 #[derive(Clone, Debug, Serialize)]
 pub struct PairingSessionRequest {
     pub device_public_key: String,
+    pub existing_device_id: Option<String>,
     pub code_challenge: String,
     pub callback_uri: String,
     pub callback_state: String,
@@ -505,8 +565,15 @@ impl AgentPairingService {
         }
         let code_verifier = random_url_safe_value();
         let callback_state = random_url_safe_value();
+        let existing_device_id = self
+            .database
+            .load_pairing_state()
+            .await
+            .map_err(|_| ControlError::Transient)?
+            .map(|state| state.device_id);
         let request = PairingSessionRequest {
             device_public_key: random_url_safe_value(),
+            existing_device_id,
             code_challenge: pkce_challenge(&code_verifier),
             callback_uri: handoff.callback_uri,
             callback_state: callback_state.clone(),
@@ -806,6 +873,48 @@ pub struct AppliedControl {
     pub screenshot_request_id: Option<String>,
 }
 
+impl AppliedControl {
+    fn from_persisted(control: AppliedCollectorControl, configuration_revision: u64) -> Self {
+        Self {
+            configuration_revision,
+            network_enabled: false,
+            communication_wechat_enabled: control.communication_wechat_enabled,
+            communication_messages_enabled: false,
+            photos_library_enabled: false,
+            screen_capture: ScreenCaptureControl {
+                enabled: control.screen_capture_enabled,
+                scheduled_enabled: control.screen_capture_scheduled_enabled,
+                interval_seconds: control.screen_capture_interval_seconds,
+                activity_enabled: control.screen_capture_activity_enabled,
+                activity_min_interval_seconds: control.screen_capture_activity_min_interval_seconds,
+                excluded_bundle_ids: control.screen_capture_excluded_bundle_ids,
+            },
+            screenshot_request_id: None,
+        }
+    }
+
+    fn persisted(&self, credentials: &DeviceCredential) -> AppliedCollectorControl {
+        AppliedCollectorControl {
+            device_id: credentials.device_id().to_owned(),
+            workspace_id: credentials.workspace_id().to_owned(),
+            configuration_revision: self.configuration_revision,
+            communication_wechat_enabled: self.communication_wechat_enabled,
+            screen_capture_enabled: self.screen_capture.enabled,
+            screen_capture_scheduled_enabled: self.screen_capture.scheduled_enabled,
+            screen_capture_interval_seconds: self.screen_capture.interval_seconds,
+            screen_capture_activity_enabled: self.screen_capture.activity_enabled,
+            screen_capture_activity_min_interval_seconds: self
+                .screen_capture
+                .activity_min_interval_seconds,
+            screen_capture_excluded_bundle_ids: self.screen_capture.excluded_bundle_ids.clone(),
+            updated_at_ms: i64::try_from(
+                OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+            )
+            .unwrap_or(i64::MAX),
+        }
+    }
+}
+
 /// Rejects malformed scopes and ignores snapshots that cannot advance the durable revision.
 ///
 /// # Errors
@@ -850,13 +959,18 @@ struct ControlState {
     pending_media_cleanup_result: Option<LocalMediaCleanupResult>,
 }
 
+#[derive(Clone)]
+struct ScreenshotCloudContext {
+    credential: DeviceCredential,
+    client: Arc<dyn ControlClient>,
+}
+
 /// Starts the authenticated Cloud-control worker.
 pub struct CloudControlRuntime;
 
 /// Handle for observing and stopping the bounded Cloud-control worker.
 pub struct CloudControlHandle {
     state: Arc<Mutex<ControlState>>,
-    authorization: CommunicationAuthorization,
     communication_controls: watch::Sender<Option<AppliedControl>>,
     publication: ControlPublication,
     owner_epoch: u64,
@@ -898,6 +1012,10 @@ impl ControlPublication {
         state.sender.send_replace(control);
         true
     }
+
+    async fn restore(&self, control: Option<AppliedControl>) {
+        self.state.lock().await.sender.send_replace(control);
+    }
 }
 
 enum CloudControlOwnerCommand {
@@ -924,11 +1042,12 @@ pub struct CloudControlOwner {
     communication_controls: watch::Sender<Option<AppliedControl>>,
     shutdown: Option<watch::Sender<bool>>,
     worker: Option<JoinHandle<Result<(), CloudControlRuntimeError>>>,
+    screen_worker: Option<JoinHandle<Result<(), CloudControlRuntimeError>>>,
 }
 
 impl CloudControlRuntime {
-    /// Loads the Keychain record at Agent startup. Missing or corrupt records fail closed to the
-    /// unpaired state and leave no stale `SQLite` pointer behind.
+    /// Loads the Keychain record at Agent startup without treating credential failure as an
+    /// Owner unpair decision.
     ///
     /// # Errors
     ///
@@ -983,9 +1102,12 @@ impl CloudControlRuntime {
             pairing_state_sender.send_replace(false);
             return Ok(None);
         }
-        let credential = load_device_credential(store.as_ref())?.ok_or(
-            CloudControlRuntimeError::Keychain(CredentialError::InvalidCredential),
-        )?;
+        pairing_state_sender.send_replace(true);
+        let credential = match load_device_credential(store.as_ref()) {
+            Ok(Some(credential)) => credential,
+            Ok(None) | Err(CredentialError::InvalidCredential) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         Self::start_with_pairing_state_and_authorization(
             database,
             LoadedDeviceCredentials::new(credential, store),
@@ -1064,6 +1186,7 @@ impl CloudControlRuntime {
             publication,
             owner_epoch,
             None,
+            None,
         )
         .await
     }
@@ -1083,8 +1206,14 @@ async fn start_control_worker(
     publication: ControlPublication,
     owner_epoch: u64,
     screen_capture: Option<ScreenCaptureCommandHandle>,
+    screenshot_cloud_context: Option<watch::Sender<Option<ScreenshotCloudContext>>>,
 ) -> Result<CloudControlHandle, CloudControlRuntimeError> {
-    let applied_revision = ensure_pairing_state(&database, credentials.credential()).await?;
+    let pairing_revision = ensure_pairing_state(&database, credentials.credential()).await?;
+    let applied_revision = complete_persisted_revision(
+        credentials.credential(),
+        pairing_revision,
+        database.load_applied_collector_control().await?.as_ref(),
+    );
     pairing_state_sender.send_replace(true);
     let state = Arc::new(Mutex::new(ControlState {
         unpaired: false,
@@ -1105,10 +1234,10 @@ async fn start_control_worker(
         owner_epoch,
         communication_controls.subscribe(),
         screen_capture,
+        screenshot_cloud_context,
     ));
     Ok(CloudControlHandle {
         state,
-        authorization,
         communication_controls,
         publication,
         owner_epoch,
@@ -1134,15 +1263,18 @@ async fn run_cloud_workers(
     owner_epoch: u64,
     screen_controls: watch::Receiver<Option<AppliedControl>>,
     screen_capture: Option<ScreenCaptureCommandHandle>,
+    screenshot_cloud_context: Option<watch::Sender<Option<ScreenshotCloudContext>>>,
 ) -> Result<(), CloudControlRuntimeError> {
     let (media_credentials, media_credential_receiver) =
         watch::channel(credentials.credential.clone());
     let (media_shutdown, media_shutdown_receiver) = watch::channel(false);
-    let mut media_worker = tokio::spawn(run_media_loop(
+    let screenshot_media_enabled = screen_capture.is_some();
+    let mut media_worker = tokio::spawn(run_data_plane_workers(
         Arc::clone(&database),
         media_credential_receiver,
         Arc::clone(&client),
         media_shutdown_receiver,
+        screenshot_media_enabled,
     ));
     let mut collector_health_worker = tokio::spawn(run_collector_health_loop(
         Arc::clone(&database),
@@ -1171,16 +1303,6 @@ async fn run_cloud_workers(
             media_shutdown.subscribe(),
         ))
     });
-    let mut screen_worker = screen_capture.map(|bridge| {
-        tokio::spawn(run_screenshot_loop(
-            Arc::clone(&database),
-            screen_controls,
-            media_credentials.subscribe(),
-            Arc::clone(&client),
-            bridge,
-            media_shutdown.subscribe(),
-        ))
-    });
     let control = run_control_loop(
         database,
         credentials,
@@ -1192,6 +1314,7 @@ async fn run_cloud_workers(
         authorization,
         owner_epoch,
         media_credentials,
+        screenshot_cloud_context,
     );
     tokio::pin!(control);
     let worker_exit = tokio::select! {
@@ -1199,13 +1322,11 @@ async fn run_cloud_workers(
         result = &mut control => CloudWorkerExit::Control(result),
         _ = &mut media_worker => CloudWorkerExit::Media,
         _ = &mut collector_health_worker => CloudWorkerExit::CollectorHealth,
-        () = wait_for_optional_worker(&mut screen_worker) => CloudWorkerExit::Screen,
         () = wait_for_optional_worker(&mut apple_worker) => CloudWorkerExit::AppleMessages,
         () = wait_for_optional_worker(&mut photo_worker) => CloudWorkerExit::Photos,
     };
     let media_completed = matches!(worker_exit, CloudWorkerExit::Media);
     let collector_health_completed = matches!(worker_exit, CloudWorkerExit::CollectorHealth);
-    let screen_completed = matches!(worker_exit, CloudWorkerExit::Screen);
     let apple_completed = matches!(worker_exit, CloudWorkerExit::AppleMessages);
     let photo_completed = matches!(worker_exit, CloudWorkerExit::Photos);
     let control_result = match worker_exit {
@@ -1215,9 +1336,6 @@ async fn run_cloud_workers(
     media_shutdown.send_replace(true);
     media_worker.abort();
     collector_health_worker.abort();
-    if let Some(worker) = &screen_worker {
-        worker.abort();
-    }
     if let Some(worker) = &apple_worker {
         worker.abort();
     }
@@ -1245,17 +1363,6 @@ async fn run_cloud_workers(
     control_result?;
     media_result?;
     collector_health_result?;
-    let screen_result = if screen_completed {
-        Ok(())
-    } else if let Some(worker) = screen_worker {
-        match worker.await {
-            Ok(result) => result,
-            Err(error) if error.is_cancelled() => Ok(()),
-            Err(_) => Err(CloudControlRuntimeError::WorkerStopped),
-        }
-    } else {
-        Ok(())
-    };
     if !apple_completed {
         if let Some(worker) = apple_worker {
             let _ = worker.await;
@@ -1266,7 +1373,7 @@ async fn run_cloud_workers(
             let _ = worker.await;
         }
     }
-    screen_result
+    Ok(())
 }
 
 async fn wait_for_optional_worker<T>(worker: &mut Option<JoinHandle<T>>) {
@@ -1283,6 +1390,10 @@ impl CloudControlOwner {
         self.worker
             .as_ref()
             .is_none_or(tokio::task::JoinHandle::is_finished)
+            || self
+                .screen_worker
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 
     #[must_use]
@@ -1319,6 +1430,16 @@ impl CloudControlOwner {
         let publication = ControlPublication::new(communication_controls.clone(), 0);
         let (commands, command_receiver) = mpsc::channel(CONTROL_OWNER_COMMAND_CAPACITY);
         let (shutdown, shutdown_receiver) = watch::channel(false);
+        let (screenshot_cloud_context, screenshot_cloud_context_receiver) = watch::channel(None);
+        let screen_worker = screen_capture.as_ref().map(|bridge| {
+            tokio::spawn(run_screenshot_loop(
+                Arc::clone(&database),
+                communication_controls.subscribe(),
+                screenshot_cloud_context_receiver,
+                bridge.clone(),
+                shutdown.subscribe(),
+            ))
+        });
         let worker = tokio::spawn(run_control_owner(
             database,
             pairing_state_sender,
@@ -1326,6 +1447,7 @@ impl CloudControlOwner {
             communication_controls.clone(),
             publication,
             screen_capture,
+            screenshot_cloud_context,
             command_receiver,
             shutdown_receiver,
         ));
@@ -1334,6 +1456,7 @@ impl CloudControlOwner {
                 communication_controls,
                 shutdown: Some(shutdown),
                 worker: Some(worker),
+                screen_worker,
             },
             CloudControlCommands { commands },
         )
@@ -1353,9 +1476,43 @@ impl CloudControlOwner {
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send_replace(true);
         }
-        match self.worker.take() {
+        let owner_result = match self.worker.take() {
             Some(worker) => stop_cloud_worker(worker).await,
             None => Ok(()),
+        };
+        let screen_result = match self.screen_worker.take() {
+            Some(worker) => stop_local_screen_worker(worker).await,
+            None => Ok(()),
+        };
+        owner_result.and(screen_result)
+    }
+}
+
+async fn stop_local_screen_worker(
+    mut worker: JoinHandle<Result<(), CloudControlRuntimeError>>,
+) -> Result<(), CloudControlRuntimeError> {
+    if worker.is_finished() {
+        return worker
+            .await
+            .map_err(|_| CloudControlRuntimeError::WorkerStopped)?;
+    }
+    let (cancel_deadline, deadline_cancelled) = std_mpsc::channel();
+    let mut deadline = tokio::task::spawn_blocking(move || {
+        matches!(
+            deadline_cancelled.recv_timeout(RUNTIME_SHUTDOWN_TIMEOUT),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        )
+    });
+    tokio::select! {
+        result = &mut worker => {
+            let _ = cancel_deadline.send(());
+            let _ = deadline.await;
+            result.map_err(|_| CloudControlRuntimeError::WorkerStopped)?
+        }
+        _ = &mut deadline => {
+            worker.abort();
+            let _ = worker.await;
+            Ok(())
         }
     }
 }
@@ -1421,10 +1578,12 @@ async fn run_control_owner(
     communication_controls: watch::Sender<Option<AppliedControl>>,
     publication: ControlPublication,
     screen_capture: Option<ScreenCaptureCommandHandle>,
+    screenshot_cloud_context: watch::Sender<Option<ScreenshotCloudContext>>,
     mut commands: mpsc::Receiver<CloudControlOwnerCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut current = None;
+    restore_local_control_publication(&database, &publication).await?;
     let mut watchdog = time::interval(CLOUD_WORKER_WATCHDOG_INTERVAL);
     watchdog.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
@@ -1454,6 +1613,7 @@ async fn run_control_owner(
                             &communication_controls,
                             &publication,
                             screen_capture.clone(),
+                            &screenshot_cloud_context,
                             &mut current,
                         )
                         .await;
@@ -1473,6 +1633,7 @@ async fn run_control_owner(
                             &communication_controls,
                             &publication,
                             screen_capture.clone(),
+                            &screenshot_cloud_context,
                             &mut current,
                         )
                         .await;
@@ -1492,6 +1653,46 @@ async fn run_control_owner(
     invalidate_and_stop_owned_control(&authorization, &publication, &mut current)
         .await
         .map(|_| ())
+}
+
+async fn restore_local_control_publication(
+    database: &DbActorHandle,
+    publication: &ControlPublication,
+) -> Result<(), CloudControlRuntimeError> {
+    let pairing = database.load_pairing_state().await?;
+    let control = database.load_applied_collector_control().await?;
+    let restored = match (pairing, control) {
+        (Some(pairing), Some(control))
+            if pairing.is_paired()
+                && pairing.device_id == control.device_id
+                && pairing.workspace_id == control.workspace_id
+                && (pairing.applied_control_revision == control.configuration_revision
+                    || control.is_legacy_bootstrap()) =>
+        {
+            Some(AppliedControl::from_persisted(
+                control,
+                pairing.applied_control_revision,
+            ))
+        }
+        _ => None,
+    };
+    publication.restore(restored).await;
+    Ok(())
+}
+
+fn complete_persisted_revision(
+    credentials: &DeviceCredential,
+    pairing_revision: u64,
+    control: Option<&AppliedCollectorControl>,
+) -> u64 {
+    control
+        .filter(|control| {
+            !control.is_legacy_bootstrap()
+                && control.device_id == credentials.device_id()
+                && control.workspace_id == credentials.workspace_id()
+                && control.configuration_revision == pairing_revision
+        })
+        .map_or(0, |control| control.configuration_revision)
 }
 
 async fn invalidate_and_stop_owned_control(
@@ -1520,10 +1721,15 @@ async fn replace_owned_control(
     communication_controls: &watch::Sender<Option<AppliedControl>>,
     publication: &ControlPublication,
     screen_capture: Option<ScreenCaptureCommandHandle>,
+    screenshot_cloud_context: &watch::Sender<Option<ScreenshotCloudContext>>,
     current: &mut Option<CloudControlHandle>,
 ) -> Result<(), CloudControlRuntimeError> {
     let owner_epoch =
         invalidate_and_stop_owned_control(authorization, publication, current).await?;
+    screenshot_cloud_context.send_replace(Some(ScreenshotCloudContext {
+        credential: credentials.credential.clone(),
+        client: Arc::clone(&client),
+    }));
     *current = Some(
         start_control_worker(
             Arc::clone(database),
@@ -1535,6 +1741,7 @@ async fn replace_owned_control(
             publication.clone(),
             owner_epoch,
             screen_capture,
+            Some(screenshot_cloud_context.clone()),
         )
         .await?,
     );
@@ -1554,13 +1761,12 @@ async fn replace_owned_control_from_keychain(
     communication_controls: &watch::Sender<Option<AppliedControl>>,
     publication: &ControlPublication,
     screen_capture: Option<ScreenCaptureCommandHandle>,
+    screenshot_cloud_context: &watch::Sender<Option<ScreenshotCloudContext>>,
     current: &mut Option<CloudControlHandle>,
 ) -> Result<bool, CloudControlRuntimeError> {
     if current.as_ref().is_some_and(|worker| !worker.is_finished()) {
         return Ok(true);
     }
-    let owner_epoch = authorization.replace_owner().await;
-    publication.replace_owner(owner_epoch).await;
     if let Some(worker) = current.take() {
         let _ = worker.shutdown().await;
     }
@@ -1570,9 +1776,21 @@ async fn replace_owned_control_from_keychain(
         pairing_state_sender.send_replace(false);
         return Ok(false);
     }
-    let credential = load_device_credential(store.as_ref())?.ok_or(
-        CloudControlRuntimeError::Keychain(CredentialError::InvalidCredential),
-    )?;
+    pairing_state_sender.send_replace(true);
+    let credential = match load_device_credential(store.as_ref()) {
+        Ok(Some(credential)) => credential,
+        Ok(None) | Err(CredentialError::InvalidCredential) => {
+            restore_local_control_publication(database, publication).await?;
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let owner_epoch = authorization.advance_owner_preserving_control().await;
+    publication.replace_owner(owner_epoch).await;
+    screenshot_cloud_context.send_replace(Some(ScreenshotCloudContext {
+        credential: credential.clone(),
+        client: Arc::clone(&client),
+    }));
     *current = Some(
         start_control_worker(
             Arc::clone(database),
@@ -1584,6 +1802,7 @@ async fn replace_owned_control_from_keychain(
             publication.clone(),
             owner_epoch,
             screen_capture,
+            Some(screenshot_cloud_context.clone()),
         )
         .await?,
     );
@@ -1592,8 +1811,8 @@ async fn replace_owned_control_from_keychain(
 
 /// Reconciles the non-secret `SQLite` pointer with the Keychain record at Agent startup.
 ///
-/// A missing or corrupt record is unpaired. A Keychain availability failure is returned so the
-/// caller can keep unrelated local runtime capabilities alive in `degraded` state.
+/// Only the durable manual-unpair marker makes the Agent unpaired. Credential failures affect
+/// Cloud connectivity without changing the Owner's pairing decision.
 ///
 /// # Errors
 ///
@@ -1616,24 +1835,28 @@ pub(crate) async fn synchronize_pairing_state_with_authorization(
     store: &dyn CredentialStore,
     authorization: &CommunicationAuthorization,
 ) -> Result<bool, CloudControlRuntimeError> {
+    let durable = database.load_pairing_state().await?;
+    if durable
+        .as_ref()
+        .is_some_and(|state| state.manually_unpaired)
+    {
+        authorization.disable().await;
+        return Ok(false);
+    }
     match load_device_credential(store) {
         Ok(Some(credential)) => {
             ensure_pairing_state(database, &credential).await?;
             Ok(true)
         }
-        Ok(None) | Err(CredentialError::InvalidCredential) => {
-            authorization.disable().await;
-            database
-                .clear_pairing_state_and_disable_sensitive_collectors()
-                .await?;
-            Ok(false)
-        }
+        Ok(None) | Err(CredentialError::InvalidCredential) => Ok(durable.is_some()),
         Err(error) => Err(error.into()),
     }
 }
 
 impl CloudControlHandle {
-    fn is_finished(&self) -> bool {
+    /// Returns whether the joined Cloud worker has already stopped.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
         self.worker
             .as_ref()
             .is_none_or(tokio::task::JoinHandle::is_finished)
@@ -1661,9 +1884,7 @@ impl CloudControlHandle {
     ///
     /// Returns an error if the worker ends unexpectedly or reports a runtime failure.
     pub async fn shutdown(mut self) -> Result<(), CloudControlRuntimeError> {
-        if self.authorization.disable_for_owner(self.owner_epoch).await {
-            self.publication.publish(self.owner_epoch, None).await;
-        }
+        self.publication.publish(self.owner_epoch, None).await;
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send_replace(true);
         }
@@ -1776,6 +1997,7 @@ async fn run_control_loop(
     authorization: CommunicationAuthorization,
     owner_epoch: u64,
     media_credentials: watch::Sender<DeviceCredential>,
+    screenshot_cloud_context: Option<watch::Sender<Option<ScreenshotCloudContext>>>,
 ) -> Result<(), CloudControlRuntimeError> {
     let mut retry_attempt = 0_u8;
     let mut wait = Duration::ZERO;
@@ -1802,13 +2024,7 @@ async fn run_control_loop(
                 retry_attempt = 0;
                 wait = CONTROL_INTERVAL;
             }
-            Err(ControlError::Transient) => {
-                retry_attempt = retry_attempt.saturating_add(1);
-                wait = retry_delay(retry_attempt);
-            }
-            Err(ControlError::Contract) => {
-                client.set_network_enabled(false);
-                suspend_communication(&state, &publication, &authorization, owner_epoch).await;
+            Err(ControlError::Transient | ControlError::Contract) => {
                 retry_attempt = retry_attempt.saturating_add(1);
                 wait = retry_delay(retry_attempt);
             }
@@ -1818,16 +2034,9 @@ async fn run_control_loop(
                         if next.device_id() != credentials.credential.device_id()
                             || next.workspace_id() != credentials.credential.workspace_id()
                         {
-                            return revoke(
-                                &database,
-                                &credentials,
-                                &state,
-                                &pairing_state_sender,
-                                &publication,
-                                &authorization,
-                                owner_epoch,
-                            )
-                            .await;
+                            retry_attempt = retry_attempt.saturating_add(1);
+                            wait = retry_delay(retry_attempt);
+                            continue;
                         }
                         match time::timeout(
                             CREDENTIAL_PERSIST_TIMEOUT,
@@ -1836,6 +2045,8 @@ async fn run_control_loop(
                                 &mut credentials,
                                 next,
                                 &media_credentials,
+                                screenshot_cloud_context.as_ref(),
+                                Arc::clone(&client),
                                 &mut shutdown,
                             ),
                         )
@@ -1848,8 +2059,8 @@ async fn run_control_loop(
                         retry_attempt = 0;
                         wait = Duration::ZERO;
                     }
-                    Err(ControlError::Revoked | ControlError::InvalidCredential) => {
-                        return revoke(
+                    Err(ControlError::Revoked) => {
+                        return mark_manually_unpaired(
                             &database,
                             &credentials,
                             &state,
@@ -1860,20 +2071,18 @@ async fn run_control_loop(
                         )
                         .await;
                     }
-                    Err(ControlError::Transient) => {
-                        retry_attempt = retry_attempt.saturating_add(1);
-                        wait = retry_delay(retry_attempt);
-                    }
-                    Err(ControlError::Contract) => {
-                        suspend_communication(&state, &publication, &authorization, owner_epoch)
-                            .await;
+                    Err(
+                        ControlError::InvalidCredential
+                        | ControlError::Transient
+                        | ControlError::Contract,
+                    ) => {
                         retry_attempt = retry_attempt.saturating_add(1);
                         wait = retry_delay(retry_attempt);
                     }
                 }
             }
             Err(ControlError::Revoked) => {
-                return revoke(
+                return mark_manually_unpaired(
                     &database,
                     &credentials,
                     &state,
@@ -1888,23 +2097,13 @@ async fn run_control_loop(
     }
 }
 
-async fn suspend_communication(
-    state: &Arc<Mutex<ControlState>>,
-    publication: &ControlPublication,
-    authorization: &CommunicationAuthorization,
-    owner_epoch: u64,
-) {
-    if authorization.suspend_for_owner(owner_epoch).await {
-        state.lock().await.communication_hydrated = false;
-        publication.publish(owner_epoch, None).await;
-    }
-}
-
 async fn persist_refreshed_credential(
     database: &DbActorHandle,
     credentials: &mut LoadedDeviceCredentials,
     next: DeviceCredential,
     media_credentials: &watch::Sender<DeviceCredential>,
+    screenshot_cloud_context: Option<&watch::Sender<Option<ScreenshotCloudContext>>>,
+    client: Arc<dyn ControlClient>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
     let mut retry_attempt = 0_u8;
@@ -1915,6 +2114,12 @@ async fn persist_refreshed_credential(
         }
         if keychain_persisted && ensure_pairing_state(database, &next).await.is_ok() {
             media_credentials.send_replace(next.clone());
+            if let Some(context) = screenshot_cloud_context {
+                context.send_replace(Some(ScreenshotCloudContext {
+                    credential: next.clone(),
+                    client: Arc::clone(&client),
+                }));
+            }
             credentials.credential = next;
             return true;
         }
@@ -1937,21 +2142,11 @@ async fn control_once(
     let snapshot = send_control_heartbeat(database, credentials, client, state).await?;
     if snapshot.revoked {
         client.set_network_enabled(false);
-        if !authorization.disable_for_owner(owner_epoch).await {
-            return Err(ControlError::Transient);
-        }
-        publication.publish(owner_epoch, None).await;
         return Err(ControlError::Revoked);
     }
     if snapshot.device_id != credentials.credential.device_id()
         || snapshot.workspace_id != credentials.credential.workspace_id()
     {
-        client.set_network_enabled(false);
-        if !authorization.suspend_for_owner(owner_epoch).await {
-            return Err(ControlError::Transient);
-        }
-        state.lock().await.communication_hydrated = false;
-        publication.publish(owner_epoch, None).await;
         return Err(ControlError::Contract);
     }
     apply_control_snapshot(
@@ -2077,12 +2272,10 @@ async fn apply_control_snapshot(
     if let Some(applied) = applied {
         persist_network_collector_state(database, &applied).await?;
         client.set_network_enabled(applied.network_enabled);
-        if applied.configuration_revision > current {
-            database
-                .save_control_revision(applied.configuration_revision)
-                .await
-                .map_err(|_| ControlError::Transient)?;
-        }
+        database
+            .save_applied_collector_control(&applied.persisted(&credentials.credential))
+            .await
+            .map_err(|_| ControlError::Transient)?;
         {
             let mut state = state.lock().await;
             state.applied_revision = Some(applied.configuration_revision);
@@ -2164,15 +2357,47 @@ pub(crate) async fn persist_aux_collector_state(
         .map_err(|_| ControlError::Transient)?
         .into_iter()
         .find(|state| state.collector_key == collector_key);
+    let incoming_media_error = is_media_upload_error_code(error_code);
+    let preserve_prior = enabled
+        && prior.as_ref().is_some_and(|state| {
+            let prior_media_error = is_media_upload_error_code(state.last_error_code.as_deref());
+            let prior_terminal_error =
+                is_terminal_media_failure_code(state.last_error_code.as_deref());
+            (error_code.is_none() && (prior_media_error || prior_terminal_error))
+                || (incoming_media_error
+                    && !prior_media_error
+                    && !prior_terminal_error
+                    && matches!(
+                        state.status,
+                        CollectorStatus::PermissionRequired
+                            | CollectorStatus::Degraded
+                            | CollectorStatus::Unsupported
+                            | CollectorStatus::Error
+                    ))
+        });
     let status = if !enabled {
         CollectorStatus::Disabled
+    } else if preserve_prior {
+        prior
+            .as_ref()
+            .expect("preserved collector state exists")
+            .status
     } else if error_code.is_some() {
         CollectorStatus::Degraded
     } else {
         CollectorStatus::Running
     };
+    let last_error_code = if preserve_prior {
+        prior
+            .as_ref()
+            .expect("preserved collector state exists")
+            .last_error_code
+            .clone()
+    } else {
+        error_code.map(str::to_owned)
+    };
     database
-        .upsert_collector_state(&CollectorState {
+        .upsert_collector_state_preserving_media_failure(&CollectorState {
             collector_key: collector_key.to_owned(),
             collector_version: option_env!("PCA_APP_VERSION")
                 .unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -2185,15 +2410,117 @@ pub(crate) async fn persist_aux_collector_state(
             } else {
                 prior.as_ref().and_then(|state| state.last_event_at_ms)
             },
-            last_health_at_ms: if enabled && error_code.is_none() {
+            last_health_at_ms: if enabled && error_code.is_none() && !preserve_prior {
                 Some(now_ms)
             } else {
                 prior.as_ref().and_then(|state| state.last_health_at_ms)
             },
-            last_error_code: error_code.map(str::to_owned),
+            last_error_code,
             created_at_ms: prior.as_ref().map_or(now_ms, |state| state.created_at_ms),
             updated_at_ms: now_ms,
         })
+        .await
+        .map_err(|_| ControlError::Transient)
+}
+
+async fn persist_media_upload_outcome(
+    database: &DbActorHandle,
+    outcome: &MediaUploadOutcome,
+    error_code: &str,
+) -> Result<(), ControlError> {
+    for collector_key in &outcome.failed_collectors {
+        persist_media_upload_health(database, collector_key, error_code, true).await?;
+    }
+    for collector_key in outcome
+        .successful_collectors
+        .difference(&outcome.failed_collectors)
+    {
+        persist_media_upload_health(database, collector_key, error_code, false).await?;
+    }
+    Ok(())
+}
+
+async fn persist_media_upload_health(
+    database: &DbActorHandle,
+    collector_key: &str,
+    media_error_code: &str,
+    failed: bool,
+) -> Result<(), ControlError> {
+    let now_ms = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| ControlError::Transient)?;
+    let Some(mut state) = database
+        .load_collector_states()
+        .await
+        .map_err(|_| ControlError::Transient)?
+        .into_iter()
+        .find(|state| state.collector_key == collector_key)
+    else {
+        return Ok(());
+    };
+    if state.status == CollectorStatus::Disabled {
+        return Ok(());
+    }
+    let primary_failure = !is_media_upload_error_code(state.last_error_code.as_deref())
+        && (state.last_error_code.is_some()
+            || matches!(
+                state.status,
+                CollectorStatus::PermissionRequired
+                    | CollectorStatus::Unsupported
+                    | CollectorStatus::Error
+            ));
+    if failed {
+        if primary_failure {
+            return Ok(());
+        }
+        state.status = CollectorStatus::Degraded;
+        state.last_error_code = Some(media_error_code.to_owned());
+    } else {
+        if state.status != CollectorStatus::Degraded
+            || !is_media_upload_error_code(state.last_error_code.as_deref())
+        {
+            return Ok(());
+        }
+        state.status = CollectorStatus::Running;
+        state.last_error_code = None;
+        state.last_health_at_ms = Some(now_ms);
+    }
+    state.updated_at_ms = now_ms;
+    database
+        .upsert_collector_state(&state)
+        .await
+        .map_err(|_| ControlError::Transient)
+}
+
+async fn recover_media_upload_health(
+    database: &DbActorHandle,
+    collector_key: &str,
+    media_error_codes: &[&str],
+) -> Result<(), ControlError> {
+    let now_ms = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| ControlError::Transient)?;
+    let Some(mut state) = database
+        .load_collector_states()
+        .await
+        .map_err(|_| ControlError::Transient)?
+        .into_iter()
+        .find(|state| state.collector_key == collector_key)
+    else {
+        return Ok(());
+    };
+    if state.status != CollectorStatus::Degraded
+        || !state
+            .last_error_code
+            .as_deref()
+            .is_some_and(|error_code| media_error_codes.contains(&error_code))
+    {
+        return Ok(());
+    }
+    state.status = CollectorStatus::Running;
+    state.last_error_code = None;
+    state.last_health_at_ms = Some(now_ms);
+    state.updated_at_ms = now_ms;
+    database
+        .upsert_collector_state(&state)
         .await
         .map_err(|_| ControlError::Transient)
 }
@@ -2242,7 +2569,65 @@ fn next_media_wait(completed_media: usize) -> Duration {
     }
 }
 
-async fn run_media_loop(
+async fn run_data_plane_workers(
+    database: Arc<DbActorHandle>,
+    credentials: watch::Receiver<DeviceCredential>,
+    client: Arc<dyn ControlClient>,
+    shutdown: watch::Receiver<bool>,
+    screenshot_media_enabled: bool,
+) -> Result<(), CloudControlRuntimeError> {
+    let event_sync = run_event_sync_loop(
+        Arc::clone(&database),
+        credentials.clone(),
+        Arc::clone(&client),
+        shutdown.clone(),
+    );
+    let communication_media = run_communication_media_loop(
+        Arc::clone(&database),
+        credentials.clone(),
+        Arc::clone(&client),
+        shutdown.clone(),
+    );
+    let photo_media = run_photo_media_loop(
+        Arc::clone(&database),
+        credentials.clone(),
+        Arc::clone(&client),
+        shutdown.clone(),
+    );
+    if screenshot_media_enabled {
+        let screenshot_media = run_screenshot_media_loop(database, credentials, client, shutdown);
+        tokio::try_join!(
+            event_sync,
+            communication_media,
+            photo_media,
+            screenshot_media
+        )?;
+    } else {
+        tokio::try_join!(event_sync, communication_media, photo_media)?;
+    }
+    Ok(())
+}
+
+async fn run_event_sync_loop(
+    database: Arc<DbActorHandle>,
+    credentials: watch::Receiver<DeviceCredential>,
+    client: Arc<dyn ControlClient>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), CloudControlRuntimeError> {
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let credential = credentials.borrow().clone();
+        let _ = sync_pending_system_events(&database, &credential, client.as_ref()).await;
+        let _ = sync_pending_communication_events(&database, &credential, client.as_ref()).await;
+        if wait_or_shutdown(CONTROL_INTERVAL, &mut shutdown).await {
+            return Ok(());
+        }
+    }
+}
+
+async fn run_communication_media_loop(
     database: Arc<DbActorHandle>,
     credentials: watch::Receiver<DeviceCredential>,
     client: Arc<dyn ControlClient>,
@@ -2257,21 +2642,153 @@ async fn run_media_loop(
             return Ok(());
         }
         let credential = credentials.borrow().clone();
-        let cycle = async {
-            let _ = sync_pending_system_events(&database, &credential, client.as_ref()).await;
-            let _ =
-                sync_pending_communication_events(&database, &credential, client.as_ref()).await;
-            let completed_media =
-                sync_pending_communication_attachments(&database, &credential, client.as_ref())
-                    .await
-                    .unwrap_or(0);
-            let _ = upload_pending_photos(&database, client.as_ref(), &credential).await;
-            completed_media
+        let (attachments, error_code) = match time::timeout(
+            MEDIA_CYCLE_TIMEOUT,
+            sync_pending_communication_attachments(&database, &credential, client.as_ref()),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => (outcome, COMMUNICATION_MEDIA_UPLOAD_FAILED),
+            Ok(Err(_)) => (
+                MediaUploadOutcome::failed(["communication.wechat", "communication.messages"]),
+                COMMUNICATION_MEDIA_UPLOAD_FAILED,
+            ),
+            Err(_) => (
+                MediaUploadOutcome::failed(["communication.wechat", "communication.messages"]),
+                MEDIA_CYCLE_TIMEOUT_ERROR,
+            ),
         };
-        let completed_media = time::timeout(MEDIA_CYCLE_TIMEOUT, cycle)
+        let completed = attachments.completed;
+        wait = if persist_media_upload_outcome(&database, &attachments, error_code)
             .await
-            .map_err(|_| CloudControlRuntimeError::WorkerStopped)?;
-        wait = next_media_wait(completed_media);
+            .is_ok()
+        {
+            next_media_wait(completed)
+        } else {
+            CONTROL_INTERVAL
+        };
+    }
+}
+
+async fn run_photo_media_loop(
+    database: Arc<DbActorHandle>,
+    credentials: watch::Receiver<DeviceCredential>,
+    client: Arc<dyn ControlClient>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), CloudControlRuntimeError> {
+    let mut wait = Duration::ZERO;
+    loop {
+        if wait != Duration::ZERO && wait_or_shutdown(wait, &mut shutdown).await {
+            return Ok(());
+        }
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let credential = credentials.borrow().clone();
+        if database
+            .dead_letter_mismatched_outbox_events(credential.workspace_id(), credential.device_id())
+            .await
+            .is_err()
+        {
+            wait = CONTROL_INTERVAL;
+            continue;
+        }
+        let (photos, error_code) = match time::timeout(
+            MEDIA_CYCLE_TIMEOUT,
+            upload_pending_photos(&database, client.as_ref(), &credential),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => (outcome, PHOTOS_UPLOAD_FAILED),
+            Ok(Err(_)) => (
+                MediaUploadOutcome::failed(["photos.library"]),
+                PHOTOS_UPLOAD_FAILED,
+            ),
+            Err(_) => (
+                MediaUploadOutcome::failed(["photos.library"]),
+                MEDIA_CYCLE_TIMEOUT_ERROR,
+            ),
+        };
+        let completed = photos.completed;
+        wait = if persist_media_upload_outcome(&database, &photos, error_code)
+            .await
+            .is_ok()
+        {
+            next_media_wait(completed)
+        } else {
+            CONTROL_INTERVAL
+        };
+    }
+}
+
+async fn run_screenshot_media_loop(
+    database: Arc<DbActorHandle>,
+    credentials: watch::Receiver<DeviceCredential>,
+    client: Arc<dyn ControlClient>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), CloudControlRuntimeError> {
+    let mut wait = Duration::ZERO;
+    let mut handled_screenshot_requests = HashSet::new();
+    loop {
+        if wait != Duration::ZERO && wait_or_shutdown(wait, &mut shutdown).await {
+            return Ok(());
+        }
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let Ok(spool_root) = screenshot_spool_root() else {
+            let _ = persist_media_upload_outcome(
+                &database,
+                &MediaUploadOutcome::failed(["screen.capture"]),
+                SCREEN_UPLOAD_FAILED,
+            )
+            .await;
+            wait = CONTROL_INTERVAL;
+            continue;
+        };
+        let credential = credentials.borrow().clone();
+        let (screenshots, error_code) = match time::timeout(
+            SCREEN_UPLOAD_BATCH_TIMEOUT,
+            upload_pending_screenshots(
+                &database,
+                client.as_ref(),
+                &credential,
+                &mut handled_screenshot_requests,
+                &spool_root,
+            ),
+        )
+        .await
+        {
+            Err(_) => (
+                MediaUploadOutcome::failed(["screen.capture"]),
+                SCREEN_UPLOAD_TIMEOUT,
+            ),
+            Ok(Err(_)) => (
+                MediaUploadOutcome::failed(["screen.capture"]),
+                SCREEN_UPLOAD_FAILED,
+            ),
+            Ok(Ok(outcome)) => (outcome, SCREEN_UPLOAD_FAILED),
+        };
+        let completed = screenshots.completed;
+        let persisted = persist_media_upload_outcome(&database, &screenshots, error_code)
+            .await
+            .is_ok();
+        let recovered = if screenshots.successful_collectors.is_empty() {
+            true
+        } else {
+            recover_media_upload_health(
+                &database,
+                "screen.capture",
+                &[SCREEN_UPLOAD_FAILED, SCREEN_UPLOAD_TIMEOUT],
+            )
+            .await
+            .is_ok()
+        };
+        wait = if persisted && recovered {
+            next_media_wait(completed)
+        } else {
+            CONTROL_INTERVAL
+        };
     }
 }
 
@@ -2350,8 +2867,7 @@ async fn run_collector_health_loop(
 async fn run_screenshot_loop(
     database: Arc<DbActorHandle>,
     mut controls: watch::Receiver<Option<AppliedControl>>,
-    credentials: watch::Receiver<DeviceCredential>,
-    client: Arc<dyn ControlClient>,
+    screenshot_cloud_context: watch::Receiver<Option<ScreenshotCloudContext>>,
     bridge: ScreenCaptureCommandHandle,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CloudControlRuntimeError> {
@@ -2379,28 +2895,6 @@ async fn run_screenshot_loop(
         if *shutdown.borrow() {
             return Ok(());
         }
-        let credential = credentials.borrow().clone();
-        if time::timeout(
-            SCREEN_UPLOAD_BATCH_TIMEOUT,
-            upload_pending_screenshots(client.as_ref(), &credential, &mut handled_requests),
-        )
-        .await
-        .is_err()
-        {
-            let timeout_control = controls.borrow().clone();
-            if let Some(control) = timeout_control {
-                let _ = persist_aux_collector_state(
-                    &database,
-                    "screen.capture",
-                    control.screen_capture.enabled,
-                    control.configuration_revision,
-                    false,
-                    Some("SCREEN_UPLOAD_TIMEOUT"),
-                )
-                .await;
-            }
-            continue;
-        }
         let Some(control) = controls.borrow().clone() else {
             continue;
         };
@@ -2408,7 +2902,7 @@ async fn run_screenshot_loop(
             if last_health_persisted.is_none_or(|last| last.elapsed() >= COLLECTOR_HEALTH_INTERVAL)
                 || persisted_health_error.is_some()
             {
-                let _ = persist_aux_collector_state(
+                persist_aux_collector_state(
                     &database,
                     "screen.capture",
                     false,
@@ -2416,7 +2910,8 @@ async fn run_screenshot_loop(
                     false,
                     None,
                 )
-                .await;
+                .await
+                .map_err(|_| CloudControlRuntimeError::WorkerStopped)?;
                 last_health_persisted = Some(Instant::now());
                 health_error = None;
                 persisted_health_error = None;
@@ -2441,12 +2936,20 @@ async fn run_screenshot_loop(
                     }
                     Ok(CaptureAttempt::Terminal(error_code)) => {
                         health_error = Some(error_code);
-                        if client
-                            .fail_screenshot_request(&credential, request_id, error_code)
-                            .await
-                            .is_ok()
-                        {
-                            handled_requests.insert(request_id.to_owned());
+                        let cloud_context = { screenshot_cloud_context.borrow().clone() };
+                        if let Some(context) = cloud_context {
+                            if context
+                                .client
+                                .fail_screenshot_request(
+                                    &context.credential,
+                                    request_id,
+                                    error_code,
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                handled_requests.insert(request_id.to_owned());
+                            }
                         }
                     }
                     Ok(CaptureAttempt::Deferred) => {}
@@ -2521,21 +3024,23 @@ async fn run_screenshot_loop(
                 }
             }
         }
+        let effective_health_error = health_error;
         if last_health_persisted.is_none_or(|last| last.elapsed() >= COLLECTOR_HEALTH_INTERVAL)
             || event_observed
-            || health_error != persisted_health_error
+            || effective_health_error != persisted_health_error
         {
-            let _ = persist_aux_collector_state(
+            persist_aux_collector_state(
                 &database,
                 "screen.capture",
                 control.screen_capture.enabled,
                 control.configuration_revision,
                 event_observed,
-                health_error,
+                effective_health_error,
             )
-            .await;
+            .await
+            .map_err(|_| CloudControlRuntimeError::WorkerStopped)?;
             last_health_persisted = Some(Instant::now());
-            persisted_health_error = health_error;
+            persisted_health_error = effective_health_error;
             event_observed = false;
         }
     }
@@ -2634,12 +3139,14 @@ async fn persist_screenshot_manifest(
 }
 
 async fn upload_pending_screenshots(
+    database: &DbActorHandle,
     client: &dyn ControlClient,
     credentials: &DeviceCredential,
     handled_requests: &mut HashSet<String>,
-) -> Result<(), ControlError> {
-    let spool_root = screenshot_spool_root()?;
-    for path in pending_manifest_paths(&spool_root)
+    spool_root: &Path,
+) -> Result<MediaUploadOutcome, ControlError> {
+    let mut outcome = MediaUploadOutcome::default();
+    for path in pending_manifest_paths(spool_root)
         .await?
         .into_iter()
         .take(4)
@@ -2650,7 +3157,7 @@ async fn upload_pending_screenshots(
         let screenshot: PendingScreenshot = if let Ok(screenshot) = serde_json::from_slice(&bytes) {
             screenshot
         } else {
-            quarantine_manifest(&path).await?;
+            quarantine_invalid_screenshot_manifest(database, &path).await?;
             continue;
         };
         if screenshot.mime_type != "image/jpeg"
@@ -2660,12 +3167,12 @@ async fn upload_pending_screenshots(
                 .as_ref()
                 .is_some_and(|value| Uuid::parse_str(value).is_err())
         {
-            quarantine_manifest(&path).await?;
+            quarantine_invalid_screenshot_manifest(database, &path).await?;
             continue;
         }
         let image_path = spool_root.join(&screenshot.image_file_name);
-        if image_path.parent() != Some(spool_root.as_path()) {
-            quarantine_manifest(&path).await?;
+        if image_path.parent() != Some(spool_root) {
+            quarantine_invalid_screenshot_manifest(database, &path).await?;
             continue;
         }
         remember_screenshot_request(&screenshot, handled_requests);
@@ -2675,14 +3182,38 @@ async fn upload_pending_screenshots(
             .is_err()
         {
             rotate_manifest(&path, &bytes).await?;
+            outcome.record_failure("screen.capture");
             continue;
         }
         remove_uploaded_media_file(&image_path).await?;
         tokio::fs::remove_file(&path)
             .await
             .map_err(|_| ControlError::Transient)?;
+        outcome.record_success("screen.capture");
     }
-    Ok(())
+    Ok(outcome)
+}
+
+async fn quarantine_invalid_screenshot_manifest(
+    database: &DbActorHandle,
+    path: &Path,
+) -> Result<(), ControlError> {
+    let subject_id = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or(ControlError::Contract)?;
+    database
+        .record_terminal_media_diagnostic(subject_id, SCREEN_LOCAL_MANIFEST_INVALID)
+        .await
+        .map_err(|_| ControlError::Transient)?;
+    persist_media_upload_health(
+        database,
+        "screen.capture",
+        SCREEN_LOCAL_MANIFEST_INVALID,
+        true,
+    )
+    .await?;
+    quarantine_manifest(path).await
 }
 
 async fn quarantine_manifest(path: &Path) -> Result<(), ControlError> {
@@ -2813,10 +3344,11 @@ async fn upload_pending_photos(
     database: &DbActorHandle,
     client: &dyn ControlClient,
     credentials: &DeviceCredential,
-) -> Result<(), ControlError> {
+) -> Result<MediaUploadOutcome, ControlError> {
     let root = photo_spool_root()?;
+    let mut outcome = MediaUploadOutcome::default();
     for task in database
-        .load_pending_photo_uploads(4)
+        .load_pending_photo_uploads(4, credentials.workspace_id(), credentials.device_id())
         .await
         .map_err(|_| ControlError::Transient)?
     {
@@ -2839,16 +3371,28 @@ async fn upload_pending_photos(
                 .complete_photo_upload(&task.photo_id)
                 .await
                 .map_err(|_| ControlError::Transient)?;
+            outcome.record_success("photos.library");
             continue;
         }
-        let photo: PendingPhoto =
-            serde_json::from_str(&task.manifest_json).map_err(|_| ControlError::Contract)?;
+        let photo: PendingPhoto = if let Ok(photo) = serde_json::from_str(&task.manifest_json) {
+            photo
+        } else {
+            database
+                .quarantine_invalid_photo_upload(&task.photo_id)
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            continue;
+        };
         if photo.photo_id != task.photo_id
             || Uuid::parse_str(&photo.photo_id).is_err()
             || Uuid::parse_str(&photo.event_id).is_err()
             || photo.media_file_name.as_deref() != Some(photo.photo_id.as_str())
         {
-            return Err(ControlError::Contract);
+            database
+                .quarantine_invalid_photo_upload(&task.photo_id)
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            continue;
         }
         let media_path = root.join(
             photo
@@ -2866,9 +3410,11 @@ async fn upload_pending_photos(
                 .complete_photo_upload(&photo.photo_id)
                 .await
                 .map_err(|_| ControlError::Transient)?;
+            outcome.record_success("photos.library");
             continue;
         }
         if client.sync_photo(credentials, &photo).await.is_err() {
+            outcome.record_failure("photos.library");
             continue;
         }
         remove_uploaded_media_file(&media_path).await?;
@@ -2877,15 +3423,23 @@ async fn upload_pending_photos(
             .complete_photo_upload(&photo.photo_id)
             .await
             .map_err(|_| ControlError::Transient)?;
+        outcome.record_success("photos.library");
     }
-    upload_pending_legacy_photos(client, credentials, &root).await
+    let legacy = upload_pending_legacy_photos(client, credentials, &root).await?;
+    outcome.completed = outcome.completed.saturating_add(legacy.completed);
+    outcome
+        .successful_collectors
+        .extend(legacy.successful_collectors);
+    outcome.failed_collectors.extend(legacy.failed_collectors);
+    Ok(outcome)
 }
 
 async fn upload_pending_legacy_photos(
     client: &dyn ControlClient,
     credentials: &DeviceCredential,
     root: &Path,
-) -> Result<(), ControlError> {
+) -> Result<MediaUploadOutcome, ControlError> {
+    let mut outcome = MediaUploadOutcome::default();
     for path in pending_manifest_paths(root).await?.into_iter().take(4) {
         let bytes = tokio::fs::read(&path)
             .await
@@ -2926,6 +3480,7 @@ async fn upload_pending_legacy_photos(
         }
         if client.sync_photo(credentials, &photo).await.is_err() {
             rotate_manifest(&path, &bytes).await?;
+            outcome.record_failure("photos.library");
             continue;
         }
         let media_path = root.join(
@@ -2942,8 +3497,9 @@ async fn upload_pending_legacy_photos(
         tokio::fs::remove_file(&path)
             .await
             .map_err(|_| ControlError::Transient)?;
+        outcome.record_success("photos.library");
     }
-    Ok(())
+    Ok(outcome)
 }
 
 async fn pending_manifest_paths(root: &Path) -> Result<Vec<PathBuf>, ControlError> {
@@ -3001,10 +3557,7 @@ async fn sync_pending_system_events(
     client: &dyn ControlClient,
 ) -> Result<(), ControlError> {
     database
-        .acknowledge_mismatched_lifecycle_events(
-            credentials.workspace_id(),
-            credentials.device_id(),
-        )
+        .dead_letter_mismatched_outbox_events(credentials.workspace_id(), credentials.device_id())
         .await
         .map_err(|_| ControlError::Transient)?;
     let events = database
@@ -3026,11 +3579,7 @@ async fn sync_pending_system_events(
         .chain(response.duplicates.iter())
         .map(String::as_str)
         .collect();
-    let rejected: std::collections::BTreeSet<_> = response
-        .rejected
-        .iter()
-        .map(|rejection| rejection.event_id.as_str())
-        .collect();
+    let rejected = terminal_rejected_event_ids(&response)?;
     if acknowledged.len() != response.accepted.len() + response.duplicates.len()
         || rejected.len() != response.rejected.len()
         || !acknowledged.is_disjoint(&rejected)
@@ -3054,8 +3603,7 @@ async fn sync_pending_system_events(
     }
     if !rejected.is_empty() {
         let event_ids = rejected.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        persist_rejected_event_health(database, &events, &event_ids, "SYNC_PAYLOAD_REJECTED")
-            .await?;
+        persist_rejected_event_health(database, &events, &event_ids, SYNC_PAYLOAD_REJECTED).await?;
         database
             .dead_letter_rejected_system_events(&event_ids)
             .await
@@ -3069,6 +3617,10 @@ async fn sync_pending_communication_events(
     credentials: &DeviceCredential,
     client: &dyn ControlClient,
 ) -> Result<(), ControlError> {
+    database
+        .dead_letter_mismatched_outbox_events(credentials.workspace_id(), credentials.device_id())
+        .await
+        .map_err(|_| ControlError::Transient)?;
     let events = database
         .load_pending_communication_events(200)
         .await
@@ -3088,11 +3640,7 @@ async fn sync_pending_communication_events(
         .chain(response.duplicates.iter())
         .map(String::as_str)
         .collect();
-    let rejected: std::collections::BTreeSet<_> = response
-        .rejected
-        .iter()
-        .map(|rejection| rejection.event_id.as_str())
-        .collect();
+    let rejected = terminal_rejected_event_ids(&response)?;
     if acknowledged.len() != response.accepted.len() + response.duplicates.len()
         || rejected.len() != response.rejected.len()
         || !acknowledged.is_disjoint(&rejected)
@@ -3116,14 +3664,37 @@ async fn sync_pending_communication_events(
     }
     if !rejected.is_empty() {
         let event_ids = rejected.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        persist_rejected_event_health(database, &events, &event_ids, "SYNC_PAYLOAD_REJECTED")
-            .await?;
+        persist_rejected_event_health(database, &events, &event_ids, SYNC_PAYLOAD_REJECTED).await?;
         database
             .dead_letter_rejected_communication_events(&event_ids)
             .await
             .map_err(|_| ControlError::Transient)?;
     }
     Ok(())
+}
+
+fn terminal_rejected_event_ids(
+    response: &SyncEventsResponse,
+) -> Result<std::collections::BTreeSet<&str>, ControlError> {
+    if response
+        .rejected
+        .iter()
+        .any(|rejection| rejection.retryable)
+    {
+        return Err(ControlError::Transient);
+    }
+    if response
+        .rejected
+        .iter()
+        .any(|rejection| rejection.error_code != SYNC_PAYLOAD_REJECTED)
+    {
+        return Err(ControlError::Contract);
+    }
+    Ok(response
+        .rejected
+        .iter()
+        .map(|rejection| rejection.event_id.as_str())
+        .collect())
 }
 
 async fn persist_rejected_event_health(
@@ -3185,14 +3756,29 @@ async fn sync_pending_communication_attachments(
     database: &DbActorHandle,
     credentials: &DeviceCredential,
     client: &dyn ControlClient,
-) -> Result<usize, ControlError> {
+) -> Result<MediaUploadOutcome, ControlError> {
     let attachments = database
         .load_pending_communication_attachments(MEDIA_BATCH_SIZE)
         .await
         .map_err(|_| ControlError::Transient)?;
-    let attachment_count = attachments.len();
-    let mut completed = 0_usize;
+    let mut outcome = MediaUploadOutcome::default();
     for attachment in attachments {
+        let Ok(collector_key) = communication_attachment_collector_key(&attachment.source) else {
+            for collector_key in ["communication.wechat", "communication.messages"] {
+                persist_media_upload_health(
+                    database,
+                    collector_key,
+                    MEDIA_SOURCE_UNSUPPORTED,
+                    true,
+                )
+                .await?;
+            }
+            database
+                .quarantine_unsupported_communication_attachment(&attachment.attachment_id)
+                .await
+                .map_err(|_| ControlError::Transient)?;
+            continue;
+        };
         if let Err(failure) = client
             .sync_communication_attachment(credentials, &attachment)
             .await
@@ -3202,7 +3788,7 @@ async fn sync_pending_communication_attachments(
                     .complete_communication_attachment(&attachment.attachment_id)
                     .await
                     .map_err(|_| ControlError::Transient)?;
-                completed = completed.saturating_add(1);
+                outcome.record_success(collector_key);
                 continue;
             }
             database
@@ -3214,15 +3800,24 @@ async fn sync_pending_communication_attachments(
                 )
                 .await
                 .map_err(|_| ControlError::Transient)?;
+            outcome.record_failure(collector_key);
             continue;
         }
         database
             .complete_communication_attachment(&attachment.attachment_id)
             .await
             .map_err(|_| ControlError::Transient)?;
-        completed = completed.saturating_add(1);
+        outcome.record_success(collector_key);
     }
-    Ok(if completed > 0 { attachment_count } else { 0 })
+    Ok(outcome)
+}
+
+fn communication_attachment_collector_key(source: &str) -> Result<&'static str, ControlError> {
+    match source {
+        "communication.wechat" | "wechat" => Ok("communication.wechat"),
+        "communication.messages" => Ok("communication.messages"),
+        _ => Err(ControlError::Contract),
+    }
 }
 
 async fn apply_communication_authorization(
@@ -3246,7 +3841,7 @@ async fn apply_communication_authorization(
         .map_err(|_| ControlError::Contract)
 }
 
-async fn revoke(
+async fn mark_manually_unpaired(
     database: &DbActorHandle,
     credentials: &LoadedDeviceCredentials,
     state: &Arc<Mutex<ControlState>>,
@@ -3255,6 +3850,12 @@ async fn revoke(
     authorization: &CommunicationAuthorization,
     owner_epoch: u64,
 ) -> Result<(), CloudControlRuntimeError> {
+    if authorization.owner_epoch().await != owner_epoch {
+        return Ok(());
+    }
+    database
+        .mark_pairing_manually_unpaired_and_disable_sensitive_collectors()
+        .await?;
     if !authorization.disable_for_owner(owner_epoch).await {
         return Ok(());
     }
@@ -3264,12 +3865,8 @@ async fn revoke(
         state.unpaired = true;
         state.applied_revision = None;
     }
-    let keychain_result = delete_device_credential(credentials.store.as_ref());
-    database
-        .clear_pairing_state_and_disable_sensitive_collectors()
-        .await?;
     pairing_state_sender.send_replace(false);
-    keychain_result?;
+    delete_device_credential(credentials.store.as_ref())?;
     Ok(())
 }
 
@@ -4181,29 +4778,43 @@ fn parse_time_ms(value: &str) -> Result<i64, ControlError> {
 mod tests {
     use super::{
         apply_communication_upload_headers, attachment_was_superseded,
-        communication_attachment_is_missing, next_media_wait, photo_marker_path,
-        quarantine_manifest, remember_screenshot_request, remove_uploaded_media_file, retry_delay,
+        communication_attachment_collector_key, communication_attachment_is_missing,
+        complete_persisted_revision, mark_manually_unpaired, next_media_wait,
+        persist_aux_collector_state, persist_media_upload_outcome, photo_marker_path,
+        quarantine_invalid_screenshot_manifest, quarantine_manifest, recover_media_upload_health,
+        remember_screenshot_request, remove_uploaded_media_file, retry_delay,
         run_collector_health_loop, screenshot_prepare_payload, sync_pending_communication_events,
-        sync_pending_system_events, AgentControlSnapshot, AppliedControl, ControlClient,
-        ControlError, ControlFuture, DeviceCredential, HttpControlClient, MediaUploadFailure,
-        MediaUploadFailureStage, PairingCallbackHandoff, PairingExchangeRequest, PendingScreenshot,
+        sync_pending_system_events, upload_pending_screenshots, AgentControlSnapshot,
+        AgentPairingService, AppliedControl, CommunicationAuthorization, ControlClient,
+        ControlError, ControlFuture, ControlPublication, ControlState, DeviceCredential,
+        HttpControlClient, LoadedDeviceCredentials, MediaUploadFailure, MediaUploadFailureStage,
+        MediaUploadOutcome, PairingCallbackHandoff, PairingClient, PairingExchangeRequest,
+        PairingSessionRequest, PairingSessionResponse, PairingStartHandoff, PendingScreenshot,
         PhotoMarker, ScreenCaptureControl, ScreenshotTrigger, SyncEventRejection,
-        SyncEventsResponse, CONTROL_INTERVAL, CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF,
-        MEDIA_BATCH_SIZE, MEDIA_UPLOAD_TIMEOUT, PRODUCTION_CLOUD_API_ORIGIN,
+        SyncEventsResponse, COMMUNICATION_MEDIA_UPLOAD_FAILED, CONTROL_INTERVAL,
+        CONTROL_REQUEST_TIMEOUT, MAX_BACKOFF, MEDIA_BATCH_SIZE, MEDIA_CYCLE_TIMEOUT_ERROR,
+        MEDIA_UPLOAD_TIMEOUT, PHOTOS_UPLOAD_FAILED, PRODUCTION_CLOUD_API_ORIGIN,
+        SCREEN_LOCAL_MANIFEST_INVALID, SCREEN_UPLOAD_FAILED, SCREEN_UPLOAD_TIMEOUT,
+        SYNC_PAYLOAD_REJECTED,
     };
-    use pca_db_local::{CommunicationMessageCommit, DbActorHandle};
+    use pca_db_local::{
+        AppliedCollectorControl, CommunicationMessageCommit, DbActorHandle, PairingState,
+    };
     use pca_domain::{
         CollectorState, CollectorStatus, CommunicationMessageRecorded,
         CommunicationMessageRecordedInput, ConversationScope, Direction, EventEnvelope,
         MessageKind, Sensitivity,
     };
+    use pca_keychain::{CredentialError, CredentialStore};
     use reqwest::Url;
     use serde_json::{Map, Value};
+    use sha2::{Digest, Sha256};
     use std::{
+        collections::HashSet,
         env,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex as StdMutex,
         },
         time::Duration,
     };
@@ -4216,10 +4827,519 @@ mod tests {
 
     static PROXY_ENVIRONMENT_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
+    #[derive(Default)]
+    struct EmptyCredentialStore;
+
+    impl CredentialStore for EmptyCredentialStore {
+        fn load(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+            Ok(None)
+        }
+
+        fn store(&self, _: &str, _: &str, _: &[u8]) -> Result<(), CredentialError> {
+            Ok(())
+        }
+
+        fn delete(&self, _: &str, _: &str) -> Result<(), CredentialError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct DeleteCountingCredentialStore {
+        deletes: AtomicUsize,
+    }
+
+    impl CredentialStore for DeleteCountingCredentialStore {
+        fn load(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+            Ok(None)
+        }
+
+        fn store(&self, _: &str, _: &str, _: &[u8]) -> Result<(), CredentialError> {
+            Ok(())
+        }
+
+        fn delete(&self, _: &str, _: &str) -> Result<(), CredentialError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn legacy_bootstrap_does_not_suppress_the_first_complete_same_revision_snapshot() {
+        let credential = DeviceCredential::new(
+            "01982222-7222-8222-8222-222222222222".to_owned(),
+            "01983333-7333-8333-8333-333333333333".to_owned(),
+            "access",
+            "refresh",
+        )
+        .expect("valid credential");
+        let mut control = AppliedCollectorControl {
+            device_id: credential.device_id().to_owned(),
+            workspace_id: credential.workspace_id().to_owned(),
+            configuration_revision: 0,
+            communication_wechat_enabled: true,
+            screen_capture_enabled: false,
+            screen_capture_scheduled_enabled: false,
+            screen_capture_interval_seconds: 300,
+            screen_capture_activity_enabled: false,
+            screen_capture_activity_min_interval_seconds: 30,
+            screen_capture_excluded_bundle_ids: Vec::new(),
+            updated_at_ms: 1,
+        };
+
+        assert_eq!(
+            complete_persisted_revision(&credential, 5, Some(&control)),
+            0
+        );
+        control.configuration_revision = 5;
+        assert_eq!(
+            complete_persisted_revision(&credential, 5, Some(&control)),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_manual_unpair_persistence_does_not_delete_the_credential() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = Arc::new(
+            DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+                .await
+                .expect("open database"),
+        );
+        let store = Arc::new(DeleteCountingCredentialStore::default());
+        let credentials = LoadedDeviceCredentials::new(
+            DeviceCredential::new(
+                "01982222-7222-8222-8222-222222222222".to_owned(),
+                "01983333-7333-8333-8333-333333333333".to_owned(),
+                "access",
+                "refresh",
+            )
+            .expect("valid credential"),
+            Arc::clone(&store) as Arc<dyn CredentialStore>,
+        );
+        let authorization = CommunicationAuthorization::new();
+        let owner_epoch = authorization.owner_epoch().await;
+        let (control_sender, _) = watch::channel(None);
+        let publication = ControlPublication::new(control_sender, owner_epoch);
+        let state = Arc::new(AsyncMutex::new(ControlState {
+            unpaired: false,
+            applied_revision: Some(5),
+            communication_hydrated: true,
+            pending_media_cleanup_result: None,
+        }));
+        let (pairing_state_sender, _) = watch::channel(true);
+
+        assert!(mark_manually_unpaired(
+            database.as_ref(),
+            &credentials,
+            &state,
+            &pairing_state_sender,
+            &publication,
+            &authorization,
+            owner_epoch,
+        )
+        .await
+        .is_err());
+        assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+
+        drop(credentials);
+        drop(state);
+        match Arc::try_unwrap(database) {
+            Ok(database) => database.shutdown().await.expect("shutdown database"),
+            Err(error) => {
+                drop(error);
+                panic!("release database");
+            }
+        }
+    }
+
+    struct CapturingPairingClient {
+        request: Arc<StdMutex<Option<PairingSessionRequest>>>,
+    }
+
+    impl PairingClient for CapturingPairingClient {
+        fn create_pairing_session<'a>(
+            &'a self,
+            request: &'a PairingSessionRequest,
+        ) -> ControlFuture<'a, PairingSessionResponse> {
+            let captured = Arc::clone(&self.request);
+            let request = request.clone();
+            Box::pin(async move {
+                *captured.lock().expect("pairing request lock") = Some(request);
+                Ok(PairingSessionResponse {
+                    session_id: "01981111-7111-8111-8111-111111111111".to_owned(),
+                    authorization_url: "https://dashboard.example.invalid/pair".to_owned(),
+                })
+            })
+        }
+
+        fn exchange_pairing_callback<'a>(
+            &'a self,
+            _: &'a PairingExchangeRequest,
+        ) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+    }
+
+    #[tokio::test]
+    async fn pairing_repair_requests_the_durable_existing_device_id() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = Arc::new(
+            DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+                .await
+                .expect("open database"),
+        );
+        let device_id = "01982222-7222-8222-8222-222222222222";
+        database
+            .save_pairing_state(&PairingState::paired(
+                device_id,
+                "01983333-7333-8333-8333-333333333333",
+                "keychain://pca/device/current",
+                4,
+                PRODUCTION_CLOUD_API_ORIGIN,
+            ))
+            .await
+            .expect("seed pairing state");
+        let request = Arc::new(StdMutex::new(None));
+        let client = Arc::new(CapturingPairingClient {
+            request: Arc::clone(&request),
+        });
+        let service = AgentPairingService::new(
+            Arc::clone(&database),
+            Arc::new(EmptyCredentialStore),
+            client,
+        );
+
+        service
+            .begin(PairingStartHandoff {
+                callback_uri: "http://127.0.0.1:43123/pca/pair/callback".to_owned(),
+            })
+            .await
+            .expect("begin repair pairing");
+
+        assert_eq!(
+            request
+                .lock()
+                .expect("pairing request lock")
+                .as_ref()
+                .and_then(|request| request.existing_device_id.as_deref()),
+            Some(device_id),
+        );
+        drop(service);
+        let Ok(database) = Arc::try_unwrap(database) else {
+            panic!("release database");
+        };
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[test]
+    fn communication_attachment_health_uses_only_canonical_collector_sources() {
+        assert_eq!(
+            communication_attachment_collector_key("communication.wechat"),
+            Ok("communication.wechat")
+        );
+        assert_eq!(
+            communication_attachment_collector_key("communication.messages"),
+            Ok("communication.messages")
+        );
+        assert_eq!(
+            communication_attachment_collector_key("wechat"),
+            Ok("communication.wechat")
+        );
+        assert!(communication_attachment_collector_key("unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn media_upload_failure_degrades_only_its_collector_and_success_recovers() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        for collector_key in ["communication.wechat", "communication.messages"] {
+            database
+                .upsert_collector_state(&CollectorState {
+                    collector_key: collector_key.to_owned(),
+                    collector_version: "test".to_owned(),
+                    status: CollectorStatus::Running,
+                    desired_config_revision: 1,
+                    applied_config_revision: 1,
+                    last_event_at_ms: Some(1),
+                    last_health_at_ms: Some(1),
+                    last_error_code: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                })
+                .await
+                .expect("seed collector health");
+        }
+
+        let failed = MediaUploadOutcome::failed(["communication.wechat"]);
+        persist_media_upload_outcome(&database, &failed, COMMUNICATION_MEDIA_UPLOAD_FAILED)
+            .await
+            .expect("persist failed upload health");
+        let states = database
+            .load_collector_states()
+            .await
+            .expect("load degraded collector states");
+        assert!(states.iter().any(|state| {
+            state.collector_key == "communication.wechat"
+                && state.status == CollectorStatus::Degraded
+                && state.last_error_code.as_deref() == Some(COMMUNICATION_MEDIA_UPLOAD_FAILED)
+        }));
+        assert!(states.iter().any(|state| {
+            state.collector_key == "communication.messages"
+                && state.status == CollectorStatus::Running
+                && state.last_error_code.is_none()
+        }));
+
+        let mut succeeded = MediaUploadOutcome::default();
+        succeeded.record_success("communication.wechat");
+        persist_media_upload_outcome(&database, &succeeded, COMMUNICATION_MEDIA_UPLOAD_FAILED)
+            .await
+            .expect("persist recovered upload health");
+        let recovered = database
+            .load_collector_states()
+            .await
+            .expect("load recovered collector state")
+            .into_iter()
+            .find(|state| state.collector_key == "communication.wechat")
+            .expect("WeChat collector state");
+        assert_eq!(recovered.status, CollectorStatus::Running);
+        assert_eq!(recovered.last_error_code, None);
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn media_cycle_timeout_degrades_every_affected_media_collector() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        for collector_key in [
+            "communication.wechat",
+            "communication.messages",
+            "photos.library",
+        ] {
+            database
+                .upsert_collector_state(&CollectorState {
+                    collector_key: collector_key.to_owned(),
+                    collector_version: "test".to_owned(),
+                    status: CollectorStatus::Running,
+                    desired_config_revision: 1,
+                    applied_config_revision: 1,
+                    last_event_at_ms: Some(1),
+                    last_health_at_ms: Some(1),
+                    last_error_code: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                })
+                .await
+                .expect("seed collector health");
+        }
+
+        persist_media_upload_outcome(
+            &database,
+            &MediaUploadOutcome::failed([
+                "communication.wechat",
+                "communication.messages",
+                "photos.library",
+            ]),
+            MEDIA_CYCLE_TIMEOUT_ERROR,
+        )
+        .await
+        .expect("persist media cycle timeout");
+        let states = database
+            .load_collector_states()
+            .await
+            .expect("load degraded collector states");
+        for collector_key in [
+            "communication.wechat",
+            "communication.messages",
+            "photos.library",
+        ] {
+            let state = states
+                .iter()
+                .find(|state| state.collector_key == collector_key)
+                .expect("seeded collector state");
+            assert_eq!(state.status, CollectorStatus::Degraded);
+            assert_eq!(
+                state.last_error_code.as_deref(),
+                Some(MEDIA_CYCLE_TIMEOUT_ERROR)
+            );
+        }
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn media_uploads_do_not_mask_a_primary_failure_or_clear_their_own_error_from_collection()
+    {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        for (collector_key, status, error_code) in [
+            (
+                "communication.wechat",
+                CollectorStatus::PermissionRequired,
+                Some("WECHAT_PERMISSION_REQUIRED"),
+            ),
+            (
+                "photos.library",
+                CollectorStatus::Degraded,
+                Some(PHOTOS_UPLOAD_FAILED),
+            ),
+        ] {
+            database
+                .upsert_collector_state(&CollectorState {
+                    collector_key: collector_key.to_owned(),
+                    collector_version: "test".to_owned(),
+                    status,
+                    desired_config_revision: 1,
+                    applied_config_revision: 1,
+                    last_event_at_ms: Some(1),
+                    last_health_at_ms: Some(1),
+                    last_error_code: error_code.map(str::to_owned),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                })
+                .await
+                .expect("seed collector state");
+        }
+
+        let failed = MediaUploadOutcome::failed(["communication.wechat"]);
+        persist_media_upload_outcome(&database, &failed, COMMUNICATION_MEDIA_UPLOAD_FAILED)
+            .await
+            .expect("persist media failure");
+        let mut succeeded = MediaUploadOutcome::default();
+        succeeded.record_success("communication.wechat");
+        persist_media_upload_outcome(&database, &succeeded, COMMUNICATION_MEDIA_UPLOAD_FAILED)
+            .await
+            .expect("persist media success");
+        persist_aux_collector_state(&database, "photos.library", true, 1, true, None)
+            .await
+            .expect("persist successful photo collection");
+
+        let states = database
+            .load_collector_states()
+            .await
+            .expect("load collector states");
+        for (collector_key, status, error_code) in [
+            (
+                "communication.wechat",
+                CollectorStatus::PermissionRequired,
+                Some("WECHAT_PERMISSION_REQUIRED"),
+            ),
+            (
+                "photos.library",
+                CollectorStatus::Degraded,
+                Some(PHOTOS_UPLOAD_FAILED),
+            ),
+        ] {
+            let state = states
+                .iter()
+                .find(|state| state.collector_key == collector_key)
+                .expect("seeded collector state");
+            assert_eq!(state.status, status);
+            assert_eq!(state.last_error_code.as_deref(), error_code);
+        }
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn successful_screenshot_upload_recovers_a_matching_upload_failure() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "screen.capture".to_owned(),
+                collector_version: "test".to_owned(),
+                status: CollectorStatus::Degraded,
+                desired_config_revision: 1,
+                applied_config_revision: 1,
+                last_event_at_ms: Some(1),
+                last_health_at_ms: Some(1),
+                last_error_code: Some(SCREEN_UPLOAD_TIMEOUT.to_owned()),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .expect("seed screenshot upload failure");
+
+        recover_media_upload_health(
+            &database,
+            "screen.capture",
+            &[SCREEN_UPLOAD_FAILED, SCREEN_UPLOAD_TIMEOUT],
+        )
+        .await
+        .expect("recover screenshot upload health");
+
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("load collector state")
+            .into_iter()
+            .find(|state| state.collector_key == "screen.capture")
+            .expect("screen capture collector state");
+        assert_eq!(state.status, CollectorStatus::Running);
+        assert_eq!(state.last_error_code, None);
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn first_screenshot_upload_timeout_degrades_a_running_collector() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "screen.capture".to_owned(),
+                collector_version: "test".to_owned(),
+                status: CollectorStatus::Running,
+                desired_config_revision: 1,
+                applied_config_revision: 1,
+                last_event_at_ms: Some(1),
+                last_health_at_ms: Some(1),
+                last_error_code: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .expect("seed running screenshot collector");
+
+        persist_aux_collector_state(
+            &database,
+            "screen.capture",
+            true,
+            1,
+            false,
+            Some(SCREEN_UPLOAD_TIMEOUT),
+        )
+        .await
+        .expect("persist first screenshot timeout");
+
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("load collector state")
+            .into_iter()
+            .find(|state| state.collector_key == "screen.capture")
+            .expect("screen capture collector state");
+        assert_eq!(state.status, CollectorStatus::Degraded);
+        assert_eq!(
+            state.last_error_code.as_deref(),
+            Some(SCREEN_UPLOAD_TIMEOUT)
+        );
+        database.shutdown().await.expect("shutdown database");
+    }
+
     struct CollectorHealthCountingClient(AtomicUsize);
 
     struct NetworkCollectorHealthClient {
         reports: AtomicUsize,
+        report_updates: watch::Sender<usize>,
         available: AtomicBool,
     }
 
@@ -4269,8 +5389,11 @@ mod tests {
             _: &'a DeviceCredential,
             _: &'a [CollectorState],
         ) -> ControlFuture<'a, ()> {
-            self.reports.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            Box::pin(async {
+                let reports = self.reports.fetch_add(1, Ordering::SeqCst) + 1;
+                self.report_updates.send_replace(reports);
+                Ok(())
+            })
         }
     }
 
@@ -4365,7 +5488,7 @@ mod tests {
         )
         .expect("valid credential");
         let (_credential, credential_receiver) = watch::channel(credential);
-        let (_control, control_receiver) = watch::channel(Some(AppliedControl {
+        let applied_control = Some(AppliedControl {
             configuration_revision: 1,
             network_enabled: true,
             communication_wechat_enabled: false,
@@ -4373,10 +5496,13 @@ mod tests {
             photos_library_enabled: false,
             screen_capture: ScreenCaptureControl::default(),
             screenshot_request_id: None,
-        }));
+        });
+        let (control, control_receiver) = watch::channel(applied_control.clone());
         let (shutdown, shutdown_receiver) = watch::channel(false);
+        let (report_updates, mut report_receiver) = watch::channel(0);
         let client = Arc::new(NetworkCollectorHealthClient {
             reports: AtomicUsize::new(0),
+            report_updates,
             available: AtomicBool::new(false),
         });
         let worker = tokio::spawn(run_collector_health_loop(
@@ -4387,20 +5513,21 @@ mod tests {
             shutdown_receiver,
         ));
 
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(10)).await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
+        control.send_replace(applied_control);
+        report_receiver
+            .changed()
+            .await
+            .expect("first health report");
         assert_eq!(client.reports.load(Ordering::SeqCst), 1);
         client.available.store(true, Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(29)).await;
         tokio::task::yield_now().await;
         assert_eq!(client.reports.load(Ordering::SeqCst), 1);
         tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
+        report_receiver
+            .changed()
+            .await
+            .expect("second health report");
         assert_eq!(client.reports.load(Ordering::SeqCst), 2);
 
         shutdown.send_replace(true);
@@ -4618,6 +5745,64 @@ mod tests {
             .starts_with("broken.invalid-"));
     }
 
+    #[tokio::test]
+    async fn corrupt_screenshot_manifest_is_diagnostic_and_stays_degraded() {
+        let directory = tempfile::tempdir().expect("temporary spool");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "screen.capture".to_owned(),
+                collector_version: "test".to_owned(),
+                status: CollectorStatus::Running,
+                desired_config_revision: 1,
+                applied_config_revision: 1,
+                last_event_at_ms: Some(1),
+                last_health_at_ms: Some(1),
+                last_error_code: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .expect("seed Screenshot Collector state");
+        let path = directory.path().join("broken.json");
+        tokio::fs::write(&path, b"not-json")
+            .await
+            .expect("write corrupt manifest");
+
+        quarantine_invalid_screenshot_manifest(&database, &path)
+            .await
+            .expect("quarantine corrupt Screenshot manifest");
+        persist_aux_collector_state(&database, "screen.capture", true, 1, false, None)
+            .await
+            .expect("persist later healthy Screenshot observation");
+
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("load Screenshot Collector state")
+            .into_iter()
+            .find(|state| state.collector_key == "screen.capture")
+            .expect("Screenshot Collector state");
+        assert_eq!(state.status, CollectorStatus::Degraded);
+        assert_eq!(
+            state.last_error_code.as_deref(),
+            Some(SCREEN_LOCAL_MANIFEST_INVALID)
+        );
+        let diagnostics = rusqlite::Connection::open(directory.path().join("agent.sqlite3"))
+            .expect("open diagnostic database")
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostic_events
+                 WHERE code = 'SCREEN_LOCAL_MANIFEST_INVALID'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("count Screenshot diagnostics");
+        assert_eq!(diagnostics, 1);
+        database.shutdown().await.expect("shutdown database");
+    }
+
     #[test]
     fn photo_completion_markers_live_outside_the_hot_upload_directory() {
         let root = std::path::Path::new("/private/photo-spool");
@@ -4631,6 +5816,63 @@ mod tests {
             photo_marker_path(root, photo_id, PhotoMarker::Oversized),
             root.join("Handled").join(format!("{photo_id}.oversized"))
         );
+    }
+
+    #[tokio::test]
+    async fn screenshot_upload_batch_drains_an_explicit_spool_independently() {
+        let directory = tempfile::tempdir().expect("temporary screenshot spool");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        let spool = directory.path().join("screenshots");
+        tokio::fs::create_dir(&spool)
+            .await
+            .expect("create screenshot spool");
+        let screenshot_id = "01985555-7555-8555-8555-555555555555";
+        let image_file_name = format!("{screenshot_id}.jpg");
+        let image = b"independent screenshot upload";
+        tokio::fs::write(spool.join(&image_file_name), image)
+            .await
+            .expect("write screenshot image");
+        let screenshot = PendingScreenshot {
+            screenshot_id: screenshot_id.to_owned(),
+            request_id: None,
+            trigger: ScreenshotTrigger::Scheduled,
+            captured_at: "2026-08-16T00:00:00Z".to_owned(),
+            app_bundle_id: Some("com.example.App".to_owned()),
+            pixel_width: 1920,
+            pixel_height: 1080,
+            sha256: format!("{:x}", Sha256::digest(image)),
+            size_bytes: u64::try_from(image.len()).expect("screenshot size"),
+            mime_type: "image/jpeg".to_owned(),
+            image_file_name: image_file_name.clone(),
+        };
+        tokio::fs::write(
+            spool.join(format!("{screenshot_id}.json")),
+            serde_json::to_vec(&screenshot).expect("serialize screenshot manifest"),
+        )
+        .await
+        .expect("write screenshot manifest");
+        let credential = DeviceCredential::new(
+            "01985555-7555-8555-8555-555555555556".to_owned(),
+            "01982222-7222-8222-8222-222222222222".to_owned(),
+            "access-credential-for-screenshot-test",
+            "refresh-credential-for-screenshot-test",
+        )
+        .expect("valid credential");
+        let client = AcceptingScreenshotClient(AtomicUsize::new(0));
+        let mut handled = HashSet::new();
+
+        let outcome =
+            upload_pending_screenshots(&database, &client, &credential, &mut handled, &spool)
+                .await
+                .expect("upload screenshot batch");
+
+        assert_eq!(outcome.completed, 1);
+        assert_eq!(client.0.load(Ordering::SeqCst), 1);
+        assert!(!spool.join(image_file_name).exists());
+        assert!(!spool.join(format!("{screenshot_id}.json")).exists());
+        database.shutdown().await.expect("shutdown database");
     }
 
     #[test]
@@ -4761,7 +6003,15 @@ mod tests {
 
     struct AcceptingSyncClient;
 
+    struct AcceptingScreenshotClient(AtomicUsize);
+
     struct RejectingSystemSyncClient;
+
+    struct RetryableRejectingSystemSyncClient;
+
+    struct MixedSystemSyncClient {
+        rejected_event_id: String,
+    }
 
     impl ControlClient for AcceptingSyncClient {
         fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
@@ -4793,6 +6043,29 @@ mod tests {
         }
     }
 
+    impl ControlClient for AcceptingScreenshotClient {
+        fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn heartbeat_and_control<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: u64,
+        ) -> ControlFuture<'a, AgentControlSnapshot> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn sync_screenshot<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: &'a PendingScreenshot,
+        ) -> ControlFuture<'a, ()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     impl ControlClient for RejectingSystemSyncClient {
         fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
             Box::pin(async { Err(ControlError::Contract) })
@@ -4815,12 +6088,93 @@ mod tests {
                 .iter()
                 .map(|event| SyncEventRejection {
                     event_id: event.event_id.clone(),
+                    error_code: SYNC_PAYLOAD_REJECTED.to_owned(),
+                    retryable: false,
                 })
                 .collect();
             Box::pin(async move {
                 Ok(SyncEventsResponse {
                     batch_id: "test-batch".to_owned(),
                     accepted: Vec::new(),
+                    duplicates: Vec::new(),
+                    rejected,
+                })
+            })
+        }
+    }
+
+    impl ControlClient for RetryableRejectingSystemSyncClient {
+        fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn heartbeat_and_control<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: u64,
+        ) -> ControlFuture<'a, AgentControlSnapshot> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn sync_system_events<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            events: &'a [EventEnvelope],
+        ) -> ControlFuture<'a, SyncEventsResponse> {
+            let rejected = events
+                .iter()
+                .map(|event| SyncEventRejection {
+                    event_id: event.event_id.clone(),
+                    error_code: "SYNC_RATE_LIMITED".to_owned(),
+                    retryable: true,
+                })
+                .collect();
+            Box::pin(async move {
+                Ok(SyncEventsResponse {
+                    batch_id: "test-batch".to_owned(),
+                    accepted: Vec::new(),
+                    duplicates: Vec::new(),
+                    rejected,
+                })
+            })
+        }
+    }
+
+    impl ControlClient for MixedSystemSyncClient {
+        fn refresh<'a>(&'a self, _: &'a DeviceCredential) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn heartbeat_and_control<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            _: u64,
+        ) -> ControlFuture<'a, AgentControlSnapshot> {
+            Box::pin(async { Err(ControlError::Contract) })
+        }
+
+        fn sync_system_events<'a>(
+            &'a self,
+            _: &'a DeviceCredential,
+            events: &'a [EventEnvelope],
+        ) -> ControlFuture<'a, SyncEventsResponse> {
+            let mut accepted = Vec::new();
+            let mut rejected = Vec::new();
+            for event in events {
+                if event.event_id == self.rejected_event_id {
+                    rejected.push(SyncEventRejection {
+                        event_id: event.event_id.clone(),
+                        error_code: SYNC_PAYLOAD_REJECTED.to_owned(),
+                        retryable: false,
+                    });
+                } else {
+                    accepted.push(event.event_id.clone());
+                }
+            }
+            Box::pin(async move {
+                Ok(SyncEventsResponse {
+                    batch_id: "test-batch".to_owned(),
+                    accepted,
                     duplicates: Vec::new(),
                     rejected,
                 })
@@ -4852,6 +6206,8 @@ mod tests {
                 .iter()
                 .map(|event| SyncEventRejection {
                     event_id: event.event_id.clone(),
+                    error_code: SYNC_PAYLOAD_REJECTED.to_owned(),
+                    retryable: false,
                 })
                 .collect();
             Box::pin(async move {
@@ -4986,6 +6342,100 @@ mod tests {
             .load_pending_system_events(20)
             .await
             .expect("load pending system events")
+            .is_empty());
+        assert_eq!(
+            database.active_outbox_depth().await.expect("outbox depth"),
+            0
+        );
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn retryable_cloud_rejection_remains_pending_without_dead_letter() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        let event = system_metric_event("01986666-7666-8666-8666-66666666666d");
+        database
+            .append_event_with_outbox(&event)
+            .await
+            .expect("persist system event");
+        let credential = DeviceCredential::new(
+            event.device_id.clone(),
+            event.workspace_id.clone(),
+            "access-credential-for-sync-test",
+            "refresh-credential-for-sync-test",
+        )
+        .expect("valid device credential");
+
+        let error =
+            sync_pending_system_events(&database, &credential, &RetryableRejectingSystemSyncClient)
+                .await
+                .expect_err("retryable rejection must not become terminal");
+
+        assert_eq!(error, ControlError::Transient);
+        assert_eq!(
+            database
+                .load_pending_system_events(20)
+                .await
+                .expect("load pending system events")
+                .len(),
+            1
+        );
+        assert_eq!(
+            database.active_outbox_depth().await.expect("outbox depth"),
+            1
+        );
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn mixed_cloud_response_acknowledges_valid_event_and_unblocks_the_next_batch() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+            .await
+            .expect("open database");
+        let rejected = system_metric_event("01986666-7666-8666-8666-66666666666e");
+        let accepted = system_metric_event("01986666-7666-8666-8666-66666666666f");
+        for event in [&rejected, &accepted] {
+            database
+                .append_event_with_outbox(event)
+                .await
+                .expect("persist system event");
+        }
+        let credential = DeviceCredential::new(
+            rejected.device_id.clone(),
+            rejected.workspace_id.clone(),
+            "access-credential-for-sync-test",
+            "refresh-credential-for-sync-test",
+        )
+        .expect("valid device credential");
+        let client = MixedSystemSyncClient {
+            rejected_event_id: rejected.event_id.clone(),
+        };
+
+        sync_pending_system_events(&database, &credential, &client)
+            .await
+            .expect("apply mixed sync response");
+        assert!(database
+            .load_pending_system_events(20)
+            .await
+            .expect("load pending system events")
+            .is_empty());
+
+        let later = system_metric_event("01986666-7666-8666-8666-666666666670");
+        database
+            .append_event_with_outbox(&later)
+            .await
+            .expect("persist later event");
+        sync_pending_system_events(&database, &credential, &client)
+            .await
+            .expect("sync later event");
+        assert!(database
+            .load_pending_system_events(20)
+            .await
+            .expect("load later pending events")
             .is_empty());
         assert_eq!(
             database.active_outbox_depth().await.expect("outbox depth"),

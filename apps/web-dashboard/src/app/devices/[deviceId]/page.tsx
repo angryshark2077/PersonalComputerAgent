@@ -218,7 +218,11 @@ export default function DevicePage() {
         <Link className="primary-link" href={`/devices/${encodeURIComponent(deviceId)}/photos`}>View photos</Link>
       </div>
       {error !== null ? <p role="alert">{error}</p> : null}
-      <CollectorHealthPanel health={screen.device.status?.collector_health ?? []} />
+      <CollectorHealthPanel
+        health={screen.device.status?.collector_health ?? []}
+        presence={screen.device.status?.presence}
+        lastSuccessfulCheckIn={screen.device.status?.observed_at}
+      />
       <CollectorScopeCard
           name="Network"
           detail="SSID, BSSID, local IP and precise device location"
@@ -483,15 +487,27 @@ const collectorHealthDefinitions = [
   ["screen.capture", "Screenshots"],
 ] as const;
 
-function CollectorHealthPanel({ health }: { health: DashboardCollectorHealth[] }) {
+function CollectorHealthPanel({
+  health,
+  presence,
+  lastSuccessfulCheckIn,
+}: {
+  health: DashboardCollectorHealth[];
+  presence: "online" | "stale" | "offline" | "sleeping" | undefined;
+  lastSuccessfulCheckIn: string | undefined;
+}) {
   return (
     <section className="dashboard-panel collector-card" aria-labelledby="collector-health-heading">
       <h2 id="collector-health-heading">Collector health</h2>
       <p>The Agent checks and reports collector health every 30 minutes while it is running.</p>
+      <p>
+        Device connectivity: <strong>{presence === undefined ? "No successful check-in" : statusLabel(presence)}</strong>
+        {lastSuccessfulCheckIn === undefined ? null : ` · Last successful check-in ${formatHealthTime(lastSuccessfulCheckIn)}`}
+      </p>
       <div className="collector-health-list">
         {collectorHealthDefinitions.map(([key, name]) => {
           const record = health.find((candidate) => candidate.collector_key === key);
-          const presentation = collectorHealthPresentation(record);
+          const presentation = collectorHealthPresentation(record, Date.now(), presence);
           return (
             <article className={`collector-health-row${presentation.alert ? " is-alert" : ""}`} key={key}>
               <div>
@@ -510,6 +526,10 @@ function CollectorHealthPanel({ health }: { health: DashboardCollectorHealth[] }
       </div>
     </section>
   );
+}
+
+function statusLabel(status: string): string {
+  return status.split("_").map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" ");
 }
 
 function formatHealthTime(value: string | null | undefined): string {

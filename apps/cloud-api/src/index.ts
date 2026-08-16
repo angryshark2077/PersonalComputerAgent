@@ -89,6 +89,7 @@ export function createApp(options: CreateAppOptions): Hono {
     await options.repository.createPairingSession({
       sessionIdHash: hashSecret(sessionId),
       devicePublicKeyHash: hashSecret(input.device_public_key),
+      requestedDeviceId: input.existing_device_id ?? null,
       codeChallenge: input.code_challenge,
       callbackUri: input.callback_uri,
       callbackStateHash: hashSecret(input.callback_state),
@@ -263,20 +264,28 @@ export function createApp(options: CreateAppOptions): Hono {
     if (batch === null || batch.deviceId !== device.deviceId) {
       return errorResponse(context, 400, "REQUEST_INVALID", "Invalid system event batch.");
     }
-    if (batch.events.some((event) => event.workspaceId !== device.workspaceId || event.deviceId !== device.deviceId)) {
+    if (batch.entries.some(({ envelope }) =>
+      envelope.workspace_id !== device.workspaceId || envelope.device_id !== device.deviceId
+    )) {
       return errorResponse(context, 403, "WORKSPACE_FORBIDDEN", "The requested Workspace is forbidden.");
     }
+    const events = batch.entries.flatMap(({ event }) => event === null ? [] : [event]);
+    const rejected = batch.entries.flatMap(({ envelope, event }) => event === null ? [{
+      event_id: envelope.event_id,
+      error_code: "SYNC_PAYLOAD_REJECTED",
+      retryable: false,
+    }] : []);
     try {
       const result = await options.repository.appendSystemEvents(
         device.workspaceId,
         device.deviceId,
-        batch.events,
+        events,
       );
       return context.json({
         batch_id: batch.batchId,
         accepted: result.acceptedEventIds,
         duplicates: result.duplicateEventIds,
-        rejected: [],
+        rejected,
         server_time: new Date().toISOString(),
       });
     } catch (error) {
@@ -291,20 +300,28 @@ export function createApp(options: CreateAppOptions): Hono {
     if (batch === null || batch.deviceId !== device.deviceId) {
       return errorResponse(context, 400, "REQUEST_INVALID", "Invalid communication event batch.");
     }
-    if (batch.events.some((event) => event.workspaceId !== device.workspaceId || event.deviceId !== device.deviceId)) {
+    if (batch.entries.some(({ envelope }) =>
+      envelope.workspace_id !== device.workspaceId || envelope.device_id !== device.deviceId
+    )) {
       return errorResponse(context, 403, "WORKSPACE_FORBIDDEN", "The requested Workspace is forbidden.");
     }
+    const events = batch.entries.flatMap(({ event }) => event === null ? [] : [event]);
+    const rejected = batch.entries.flatMap(({ envelope, event }) => event === null ? [{
+      event_id: envelope.event_id,
+      error_code: "SYNC_PAYLOAD_REJECTED",
+      retryable: false,
+    }] : []);
     try {
       const result = await options.repository.appendCommunicationEvents(
         device.workspaceId,
         device.deviceId,
-        batch.events,
+        events,
       );
       return context.json({
         batch_id: batch.batchId,
         accepted: result.acceptedEventIds,
         duplicates: result.duplicateEventIds,
-        rejected: [],
+        rejected,
         server_time: new Date().toISOString(),
       });
     } catch (error) {

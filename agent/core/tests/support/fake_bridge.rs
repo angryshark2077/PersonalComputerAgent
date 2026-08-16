@@ -8,7 +8,16 @@ fn main() {
     let Some(socket_path) = arguments.get(2).map(PathBuf::from) else {
         std::process::exit(64);
     };
-    if arguments.len() != 3 || !socket_path.is_absolute() {
+    let valid_sleep_control = match arguments.as_slice() {
+        [_, _, _, option, path]
+            if option.as_os_str() == std::ffi::OsStr::new("--sleep-control-socket") =>
+        {
+            PathBuf::from(path).is_absolute()
+        }
+        [_, _, _] => true,
+        _ => false,
+    };
+    if !valid_sleep_control || !socket_path.is_absolute() {
         std::process::exit(64);
     }
     let Some(run_dir) = socket_path.parent() else {

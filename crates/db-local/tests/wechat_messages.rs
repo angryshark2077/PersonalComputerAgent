@@ -5,7 +5,7 @@ use std::{
 };
 
 use pca_db_local::{
-    CommunicationAttachmentSpoolReference, CommunicationMessageCommit, DbActorHandle,
+    CommunicationAttachmentSpoolReference, CommunicationMessageCommit, DbActorHandle, DbError,
 };
 use pca_domain::{
     CommunicationAttachment, CommunicationMessageRecorded, CommunicationMessageRecordedInput,
@@ -556,6 +556,83 @@ async fn source_key_replay_allows_sender_metadata_to_be_observed_separately() {
         .commit_communication_message(&replay)
         .await
         .expect("sender metadata does not rewrite immutable message event");
+    assert_eq!(row_counts(&path), (1, 1, 1, 1, 1, 1));
+}
+
+#[tokio::test]
+async fn exact_source_replay_from_a_repaired_device_keeps_the_original_event() {
+    let (_directory, path) = database_path();
+    let store = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let commit = valid_commit(&path);
+    store
+        .commit_communication_message(&commit)
+        .await
+        .expect("commit original device message");
+
+    let mut repaired_device_replay = commit.clone();
+    repaired_device_replay.event.event_id = "event-from-repaired-device".to_owned();
+    repaired_device_replay.event.device_id = "device-2".to_owned();
+    store
+        .commit_communication_message(&repaired_device_replay)
+        .await
+        .expect("deduplicate exact source replay from repaired device");
+
+    assert_eq!(row_counts(&path), (1, 1, 1, 1, 1, 1));
+    let connection = Connection::open(&path).expect("inspect original event identity");
+    let identity = connection
+        .query_row(
+            "SELECT event_id, device_id FROM events_local WHERE event_type = 'communication.message_recorded'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .expect("read original event identity");
+    assert_eq!(identity, ("event-1".to_owned(), "device-1".to_owned()));
+}
+
+#[tokio::test]
+async fn repaired_device_replay_with_changed_message_content_is_rejected() {
+    let (_directory, path) = database_path();
+    let store = DbActorHandle::open(&path, "0.1.0")
+        .await
+        .expect("open database");
+    let commit = valid_commit(&path);
+    store
+        .commit_communication_message(&commit)
+        .await
+        .expect("commit original device message");
+
+    let mut conflicting = commit.clone();
+    conflicting.event.event_id = "event-from-repaired-device".to_owned();
+    conflicting.event.device_id = "device-2".to_owned();
+    conflicting.message =
+        CommunicationMessageRecorded::try_new(CommunicationMessageRecordedInput {
+            message_id: "different-message".to_owned(),
+            conversation_id: "conversation-1".to_owned(),
+            sender_id: "wxid_sender".to_owned(),
+            sender_display_name: "Sender".to_owned(),
+            source_key: "source-key-1".to_owned(),
+            occurred_at: "2026-08-02T12:00:00Z".to_owned(),
+            direction: Direction::Incoming,
+            kind: MessageKind::Image,
+            conversation: ConversationScope::Direct,
+            text: None,
+            attachments: commit.message.attachments().to_vec(),
+        })
+        .expect("valid conflicting message");
+    let Value::Object(payload) =
+        serde_json::to_value(&conflicting.message).expect("conflicting message payload")
+    else {
+        panic!("message payload is an object");
+    };
+    conflicting.event.payload = payload;
+
+    let error = store
+        .commit_communication_message(&conflicting)
+        .await
+        .expect_err("changed immutable content must be rejected");
+    assert_eq!(error, DbError::CommunicationSourceConflict);
     assert_eq!(row_counts(&path), (1, 1, 1, 1, 1, 1));
 }
 

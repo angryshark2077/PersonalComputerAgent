@@ -177,12 +177,18 @@ fn observation_group(observation: &SystemObservation) -> MetricGroup {
 }
 
 async fn next_group(observations: &mut mpsc::Receiver<SystemObservation>) -> MetricGroup {
+    observation_group(&next_observation(observations).await)
+}
+
+async fn next_observation(
+    observations: &mut mpsc::Receiver<SystemObservation>,
+) -> SystemObservation {
     for _ in 0..10_000 {
         match observations.try_recv() {
-            Ok(observation) => return observation_group(&observation),
+            Ok(observation) => return observation,
             Err(mpsc::error::TryRecvError::Empty) => {
                 tokio::task::yield_now().await;
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_micros(50));
             }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 panic!("collector observation channel disconnected")
@@ -205,6 +211,24 @@ async fn assert_initial_groups(observations: &mut mpsc::Receiver<SystemObservati
     tokio::task::yield_now().await;
 }
 
+async fn initial_observation_for_group(
+    observations: &mut mpsc::Receiver<SystemObservation>,
+    wanted: MetricGroup,
+) -> SystemObservation {
+    let initial = [
+        next_observation(observations).await,
+        next_observation(observations).await,
+    ];
+    assert_ne!(
+        observation_group(&initial[0]),
+        observation_group(&initial[1])
+    );
+    initial
+        .into_iter()
+        .find(|observation| observation_group(observation) == wanted)
+        .expect("initial metric group exists")
+}
+
 async fn next_for_group(
     observations: &mut mpsc::Receiver<SystemObservation>,
     wanted: MetricGroup,
@@ -217,7 +241,7 @@ async fn next_for_group(
             }
             Ok(_) | Err(mpsc::error::TryRecvError::Empty) => {
                 tokio::task::yield_now().await;
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_micros(50));
             }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 panic!("collector observation channel disconnected")
@@ -233,7 +257,7 @@ async fn wait_for_calls(controls: &FakeControls, cpu: usize, disk: usize) {
             return;
         }
         tokio::task::yield_now().await;
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_micros(50));
     }
     panic!(
         "sample calls did not reach CPU={cpu}, disk={disk}; got CPU={}, disk={}",
@@ -356,7 +380,8 @@ async fn unsupported_error_stops_only_its_metric_group_until_shutdown() {
     let controls =
         FakeControls::cpu_script([Err(terminal_error(SystemSampleErrorKind::Unsupported))]);
     let (handle, mut observations) = test_runtime(&controls, 16);
-    let observation = next_for_group(&mut observations, MetricGroup::CpuMemory).await;
+    let observation =
+        initial_observation_for_group(&mut observations, MetricGroup::CpuMemory).await;
     assert!(matches!(
         observation,
         SystemObservation::Failed {
@@ -367,7 +392,6 @@ async fn unsupported_error_stops_only_its_metric_group_until_shutdown() {
             ..
         }
     ));
-    let _ = next_for_group(&mut observations, MetricGroup::Disk).await;
 
     tokio::time::advance(Duration::from_secs(900)).await;
     wait_for_calls(&controls, 1, 2).await;
@@ -382,7 +406,8 @@ async fn unsupported_error_stops_only_its_metric_group_until_shutdown() {
 async fn fatal_error_stops_only_its_metric_group_until_shutdown() {
     let controls = FakeControls::cpu_script([Err(terminal_error(SystemSampleErrorKind::Fatal))]);
     let (handle, mut observations) = test_runtime(&controls, 16);
-    let observation = next_for_group(&mut observations, MetricGroup::CpuMemory).await;
+    let observation =
+        initial_observation_for_group(&mut observations, MetricGroup::CpuMemory).await;
     assert!(matches!(
         observation,
         SystemObservation::Failed {
@@ -393,7 +418,6 @@ async fn fatal_error_stops_only_its_metric_group_until_shutdown() {
             ..
         }
     ));
-    let _ = next_for_group(&mut observations, MetricGroup::Disk).await;
 
     tokio::time::advance(Duration::from_secs(900)).await;
     wait_for_calls(&controls, 1, 2).await;

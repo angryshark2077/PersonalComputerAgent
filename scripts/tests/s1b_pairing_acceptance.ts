@@ -262,7 +262,11 @@ async function runRevokeAgent(
     statusPath,
     `${JSON.stringify({ api_origin: apiOrigin })}\n`,
   );
-  if (result.code !== 0) throw new Error(`acceptance Agent phase revoke exited ${result.code}`);
+  if (result.code !== 0) {
+    throw new Error(
+      `acceptance Agent phase revoke exited ${result.code}: ${result.stderr.trim()}`,
+    );
+  }
   return result;
 }
 

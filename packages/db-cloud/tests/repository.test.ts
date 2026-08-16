@@ -142,6 +142,167 @@ test("wrong PKCE challenge does not consume the authorization code", async () =>
   assert.equal(grant.credentialGeneration, 1);
 });
 
+test("repair pairing reuses the existing device and preserves its collector config", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  await pairDevice(repository);
+  await repository.appendConfigAudit({
+    auditId: "01985555-7555-8555-8555-555555555556",
+    actorUserId: ownerUserId,
+    workspaceId,
+    deviceId,
+    config: {
+      networkEnabled: true,
+      wechatEnabled: true,
+      messagesEnabled: false,
+      photosEnabled: false,
+      screenCaptureEnabled: true,
+      screenCaptureScheduledEnabled: true,
+      screenCaptureIntervalSeconds: 600,
+      screenCaptureActivityEnabled: true,
+      screenCaptureActivityMinIntervalSeconds: 45,
+      screenCaptureExcludedBundleIds: ["com.example.private"],
+    },
+    now,
+  });
+  await repository.createPairingSession({
+    sessionIdHash: hash("g"),
+    devicePublicKeyHash: hash("h"),
+    requestedDeviceId: deviceId,
+    codeChallenge: "repair-challenge",
+    callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("i"),
+    expiresAt: later,
+    createdAt: now,
+  });
+  await repository.authorizePairingSession({
+    sessionIdHash: hash("g"),
+    authorizationCodeHash: hash("j"),
+    workspaceId,
+    ownerUserId,
+    callbackStateHash: hash("i"),
+    expiresAt: later,
+    now,
+  });
+
+  const grant = await repository.consumeAuthorizationCode({
+    sessionIdHash: hash("g"),
+    authorizationCodeHash: hash("j"),
+    codeChallenge: "repair-challenge",
+    deviceId: "01984444-7444-8444-8444-444444444444",
+    accessTokenHash: hash("k"),
+    refreshTokenHash: hash("l"),
+    accessExpiresAt: later,
+    refreshExpiresAt: new Date("2026-09-30T12:00:00.000Z"),
+    now,
+  });
+
+  assert.equal(grant.deviceId, deviceId);
+  assert.equal(grant.credentialGeneration, 2);
+  assert.equal((await repository.listOwnerDevices(workspaceId, ownerUserId)).length, 1);
+  const snapshot = await repository.loadControlSnapshot(deviceId, workspaceId);
+  assert.equal(snapshot.configuration_revision, 1);
+  assert.equal(snapshot.collectors["communication.wechat"].enabled, true);
+  assert.equal(snapshot.collectors["screen.capture"].enabled, true);
+  assert.equal(snapshot.collectors["screen.capture"].interval_seconds, 600);
+  await assert.rejects(
+    repository.authenticateDeviceAccess(hash("5"), now),
+    (error) => error instanceof ControlRepositoryError && error.code === "CREDENTIAL_INVALID",
+  );
+  assert.deepEqual(await repository.authenticateDeviceAccess(hash("k"), now), {
+    workspaceId,
+    deviceId,
+  });
+});
+
+test("repair pairing creates a fresh identity after the requested Cloud device was purged", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  const deletedDeviceId = "01981111-7111-8111-8111-111111111111";
+  const replacementDeviceId = "01984444-7444-8444-8444-444444444444";
+  await pairDevice(repository);
+  await repository.deleteOwnerDevice(deletedDeviceId, workspaceId, ownerUserId);
+  await repository.createPairingSession({
+    sessionIdHash: hash("g"),
+    devicePublicKeyHash: hash("h"),
+    requestedDeviceId: deletedDeviceId,
+    codeChallenge: "replacement-challenge",
+    callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("i"),
+    expiresAt: later,
+    createdAt: now,
+  });
+  await repository.authorizePairingSession({
+    sessionIdHash: hash("g"),
+    authorizationCodeHash: hash("j"),
+    workspaceId,
+    ownerUserId,
+    callbackStateHash: hash("i"),
+    expiresAt: later,
+    now,
+  });
+
+  const grant = await repository.consumeAuthorizationCode({
+    sessionIdHash: hash("g"),
+    authorizationCodeHash: hash("j"),
+    codeChallenge: "replacement-challenge",
+    deviceId: replacementDeviceId,
+    accessTokenHash: hash("k"),
+    refreshTokenHash: hash("l"),
+    accessExpiresAt: later,
+    refreshExpiresAt: later,
+    now,
+  });
+
+  assert.equal(grant.deviceId, replacementDeviceId);
+  assert.equal(grant.credentialGeneration, 1);
+  assert.equal((await repository.listOwnerDevices(workspaceId, ownerUserId)).length, 1);
+});
+
+test("repair pairing cannot claim a device from another Workspace", async () => {
+  const otherWorkspaceId = "01987777-7777-8777-8777-777777777777";
+  const repository = new MemoryControlRepository([
+    membership,
+    { workspaceId: otherWorkspaceId, userId: ownerUserId },
+  ]);
+  const deviceId = "01981111-7111-8111-8111-111111111111";
+  await pairDevice(repository);
+  await repository.createPairingSession({
+    sessionIdHash: hash("m"),
+    devicePublicKeyHash: hash("n"),
+    requestedDeviceId: deviceId,
+    codeChallenge: "cross-workspace-challenge",
+    callbackUri: "http://127.0.0.1:43123/pca/pair/callback",
+    callbackStateHash: hash("o"),
+    expiresAt: later,
+    createdAt: now,
+  });
+  await repository.authorizePairingSession({
+    sessionIdHash: hash("m"),
+    authorizationCodeHash: hash("p"),
+    workspaceId: otherWorkspaceId,
+    ownerUserId,
+    callbackStateHash: hash("o"),
+    expiresAt: later,
+    now,
+  });
+
+  await assert.rejects(
+    repository.consumeAuthorizationCode({
+      sessionIdHash: hash("m"),
+      authorizationCodeHash: hash("p"),
+      codeChallenge: "cross-workspace-challenge",
+      deviceId: "01984444-7444-8444-8444-444444444444",
+      accessTokenHash: hash("q"),
+      refreshTokenHash: hash("r"),
+      accessExpiresAt: later,
+      refreshExpiresAt: later,
+      now,
+    }),
+    (error) =>
+      error instanceof ControlRepositoryError && error.code === "WORKSPACE_FORBIDDEN",
+  );
+});
+
 test("control state is Workspace-scoped, monotonic, and audited", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);

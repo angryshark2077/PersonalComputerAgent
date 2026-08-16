@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { DashboardShell } from "../../../../../components/dashboard-shell";
 import {
@@ -19,6 +19,11 @@ import {
   type DashboardMessage,
 } from "../../../../../lib/api";
 import { getBrowserSession, redirectToSignIn } from "../../../../../lib/auth";
+import {
+  parseSharedChatRecord,
+  type SharedChatItem,
+  type SharedChatRecord,
+} from "../../../../../lib/shared-chat";
 
 export default function ChatMessagesPage() {
   return <CommunicationMessagesPage source="communication.wechat" rootPath="chats" />;
@@ -223,6 +228,8 @@ function initial(name: string): string {
 }
 
 function TextMessage({ text }: { text: string | null }) {
+  const sharedChat = parseSharedChatRecord(text);
+  if (sharedChat !== null) return <SharedChatMessage record={sharedChat} />;
   const contact = parseContactCard(text);
   if (contact === null) return <p className="message-text">{text}</p>;
   return (
@@ -234,6 +241,106 @@ function TextMessage({ text }: { text: string | null }) {
       </div>
     </section>
   );
+}
+
+function SharedChatMessage({ record }: { record: SharedChatRecord }) {
+  const [open, setOpen] = useState(false);
+  const titleId = useId();
+  const trigger = useRef<HTMLButtonElement | null>(null);
+  const closeButton = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    closeButton.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("keydown", closeOnEscape);
+      trigger.current?.focus();
+    };
+  }, [open]);
+
+  return (
+    <>
+      <button
+        ref={trigger}
+        className="shared-chat-card"
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={() => setOpen(true)}
+      >
+        <span className="shared-chat-card-title">{record.title}</span>
+        <span className="shared-chat-card-preview">
+          {record.items.slice(0, 3).map((item) => `${item.sender}: ${previewLine(item)}`).join("\n")}
+        </span>
+        <span className="shared-chat-card-footer">聊天记录 · {record.items.length} 条 · 点击查看全部</span>
+      </button>
+      {open ? (
+        <div
+          className="shared-chat-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={titleId}
+          onClick={() => setOpen(false)}
+        >
+          <section className="shared-chat-dialog" onClick={(event) => event.stopPropagation()}>
+            <header className="shared-chat-dialog-header">
+              <div>
+                <p className="shared-chat-dialog-label">聊天记录</p>
+                <h2 id={titleId}>{record.title}</h2>
+              </div>
+              <button ref={closeButton} type="button" onClick={() => setOpen(false)} aria-label="关闭聊天记录">
+                关闭
+              </button>
+            </header>
+            <ol className="shared-chat-items">
+              {record.items.map((item, index) => (
+                <li key={`${item.sender}:${item.sentAt}:${index}`} className="shared-chat-item">
+                  <Avatar name={item.sender} url={null} />
+                  <div className="shared-chat-item-content">
+                    <header>
+                      <strong>{item.sender}</strong>
+                      <time>{item.sentAt}</time>
+                    </header>
+                    {item.lines.map((line, lineIndex) => (
+                      <SharedChatLine key={`${lineIndex}:${line}`} line={line} />
+                    ))}
+                  </div>
+                </li>
+              ))}
+            </ol>
+          </section>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function previewLine(item: SharedChatItem): string {
+  const first = item.lines.find((line) => !line.startsWith("↳ ") && !line.startsWith("链接："));
+  return first?.replace(/^【链接】/, "") ?? item.lines[0] ?? "消息";
+}
+
+function SharedChatLine({ line }: { line: string }) {
+  if (line.startsWith("↳ ")) return <blockquote>{line.slice(2)}</blockquote>;
+  if (line.startsWith("链接：")) {
+    const url = safeHttpUrl(line.slice("链接：".length));
+    return url === null
+      ? <p>{line}</p>
+      : <a href={url} target="_blank" rel="noreferrer">打开原链接</a>;
+  }
+  return <p>{line}</p>;
+}
+
+function safeHttpUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseContactCard(text: string | null): {

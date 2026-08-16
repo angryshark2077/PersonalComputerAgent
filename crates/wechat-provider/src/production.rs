@@ -45,6 +45,7 @@ const MAX_PER_CONVERSATION: usize = 20;
 const MAX_PENDING_IMAGE_RETRIES_PER_CONVERSATION: usize = 256;
 const MAX_PENDING_FILE_RETRIES_PER_CONVERSATION: usize = 256;
 const MAX_PENDING_VIDEO_RETRIES_PER_CONVERSATION: usize = 256;
+const MAX_PENDING_AUDIO_RETRIES_PER_CONVERSATION: usize = 256;
 const KIND_BATCH_QUOTA: usize = MAX_BATCH / 5;
 const INITIAL_HISTORY_SECONDS: u64 = 60 * 24 * 60 * 60;
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,6 +55,7 @@ const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const FILE_TIMESTAMP_FALLBACK_SECONDS: u64 = 5 * 60;
 const VOICE_SAMPLE_RATE: u32 = 24_000;
 const IMAGE_CODE_CACHE: &str =
@@ -293,7 +295,10 @@ impl WechatSource for MacOSWechatSource {
                     );
                     let mut cursors = cursors.lock().map_err(|_| capability_unavailable())?;
                     for (key, sequence) in restored {
-                        cursors.entry(key).or_insert(sequence);
+                        cursors
+                            .entry(key)
+                            .and_modify(|current| *current = (*current).max(sequence))
+                            .or_insert(sequence);
                     }
                 }
                 read_message_batch(
@@ -748,8 +753,12 @@ fn read_message_batch(
                 &paths.media_databases,
                 &material,
                 remaining,
+                retry_pending_media,
             );
             if let Ok(audio_batch) = audio_batch {
+                for cursor_key in audio_batch.cursor_removals {
+                    cursor_guard.remove(&cursor_key);
+                }
                 for (cursor_key, sequence) in audio_batch.cursor_updates {
                     cursor_guard
                         .entry(cursor_key)
@@ -1026,7 +1035,7 @@ fn read_database_text(
             continue;
         }
         let cursor_key = format!(
-            "{}:{}:display-text-v2",
+            "{}:{}:display-text-v3",
             context.database_name, session.username
         );
         let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
@@ -1071,14 +1080,19 @@ fn read_database_text(
                 records.push((cursor_key.clone(), row.local_id, None));
                 continue;
             }
-            let direction = if row.real_sender_id == my_rowid {
-                if row.server_id <= 0 || row.status < 0 {
+            let direction = match message_row_disposition(
+                row.real_sender_id,
+                my_rowid,
+                row.server_id,
+                row.status,
+            ) {
+                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingFailed => {
                     records.push((cursor_key.clone(), row.local_id, None));
                     continue;
                 }
-                SourceDirection::Outgoing
-            } else {
-                SourceDirection::Incoming
+                MessageRowDisposition::OutgoingSent => SourceDirection::Outgoing,
+                MessageRowDisposition::Incoming => SourceDirection::Incoming,
             };
             let (sender_id, sender_display_name, sender_avatar_url) = match direction {
                 SourceDirection::Outgoing => {
@@ -1114,9 +1128,14 @@ fn read_database_text(
                 records.push((cursor_key.clone(), row.local_id, None));
                 continue;
             };
-            let Some(body) =
+            let complete_forwarded_chat = ((row.local_type & 0xffff_ffff) == 49
+                && app_message_type(&body) == Some(19))
+            .then(|| format_forwarded_chat_message(&body))
+            .flatten();
+            let has_complete_forwarded_chat = complete_forwarded_chat.is_some();
+            let Some(body) = complete_forwarded_chat.or_else(|| {
                 display_text_message_with_contacts(row.local_type, &body, context.contact_cards)
-            else {
+            }) else {
                 records.push((cursor_key.clone(), row.local_id, None));
                 continue;
             };
@@ -1129,10 +1148,13 @@ fn read_database_text(
             } else {
                 format!("local-{}", row.local_id)
             };
-            let source_key = format!(
+            let mut source_key = format!(
                 "wechat:{}:{table_name}:{}",
                 context.database_name, row.local_id
             );
+            if has_complete_forwarded_chat {
+                source_key.push_str(":shared-chat-v2");
+            }
             records.push((
                 cursor_key.clone(),
                 row.local_id,
@@ -1305,6 +1327,24 @@ fn read_database_images(
                 continue;
             }
             let is_retry = row.local_id <= after && retry_ids.contains(&row.local_id);
+            let direction = match message_row_disposition(
+                row.real_sender_id,
+                my_rowid,
+                row.server_id,
+                row.status,
+            ) {
+                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingFailed => {
+                    if is_retry {
+                        cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
+                    } else {
+                        scanned_through = row.local_id;
+                    }
+                    continue;
+                }
+                MessageRowDisposition::OutgoingSent => SourceDirection::Outgoing,
+                MessageRowDisposition::Incoming => SourceDirection::Incoming,
+            };
             let decoded_content =
                 decode_message_content(&row.compress_content, &row.message_content);
             let image_md5s = decoded_content
@@ -1475,14 +1515,6 @@ fn read_database_images(
             } else {
                 continue;
             }
-            let direction = if row.real_sender_id == my_rowid {
-                if row.server_id <= 0 || row.status < 0 {
-                    continue;
-                }
-                SourceDirection::Outgoing
-            } else {
-                SourceDirection::Incoming
-            };
             let (sender_id, sender_display_name, sender_avatar_url) = match direction {
                 SourceDirection::Outgoing => {
                     (context.local_username.to_owned(), "You".to_owned(), None)
@@ -1749,17 +1781,27 @@ fn read_database_emoticons(
                 continue;
             }
             let is_retry = row.local_id <= after && retry_ids.contains(&row.local_id);
+            let direction = match message_row_disposition(
+                row.real_sender_id,
+                my_rowid,
+                row.server_id,
+                row.status,
+            ) {
+                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingFailed => {
+                    if is_retry {
+                        cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
+                    } else {
+                        scanned_through = row.local_id;
+                    }
+                    continue;
+                }
+                MessageRowDisposition::OutgoingSent => SourceDirection::Outgoing,
+                MessageRowDisposition::Incoming => SourceDirection::Incoming,
+            };
             if !is_retry {
                 scanned_through = row.local_id;
             }
-            let direction = if row.real_sender_id == my_rowid {
-                if row.server_id <= 0 || row.status < 0 {
-                    continue;
-                }
-                SourceDirection::Outgoing
-            } else {
-                SourceDirection::Incoming
-            };
             let (sender_id, sender_display_name, sender_avatar_url) = match direction {
                 SourceDirection::Outgoing => {
                     (context.local_username.to_owned(), "You".to_owned(), None)
@@ -1899,6 +1941,7 @@ fn read_database_emoticons(
 struct AudioReadBatch {
     records: Vec<SourceMessageRecord>,
     cursor_updates: Vec<(String, i64)>,
+    cursor_removals: Vec<String>,
 }
 
 struct VideoReadBatch {
@@ -2035,6 +2078,24 @@ fn read_database_files(
                 continue;
             }
             let is_retry = row.local_id <= after && retry_ids.contains(&row.local_id);
+            let direction = match message_row_disposition(
+                row.real_sender_id,
+                my_rowid,
+                row.server_id,
+                row.status,
+            ) {
+                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingFailed => {
+                    if is_retry {
+                        cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
+                    } else {
+                        scanned_through = row.local_id;
+                    }
+                    continue;
+                }
+                MessageRowDisposition::OutgoingSent => SourceDirection::Outgoing,
+                MessageRowDisposition::Incoming => SourceDirection::Incoming,
+            };
             if !is_retry {
                 scanned_through = row.local_id;
             }
@@ -2051,14 +2112,6 @@ fn read_database_files(
             let expected_size = xml_text(&content, "totallen")
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|value| *value > 0);
-            let direction = if row.real_sender_id == my_rowid {
-                if row.server_id <= 0 || row.status < 0 {
-                    continue;
-                }
-                SourceDirection::Outgoing
-            } else {
-                SourceDirection::Incoming
-            };
             let (sender_id, sender_display_name, sender_avatar_url) = match direction {
                 SourceDirection::Outgoing => (
                     read_context.local_username.to_owned(),
@@ -2311,16 +2364,26 @@ fn read_database_videos(
                 continue;
             }
             let is_retry = row.local_id <= after && retry_ids.contains(&row.local_id);
-            let decoded_content =
-                decode_message_content(&row.compress_content, &row.message_content);
-            let direction = if row.real_sender_id == my_rowid {
-                if row.server_id <= 0 || row.status < 0 {
+            let direction = match message_row_disposition(
+                row.real_sender_id,
+                my_rowid,
+                row.server_id,
+                row.status,
+            ) {
+                MessageRowDisposition::OutgoingPending => break,
+                MessageRowDisposition::OutgoingFailed => {
+                    if is_retry {
+                        cursor_removals.push(format!("{retry_prefix}{}", row.local_id));
+                    } else {
+                        scanned_through = row.local_id;
+                    }
                     continue;
                 }
-                SourceDirection::Outgoing
-            } else {
-                SourceDirection::Incoming
+                MessageRowDisposition::OutgoingSent => SourceDirection::Outgoing,
+                MessageRowDisposition::Incoming => SourceDirection::Incoming,
             };
+            let decoded_content =
+                decode_message_content(&row.compress_content, &row.message_content);
             let (sender_id, sender_display_name, sender_avatar_url) = match direction {
                 SourceDirection::Outgoing => {
                     (context.local_username.to_owned(), "You".to_owned(), None)
@@ -2464,6 +2527,7 @@ fn read_database_audio(
     media_databases: &[PathBuf],
     material: &WechatKeyMaterial,
     limit: usize,
+    retry_pending_media: bool,
 ) -> Result<AudioReadBatch, SqlcipherProbeFailure> {
     let my_rowid = local_sender_rowid(connection, context.local_username)?
         .ok_or(SqlcipherProbeFailure::AccountUnverified)?;
@@ -2472,6 +2536,7 @@ fn read_database_audio(
         .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?;
     let mut records = Vec::new();
     let mut cursor_updates = Vec::new();
+    let mut cursor_removals = Vec::new();
     for session in sessions {
         if records.len() >= limit {
             break;
@@ -2508,7 +2573,33 @@ fn read_database_audio(
         }
         let cursor_key = format!("{}:{}:audio", context.database_name, session.username);
         let after = context.cursors.get(&cursor_key).copied().unwrap_or(0);
+        let retry_prefix = format!("{cursor_key}:pending:");
+        let retry_rows = pending_retry_rows(context.cursors, &retry_prefix, retry_pending_media);
+        cursor_removals.extend(
+            retry_rows
+                .iter()
+                .filter(|(_, _, create_time)| *create_time < context.cutoff)
+                .map(|(key, _, _)| key.clone()),
+        );
+        let retry_ids = retry_rows
+            .iter()
+            .filter(|(_, _, create_time)| *create_time >= context.cutoff)
+            .take(MAX_PENDING_AUDIO_RETRIES_PER_CONVERSATION)
+            .map(|(_, local_id, _)| *local_id)
+            .collect::<BTreeSet<_>>();
         let per_conversation = MAX_PER_CONVERSATION.min(limit - records.len());
+        let retry_clause = if retry_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " OR local_id IN ({})",
+                retry_ids
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         let sql = format!(
             "SELECT CAST(local_id AS INTEGER), \
                     CAST(COALESCE(server_id, 0) AS INTEGER), \
@@ -2516,7 +2607,7 @@ fn read_database_audio(
                     CAST(COALESCE(real_sender_id, 0) AS INTEGER), \
                     CAST(COALESCE(status, 0) AS INTEGER) FROM \"{table_name}\" \
              WHERE (local_type & 4294967295) = 34 \
-               AND local_id > ?1 AND create_time >= ?2 \
+               AND (local_id > ?1{retry_clause}) AND create_time >= ?2 \
              ORDER BY local_id ASC LIMIT ?3"
         );
         let mut statement = connection
@@ -2547,35 +2638,21 @@ fn read_database_audio(
             if local_id <= 0 || create_time <= 0 {
                 continue;
             }
-            scanned_through = local_id;
-            let same_time_index =
-                voice_same_time_index(connection, &table_name, create_time, local_id)?;
-            let silk = media_databases.iter().find_map(|database| {
-                with_recovered_database(database, material, DATABASE_TIMEOUT, |media| {
-                    read_voice_blob(
-                        media,
-                        &session.username,
-                        server_id,
-                        create_time,
-                        same_time_index,
-                    )
-                })
-                .ok()
-                .flatten()
-            });
-            let Some((attachment, source_path)) = silk.and_then(|silk| {
-                decode_voice_attachment(silk, context.database_name, &table_name, local_id)
-            }) else {
-                continue;
-            };
-            let direction = if real_sender_id == my_rowid {
-                if server_id <= 0 || status < 0 {
-                    continue;
-                }
-                SourceDirection::Outgoing
-            } else {
-                SourceDirection::Incoming
-            };
+            let is_retry = local_id <= after && retry_ids.contains(&local_id);
+            let direction =
+                match message_row_disposition(real_sender_id, my_rowid, server_id, status) {
+                    MessageRowDisposition::OutgoingPending => break,
+                    MessageRowDisposition::OutgoingFailed => {
+                        if is_retry {
+                            cursor_removals.push(format!("{retry_prefix}{local_id}"));
+                        } else {
+                            scanned_through = local_id;
+                        }
+                        continue;
+                    }
+                    MessageRowDisposition::OutgoingSent => SourceDirection::Outgoing,
+                    MessageRowDisposition::Incoming => SourceDirection::Incoming,
+                };
             let (sender_id, sender_display_name, sender_avatar_url) = match direction {
                 SourceDirection::Outgoing => {
                     (context.local_username.to_owned(), "You".to_owned(), None)
@@ -2606,16 +2683,76 @@ fn read_database_audio(
                 .ok()
                 .and_then(|time| time.format(&Rfc3339).ok())
                 .ok_or(SqlcipherProbeFailure::UnsupportedSchema)?;
+            let message_id = if server_id > 0 {
+                server_id.to_string()
+            } else {
+                format!("local-{local_id}")
+            };
+            let finality = match direction {
+                SourceDirection::Incoming => SourceFinality::IncomingPersisted,
+                SourceDirection::Outgoing => SourceFinality::OutgoingSent,
+                SourceDirection::Unknown => SourceFinality::Unknown,
+            };
+            let same_time_index =
+                voice_same_time_index(connection, &table_name, create_time, local_id)?;
+            let silk = media_databases.iter().find_map(|database| {
+                with_recovered_database(database, material, DATABASE_TIMEOUT, |media| {
+                    read_voice_blob(
+                        media,
+                        &session.username,
+                        server_id,
+                        create_time,
+                        same_time_index,
+                    )
+                })
+                .ok()
+                .flatten()
+            });
+            let Some((attachment, source_path)) = silk.and_then(|silk| {
+                decode_voice_attachment(silk, context.database_name, &table_name, local_id)
+            }) else {
+                if !is_retry {
+                    cursor_updates.push((format!("{retry_prefix}{local_id}"), create_time));
+                    scanned_through = local_id;
+                    records.push(SourceMessageRecord {
+                        account_id: context.account_id.to_owned(),
+                        source_sequence: u64::try_from(local_id)
+                            .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
+                        message_id,
+                        conversation_id: session.username.clone(),
+                        conversation_display_name: metadata.display_name.clone(),
+                        conversation_avatar_url: metadata.avatar_url.clone(),
+                        sender_id,
+                        sender_display_name,
+                        sender_avatar_url,
+                        source_key: format!(
+                            "wechat:{}:{table_name}:{local_id}:audio-pending",
+                            context.database_name
+                        ),
+                        occurred_at,
+                        local_account: LocalAccountProof::Verified,
+                        direction,
+                        kind: SourceMessageKind::Text,
+                        conversation: conversation.clone(),
+                        finality,
+                        payload: SourcePayload::Text {
+                            body: "[语音] 等待微信保存语音文件".to_owned(),
+                        },
+                    });
+                }
+                continue;
+            };
+            if is_retry {
+                cursor_removals.push(format!("{retry_prefix}{local_id}"));
+            } else {
+                scanned_through = local_id;
+            }
             let attachment_id = attachment.attachment_id().to_owned();
             records.push(SourceMessageRecord {
                 account_id: context.account_id.to_owned(),
                 source_sequence: u64::try_from(local_id)
                     .map_err(|_| SqlcipherProbeFailure::UnsupportedSchema)?,
-                message_id: if server_id > 0 {
-                    server_id.to_string()
-                } else {
-                    format!("local-{local_id}")
-                },
+                message_id,
                 conversation_id: session.username.clone(),
                 conversation_display_name: metadata.display_name.clone(),
                 conversation_avatar_url: metadata.avatar_url.clone(),
@@ -2631,11 +2768,7 @@ fn read_database_audio(
                 direction,
                 kind: SourceMessageKind::Audio,
                 conversation: conversation.clone(),
-                finality: match direction {
-                    SourceDirection::Incoming => SourceFinality::IncomingPersisted,
-                    SourceDirection::Outgoing => SourceFinality::OutgoingSent,
-                    SourceDirection::Unknown => SourceFinality::Unknown,
-                },
+                finality,
                 payload: SourcePayload::Media {
                     attachment: Some(attachment),
                     completed_source: Some(crate::source::SourceCompletedMedia {
@@ -2652,6 +2785,7 @@ fn read_database_audio(
     Ok(AudioReadBatch {
         records,
         cursor_updates,
+        cursor_removals,
     })
 }
 
@@ -4285,6 +4419,31 @@ struct ImageMessageRow {
     packed_info_data: Value,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MessageRowDisposition {
+    Incoming,
+    OutgoingSent,
+    OutgoingPending,
+    OutgoingFailed,
+}
+
+fn message_row_disposition(
+    real_sender_id: i64,
+    local_sender_id: i64,
+    server_id: i64,
+    status: i64,
+) -> MessageRowDisposition {
+    if real_sender_id != local_sender_id {
+        MessageRowDisposition::Incoming
+    } else if status < 0 {
+        MessageRowDisposition::OutgoingFailed
+    } else if server_id <= 0 {
+        MessageRowDisposition::OutgoingPending
+    } else {
+        MessageRowDisposition::OutgoingSent
+    }
+}
+
 fn read_sessions(connection: &Connection) -> Result<Vec<Session>, SqlcipherProbeFailure> {
     let mut statement = connection
         .prepare(
@@ -5094,16 +5253,29 @@ fn decode_value(value: &Value) -> Option<String> {
         _ => return None,
     };
     let decoded = if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        zstd::stream::decode_all(bytes).ok()?
+        decode_zstd_text(bytes)?
     } else {
+        if bytes.len() > MAX_TEXT_BYTES {
+            return None;
+        }
         bytes.to_vec()
     };
     nonempty_text(String::from_utf8(decoded).ok()?)
 }
 
+fn decode_zstd_text(bytes: &[u8]) -> Option<Vec<u8>> {
+    let decoder = zstd::stream::read::Decoder::new(bytes).ok()?;
+    let mut output = Vec::with_capacity(bytes.len().min(MAX_TEXT_BYTES));
+    decoder
+        .take(u64::try_from(MAX_TEXT_BYTES).ok()?.saturating_add(1))
+        .read_to_end(&mut output)
+        .ok()?;
+    (output.len() <= MAX_TEXT_BYTES).then_some(output)
+}
+
 fn nonempty_text(text: impl AsRef<str>) -> Option<String> {
     let text = text.as_ref().trim_matches('\0').trim().to_owned();
-    (!text.is_empty() && text.len() <= 4 * 1024 * 1024).then_some(text)
+    (!text.is_empty() && text.len() <= MAX_TEXT_BYTES).then_some(text)
 }
 
 fn display_text_message_with_contacts(
@@ -5125,6 +5297,9 @@ fn display_text_message_with_contacts(
         }
         49 if is_location_app_message(content) => format_location_message(content),
         49 if app_type == Some(6) => None,
+        49 if app_type == Some(19) => {
+            format_forwarded_chat_message(content).or_else(|| format_app_message(content))
+        }
         49 => format_app_message(content),
         _ => None,
     }
@@ -5263,6 +5438,95 @@ fn format_red_packet_message(content: &str) -> Option<String> {
     })
 }
 
+fn format_forwarded_chat_message(content: &str) -> Option<String> {
+    const MAX_ITEMS: usize = 100;
+    const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+    let record = xml_text(content, "recorditem")?;
+    let title = xml_text(&record, "title")
+        .or_else(|| xml_text(content, "title"))
+        .map_or_else(
+            || "聊天记录".to_owned(),
+            |title| title.chars().take(512).collect::<String>(),
+        );
+    let mut entries = Vec::new();
+    for item in xml_elements(&record, "dataitem", MAX_ITEMS) {
+        let sender = xml_text(item, "sourcename").unwrap_or_else(|| "未知发送人".to_owned());
+        let sent_at = xml_text(item, "sourcetime").unwrap_or_else(|| "时间未知".to_owned());
+        let datatype = xml_attribute(item, "datatype").and_then(|value| value.parse::<u32>().ok());
+        let mut lines = Vec::new();
+        match datatype {
+            Some(1) => {
+                if let Some(body) =
+                    xml_text(item, "datadesc").or_else(|| xml_text(item, "datatitle"))
+                {
+                    lines.push(body);
+                }
+                if let Some(quoted) = xml_text(item, "referdesc").or_else(|| {
+                    let name = xml_text(item, "displayname")?;
+                    let body = xml_text(item, "content")?;
+                    Some(format!("{name}: {body}"))
+                }) {
+                    lines.push(format!("↳ {quoted}"));
+                }
+            }
+            Some(5) => {
+                if let Some(title) = xml_text(item, "datatitle") {
+                    lines.push(format!("【链接】{title}"));
+                }
+                if let Some(description) = xml_text(item, "datadesc") {
+                    lines.push(description);
+                }
+                if let Some(url) = xml_text(item, "link").or_else(|| xml_text(item, "streamweburl"))
+                {
+                    lines.push(format!("链接：{url}"));
+                }
+            }
+            _ => {
+                if let Some(title) = xml_text(item, "datatitle") {
+                    lines.push(format!("【消息】{title}"));
+                }
+                if let Some(description) = xml_text(item, "datadesc") {
+                    lines.push(description);
+                }
+                if let Some(url) = xml_text(item, "link").or_else(|| xml_text(item, "streamweburl"))
+                {
+                    lines.push(format!("链接：{url}"));
+                }
+            }
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        entries.push(format!("── {sender} · {sent_at} ──\n{}", lines.join("\n")));
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let header_reserve = format!("[聊天记录] {title}\n[完整记录 · {MAX_ITEMS} 条]");
+    let mut selected_entries = Vec::new();
+    let mut selected_bytes = header_reserve.len();
+    for entry in entries {
+        if selected_bytes + entry.len() + 1 > MAX_OUTPUT_BYTES {
+            break;
+        }
+        selected_bytes += entry.len() + 1;
+        selected_entries.push(entry);
+    }
+    if selected_entries.is_empty() {
+        return None;
+    }
+    let mut formatted = format!(
+        "[聊天记录] {title}\n[完整记录 · {} 条]",
+        selected_entries.len()
+    );
+    for entry in selected_entries {
+        formatted.push('\n');
+        formatted.push_str(&entry);
+    }
+    nonempty_text(formatted)
+}
+
 fn format_app_message(content: &str) -> Option<String> {
     let message_type = app_message_type(content);
     let source_username = xml_text(content, "sourceusername").unwrap_or_default();
@@ -5335,6 +5599,40 @@ fn xml_attribute(content: &str, attribute: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn xml_elements<'a>(content: &'a str, tag: &str, limit: usize) -> Vec<&'a str> {
+    let start_tag = format!("<{tag}");
+    let end_tag = format!("</{tag}>");
+    let mut elements = Vec::new();
+    let mut offset = 0;
+    while elements.len() < limit {
+        let Some(relative_start) = content[offset..].find(&start_tag) else {
+            break;
+        };
+        let start = offset + relative_start;
+        let name_end = start + start_tag.len();
+        let valid_boundary = content[name_end..]
+            .chars()
+            .next()
+            .is_some_and(|character| character == '>' || character.is_ascii_whitespace());
+        if !valid_boundary {
+            offset = name_end;
+            continue;
+        }
+        let Some(open_end) = content[name_end..].find('>').map(|end| name_end + end + 1) else {
+            break;
+        };
+        let Some(end) = content[open_end..]
+            .find(&end_tag)
+            .map(|end| open_end + end + end_tag.len())
+        else {
+            break;
+        };
+        elements.push(&content[start..end]);
+        offset = end;
+    }
+    elements
 }
 
 fn unique_nonempty<const N: usize>(values: [Option<String>; N]) -> Vec<String> {
@@ -5472,7 +5770,7 @@ fn bootstrap_source_cursors(
         .collect::<BTreeSet<_>>();
     let Ok(mut statement) = connection.prepare(
         "SELECT message.external_conversation_id, message.source_sequence, \
-                message.source_key, message.occurred_at_ms \
+                message.source_key, message.occurred_at_ms, message.text_body \
          FROM communication_messages AS message \
          WHERE message.account_id = ?1",
     ) else {
@@ -5484,35 +5782,58 @@ fn bootstrap_source_cursors(
             row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, i64>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     }) else {
         return BTreeMap::new();
     };
+    let rows = rows.filter_map(Result::ok).collect::<Vec<_>>();
+    let completed_source_keys = rows
+        .iter()
+        .map(|row| row.2.clone())
+        .collect::<BTreeSet<_>>();
     let mut cursors: BTreeMap<String, i64> = BTreeMap::new();
-    let mut pending_images = Vec::new();
-    let mut completed_images = BTreeSet::new();
-    for row in rows.filter_map(Result::ok) {
-        if row.2.ends_with(":image:full") {
-            completed_images.insert(row.2.clone());
-        }
-        if let Some((cursor_key, sequence, pending)) =
-            cursors_from_local_message(row, &database_names)
-        {
+    let mut forwarded_chat_backfills: BTreeMap<String, i64> = BTreeMap::new();
+    let mut pending_media = Vec::new();
+    for (conversation_id, source_sequence, source_key, occurred_at_ms, text_body) in rows {
+        if let Some((cursor_key, sequence, pending)) = cursors_from_local_message(
+            (
+                conversation_id,
+                source_sequence,
+                source_key.clone(),
+                occurred_at_ms,
+            ),
+            &database_names,
+        ) {
+            if text_body
+                .as_deref()
+                .is_some_and(|text| text.starts_with("[聊天记录]"))
+                && !source_key.ends_with(":shared-chat-v2")
+                && !completed_source_keys.contains(&format!("{source_key}:shared-chat-v2"))
+            {
+                forwarded_chat_backfills
+                    .entry(cursor_key.clone())
+                    .and_modify(|current| *current = (*current).min(sequence.saturating_sub(1)))
+                    .or_insert_with(|| sequence.saturating_sub(1));
+            }
             cursors
                 .entry(cursor_key)
                 .and_modify(|current| *current = (*current).max(sequence))
                 .or_insert(sequence);
             if let Some((key, create_time, completed_source_key)) = pending {
                 if let Some(completed_source_key) = completed_source_key {
-                    pending_images.push((key, create_time, completed_source_key));
+                    pending_media.push((key, create_time, completed_source_key));
                 } else {
                     cursors.insert(key, create_time);
                 }
             }
         }
     }
-    for (key, create_time, completed_source_key) in pending_images {
-        if !completed_images.contains(&completed_source_key) {
+    for (cursor_key, sequence) in forwarded_chat_backfills {
+        cursors.insert(cursor_key, sequence);
+    }
+    for (key, create_time, completed_source_key) in pending_media {
+        if !completed_source_keys.contains(&completed_source_key) {
             cursors.insert(key, create_time);
         }
     }
@@ -5544,10 +5865,19 @@ fn cursors_from_local_message(
     }
     let suffix = parts.collect::<Vec<_>>();
     let (kind, pending_kind, completed_source_key) = match suffix.as_slice() {
-        [] => ("display-text-v2", None, None),
+        [] | ["shared-chat-v2"] => ("display-text-v3", None, None),
         ["audio"] => ("audio", None, None),
+        ["audio-pending"] => (
+            "audio",
+            Some("audio:pending"),
+            Some(source_key.strip_suffix("-pending")?.to_owned()),
+        ),
         ["file"] => ("file-v2", None, None),
-        ["file-pending"] => ("file-v2", Some("file-v2:pending"), None),
+        ["file-pending"] => (
+            "file-v2",
+            Some("file-v2:pending"),
+            Some(source_key.strip_suffix("-pending")?.to_owned()),
+        ),
         ["image", "full"] => ("image", None, None),
         ["image"] => (
             "image",
@@ -5555,9 +5885,17 @@ fn cursors_from_local_message(
             Some(format!("{source_key}:full")),
         ),
         ["emoticon"] => ("emoticon-v2", None, None),
-        ["emoticon-placeholder"] => ("emoticon-v2", Some("emoticon-v2:pending"), None),
+        ["emoticon-placeholder"] => (
+            "emoticon-v2",
+            Some("emoticon-v2:pending"),
+            Some(source_key.strip_suffix("-placeholder")?.to_owned()),
+        ),
         ["video"] => ("video", None, None),
-        ["video-pending"] => ("video", Some("video:pending"), None),
+        ["video-pending"] => (
+            "video",
+            Some("video:pending"),
+            Some(source_key.strip_suffix("-pending")?.to_owned()),
+        ),
         _ => return None,
     };
     let pending = pending_kind.map(|pending_kind| {
@@ -5646,23 +5984,23 @@ fn capability_unavailable() -> DomainError {
 mod tests {
     use super::{
         bootstrap_source_cursors, claim_pending_media_retry, clean_account_directory_name,
-        decode_value, decode_voice_attachment, decoded_image_attachment, decrypt_emoticon,
-        decrypt_v4_image, derive_image_keys, display_text_message, extend_message_database_routes,
-        extract_hevc_nalu_units, file_attachment, image_attachment_id, image_mime_type,
-        index_decoded_images, index_message_files, index_video_files, is_direct_conversation,
-        is_message_database, kvcomm_codes_from_filename, message_table_name,
-        normalize_decrypted_image, parse_group_nicknames, parse_image_dat_name,
+        decode_value, decode_voice_attachment, decode_zstd_text, decoded_image_attachment,
+        decrypt_emoticon, decrypt_v4_image, derive_image_keys, display_text_message,
+        extend_message_database_routes, extract_hevc_nalu_units, file_attachment,
+        image_attachment_id, image_mime_type, index_decoded_images, index_message_files,
+        index_video_files, is_direct_conversation, is_message_database, kvcomm_codes_from_filename,
+        message_table_name, normalize_decrypted_image, parse_group_nicknames, parse_image_dat_name,
         parse_image_md5_candidates, parse_video_file_key, parse_video_length,
         parse_video_md5_candidates, probe_wechat_app_data_root, read_contact_cards,
-        read_conversation_metadata, read_database_emoticons, read_database_files,
-        read_database_images, read_database_text, read_database_videos, read_voice_blob,
-        resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
+        read_conversation_metadata, read_database_audio, read_database_emoticons,
+        read_database_files, read_database_images, read_database_text, read_database_videos,
+        read_voice_blob, resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
         resolve_message_file, resolve_video_path, retention_cutoff_from, select_image_candidate,
         should_retire_failed_full_image_retry, should_scan_message_source, source_access_error,
         source_instance_id, stage_decrypted_image, start_source_worker, video_attachment,
         voice_same_time_index, ContactCardProfile, ConversationMetadata, ImageKeys,
         MessageSourceSnapshot, Session, SourceFileStamp, SourcePaths, SourcePayload, SourceWorker,
-        TextReadContext, WechatAppDataAccess, SESSION_DATABASE,
+        TextReadContext, WechatAppDataAccess, MAX_TEXT_BYTES, SESSION_DATABASE,
     };
 
     #[test]
@@ -5828,12 +6166,16 @@ mod tests {
                     external_conversation_id TEXT NOT NULL,
                     source_sequence INTEGER NOT NULL,
                     source_key TEXT NOT NULL,
-                    occurred_at_ms INTEGER NOT NULL
+                    occurred_at_ms INTEGER NOT NULL,
+                    text_body TEXT
                  );
                  INSERT INTO communication_cursors VALUES
                     ('account-1', 'wxid_friend', 9876, 1),
                     ('other-account', 'wxid_other', 9999, 1);
-                 INSERT INTO communication_messages VALUES
+                 INSERT INTO communication_messages (
+                    account_id, external_conversation_id, source_sequence,
+                    source_key, occurred_at_ms
+                 ) VALUES
                     ('account-1', 'wxid_friend', 6,
                      'wechat:message_0.db:Msg_abc:6', 6000),
                     ('account-1', 'wxid_friend', 7,
@@ -5844,14 +6186,39 @@ mod tests {
                      'wechat:message_0.db:Msg_abc:8:image:full', 8000),
                     ('account-1', 'wxid_friend', 9,
                      'wechat:message_0.db:Msg_abc:9:emoticon-placeholder', 9000),
+                    ('account-1', 'wxid_friend', 9,
+                     'wechat:message_0.db:Msg_abc:9:emoticon', 9000),
                     ('account-1', 'wxid_friend', 10,
                      'wechat:message_0.db:Msg_abc:10:file-pending', 10000),
+                    ('account-1', 'wxid_friend', 10,
+                     'wechat:message_0.db:Msg_abc:10:file', 10000),
                     ('account-1', 'wxid_friend', 11,
                      'wechat:message_0.db:Msg_abc:11:video-pending', 11000),
+                    ('account-1', 'wxid_friend', 11,
+                     'wechat:message_0.db:Msg_abc:11:video', 11000),
                     ('account-1', 'wxid_friend', 12,
                      'wechat:message_0.db:Msg_abc:12:audio', 12000),
+                    ('account-1', 'wxid_pending', 13,
+                     'wechat:message_0.db:Msg_pending:13:emoticon-placeholder', 13000),
+                    ('account-1', 'wxid_pending', 14,
+                     'wechat:message_0.db:Msg_pending:14:file-pending', 14000),
+                    ('account-1', 'wxid_pending', 15,
+                     'wechat:message_0.db:Msg_pending:15:video-pending', 15000),
+                    ('account-1', 'wxid_pending', 16,
+                     'wechat:message_0.db:Msg_pending:16:audio-pending', 16000),
                     ('other-account', 'wxid_other', 12,
-                     'wechat:message_0.db:Msg_other:12:file-pending', 12000);",
+                     'wechat:message_0.db:Msg_other:12:file-pending', 12000);
+                 INSERT INTO communication_messages VALUES
+                    ('account-1', 'wxid_backfill', 20, 'wechat:message_0.db:Msg_backfill:20',
+                     20000, '[聊天记录] 旧摘要'),
+                    ('account-1', 'wxid_backfill', 21, 'wechat:message_0.db:Msg_backfill:21',
+                     21000, 'later text'),
+                    ('account-1', 'wxid_upgraded', 30, 'wechat:message_0.db:Msg_upgraded:30',
+                     30000, '[聊天记录] 旧摘要'),
+                    ('account-1', 'wxid_upgraded', 30, 'wechat:message_0.db:Msg_upgraded:30:shared-chat-v2',
+                     30000, '[聊天记录] 完整记录'),
+                    ('account-1', 'wxid_upgraded', 31, 'wechat:message_0.db:Msg_upgraded:31',
+                     31000, 'later text');",
             )
             .expect("seed cursor fixture");
         drop(connection);
@@ -5861,17 +6228,26 @@ mod tests {
             "account-1",
             &[fixture.path().join("message_0.db")],
         );
-        assert_eq!(cursors["message_0.db:wxid_friend:display-text-v2"], 6);
+        assert_eq!(cursors["message_0.db:wxid_friend:display-text-v3"], 6);
+        assert_eq!(cursors["message_0.db:wxid_backfill:display-text-v3"], 19);
+        assert_eq!(cursors["message_0.db:wxid_upgraded:display-text-v3"], 31);
         assert_eq!(cursors["message_0.db:wxid_friend:image"], 8);
         assert_eq!(cursors["message_0.db:wxid_friend:emoticon-v2"], 9);
         assert_eq!(cursors["message_0.db:wxid_friend:file-v2"], 10);
         assert_eq!(cursors["message_0.db:wxid_friend:video"], 11);
         assert_eq!(cursors["message_0.db:wxid_friend:audio"], 12);
         assert_eq!(cursors["message_0.db:wxid_friend:image:full-pending:7"], 7);
-        assert_eq!(cursors["message_0.db:wxid_friend:emoticon-v2:pending:9"], 9);
-        assert_eq!(cursors["message_0.db:wxid_friend:file-v2:pending:10"], 10);
-        assert_eq!(cursors["message_0.db:wxid_friend:video:pending:11"], 11);
         assert!(!cursors.contains_key("message_0.db:wxid_friend:image:full-pending:8"));
+        assert!(!cursors.contains_key("message_0.db:wxid_friend:emoticon-v2:pending:9"));
+        assert!(!cursors.contains_key("message_0.db:wxid_friend:file-v2:pending:10"));
+        assert!(!cursors.contains_key("message_0.db:wxid_friend:video:pending:11"));
+        assert_eq!(
+            cursors["message_0.db:wxid_pending:emoticon-v2:pending:13"],
+            13
+        );
+        assert_eq!(cursors["message_0.db:wxid_pending:file-v2:pending:14"], 14);
+        assert_eq!(cursors["message_0.db:wxid_pending:video:pending:15"], 15);
+        assert_eq!(cursors["message_0.db:wxid_pending:audio:pending:16"], 16);
         assert!(!cursors.keys().any(|key| key.contains("wxid_other")));
     }
 
@@ -5990,6 +6366,18 @@ mod tests {
     }
 
     #[test]
+    fn production_formats_the_complete_forwarded_chat_record() {
+        let content = "<msg><appmsg><title>群聊的聊天记录</title><des>只有预览</des><type>19</type><recorditem><![CDATA[<recordinfo><title>群聊的聊天记录</title><datalist count=\"2\"><dataitem datatype=\"1\"><sourcename>詹涛</sourcename><sourcetime>2026-08-15 19:55</sourcetime><datadesc>今天一万多营业额是有了</datadesc></dataitem><dataitem datatype=\"5\"><sourcename>是汤姆呀🌞</sourcename><sourcetime>2026-08-15 22:25</sourcetime><datatitle>视频标题</datatitle><datadesc>视频作者</datadesc><link>https://b23.tv/example</link></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>";
+
+        assert_eq!(
+            display_text_message(49, content).as_deref(),
+            Some(
+                "[聊天记录] 群聊的聊天记录\n[完整记录 · 2 条]\n── 詹涛 · 2026-08-15 19:55 ──\n今天一万多营业额是有了\n── 是汤姆呀🌞 · 2026-08-15 22:25 ──\n【链接】视频标题\n视频作者\n链接：https://b23.tv/example"
+            )
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the fixture covers every newly supported database message shape"
@@ -6042,6 +6430,11 @@ mod tests {
                 48,
                 "<msg><location x=\"31.2304\" y=\"121.4737\" poiname=\"人民广场\" label=\"上海市黄浦区\" /></msg>",
             ),
+            (
+                8,
+                49,
+                "<msg><appmsg><title>群聊的聊天记录</title><type>19</type><recorditem><![CDATA[<recordinfo><title>群聊的聊天记录</title><datalist count=\"1\"><dataitem datatype=\"1\"><sourcename>詹涛</sourcename><sourcetime>2026-08-15 19:55</sourcetime><datadesc>完整内容</datadesc></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>",
+            ),
         ];
         for (local_id, local_type, content) in rows {
             connection
@@ -6083,9 +6476,14 @@ mod tests {
             20,
         )
         .expect("read special messages");
-        assert_eq!(records.len(), 7);
+        assert_eq!(records.len(), 8);
         assert!(records.iter().all(|(cursor, _, record)| {
-            cursor == "message_0.db:wxid_friend:display-text-v2" && record.is_some()
+            cursor == "message_0.db:wxid_friend:display-text-v3" && record.is_some()
+        }));
+        assert!(records.iter().any(|(_, _, record)| {
+            record.as_ref().is_some_and(|record| {
+                record.source_key == format!("wechat:message_0.db:{table_name}:8:shared-chat-v2")
+            })
         }));
         let bodies = records
             .into_iter()
@@ -6105,8 +6503,201 @@ mod tests {
                 "[红包] 节日快乐",
                 "[视频号] 视频标题 · 视频作者",
                 "[位置] 人民广场 · 上海市黄浦区 · 坐标：31.2304,121.4737",
+                "[聊天记录] 群聊的聊天记录\n[完整记录 · 1 条]\n── 詹涛 · 2026-08-15 19:55 ──\n完整内容",
             ]
         );
+    }
+
+    #[test]
+    fn production_does_not_advance_past_an_outbound_message_still_being_sent() {
+        let connection = Connection::open_in_memory().expect("open outbound fixture");
+        let conversation_id = "wxid_friend";
+        let table_name = message_table_name(conversation_id);
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE Name2Id (user_name TEXT);\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'wxid_local');\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (2, '{conversation_id}');\
+                 CREATE TABLE \"{table_name}\" (\
+                    local_id INTEGER, server_id INTEGER, create_time INTEGER,\
+                    real_sender_id INTEGER, status INTEGER, local_type INTEGER,\
+                    message_content TEXT, compress_content BLOB\
+                 );\
+                 INSERT INTO \"{table_name}\" VALUES (7, 0, 1000, 1, 0, 1, 'sending', NULL);"
+            ))
+            .expect("create outbound fixture schema");
+        let metadata = std::collections::BTreeMap::from([(
+            conversation_id.to_owned(),
+            ConversationMetadata {
+                display_name: "Friend".to_owned(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: std::collections::BTreeMap::new(),
+                participant_avatar_urls: std::collections::BTreeMap::new(),
+            },
+        )]);
+        let contact_cards = std::collections::BTreeMap::new();
+        let cursors = std::collections::BTreeMap::new();
+        let context = TextReadContext {
+            database_name: "message_0.db",
+            local_username: "wxid_local",
+            account_id: "account",
+            conversation_metadata: &metadata,
+            contact_cards: &contact_cards,
+            cursors: &cursors,
+            cutoff: 0,
+        };
+
+        let sending = read_database_text(
+            &connection,
+            &context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            20,
+        )
+        .expect("read sending message");
+        assert!(
+            sending.is_empty(),
+            "sending row must remain behind the cursor"
+        );
+
+        connection
+            .execute(
+                &format!("UPDATE \"{table_name}\" SET server_id = 107 WHERE local_id = 7"),
+                [],
+            )
+            .expect("finish outbound message");
+        let sent = read_database_text(
+            &connection,
+            &context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            20,
+        )
+        .expect("read completed outbound message");
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].2.is_some());
+    }
+
+    #[test]
+    fn production_unsupported_message_type_does_not_block_later_supported_text() {
+        let connection = Connection::open_in_memory().expect("open unsupported type fixture");
+        let conversation_id = "wxid_friend";
+        let table_name = message_table_name(conversation_id);
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE Name2Id (user_name TEXT);\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'wxid_local');\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (2, '{conversation_id}');\
+                 CREATE TABLE \"{table_name}\" (\
+                    local_id INTEGER, server_id INTEGER, create_time INTEGER,\
+                    real_sender_id INTEGER, status INTEGER, local_type INTEGER,\
+                    message_content TEXT, compress_content BLOB\
+                 );\
+                 INSERT INTO \"{table_name}\" VALUES (7, 107, 1000, 2, 0, 10000, 'unsupported', NULL);\
+                 INSERT INTO \"{table_name}\" VALUES (8, 108, 1001, 2, 0, 1, 'later text', NULL);"
+            ))
+            .expect("create unsupported type fixture schema");
+        let metadata = std::collections::BTreeMap::from([(
+            conversation_id.to_owned(),
+            ConversationMetadata {
+                display_name: "Friend".to_owned(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: std::collections::BTreeMap::new(),
+                participant_avatar_urls: std::collections::BTreeMap::new(),
+            },
+        )]);
+        let contact_cards = std::collections::BTreeMap::new();
+        let cursors = std::collections::BTreeMap::new();
+        let context = TextReadContext {
+            database_name: "message_0.db",
+            local_username: "wxid_local",
+            account_id: "account",
+            conversation_metadata: &metadata,
+            contact_cards: &contact_cards,
+            cursors: &cursors,
+            cutoff: 0,
+        };
+
+        let records = read_database_text(
+            &connection,
+            &context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            20,
+        )
+        .expect("read after unsupported message type");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1, 8);
+        assert!(records[0].2.is_some());
+    }
+
+    #[test]
+    fn production_records_pending_audio_before_the_media_database_catches_up() {
+        let connection = Connection::open_in_memory().expect("open delayed audio fixture");
+        let conversation_id = "wxid_friend";
+        let table_name = message_table_name(conversation_id);
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE Name2Id (user_name TEXT);\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'wxid_local');\
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (2, '{conversation_id}');\
+                 CREATE TABLE \"{table_name}\" (\
+                    local_id INTEGER, server_id INTEGER, create_time INTEGER,\
+                    real_sender_id INTEGER, status INTEGER, local_type INTEGER\
+                 );\
+                 INSERT INTO \"{table_name}\" VALUES (7, 107, 1000, 2, 0, 34);"
+            ))
+            .expect("create delayed audio schema");
+        let metadata = std::collections::BTreeMap::from([(
+            conversation_id.to_owned(),
+            ConversationMetadata {
+                display_name: "Friend".to_owned(),
+                avatar_url: None,
+                member_count: None,
+                participant_names: std::collections::BTreeMap::new(),
+                participant_avatar_urls: std::collections::BTreeMap::new(),
+            },
+        )]);
+        let contact_cards = std::collections::BTreeMap::new();
+        let cursors = std::collections::BTreeMap::new();
+        let context = TextReadContext {
+            database_name: "message_0.db",
+            local_username: "wxid_local",
+            account_id: "account",
+            conversation_metadata: &metadata,
+            contact_cards: &contact_cards,
+            cursors: &cursors,
+            cutoff: 0,
+        };
+        let material = WechatKeyMaterial::new("account", [7_u8; 32])
+            .expect("create delayed audio key material");
+
+        let batch = read_database_audio(
+            &connection,
+            &context,
+            &[Session {
+                username: conversation_id.to_owned(),
+            }],
+            &[],
+            &material,
+            20,
+            true,
+        )
+        .expect("record delayed audio retry");
+        assert_eq!(batch.records.len(), 1);
+        assert!(matches!(
+            &batch.records[0].payload,
+            SourcePayload::Text { body } if body == "[语音] 等待微信保存语音文件"
+        ));
+        assert!(batch.cursor_updates.contains(&(
+            format!("message_0.db:{conversation_id}:audio:pending:7"),
+            1000
+        )));
     }
 
     #[test]
@@ -7059,6 +7650,15 @@ mod tests {
             decode_value(&Value::Blob(compressed)).as_deref(),
             Some("compressed hello")
         );
+    }
+
+    #[test]
+    fn production_text_decoder_rejects_zstd_output_over_the_text_limit() {
+        let oversized = vec![b'a'; MAX_TEXT_BYTES + 1];
+        let compressed =
+            zstd::stream::encode_all(oversized.as_slice(), 1).expect("compress oversized text");
+
+        assert!(decode_zstd_text(&compressed).is_none());
     }
 
     #[test]

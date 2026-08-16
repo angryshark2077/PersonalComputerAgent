@@ -196,10 +196,16 @@ fn wait_for_file_while_running(child: &mut ChildGuard, path: &Path) {
             }
             panic!("child exited before rendezvous: {status}; stderr={stderr}");
         }
-        assert!(
-            Instant::now() < deadline,
-            "expected process rendezvous file within five seconds"
-        );
+        if Instant::now() >= deadline {
+            let _ = child.child.kill();
+            let _ = child.child.wait();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.child.stderr.take() {
+                pipe.read_to_string(&mut stderr)
+                    .expect("read timed-out child stderr");
+            }
+            panic!("expected process rendezvous file within five seconds; stderr={stderr}");
+        }
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -602,7 +608,7 @@ fn stale_health_and_unavailable_prepare_sleep_have_meaningful_exit_codes() {
     assert_eq!(prepare.status.code(), Some(3));
     assert_eq!(
         String::from_utf8_lossy(&prepare.stderr),
-        "pca-agentd: live prepare-sleep control is unsupported by Bridge protocol v1\n"
+        "pca-agentd: prepare-sleep is available only through the authenticated Bridge control socket\n"
     );
 }
 

@@ -1,10 +1,4 @@
-use std::{
-    collections::HashSet,
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-    os::unix::fs::MetadataExt,
-    path::Path,
-};
+use std::{collections::HashSet, fs::File, os::unix::fs::MetadataExt, path::Path};
 
 use pca_domain::{
     AgentStatus, BridgeStatus, CollectorState, CollectorStatus, CommunicationAttachment,
@@ -25,8 +19,9 @@ use std::{
 #[cfg(feature = "process-test-hooks")]
 use crate::actor::{ProcessTestBarrier, ProcessTestHooks};
 use crate::{
-    migrations::MAX_SUPPORTED_SCHEMA_VERSION, CommunicationMessageCommit, DbError, DbHealth,
-    PairingState, PendingCommunicationAttachment, PendingPhotoUpload, PhotoUploadCommit,
+    migrations::MAX_SUPPORTED_SCHEMA_VERSION, AppliedCollectorControl, CommunicationMessageCommit,
+    DbError, DbHealth, PairingState, PendingCommunicationAttachment, PendingPhotoUpload,
+    PhotoUploadCommit,
 };
 
 struct SerializedEvent<'a> {
@@ -117,17 +112,26 @@ pub(crate) fn commit_communication_message(
     let transaction = connection
         .transaction()
         .map_err(|error| DbError::sqlite("start communication message transaction", error))?;
-    if communication_message_exists(&transaction, commit)? {
-        validate_existing_communication_event(&transaction, &serialized)?;
-        validate_existing_outbox(&transaction, &serialized)?;
-        validate_existing_attachment_spool(&transaction, commit)?;
-        for event in &metadata {
-            insert_event(&transaction, event)?;
-            insert_stable_outbox(&transaction, event)?;
+    match existing_communication_message(&transaction, commit, &serialized)? {
+        ExistingCommunicationMessage::Absent => {}
+        ExistingCommunicationMessage::SameEvent => {
+            validate_existing_communication_event(&transaction, &serialized)?;
+            validate_existing_outbox(&transaction, &serialized)?;
+            validate_existing_attachment_spool(&transaction, commit)?;
+            for event in &metadata {
+                insert_event(&transaction, event)?;
+                insert_stable_outbox(&transaction, event)?;
+            }
+            return transaction.commit().map_err(|error| {
+                DbError::sqlite("commit communication metadata transaction", error)
+            });
         }
-        return transaction
-            .commit()
-            .map_err(|error| DbError::sqlite("commit communication metadata transaction", error));
+        ExistingCommunicationMessage::RepairedDeviceReplay => {
+            validate_existing_attachment_spool(&transaction, commit)?;
+            return transaction.commit().map_err(|error| {
+                DbError::sqlite("commit repaired-device replay transaction", error)
+            });
+        }
     }
 
     insert_event(&transaction, &serialized)?;
@@ -145,6 +149,42 @@ pub(crate) fn commit_communication_message(
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit communication message transaction", error))
+}
+
+pub(crate) fn record_communication_source_conflict(
+    connection: &Connection,
+    source_key: &str,
+) -> Result<(), DbError> {
+    let source_key_hash = format!("{:x}", Sha256::digest(source_key.as_bytes()));
+    let occurred_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    let code = "COMMUNICATION_SOURCE_IDENTITY_CONFLICT";
+    let diagnostic_id = format!("{code}:{source_key_hash}");
+    let redacted_json = serde_json::json!({
+        "collector": "communication.wechat",
+        "stage": "local_persistence",
+        "category": "immutable_source_conflict",
+        "source_key_hash": source_key_hash,
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT INTO diagnostic_events (
+                diagnostic_id, occurred_at_ms, level, code, redacted_json
+             ) VALUES (?1, ?2, 'error', ?3, ?4)
+             ON CONFLICT(diagnostic_id) DO UPDATE SET
+                occurred_at_ms = excluded.occurred_at_ms,
+                level = excluded.level,
+                code = excluded.code,
+                redacted_json = excluded.redacted_json",
+            params![diagnostic_id, occurred_at_ms, code, redacted_json],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("record communication source conflict", error))
 }
 
 pub(crate) fn commit_photo_upload(
@@ -261,18 +301,24 @@ pub(crate) fn photo_upload_exists(
 pub(crate) fn load_pending_photo_uploads(
     connection: &Connection,
     limit: u16,
+    workspace_id: &str,
+    device_id: &str,
 ) -> Result<Vec<PendingPhotoUpload>, DbError> {
     let mut statement = connection
         .prepare(
-            "SELECT photo_id, manifest_json
-             FROM photo_upload_spool
-             WHERE transfer_state = 'pending'
-             ORDER BY created_at_ms, photo_id
-             LIMIT ?1",
+            "SELECT p.photo_id, p.manifest_json
+             FROM photo_upload_spool AS p
+             INNER JOIN events_local AS e ON e.event_id = p.event_id
+             WHERE p.transfer_state = 'pending'
+               AND p.terminal_failure_code IS NULL
+               AND e.workspace_id = ?1
+               AND e.device_id = ?2
+             ORDER BY p.created_at_ms, p.photo_id
+             LIMIT ?3",
         )
         .map_err(|error| DbError::sqlite("prepare pending photo upload query", error))?;
     let rows = statement
-        .query_map([i64::from(limit)], |row| {
+        .query_map(params![workspace_id, device_id, i64::from(limit)], |row| {
             Ok(PendingPhotoUpload {
                 photo_id: row.get(0)?,
                 manifest_json: row.get(1)?,
@@ -298,7 +344,9 @@ pub(crate) fn complete_photo_upload(
             "UPDATE photo_upload_spool
              SET transfer_state = 'completed',
                  completed_at_ms = CAST(unixepoch('subsec') * 1000 AS INTEGER)
-             WHERE photo_id = ?1 AND transfer_state = 'pending'",
+             WHERE photo_id = ?1
+               AND transfer_state = 'pending'
+               AND terminal_failure_code IS NULL",
             [photo_id],
         )
         .map_err(|error| DbError::sqlite("complete photo upload", error))?;
@@ -310,6 +358,61 @@ pub(crate) fn complete_photo_upload(
             "photo upload is not pending",
         ))
     }
+}
+
+pub(crate) fn quarantine_invalid_photo_upload(
+    connection: &Connection,
+    photo_id: &str,
+) -> Result<(), DbError> {
+    if !is_uuid_like(photo_id) {
+        return Err(DbError::sqlite(
+            "quarantine invalid photo upload",
+            "photo ID is not a UUID",
+        ));
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| DbError::sqlite("start invalid photo quarantine", error))?;
+    let occurred_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    let updated = transaction
+        .execute(
+            "UPDATE photo_upload_spool
+             SET terminal_failure_code = 'PHOTOS_LOCAL_MANIFEST_INVALID'
+             WHERE photo_id = ?1
+               AND transfer_state = 'pending'
+               AND terminal_failure_code IS NULL",
+            [photo_id],
+        )
+        .map_err(|error| DbError::sqlite("quarantine invalid photo upload", error))?;
+    if updated != 1 {
+        return Err(DbError::sqlite(
+            "quarantine invalid photo upload",
+            "photo upload is not retryable",
+        ));
+    }
+    record_media_diagnostic(
+        &transaction,
+        photo_id,
+        "PHOTOS_LOCAL_MANIFEST_INVALID",
+        "local_validation",
+        "contract",
+        None,
+        occurred_at_ms,
+    )?;
+    persist_terminal_media_collector_failure(
+        &transaction,
+        "photos.library",
+        "PHOTOS_LOCAL_MANIFEST_INVALID",
+        occurred_at_ms,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit invalid photo quarantine", error))
 }
 
 fn validate_communication_commit(commit: &CommunicationMessageCommit) -> Result<(), DbError> {
@@ -437,10 +540,17 @@ fn validate_spool_references<'a>(
     Ok(validated)
 }
 
-fn communication_message_exists(
+enum ExistingCommunicationMessage {
+    Absent,
+    SameEvent,
+    RepairedDeviceReplay,
+}
+
+fn existing_communication_message(
     transaction: &Transaction<'_>,
     commit: &CommunicationMessageCommit,
-) -> Result<bool, DbError> {
+    serialized: &SerializedEvent<'_>,
+) -> Result<ExistingCommunicationMessage, DbError> {
     let existing = transaction
         .query_row(
             "SELECT event_id, external_conversation_id, source_sequence
@@ -458,18 +568,60 @@ fn communication_message_exists(
         .optional()
         .map_err(|error| DbError::sqlite("read existing communication message", error))?;
     let Some((event_id, conversation_id, source_sequence)) = existing else {
-        return Ok(false);
+        return Ok(ExistingCommunicationMessage::Absent);
     };
-    if event_id == commit.event.event_id
-        && conversation_id == commit.message.conversation_id()
-        && u64::try_from(source_sequence).ok() == Some(commit.source_sequence)
+    if conversation_id != commit.message.conversation_id()
+        || u64::try_from(source_sequence).ok() != Some(commit.source_sequence)
     {
-        Ok(true)
+        return Err(DbError::CommunicationSourceConflict);
+    }
+    if event_id == commit.event.event_id {
+        return Ok(ExistingCommunicationMessage::SameEvent);
+    }
+    validate_repaired_device_replay(transaction, &event_id, serialized)?;
+    Ok(ExistingCommunicationMessage::RepairedDeviceReplay)
+}
+
+fn validate_repaired_device_replay(
+    transaction: &Transaction<'_>,
+    existing_event_id: &str,
+    serialized: &SerializedEvent<'_>,
+) -> Result<(), DbError> {
+    let event = serialized.event;
+    let existing_payload = transaction
+        .query_row(
+            "SELECT payload_json FROM events_local
+             WHERE event_id = ?1
+               AND workspace_id = ?2
+               AND device_id <> ?3
+               AND event_type = ?4
+               AND source = ?5
+               AND schema_version = ?6
+               AND occurred_at_ms = CAST(unixepoch(?7, 'subsec') * 1000 AS INTEGER)
+               AND sensitivity = ?8
+               AND attachment_refs_json = ?9
+               AND idempotency_key IS ?10",
+            params![
+                existing_event_id,
+                event.workspace_id,
+                event.device_id,
+                event.event_type,
+                event.source,
+                event.schema_version,
+                event.occurred_at,
+                sensitivity_name(event.sensitivity),
+                serialized.attachment_refs_json,
+                event.idempotency_key,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| DbError::sqlite("validate repaired-device replay", error))?
+        .ok_or(DbError::CommunicationSourceConflict)?;
+    if communication_payload_matches(&existing_payload, &event.payload)? {
+        Ok(())
     } else {
-        Err(DbError::sqlite(
-            "validate existing communication message",
-            "source key conflicts with a different immutable communication message",
-        ))
+        Err(DbError::CommunicationSourceConflict)
     }
 }
 
@@ -505,10 +657,7 @@ fn validate_existing_attachment_spool(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|error| DbError::sqlite("read existing attachment spool", error))?;
     if persisted.len() != commit.attachment_spool.len() {
-        return Err(DbError::sqlite(
-            "validate existing attachment spool",
-            "source key conflicts with a different attachment spool count",
-        ));
+        return Err(DbError::CommunicationSourceConflict);
     }
 
     for reference in &commit.attachment_spool {
@@ -540,10 +689,7 @@ fn validate_existing_attachment_spool(
             },
         );
         if !matches {
-            return Err(DbError::sqlite(
-                "validate existing attachment spool",
-                "source key conflicts with different immutable attachment spool metadata",
-            ));
+            return Err(DbError::CommunicationSourceConflict);
         }
     }
     Ok(())
@@ -656,15 +802,12 @@ pub(crate) fn open_communication_spool_file(
         rustix::fs::Mode::empty(),
     )
     .map(File::from)
-    .map_err(|error| DbError::sqlite("open communication spool root", error))?;
+    .map_err(|_| DbError::CommunicationSpoolUnavailable)?;
     let root_metadata = directory
         .metadata()
-        .map_err(|error| DbError::sqlite("inspect communication spool root", error))?;
+        .map_err(|_| DbError::CommunicationSpoolUnavailable)?;
     if !root_metadata.is_dir() || root_metadata.mode() & 0o077 != 0 {
-        return Err(DbError::sqlite(
-            "inspect communication spool root",
-            "communication spool root is not owner-private",
-        ));
+        return Err(DbError::CommunicationSpoolUnavailable);
     }
 
     let file = rustix::fs::openat(
@@ -674,16 +817,13 @@ pub(crate) fn open_communication_spool_file(
         rustix::fs::Mode::empty(),
     )
     .map(File::from)
-    .map_err(|error| DbError::sqlite("open communication spool file", error))?;
+    .map_err(|_| DbError::CommunicationSpoolUnavailable)?;
     if !file
         .metadata()
-        .map_err(|error| DbError::sqlite("inspect communication spool file", error))?
+        .map_err(|_| DbError::CommunicationSpoolUnavailable)?
         .is_file()
     {
-        return Err(DbError::sqlite(
-            "inspect communication spool file",
-            "communication spool entry must be a regular file",
-        ));
+        return Err(DbError::CommunicationSpoolUnavailable);
     }
     Ok(file)
 }
@@ -896,28 +1036,27 @@ fn validate_existing_communication_event(
         )
         .optional()
         .map_err(|error| DbError::sqlite("validate existing communication event", error))?
-        .ok_or_else(|| {
-            DbError::sqlite(
-                "validate existing communication event",
-                "stable communication event conflicts with different immutable fields",
-            )
-        })?;
+        .ok_or(DbError::CommunicationSourceConflict)?;
+    if communication_payload_matches(&existing_payload, &serialized.event.payload)? {
+        Ok(())
+    } else {
+        Err(DbError::CommunicationSourceConflict)
+    }
+}
+
+fn communication_payload_matches(
+    existing_payload: &str,
+    candidate_payload: &serde_json::Map<String, serde_json::Value>,
+) -> Result<bool, DbError> {
     let mut existing_payload =
-        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&existing_payload)
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(existing_payload)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let mut candidate_payload = serialized.event.payload.clone();
+    let mut candidate_payload = candidate_payload.clone();
     for field in ["sender_id", "sender_display_name"] {
         existing_payload.remove(field);
         candidate_payload.remove(field);
     }
-    if existing_payload == candidate_payload {
-        Ok(())
-    } else {
-        Err(DbError::sqlite(
-            "validate existing communication event",
-            "stable communication event conflicts with different message content",
-        ))
-    }
+    Ok(existing_payload == candidate_payload)
 }
 
 fn insert_stable_outbox(
@@ -1110,6 +1249,21 @@ pub(crate) fn upsert_collector_state_in(
     connection: &Connection,
     state: &CollectorState,
 ) -> Result<(), DbError> {
+    upsert_collector_state_with_media_guard_in(connection, state, false)
+}
+
+pub(crate) fn upsert_collector_state_preserving_media_failure_in(
+    connection: &Connection,
+    state: &CollectorState,
+) -> Result<(), DbError> {
+    upsert_collector_state_with_media_guard_in(connection, state, true)
+}
+
+fn upsert_collector_state_with_media_guard_in(
+    connection: &Connection,
+    state: &CollectorState,
+    preserve_media_failure: bool,
+) -> Result<(), DbError> {
     connection
         .execute(
             "INSERT INTO collector_states (
@@ -1119,7 +1273,14 @@ pub(crate) fn upsert_collector_state_in(
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(collector_key) DO UPDATE SET
                 status = CASE
-                    WHEN collector_states.last_error_code = 'SYNC_PAYLOAD_REJECTED'
+                    WHEN (collector_states.last_error_code = 'SYNC_PAYLOAD_REJECTED'
+                          OR (?11 = 1 AND collector_states.last_error_code IN (
+                              'COMMUNICATION_MEDIA_UPLOAD_FAILED',
+                              'PHOTOS_UPLOAD_FAILED',
+                              'SCREEN_UPLOAD_FAILED',
+                              'SCREEN_UPLOAD_TIMEOUT',
+                              'MEDIA_CYCLE_TIMEOUT'
+                          )))
                      AND excluded.status = 'running'
                      AND excluded.last_error_code IS NULL
                     THEN 'degraded'
@@ -1129,9 +1290,29 @@ pub(crate) fn upsert_collector_state_in(
                 desired_revision = excluded.desired_revision,
                 applied_revision = excluded.applied_revision,
                 last_event_at_ms = excluded.last_event_at_ms,
-                last_health_at_ms = excluded.last_health_at_ms,
+                last_health_at_ms = CASE
+                    WHEN ?11 = 1
+                     AND collector_states.last_error_code IN (
+                         'COMMUNICATION_MEDIA_UPLOAD_FAILED',
+                         'PHOTOS_UPLOAD_FAILED',
+                         'SCREEN_UPLOAD_FAILED',
+                         'SCREEN_UPLOAD_TIMEOUT',
+                         'MEDIA_CYCLE_TIMEOUT'
+                     )
+                     AND excluded.status = 'running'
+                     AND excluded.last_error_code IS NULL
+                    THEN collector_states.last_health_at_ms
+                    ELSE excluded.last_health_at_ms
+                END,
                 last_error_code = CASE
-                    WHEN collector_states.last_error_code = 'SYNC_PAYLOAD_REJECTED'
+                    WHEN (collector_states.last_error_code = 'SYNC_PAYLOAD_REJECTED'
+                          OR (?11 = 1 AND collector_states.last_error_code IN (
+                              'COMMUNICATION_MEDIA_UPLOAD_FAILED',
+                              'PHOTOS_UPLOAD_FAILED',
+                              'SCREEN_UPLOAD_FAILED',
+                              'SCREEN_UPLOAD_TIMEOUT',
+                              'MEDIA_CYCLE_TIMEOUT'
+                          )))
                      AND excluded.status = 'running'
                      AND excluded.last_error_code IS NULL
                     THEN collector_states.last_error_code
@@ -1150,6 +1331,7 @@ pub(crate) fn upsert_collector_state_in(
                 state.last_error_code,
                 state.created_at_ms,
                 state.updated_at_ms,
+                i64::from(preserve_media_failure),
             ],
         )
         .map(|_| ())
@@ -1160,7 +1342,7 @@ pub(crate) fn load_pairing_state(connection: &Connection) -> Result<Option<Pairi
     connection
         .query_row(
             "SELECT device_id, workspace_id, credential_ref, credential_generation,
-                    cloud_api_origin, applied_control_revision, paired_at_ms
+                    cloud_api_origin, applied_control_revision, paired_at_ms, manually_unpaired
              FROM pairing_state WHERE singleton_id = 1",
             [],
             |row| {
@@ -1172,6 +1354,7 @@ pub(crate) fn load_pairing_state(connection: &Connection) -> Result<Option<Pairi
                     cloud_api_origin: row.get(4)?,
                     applied_control_revision: row.get(5)?,
                     paired_at_ms: row.get(6)?,
+                    manually_unpaired: row.get(7)?,
                 })
             },
         )
@@ -1180,15 +1363,27 @@ pub(crate) fn load_pairing_state(connection: &Connection) -> Result<Option<Pairi
 }
 
 pub(crate) fn save_pairing_state(
-    connection: &Connection,
+    connection: &mut Connection,
     state: &PairingState,
 ) -> Result<(), DbError> {
-    connection
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start pairing state transaction", error))?;
+    transaction
+        .execute(
+            "DELETE FROM applied_collector_control
+             WHERE singleton_id = 1
+               AND (device_id <> ?1 OR workspace_id <> ?2)",
+            params![state.device_id, state.workspace_id],
+        )
+        .map_err(|error| DbError::sqlite("clear replaced pairing control", error))?;
+    transaction
         .execute(
             "INSERT INTO pairing_state (
                 singleton_id, device_id, workspace_id, credential_ref,
-                credential_generation, cloud_api_origin, applied_control_revision, paired_at_ms
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                credential_generation, cloud_api_origin, applied_control_revision, paired_at_ms,
+                manually_unpaired
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(singleton_id) DO UPDATE SET
                 device_id = excluded.device_id,
                 workspace_id = excluded.workspace_id,
@@ -1196,7 +1391,8 @@ pub(crate) fn save_pairing_state(
                 credential_generation = excluded.credential_generation,
                 cloud_api_origin = excluded.cloud_api_origin,
                 applied_control_revision = excluded.applied_control_revision,
-                paired_at_ms = excluded.paired_at_ms",
+                paired_at_ms = excluded.paired_at_ms,
+                manually_unpaired = excluded.manually_unpaired",
             params![
                 state.device_id,
                 state.workspace_id,
@@ -1205,10 +1401,13 @@ pub(crate) fn save_pairing_state(
                 state.cloud_api_origin,
                 state.applied_control_revision,
                 state.paired_at_ms,
+                state.manually_unpaired,
             ],
         )
-        .map(|_| ())
-        .map_err(|error| DbError::sqlite("save pairing state", error))
+        .map_err(|error| DbError::sqlite("save pairing state", error))?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit pairing state", error))
 }
 
 pub(crate) fn save_control_revision(
@@ -1233,22 +1432,197 @@ pub(crate) fn save_control_revision(
     }
 }
 
-pub(crate) fn clear_pairing_state(connection: &Connection) -> Result<(), DbError> {
+pub(crate) fn load_applied_collector_control(
+    connection: &Connection,
+) -> Result<Option<AppliedCollectorControl>, DbError> {
     connection
-        .execute("DELETE FROM pairing_state WHERE singleton_id = 1", [])
-        .map(|_| ())
-        .map_err(|error| DbError::sqlite("clear pairing state", error))
+        .query_row(
+            "SELECT device_id, workspace_id, configuration_revision,
+                    communication_wechat_enabled, screen_capture_enabled,
+                    screen_capture_scheduled_enabled, screen_capture_interval_seconds,
+                    screen_capture_activity_enabled,
+                    screen_capture_activity_min_interval_seconds,
+                    screen_capture_excluded_bundle_ids_json, updated_at_ms
+             FROM applied_collector_control WHERE singleton_id = 1",
+            [],
+            |row| {
+                let excluded_json = row.get::<_, String>(9)?;
+                let excluded =
+                    serde_json::from_str::<Vec<String>>(&excluded_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            9,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                Ok(AppliedCollectorControl {
+                    device_id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    configuration_revision: row.get(2)?,
+                    communication_wechat_enabled: row.get(3)?,
+                    screen_capture_enabled: row.get(4)?,
+                    screen_capture_scheduled_enabled: row.get(5)?,
+                    screen_capture_interval_seconds: row.get(6)?,
+                    screen_capture_activity_enabled: row.get(7)?,
+                    screen_capture_activity_min_interval_seconds: row.get(8)?,
+                    screen_capture_excluded_bundle_ids: excluded,
+                    updated_at_ms: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| DbError::sqlite("load applied Collector control", error))
 }
 
-pub(crate) fn clear_pairing_state_and_disable_sensitive_collectors(
+pub(crate) fn save_applied_collector_control(
+    connection: &mut Connection,
+    control: &AppliedCollectorControl,
+) -> Result<(), DbError> {
+    validate_applied_collector_control(control)?;
+    let excluded_bundle_ids = serde_json::to_string(&control.screen_capture_excluded_bundle_ids)
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| DbError::sqlite("start applied Collector control transaction", error))?;
+    let pairing = transaction
+        .query_row(
+            "SELECT device_id, workspace_id, manually_unpaired
+             FROM pairing_state WHERE singleton_id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| DbError::sqlite("validate applied Collector control identity", error))?;
+    if pairing.as_ref()
+        != Some(&(
+            control.device_id.clone(),
+            control.workspace_id.clone(),
+            false,
+        ))
+    {
+        return Err(DbError::sqlite(
+            "validate applied Collector control identity",
+            "control does not belong to the active local pairing",
+        ));
+    }
+    let control_updated = transaction
+        .execute(
+            "INSERT INTO applied_collector_control (
+                singleton_id, device_id, workspace_id, configuration_revision,
+                communication_wechat_enabled, screen_capture_enabled,
+                screen_capture_scheduled_enabled, screen_capture_interval_seconds,
+                screen_capture_activity_enabled,
+                screen_capture_activity_min_interval_seconds,
+                screen_capture_excluded_bundle_ids_json, updated_at_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(singleton_id) DO UPDATE SET
+                device_id = excluded.device_id,
+                workspace_id = excluded.workspace_id,
+                configuration_revision = excluded.configuration_revision,
+                communication_wechat_enabled = excluded.communication_wechat_enabled,
+                screen_capture_enabled = excluded.screen_capture_enabled,
+                screen_capture_scheduled_enabled = excluded.screen_capture_scheduled_enabled,
+                screen_capture_interval_seconds = excluded.screen_capture_interval_seconds,
+                screen_capture_activity_enabled = excluded.screen_capture_activity_enabled,
+                screen_capture_activity_min_interval_seconds =
+                    excluded.screen_capture_activity_min_interval_seconds,
+                screen_capture_excluded_bundle_ids_json =
+                    excluded.screen_capture_excluded_bundle_ids_json,
+                updated_at_ms = excluded.updated_at_ms
+             WHERE excluded.device_id = applied_collector_control.device_id
+               AND excluded.workspace_id = applied_collector_control.workspace_id
+               AND excluded.configuration_revision >=
+                   applied_collector_control.configuration_revision",
+            params![
+                control.device_id,
+                control.workspace_id,
+                control.configuration_revision,
+                control.communication_wechat_enabled,
+                control.screen_capture_enabled,
+                control.screen_capture_scheduled_enabled,
+                control.screen_capture_interval_seconds,
+                control.screen_capture_activity_enabled,
+                control.screen_capture_activity_min_interval_seconds,
+                excluded_bundle_ids,
+                control.updated_at_ms,
+            ],
+        )
+        .map_err(|error| DbError::sqlite("save applied Collector control", error))?;
+    if control_updated == 0 {
+        return transaction
+            .rollback()
+            .map_err(|error| DbError::sqlite("rollback stale applied Collector control", error));
+    }
+    transaction
+        .execute(
+            "UPDATE pairing_state
+             SET applied_control_revision = MAX(applied_control_revision, ?1)
+             WHERE singleton_id = 1",
+            [control.configuration_revision],
+        )
+        .map_err(|error| DbError::sqlite("save applied Collector control revision", error))?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit applied Collector control", error))
+}
+
+fn validate_applied_collector_control(control: &AppliedCollectorControl) -> Result<(), DbError> {
+    if !is_uuid_like(&control.device_id)
+        || !is_uuid_like(&control.workspace_id)
+        || control.configuration_revision == 0
+        || !(60..=86_400).contains(&control.screen_capture_interval_seconds)
+        || !(10..=3_600).contains(&control.screen_capture_activity_min_interval_seconds)
+        || control.screen_capture_excluded_bundle_ids.len() > 100
+        || control
+            .screen_capture_excluded_bundle_ids
+            .iter()
+            .any(|value| {
+                value.is_empty()
+                    || value.len() > 255
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            })
+        || control.updated_at_ms < 0
+    {
+        return Err(DbError::sqlite(
+            "validate applied Collector control",
+            "control does not match the fixed local persistence contract",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_pairing_manually_unpaired_and_disable_sensitive_collectors(
     connection: &mut Connection,
 ) -> Result<(), DbError> {
     let transaction = connection
         .transaction()
         .map_err(|error| DbError::sqlite("start pairing revocation transaction", error))?;
+    let updated = transaction
+        .execute(
+            "UPDATE pairing_state SET manually_unpaired = 1 WHERE singleton_id = 1",
+            [],
+        )
+        .map_err(|error| DbError::sqlite("mark pairing manually unpaired", error))?;
+    if updated != 1 {
+        return Err(DbError::sqlite(
+            "mark pairing manually unpaired",
+            "pairing state is absent",
+        ));
+    }
     transaction
-        .execute("DELETE FROM pairing_state WHERE singleton_id = 1", [])
-        .map_err(|error| DbError::sqlite("clear pairing state", error))?;
+        .execute(
+            "DELETE FROM applied_collector_control WHERE singleton_id = 1",
+            [],
+        )
+        .map_err(|error| DbError::sqlite("clear applied Collector control", error))?;
     let now_ms = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1256,7 +1630,7 @@ pub(crate) fn clear_pairing_state_and_disable_sensitive_collectors(
             .as_millis(),
     )
     .unwrap_or(i64::MAX);
-    for collector_key in ["network", "communication.wechat"] {
+    for collector_key in ["network", "communication.wechat", "screen.capture"] {
         transaction
             .execute(
                 "INSERT INTO collector_states (
@@ -1417,42 +1791,27 @@ fn system_event_sensitivity(value: &str) -> Sensitivity {
     }
 }
 
-pub(crate) fn acknowledge_mismatched_lifecycle_events(
+pub(crate) fn dead_letter_mismatched_outbox_events(
     connection: &mut Connection,
     workspace_id: &str,
     device_id: &str,
 ) -> Result<u64, DbError> {
     let transaction = connection
         .transaction()
-        .map_err(|error| DbError::sqlite("start lifecycle identity quarantine", error))?;
+        .map_err(|error| DbError::sqlite("start Outbox identity quarantine", error))?;
     let updated = transaction
         .execute(
             "UPDATE sync_outbox
-             SET state = 'acked'
+             SET state = 'dead_letter'
              WHERE state = 'pending'
                AND EXISTS (
                    SELECT 1 FROM events_local AS e
                    WHERE e.event_id = sync_outbox.event_id
-                     AND e.event_type IN (
-                         'agent.started',
-                         'agent.stopped',
-                         'agent.crash_recovered',
-                         'system.sleep',
-                         'system.wake',
-                         'network.offline',
-                         'network.online',
-                         'network.changed',
-                         'AGENT_STARTED',
-                         'AGENT_STOPPED',
-                         'AGENT_CRASH_RECOVERED',
-                         'SYSTEM_SLEEP',
-                         'SYSTEM_WAKE'
-                     )
                      AND (e.workspace_id <> ?1 OR e.device_id <> ?2)
                )",
             params![workspace_id, device_id],
         )
-        .map_err(|error| DbError::sqlite("acknowledge mismatched lifecycle events", error))?;
+        .map_err(|error| DbError::sqlite("dead-letter mismatched Outbox events", error))?;
     if updated > 0 {
         let occurred_at_ms = i64::try_from(
             OffsetDateTime::now_utc()
@@ -1460,14 +1819,14 @@ pub(crate) fn acknowledge_mismatched_lifecycle_events(
                 .div_euclid(1_000_000),
         )
         .unwrap_or(i64::MAX);
-        let redacted_json = serde_json::json!({ "discarded_event_count": updated }).to_string();
+        let redacted_json = serde_json::json!({ "dead_lettered_event_count": updated }).to_string();
         transaction
             .execute(
                 "INSERT INTO diagnostic_events (
                     diagnostic_id, occurred_at_ms, level, code, redacted_json
                  ) VALUES (
-                    'LIFECYCLE_IDENTITY_MISMATCH', ?1, 'warning',
-                    'LIFECYCLE_IDENTITY_MISMATCH', ?2
+                    'OUTBOX_IDENTITY_MISMATCH', ?1, 'warning',
+                    'OUTBOX_IDENTITY_MISMATCH', ?2
                  )
                  ON CONFLICT(diagnostic_id) DO UPDATE SET
                     occurred_at_ms = excluded.occurred_at_ms,
@@ -1476,17 +1835,13 @@ pub(crate) fn acknowledge_mismatched_lifecycle_events(
                     redacted_json = excluded.redacted_json",
                 params![occurred_at_ms, redacted_json],
             )
-            .map_err(|error| DbError::sqlite("record lifecycle identity diagnostic", error))?;
+            .map_err(|error| DbError::sqlite("record Outbox identity diagnostic", error))?;
     }
     transaction
         .commit()
-        .map_err(|error| DbError::sqlite("commit lifecycle identity quarantine", error))?;
-    u64::try_from(updated).map_err(|_| {
-        DbError::sqlite(
-            "acknowledge mismatched lifecycle events",
-            "row count overflow",
-        )
-    })
+        .map_err(|error| DbError::sqlite("commit Outbox identity quarantine", error))?;
+    u64::try_from(updated)
+        .map_err(|_| DbError::sqlite("dead-letter mismatched Outbox events", "row count overflow"))
 }
 
 pub(crate) fn acknowledge_system_events(
@@ -1780,6 +2135,7 @@ fn dead_letter_rejected_events(
 
 struct PendingAttachmentManifest {
     event_id: String,
+    source: String,
     attachment_id: String,
     sha256: String,
     size_bytes: i64,
@@ -1795,13 +2151,16 @@ pub(crate) fn load_pending_communication_attachments(
 ) -> Result<Vec<PendingCommunicationAttachment>, DbError> {
     let mut statement = connection
         .prepare(
-            "SELECT m.event_id, s.attachment_id, s.sha256, s.size_bytes, s.mime_type,
+            "SELECT m.event_id, e.source, s.attachment_id, s.sha256, s.size_bytes, s.mime_type,
                     s.spool_relative_path, s.transfer_state
              FROM attachment_spool AS s
              INNER JOIN communication_messages AS m
                 ON m.local_message_id = s.local_message_id
+             INNER JOIN events_local AS e ON e.event_id = m.event_id
              INNER JOIN sync_outbox AS o ON o.event_id = m.event_id
-             WHERE o.state = 'acked' AND s.transfer_state <> 'completed'
+             WHERE o.state = 'acked'
+               AND s.transfer_state <> 'completed'
+               AND s.terminal_failure_code IS NULL
              ORDER BY s.created_at_ms, s.attachment_id",
         )
         .map_err(|error| DbError::sqlite("prepare pending attachment query", error))?;
@@ -1809,12 +2168,13 @@ pub(crate) fn load_pending_communication_attachments(
         .query_map([], |row| {
             Ok(PendingAttachmentManifest {
                 event_id: row.get(0)?,
-                attachment_id: row.get(1)?,
-                sha256: row.get(2)?,
-                size_bytes: row.get(3)?,
-                mime_type: row.get(4)?,
-                file_name: row.get(5)?,
-                transfer_state: row.get(6)?,
+                source: row.get(1)?,
+                attachment_id: row.get(2)?,
+                sha256: row.get(3)?,
+                size_bytes: row.get(4)?,
+                mime_type: row.get(5)?,
+                file_name: row.get(6)?,
+                transfer_state: row.get(7)?,
             })
         })
         .map_err(|error| DbError::sqlite("query pending attachments", error))?;
@@ -1859,8 +2219,8 @@ fn load_valid_attachments(
         };
         match load_valid_attachment(spool_root, manifest) {
             Ok(attachment) => loaded.push(attachment),
-            Err((attachment_id, _error)) => {
-                quarantine_invalid_attachment(connection, &attachment_id)?;
+            Err((attachment_id, source, _error)) => {
+                quarantine_invalid_attachment(connection, &attachment_id, &source)?;
             }
         }
     }
@@ -1870,42 +2230,28 @@ fn load_valid_attachments(
 fn load_valid_attachment(
     spool_root: &Path,
     manifest: PendingAttachmentManifest,
-) -> Result<PendingCommunicationAttachment, (String, DbError)> {
+) -> Result<PendingCommunicationAttachment, (String, String, DbError)> {
     let attachment_id = manifest.attachment_id.clone();
+    let source = manifest.source.clone();
     let result = (|| {
         let expected_size = u64::try_from(manifest.size_bytes).map_err(|_| {
             DbError::sqlite("read pending attachment", "attachment size is invalid")
         })?;
-        let mut file = open_communication_spool_file(spool_root, &manifest.file_name)?;
-        let mut hasher = Sha256::new();
-        let mut bytes_read = 0_u64;
-        let mut buffer = vec![0_u8; 1024 * 1024];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|error| DbError::sqlite("read pending attachment body", error))?;
-            if read == 0 {
-                break;
-            }
-            bytes_read = bytes_read
-                .checked_add(u64::try_from(read).map_err(|_| {
-                    DbError::sqlite("read pending attachment", "attachment size is invalid")
-                })?)
-                .ok_or_else(|| {
-                    DbError::sqlite("read pending attachment", "attachment size is invalid")
-                })?;
-            hasher.update(&buffer[..read]);
-        }
-        if bytes_read != expected_size || format!("{:x}", hasher.finalize()) != manifest.sha256 {
+        let file = open_communication_spool_file(spool_root, &manifest.file_name)?;
+        if file
+            .metadata()
+            .map_err(|error| DbError::sqlite("read pending attachment metadata", error))?
+            .len()
+            != expected_size
+        {
             return Err(DbError::sqlite(
-                "verify pending attachment body",
-                "attachment body does not match immutable manifest",
+                "verify pending attachment metadata",
+                "attachment size does not match immutable manifest",
             ));
         }
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| DbError::sqlite("rewind pending attachment body", error))?;
         Ok(PendingCommunicationAttachment {
             event_id: manifest.event_id,
+            source: manifest.source,
             attachment_id: manifest.attachment_id,
             sha256: manifest.sha256,
             size_bytes: expected_size,
@@ -1913,20 +2259,25 @@ fn load_valid_attachment(
             file,
         })
     })();
-    result.map_err(|error| (attachment_id, error))
+    result.map_err(|error| (attachment_id, source, error))
 }
 
-fn quarantine_invalid_attachment(
+pub(crate) fn quarantine_invalid_attachment(
     connection: &Connection,
     attachment_id: &str,
+    source: &str,
 ) -> Result<(), DbError> {
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| DbError::sqlite("start invalid attachment quarantine", error))?;
     transaction
         .execute(
-            "UPDATE attachment_spool SET transfer_state = 'failed'
-             WHERE attachment_id = ?1 AND transfer_state <> 'completed'",
+            "UPDATE attachment_spool
+             SET transfer_state = 'failed',
+                 terminal_failure_code = 'MEDIA_LOCAL_BODY_INVALID'
+             WHERE attachment_id = ?1
+               AND transfer_state <> 'completed'
+               AND terminal_failure_code IS NULL",
             [attachment_id],
         )
         .map_err(|error| DbError::sqlite("quarantine invalid attachment", error))?;
@@ -1945,6 +2296,14 @@ fn quarantine_invalid_attachment(
         None,
         occurred_at_ms,
     )?;
+    if let Some(collector_key) = communication_collector_key(source) {
+        persist_terminal_media_collector_failure(
+            &transaction,
+            collector_key,
+            "MEDIA_LOCAL_BODY_INVALID",
+            occurred_at_ms,
+        )?;
+    }
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit invalid attachment quarantine", error))
@@ -1959,7 +2318,9 @@ pub(crate) fn complete_communication_attachment(
             "UPDATE attachment_spool
              SET transfer_state = 'completed',
                  completed_at_ms = CAST(unixepoch('now', 'subsec') * 1000 AS INTEGER)
-             WHERE attachment_id = ?1 AND transfer_state <> 'completed'",
+             WHERE attachment_id = ?1
+               AND transfer_state <> 'completed'
+               AND terminal_failure_code IS NULL",
             [attachment_id],
         )
         .map_err(|error| DbError::sqlite("complete communication attachment", error))?;
@@ -2016,7 +2377,9 @@ pub(crate) fn defer_communication_attachment(
                     (SELECT COALESCE(MAX(queued.created_at_ms), 0) + 1
                      FROM attachment_spool AS queued)
                  )
-             WHERE attachment_id = ?1 AND transfer_state <> 'completed'",
+             WHERE attachment_id = ?1
+               AND transfer_state <> 'completed'
+               AND terminal_failure_code IS NULL",
             params![attachment_id, attempted_at_ms],
         )
         .map_err(|error| DbError::sqlite("defer communication attachment", error))?;
@@ -2038,6 +2401,50 @@ pub(crate) fn defer_communication_attachment(
     transaction
         .commit()
         .map_err(|error| DbError::sqlite("commit attachment deferral", error))
+}
+
+pub(crate) fn quarantine_unsupported_communication_attachment(
+    connection: &Connection,
+    attachment_id: &str,
+) -> Result<(), DbError> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| DbError::sqlite("start unsupported attachment quarantine", error))?;
+    let occurred_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    let updated = transaction
+        .execute(
+            "UPDATE attachment_spool
+             SET transfer_state = 'failed',
+                 terminal_failure_code = 'MEDIA_SOURCE_UNSUPPORTED'
+             WHERE attachment_id = ?1
+               AND transfer_state <> 'completed'
+               AND terminal_failure_code IS NULL",
+            [attachment_id],
+        )
+        .map_err(|error| DbError::sqlite("quarantine unsupported attachment", error))?;
+    if updated != 1 {
+        return Err(DbError::sqlite(
+            "quarantine unsupported attachment",
+            "attachment was not retryable",
+        ));
+    }
+    record_media_diagnostic(
+        &transaction,
+        attachment_id,
+        "MEDIA_SOURCE_UNSUPPORTED",
+        "local_validation",
+        "contract",
+        None,
+        occurred_at_ms,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit unsupported attachment quarantine", error))
 }
 
 fn record_media_diagnostic(
@@ -2072,6 +2479,81 @@ fn record_media_diagnostic(
         )
         .map(|_| ())
         .map_err(|error| DbError::sqlite("record media diagnostic", error))
+}
+
+pub(crate) fn record_terminal_media_diagnostic(
+    connection: &Connection,
+    subject_id: &str,
+    code: &str,
+) -> Result<(), DbError> {
+    if subject_id.is_empty()
+        || subject_id.len() > 255
+        || !matches!(code, "SCREEN_LOCAL_MANIFEST_INVALID")
+    {
+        return Err(DbError::sqlite(
+            "validate terminal media diagnostic",
+            "terminal media diagnostic does not match the fixed contract",
+        ));
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| DbError::sqlite("start terminal media diagnostic", error))?;
+    let occurred_at_ms = i64::try_from(
+        OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .div_euclid(1_000_000),
+    )
+    .unwrap_or(i64::MAX);
+    record_media_diagnostic(
+        &transaction,
+        subject_id,
+        code,
+        "local_validation",
+        "contract",
+        None,
+        occurred_at_ms,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| DbError::sqlite("commit terminal media diagnostic", error))
+}
+
+fn communication_collector_key(source: &str) -> Option<&'static str> {
+    match source {
+        "communication.wechat" | "wechat" => Some("communication.wechat"),
+        "communication.messages" | "messages" => Some("communication.messages"),
+        _ => None,
+    }
+}
+
+fn persist_terminal_media_collector_failure(
+    transaction: &Transaction<'_>,
+    collector_key: &str,
+    code: &str,
+    occurred_at_ms: i64,
+) -> Result<(), DbError> {
+    transaction
+        .execute(
+            "UPDATE collector_states
+             SET status = 'degraded',
+                 last_error_code = ?2,
+                 updated_at_ms = MAX(updated_at_ms, ?3)
+             WHERE collector_key = ?1
+               AND status <> 'disabled'
+               AND (
+                    last_error_code IS NULL
+                    OR last_error_code IN (
+                        'COMMUNICATION_MEDIA_UPLOAD_FAILED',
+                        'PHOTOS_UPLOAD_FAILED',
+                        'SCREEN_UPLOAD_FAILED',
+                        'SCREEN_UPLOAD_TIMEOUT',
+                        'MEDIA_CYCLE_TIMEOUT'
+                    )
+               )",
+            params![collector_key, code, occurred_at_ms],
+        )
+        .map(|_| ())
+        .map_err(|error| DbError::sqlite("persist terminal media Collector failure", error))
 }
 
 pub(crate) fn cleanup_completed_communication_attachments_batch(
@@ -2334,7 +2816,10 @@ pub(crate) fn checkpoint(connection: &Connection) -> Result<(), DbError> {
     if busy == 0 {
         Ok(())
     } else {
-        Err(DbError::sqlite("checkpoint WAL", "database remained busy"))
+        Err(DbError::retryable(
+            "checkpoint WAL",
+            "database remained busy",
+        ))
     }
 }
 

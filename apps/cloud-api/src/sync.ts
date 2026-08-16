@@ -12,13 +12,18 @@ import type {
 export interface SyncBatchRequest {
   batchId: string;
   deviceId: string;
-  events: SystemEventRecord[];
+  entries: Array<ParsedSyncEvent<SystemEventRecord>>;
 }
 
 export interface CommunicationSyncBatchRequest {
   batchId: string;
   deviceId: string;
-  events: CommunicationEventRecord[];
+  entries: Array<ParsedSyncEvent<CommunicationEventRecord>>;
+}
+
+export interface ParsedSyncEvent<T> {
+  envelope: EventEnvelope;
+  event: T | null;
 }
 
 type LifecycleEventType =
@@ -46,24 +51,21 @@ export function parseSyncBatch(value: unknown): SyncBatchRequest | null {
   if (!validateContract("sync-batch-request", value).valid || !isRecord(value)) return null;
   if (value.compressed === true) return null;
   const events = value.events as EventEnvelope[];
-  const parsed = events.map(parseSystemEvent);
-  if (parsed.some((event) => event === null)) return null;
   return {
     batchId: value.batch_id as string,
     deviceId: value.device_id as string,
-    events: parsed as SystemEventRecord[],
+    entries: events.map((envelope) => ({ envelope, event: parseSystemEvent(envelope) })),
   };
 }
 
 export function parseCommunicationSyncBatch(value: unknown): CommunicationSyncBatchRequest | null {
   if (!validateContract("sync-batch-request", value).valid || !isRecord(value)) return null;
   if (value.compressed === true) return null;
-  const events = (value.events as EventEnvelope[]).map(parseCommunicationEvent);
-  if (events.some((event) => event === null)) return null;
+  const events = value.events as EventEnvelope[];
   return {
     batchId: value.batch_id as string,
     deviceId: value.device_id as string,
-    events: events as CommunicationEventRecord[],
+    entries: events.map((envelope) => ({ envelope, event: parseCommunicationEvent(envelope) })),
   };
 }
 

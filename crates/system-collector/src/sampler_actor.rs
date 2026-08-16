@@ -1,5 +1,10 @@
 use pca_domain::{CpuMemorySample, DiskSample, SystemMetricSample};
-use std::{fmt, thread, time::Duration};
+use std::{
+    fmt,
+    sync::{mpsc as std_mpsc, Mutex},
+    thread,
+    time::Duration,
+};
 use tokio::sync::{mpsc, oneshot};
 
 const REQUEST_QUEUE_CAPACITY: usize = 4;
@@ -72,7 +77,7 @@ enum SampleRequest {
 
 pub struct SamplerHandle {
     requests: Option<mpsc::Sender<SampleRequest>>,
-    owner_stopped: Option<oneshot::Receiver<()>>,
+    owner_stopped: Option<Mutex<std_mpsc::Receiver<()>>>,
     owner_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -105,15 +110,30 @@ impl SamplerHandle {
         self.requests.take();
         let owner_signaled = match self.owner_stopped.take() {
             Some(receiver) => {
-                if let Ok(result) = tokio::time::timeout(SHUTDOWN_TIMEOUT, receiver).await {
-                    result.is_ok()
-                } else {
-                    self.owner_thread.take();
-                    return Err(SystemSampleError::new(
+                match tokio::task::spawn_blocking(move || {
+                    receiver
+                        .into_inner()
+                        .map_err(|_| std_mpsc::RecvTimeoutError::Disconnected)?
+                        .recv_timeout(SHUTDOWN_TIMEOUT)
+                })
+                .await
+                .map_err(|error| {
+                    SystemSampleError::new(
+                        SystemSampleErrorKind::Fatal,
+                        "SYSTEM_SAMPLER_JOIN_FAILED",
+                        error.to_string(),
+                    )
+                })? {
+                    Ok(()) => true,
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        self.owner_thread.take();
+                        return Err(SystemSampleError::new(
                         SystemSampleErrorKind::Fatal,
                         "SYSTEM_SAMPLER_STOP_TIMEOUT",
                         "the system sampler owner thread did not stop before the shutdown deadline",
                     ));
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => false,
                 }
             }
             None => false,
@@ -149,7 +169,7 @@ pub fn try_start_sampler<S: SystemMetricsSource>(
     mut source: S,
 ) -> Result<SamplerHandle, SystemSampleError> {
     let (requests, mut receiver) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
-    let (owner_stopped, stopped_receiver) = oneshot::channel();
+    let (owner_stopped, stopped_receiver) = std_mpsc::channel();
     let owner_thread = thread::Builder::new()
         .name("pca-system-sampler".to_owned())
         .spawn(move || {
@@ -177,7 +197,7 @@ pub fn try_start_sampler<S: SystemMetricsSource>(
 
     Ok(SamplerHandle {
         requests: Some(requests),
-        owner_stopped: Some(stopped_receiver),
+        owner_stopped: Some(Mutex::new(stopped_receiver)),
         owner_thread: Some(owner_thread),
     })
 }

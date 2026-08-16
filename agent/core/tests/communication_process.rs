@@ -365,6 +365,10 @@ fn disabled(revision: u64) -> CommunicationControl {
 }
 
 fn text_record(sequence: u64) -> NormalizedCommunicationRecord {
+    text_record_with_body(sequence, "private body")
+}
+
+fn text_record_with_body(sequence: u64, body: &str) -> NormalizedCommunicationRecord {
     NormalizedCommunicationRecord::try_new(
         "wechat-account-1".to_owned(),
         sequence,
@@ -379,13 +383,21 @@ fn text_record(sequence: u64) -> NormalizedCommunicationRecord {
             direction: Direction::Outgoing,
             kind: MessageKind::Text,
             conversation: ConversationScope::Direct,
-            text: Some("private body".to_owned()),
+            text: Some(body.to_owned()),
             attachments: Vec::new(),
         })
         .expect("valid text message"),
         Vec::new(),
     )
     .expect("valid normalized text record")
+}
+
+fn repaired_identity() -> CommunicationIdentity {
+    CommunicationIdentity::try_new(
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+    )
+    .expect("valid repaired identity")
 }
 
 fn media_record(path: &Path, declared: &[u8], sequence: u64) -> NormalizedCommunicationRecord {
@@ -483,6 +495,25 @@ async fn wait_for(counter: &AtomicUsize, expected: usize) {
     panic!("counter did not reach {expected}");
 }
 
+async fn wait_for_pending_communication_events(database: &DbActorHandle, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if database
+                .load_pending_communication_events(20)
+                .await
+                .expect("load pending communication events")
+                .len()
+                == expected
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending communication event count reached expected value");
+}
+
 fn prevent_virtual_time_auto_advance() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async {
         loop {
@@ -567,6 +598,33 @@ async fn cancellation_joins_the_poll_and_prevents_a_post_cancel_commit() {
     assert!(harness.state.poll_dropped.load(Ordering::SeqCst));
     assert_eq!(harness.state.stop_calls.load(Ordering::SeqCst), 1);
     harness.assert_no_communication_commit().await;
+}
+
+#[tokio::test]
+async fn sleep_or_process_restart_creates_a_fresh_provider_and_commits_the_next_message() {
+    let harness = Harness::new().await;
+    harness
+        .state
+        .poll_results
+        .lock()
+        .unwrap()
+        .extend([Ok(vec![text_record(1)]), Ok(vec![text_record(2)])]);
+
+    let first = harness.start(enabled(1)).await;
+    wait_for(&harness.state.poll_calls, 1).await;
+    wait_for_pending_communication_events(&harness.database, 3).await;
+    first
+        .shutdown()
+        .await
+        .expect("stop before sleep or process exit");
+
+    let second = harness.start(enabled(1)).await;
+    wait_for(&harness.state.poll_calls, 2).await;
+    wait_for_pending_communication_events(&harness.database, 6).await;
+
+    assert_eq!(harness.state.factory_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.state.discover_calls.load(Ordering::SeqCst), 2);
+    second.shutdown().await.expect("stop restarted provider");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1144,6 +1202,61 @@ async fn replayed_media_with_a_changed_manifest_does_not_block_a_new_message() {
     assert_eq!(row_count(&connection, "attachment_spool"), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn repaired_device_source_conflict_is_diagnosed_without_blocking_later_messages() {
+    let time_guard = prevent_virtual_time_auto_advance();
+    let harness = Harness::new().await;
+    harness
+        .state
+        .poll_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![text_record(1)]));
+    let runtime = harness.start(enabled(1)).await;
+    wait_for_message_count(&harness.database_path, 1).await;
+    runtime.shutdown().await.unwrap();
+
+    harness
+        .state
+        .poll_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(vec![
+            text_record_with_body(1, "conflicting private body"),
+            text_record(2),
+        ]));
+    let repaired_control = CommunicationControl::paired(repaired_identity(), 2, true)
+        .expect("valid repaired-device control");
+    let runtime = harness.start(repaired_control).await;
+    wait_for_message_count(&harness.database_path, 2).await;
+    wait_for_collector_code(&harness.database, "COMMUNICATION_SOURCE_IDENTITY_CONFLICT").await;
+    let factory_calls_after_conflict = harness.state.factory_calls.load(Ordering::SeqCst);
+    wait_for(&harness.state.stop_calls, 2).await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    settle().await;
+    assert_eq!(
+        harness.state.factory_calls.load(Ordering::SeqCst),
+        factory_calls_after_conflict + 1,
+        "a non-retryable commit conflict must rebuild the Provider from persisted cursors"
+    );
+    runtime.shutdown().await.unwrap();
+
+    let connection = Connection::open(&harness.database_path).unwrap();
+    assert_eq!(row_count(&connection, "communication_messages"), 2);
+    let diagnostic = connection
+        .query_row(
+            "SELECT redacted_json FROM diagnostic_events
+             WHERE code = 'COMMUNICATION_SOURCE_IDENTITY_CONFLICT'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read redacted source-conflict diagnostic");
+    assert!(diagnostic.contains("source_key_hash"));
+    assert!(!diagnostic.contains("opaque-source-key-1"));
+    assert!(!diagnostic.contains("conflicting private body"));
+    time_guard.abort();
+}
+
 #[tokio::test]
 async fn b1_cancellation_after_first_finalized_attachment_removes_attempt_files() {
     let harness = Harness::new().await;
@@ -1227,7 +1340,7 @@ async fn b1_database_commit_failure_removes_newly_finalized_file() {
         .push_back(Ok(vec![media_record(&source, bytes, u64::MAX)]));
     let runtime = harness.start(enabled(1)).await;
     wait_for(&harness.state.poll_calls, 1).await;
-    wait_for_collector_error(&harness.database, 1).await;
+    wait_for_collector_error(&harness.database, 1, "COMMUNICATION_LOCAL_DATABASE_FAILED").await;
     runtime.shutdown().await.unwrap();
 
     harness.assert_no_communication_commit().await;
@@ -1274,7 +1387,12 @@ async fn b1_second_attachment_failure_removes_first_new_final() {
         )]));
     let runtime = harness.start(enabled(1)).await;
     wait_for(&harness.state.poll_calls, 1).await;
-    wait_for_collector_error(&harness.database, 1).await;
+    wait_for_collector_error(
+        &harness.database,
+        1,
+        "COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE",
+    )
+    .await;
     runtime.shutdown().await.unwrap();
 
     harness.assert_no_communication_commit().await;
@@ -1324,7 +1442,12 @@ async fn b1_preexisting_deduplicated_file_survives_later_attachment_failure() {
         )]));
     let runtime = harness.start(enabled(1)).await;
     wait_for(&harness.state.poll_calls, 1).await;
-    wait_for_collector_error(&harness.database, 1).await;
+    wait_for_collector_error(
+        &harness.database,
+        1,
+        "COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE",
+    )
+    .await;
     runtime.shutdown().await.unwrap();
 
     harness.assert_no_communication_commit().await;
@@ -1351,7 +1474,7 @@ async fn b1_mime_family_mismatch_is_rejected_without_spool_or_database_rows() {
         )]));
     let runtime = harness.start(enabled(1)).await;
     wait_for(&harness.state.poll_calls, 1).await;
-    wait_for_collector_error(&harness.database, 1).await;
+    wait_for_collector_error(&harness.database, 1, "COMMUNICATION_INVALID_RECORD").await;
     runtime.shutdown().await.unwrap();
 
     harness.assert_no_communication_commit().await;
@@ -1381,7 +1504,12 @@ async fn b1_symlinked_source_or_spool_ancestor_is_rejected() {
         )]));
     let source_runtime = source_harness.start(enabled(1)).await;
     wait_for(&source_harness.state.poll_calls, 1).await;
-    wait_for_collector_error(&source_harness.database, 1).await;
+    wait_for_collector_error(
+        &source_harness.database,
+        1,
+        "COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE",
+    )
+    .await;
     source_runtime.shutdown().await.unwrap();
     source_harness.assert_no_communication_commit().await;
 
@@ -1397,7 +1525,12 @@ async fn b1_symlinked_source_or_spool_ancestor_is_rejected() {
         .push_back(Ok(vec![media_record(&spool_source, bytes, 1)]));
     let spool_runtime = spool_harness.start(enabled(1)).await;
     wait_for(&spool_harness.state.poll_calls, 1).await;
-    wait_for_collector_error(&spool_harness.database, 1).await;
+    wait_for_collector_error(
+        &spool_harness.database,
+        1,
+        "COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE",
+    )
+    .await;
     spool_runtime.shutdown().await.unwrap();
     spool_harness.assert_no_communication_commit().await;
 }
@@ -1436,7 +1569,12 @@ async fn b1_replaced_spool_path_cleans_only_through_pinned_directory() {
     .expect("copy creates a partial before spool replacement");
     fs::rename(&root, &displaced).unwrap();
     symlink(&attacker, &root).unwrap();
-    wait_for_collector_error(&harness.database, 1).await;
+    wait_for_collector_error(
+        &harness.database,
+        1,
+        "COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE",
+    )
+    .await;
     runtime.shutdown().await.unwrap();
 
     harness.assert_no_communication_commit().await;
@@ -1551,7 +1689,12 @@ async fn one_broken_media_source_does_not_block_attachment_free_records_in_the_b
         ]));
 
     let runtime = harness.start(enabled(1)).await;
-    wait_for_collector_error(&harness.database, 1).await;
+    wait_for_collector_error(
+        &harness.database,
+        1,
+        "COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE",
+    )
+    .await;
     runtime.shutdown().await.unwrap();
 
     let connection = Connection::open(&harness.database_path).unwrap();
@@ -1592,13 +1735,13 @@ async fn spool_hard_limit_pauses_copy_until_usage_is_strictly_below_resume_water
     file.set_len(SPOOL_HARD_LIMIT_BYTES - 1).unwrap();
     let runtime = harness.start(enabled(1)).await;
     wait_for(&harness.state.poll_calls, 1).await;
-    wait_for_collector_error(&harness.database, 1).await;
+    wait_for_collector_error(&harness.database, 1, "DISK_SPACE_LOW").await;
     harness.assert_no_communication_commit().await;
 
     file.set_len(SPOOL_RESUME_BELOW_BYTES).unwrap();
     runtime.apply_control(enabled(2)).await.unwrap();
     wait_for(&harness.state.poll_calls, 2).await;
-    wait_for_collector_error(&harness.database, 2).await;
+    wait_for_collector_error(&harness.database, 2, "DISK_SPACE_LOW").await;
     harness.assert_no_communication_commit().await;
 
     file.set_len(SPOOL_RESUME_BELOW_BYTES - 1).unwrap();
@@ -2104,14 +2247,26 @@ fn row_count(connection: &Connection, table: &str) -> u64 {
         .unwrap()
 }
 
+async fn wait_for_message_count(database_path: &Path, expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let connection = Connection::open(database_path).expect("open message count database");
+        if row_count(&connection, "communication_messages") == expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("communication message count did not reach {expected}");
+}
+
 async fn settle() {
     for _ in 0..100 {
         tokio::task::yield_now().await;
     }
 }
 
-async fn wait_for_collector_error(database: &DbActorHandle, revision: u64) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+async fn wait_for_collector_error(database: &DbActorHandle, revision: u64, expected: &str) {
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let state = database
                 .load_collector_states()
@@ -2121,15 +2276,30 @@ async fn wait_for_collector_error(database: &DbActorHandle, revision: u64) {
                 .find(|state| state.collector_key == "communication.wechat");
             if state.is_some_and(|state| {
                 state.desired_config_revision == revision
-                    && state.last_error_code.as_deref() == Some("WECHAT_LOCAL_SPOOL_UNAVAILABLE")
+                    && state.last_error_code.as_deref() == Some(expected)
             }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
-    .await
-    .expect("collector records the spool failure");
+    .await;
+    if observed.is_err() {
+        let actual = database
+            .load_collector_states()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|state| state.collector_key == "communication.wechat")
+            .map(|state| {
+                (
+                    state.desired_config_revision,
+                    state.status,
+                    state.last_error_code,
+                )
+            });
+        panic!("collector records {expected}; actual={actual:?}");
+    }
 }
 
 async fn wait_for_collector_code(database: &DbActorHandle, expected: &str) {

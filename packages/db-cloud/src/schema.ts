@@ -197,6 +197,7 @@ export const pairingSessions = pgTable(
   {
     sessionIdHash: char("session_id_hash", { length: 64 }).primaryKey(),
     devicePublicKeyHash: char("device_public_key_hash", { length: 64 }).notNull(),
+    requestedDeviceId: uuid("requested_device_id"),
     codeChallenge: text("code_challenge").notNull(),
     callbackUri: text("callback_uri").notNull(),
     callbackStateHash: char("callback_state_hash", { length: 64 }),
@@ -208,6 +209,9 @@ export const pairingSessions = pgTable(
     index("idx_pairing_sessions_active_expiry")
       .on(table.expiresAt)
       .where(isNull(table.authorizedAt)),
+    index("idx_pairing_sessions_requested_device")
+      .on(table.requestedDeviceId)
+      .where(sql`${table.requestedDeviceId} IS NOT NULL`),
     check("pairing_sessions_id_hash_hex", sql`${table.sessionIdHash} ~ '^[0-9a-f]{64}$'`),
     check(
       "pairing_sessions_public_key_hash_hex",
@@ -361,6 +365,21 @@ export const deviceHeartbeats = pgTable(
       table.deviceId,
       table.receivedAt.desc(),
     ),
+    index("idx_device_heartbeats_privacy_retention").on(table.receivedAt).where(sql`
+      ${table.networkSsid} IS NOT NULL
+      OR ${table.networkBssid} IS NOT NULL
+      OR ${table.networkLocalIpv4} IS NOT NULL
+      OR ${table.networkLocalIpv6} IS NOT NULL
+      OR ${table.networkPublicIp} IS NOT NULL
+      OR ${table.networkIpCountry} IS NOT NULL
+      OR ${table.networkIpRegion} IS NOT NULL
+      OR ${table.networkIpCity} IS NOT NULL
+      OR ${table.networkIpAccuracy} IS NOT NULL
+      OR ${table.networkLocationLatitude} IS NOT NULL
+      OR ${table.networkLocationLongitude} IS NOT NULL
+      OR ${table.networkLocationHorizontalAccuracyMeters} IS NOT NULL
+      OR ${table.networkLocationObservedAt} IS NOT NULL
+    `),
     check(
       "device_heartbeats_presence",
       sql`${table.presence} IN ('online', 'stale', 'offline', 'sleeping')`,

@@ -464,8 +464,15 @@ async fn revoke(
     if load_device_credential(store.as_ref())?.is_some() {
         return Err("revocation left a Keychain credential".into());
     }
-    if database.load_pairing_state().await?.is_some() {
-        return Err("revocation left pairing state".into());
+    let pairing_state = database
+        .load_pairing_state()
+        .await?
+        .ok_or("manual revocation removed pairing identity")?;
+    if !pairing_state.manually_unpaired
+        || pairing_state.device_id != device_id
+        || pairing_state.workspace_id != workspace_id
+    {
+        return Err("manual revocation did not preserve the unpaired device identity".into());
     }
     let statuses = database
         .load_collector_states()
@@ -473,7 +480,7 @@ async fn revoke(
         .into_iter()
         .map(|state| (state.collector_key, state.status))
         .collect::<BTreeMap<_, _>>();
-    for collector_key in ["network", "communication.wechat"] {
+    for collector_key in ["network", "communication.wechat", "screen.capture"] {
         if statuses.get(collector_key) != Some(&CollectorStatus::Disabled) {
             return Err("revocation left a sensitive Collector enabled".into());
         }

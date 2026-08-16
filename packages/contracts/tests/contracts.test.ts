@@ -154,9 +154,21 @@ test("registry contains the complete Appendix D error-code baseline", () => {
     readFileSync(join(here, "../registry.json"), "utf8"),
   ) as { error_codes: string[] };
 
-  assert.equal(registry.error_codes.length, 57);
-  assert.equal(new Set(registry.error_codes).size, 57);
+  assert.equal(registry.error_codes.length, 69);
+  assert.equal(new Set(registry.error_codes).size, 69);
   assert.ok(registry.error_codes.includes("AUTH_REQUIRED"));
+  assert.ok(registry.error_codes.includes("COMMUNICATION_SOURCE_IDENTITY_CONFLICT"));
+  assert.ok(registry.error_codes.includes("COMMUNICATION_LOCAL_DATABASE_FAILED"));
+  assert.ok(registry.error_codes.includes("COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE"));
+  assert.ok(registry.error_codes.includes("COMMUNICATION_INVALID_RECORD"));
+  assert.ok(registry.error_codes.includes("COMMUNICATION_MEDIA_UPLOAD_FAILED"));
+  assert.ok(registry.error_codes.includes("MEDIA_LOCAL_BODY_INVALID"));
+  assert.ok(registry.error_codes.includes("MEDIA_SOURCE_UNSUPPORTED"));
+  assert.ok(registry.error_codes.includes("MEDIA_CYCLE_TIMEOUT"));
+  assert.ok(registry.error_codes.includes("PHOTOS_UPLOAD_FAILED"));
+  assert.ok(registry.error_codes.includes("PHOTOS_LOCAL_MANIFEST_INVALID"));
+  assert.ok(registry.error_codes.includes("SCREEN_UPLOAD_FAILED"));
+  assert.ok(registry.error_codes.includes("SCREEN_UPLOAD_TIMEOUT"));
   assert.ok(registry.error_codes.includes("DISK_SPACE_LOW"));
 });
 

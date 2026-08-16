@@ -30,6 +30,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::cloud_control::{is_media_upload_error_code, is_terminal_media_failure_code};
+
 pub const OUTBOX_HIGH_WATER: u64 = 10_000;
 pub const OUTBOX_LOW_WATER: u64 = 8_000;
 pub const SPOOL_HARD_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
@@ -279,6 +281,14 @@ impl CommunicationAuthorization {
         state.owner_epoch
     }
 
+    pub(crate) async fn advance_owner_preserving_control(&self) -> u64 {
+        let mut state = self.state.write().await;
+        state.owner_epoch = state.owner_epoch.saturating_add(1);
+        state.suspended_control = None;
+        self.updates.send_replace(*state);
+        state.owner_epoch
+    }
+
     pub(crate) async fn owner_epoch(&self) -> u64 {
         self.state.read().await.owner_epoch
     }
@@ -336,6 +346,7 @@ impl CommunicationAuthorization {
         true
     }
 
+    #[cfg(test)]
     pub(crate) async fn suspend_for_owner(&self, owner_epoch: u64) -> bool {
         let mut state = self.state.write().await;
         if state.owner_epoch != owner_epoch {
@@ -685,6 +696,14 @@ async fn run_supervisor(
                 }
             };
         if let Err(error) = discovered {
+            let retry_deadline =
+                if error.code != "WECHAT_OPERATION_DEADLINE_EXCEEDED" && should_retry(&error) {
+                    let delay = RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)];
+                    retry_index = (retry_index + 1).min(RETRY_DELAYS.len() - 1);
+                    Some(time::Instant::now() + delay)
+                } else {
+                    None
+                };
             if provider.stop().is_err() {
                 return quarantine_provider(
                     provider.as_mut(),
@@ -700,16 +719,14 @@ async fn run_supervisor(
             if error.code == "WECHAT_OPERATION_DEADLINE_EXCEEDED" {
                 return Err(CommunicationRuntimeError::ProviderTimedOut);
             }
-            if should_retry(&error) {
-                let delay = RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)];
-                retry_index = (retry_index + 1).min(RETRY_DELAYS.len() - 1);
-                if wait_or_command(
+            if let Some(deadline) = retry_deadline {
+                if wait_or_command_until(
                     &database,
                     &mut control,
                     &mut highest_revision,
                     &mut commands,
                     &mut authorization,
-                    delay,
+                    deadline,
                 )
                 .await?
                 {
@@ -817,7 +834,7 @@ async fn run_supervisor(
                     let provider_health_error = provider.health_error();
                     records.sort_by_key(|record| !record.completed_media().is_empty());
                     let batch_deadline = time::Instant::now() + PROVIDER_OPERATION_TIMEOUT;
-                    let mut persistence_failed = false;
+                    let mut persistence_failure = None;
                     let mut batch_paused = false;
                     let mut event_observed = false;
                     for record in records {
@@ -934,9 +951,12 @@ async fn run_supervisor(
                             }
                             result = &mut preparation => result,
                         };
-                        let Ok(mut prepared) = commit else {
-                            persistence_failed = true;
-                            continue;
+                        let mut prepared = match commit {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                persistence_failure.get_or_insert(error);
+                                continue;
+                            }
                         };
                         match commands.try_recv() {
                             Ok(command) => {
@@ -1008,8 +1028,38 @@ async fn run_supervisor(
                             database.commit_communication_message(&prepared.commit),
                         )
                         .await;
-                        let persisted = match persisted {
-                            Ok(result) => result.map_err(|_| LocalPersistenceError::Database),
+                        match persisted {
+                            Ok(Ok(())) => {
+                                prepared.spool.disarm();
+                                event_observed = true;
+                            }
+                            Ok(Err(DbError::CommunicationSourceConflict)) => {
+                                let diagnostic = time::timeout(
+                                    batch_deadline.saturating_duration_since(time::Instant::now()),
+                                    database.record_communication_source_conflict(
+                                        prepared.commit.message.source_key(),
+                                    ),
+                                )
+                                .await;
+                                match diagnostic {
+                                    Ok(result) => result?,
+                                    Err(_) => {
+                                        return Err(stop_timed_out_provider(
+                                            provider.as_mut(),
+                                            &database,
+                                            control,
+                                        )
+                                        .await);
+                                    }
+                                }
+                                persistence_failure.get_or_insert(LocalPersistenceError::Database(
+                                    DbError::CommunicationSourceConflict,
+                                ));
+                            }
+                            Ok(Err(error)) => {
+                                persistence_failure = Some(LocalPersistenceError::Database(error));
+                                break;
+                            }
                             Err(_) => {
                                 return Err(stop_timed_out_provider(
                                     provider.as_mut(),
@@ -1018,13 +1068,7 @@ async fn run_supervisor(
                                 )
                                 .await);
                             }
-                        };
-                        if persisted.is_err() {
-                            persistence_failed = true;
-                            break;
                         }
-                        prepared.spool.disarm();
-                        event_observed = true;
                     }
                     if batch_paused {
                         if provider.stop().is_err() {
@@ -1040,13 +1084,13 @@ async fn run_supervisor(
                         }
                         continue 'supervisor;
                     }
-                    if persistence_failed {
-                        persist_collector_code(
-                            &database,
-                            control,
-                            "WECHAT_LOCAL_SPOOL_UNAVAILABLE",
-                        )
-                        .await?;
+                    if let Some(failure) = persistence_failure {
+                        persist_collector_code(&database, control, failure.code()).await?;
+                        let retry_delay = if failure.retryable() {
+                            RETRY_DELAYS[0]
+                        } else {
+                            POLL_INTERVAL
+                        };
                         if provider.stop().is_err() {
                             return quarantine_provider(
                                 provider.as_mut(),
@@ -1064,7 +1108,7 @@ async fn run_supervisor(
                             &mut highest_revision,
                             &mut commands,
                             &mut authorization,
-                            RETRY_DELAYS[0],
+                            retry_delay,
                         )
                         .await?
                         {
@@ -1327,6 +1371,25 @@ async fn wait_or_command(
     authorization: &mut watch::Receiver<AuthorizationState>,
     delay: Duration,
 ) -> Result<bool, CommunicationRuntimeError> {
+    wait_or_command_until(
+        database,
+        control,
+        highest_revision,
+        commands,
+        authorization,
+        time::Instant::now() + delay,
+    )
+    .await
+}
+
+async fn wait_or_command_until(
+    database: &DbActorHandle,
+    control: &mut CommunicationControl,
+    highest_revision: &mut u64,
+    commands: &mut mpsc::Receiver<Command>,
+    authorization: &mut watch::Receiver<AuthorizationState>,
+    deadline: time::Instant,
+) -> Result<bool, CommunicationRuntimeError> {
     tokio::select! {
         biased;
         changed = authorization.changed() => {
@@ -1345,7 +1408,7 @@ async fn wait_or_command(
             }
             None => Ok(false),
         },
-        () = time::sleep(delay) => Ok(true),
+        () = time::sleep_until(deadline) => Ok(true),
     }
 }
 
@@ -1612,10 +1675,33 @@ struct PreparedMedia {
 
 #[derive(Debug)]
 enum LocalPersistenceError {
-    Database,
+    Database(DbError),
     Filesystem,
     InvalidRecord,
     Quota,
+}
+
+impl LocalPersistenceError {
+    const fn code(&self) -> &'static str {
+        match self {
+            Self::Database(DbError::CommunicationSourceConflict) => {
+                "COMMUNICATION_SOURCE_IDENTITY_CONFLICT"
+            }
+            Self::Database(DbError::CommunicationSpoolUnavailable) | Self::Filesystem => {
+                "COMMUNICATION_LOCAL_SPOOL_UNAVAILABLE"
+            }
+            Self::Database(_) => "COMMUNICATION_LOCAL_DATABASE_FAILED",
+            Self::InvalidRecord => "COMMUNICATION_INVALID_RECORD",
+            Self::Quota => "DISK_SPACE_LOW",
+        }
+    }
+
+    const fn retryable(&self) -> bool {
+        !matches!(
+            self,
+            Self::Database(DbError::CommunicationSourceConflict) | Self::InvalidRecord
+        )
+    }
 }
 
 async fn copy_completed_media(
@@ -2091,11 +2177,24 @@ async fn persist_collector(
         .map_err(CommunicationRuntimeError::Database)?
         .into_iter()
         .find(|state| state.collector_key == COLLECTOR_KEY);
+    let preserve_media_upload_failure = control.active()
+        && error_code.is_none()
+        && prior.as_ref().is_some_and(|state| {
+            is_media_upload_error_code(state.last_error_code.as_deref())
+                || is_terminal_media_failure_code(state.last_error_code.as_deref())
+        });
     database
-        .upsert_collector_state(&CollectorState {
+        .upsert_collector_state_preserving_media_failure(&CollectorState {
             collector_key: COLLECTOR_KEY.to_owned(),
             collector_version: env!("CARGO_PKG_VERSION").to_owned(),
-            status,
+            status: if preserve_media_upload_failure {
+                prior
+                    .as_ref()
+                    .expect("preserved collector state exists")
+                    .status
+            } else {
+                status
+            },
             desired_config_revision: revision,
             applied_config_revision: revision,
             last_event_at_ms: if event_observed {
@@ -2103,12 +2202,23 @@ async fn persist_collector(
             } else {
                 prior.as_ref().and_then(|state| state.last_event_at_ms)
             },
-            last_health_at_ms: if error_code.is_none() && control.active() {
+            last_health_at_ms: if error_code.is_none()
+                && control.active()
+                && !preserve_media_upload_failure
+            {
                 Some(now_ms)
             } else {
                 prior.as_ref().and_then(|state| state.last_health_at_ms)
             },
-            last_error_code: error_code.map(str::to_owned),
+            last_error_code: if preserve_media_upload_failure {
+                prior
+                    .as_ref()
+                    .expect("preserved collector state exists")
+                    .last_error_code
+                    .clone()
+            } else {
+                error_code.map(str::to_owned)
+            },
             created_at_ms: prior.as_ref().map_or(now_ms, |state| state.created_at_ms),
             updated_at_ms: now_ms,
         })
@@ -2151,7 +2261,7 @@ mod tests {
         CommunicationIdentity,
     };
     use pca_db_local::DbActorHandle;
-    use pca_domain::{CollectorStatus, DomainError};
+    use pca_domain::{CollectorState, CollectorStatus, DomainError};
     use uuid::Uuid;
 
     #[test]
@@ -2254,5 +2364,148 @@ mod tests {
             state.last_error_code.as_deref(),
             Some("WECHAT_PERMISSION_REQUIRED")
         );
+    }
+
+    #[tokio::test]
+    async fn successful_provider_poll_does_not_clear_a_pending_media_upload_failure() {
+        let directory = tempfile::tempdir().expect("create database fixture");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.1.0")
+            .await
+            .expect("open database");
+        let control = CommunicationControl::paired(
+            CommunicationIdentity {
+                workspace_id: Uuid::new_v4(),
+                device_id: Uuid::new_v4(),
+            },
+            1,
+            true,
+        )
+        .expect("valid control");
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "communication.wechat".to_owned(),
+                collector_version: "test".to_owned(),
+                status: CollectorStatus::Degraded,
+                desired_config_revision: 1,
+                applied_config_revision: 1,
+                last_event_at_ms: Some(1),
+                last_health_at_ms: Some(1),
+                last_error_code: Some("COMMUNICATION_MEDIA_UPLOAD_FAILED".to_owned()),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .expect("seed media failure");
+
+        persist_collector_state(&database, control, None)
+            .await
+            .expect("persist healthy provider poll");
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("load collector")
+            .into_iter()
+            .find(|state| state.collector_key == "communication.wechat")
+            .expect("collector exists");
+        assert_eq!(state.status, CollectorStatus::Degraded);
+        assert_eq!(
+            state.last_error_code.as_deref(),
+            Some("COMMUNICATION_MEDIA_UPLOAD_FAILED")
+        );
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn successful_provider_poll_does_not_clear_a_terminal_media_failure() {
+        let directory = tempfile::tempdir().expect("create database fixture");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.1.0")
+            .await
+            .expect("open database");
+        let control = CommunicationControl::paired(
+            CommunicationIdentity {
+                workspace_id: Uuid::new_v4(),
+                device_id: Uuid::new_v4(),
+            },
+            1,
+            true,
+        )
+        .expect("valid control");
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "communication.wechat".to_owned(),
+                collector_version: "test".to_owned(),
+                status: CollectorStatus::Degraded,
+                desired_config_revision: 1,
+                applied_config_revision: 1,
+                last_event_at_ms: Some(1),
+                last_health_at_ms: Some(1),
+                last_error_code: Some("MEDIA_LOCAL_BODY_INVALID".to_owned()),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .expect("seed terminal media failure");
+
+        persist_collector_state(&database, control, None)
+            .await
+            .expect("persist healthy provider poll");
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("load collector")
+            .into_iter()
+            .find(|state| state.collector_key == "communication.wechat")
+            .expect("collector exists");
+        assert_eq!(state.status, CollectorStatus::Degraded);
+        assert_eq!(
+            state.last_error_code.as_deref(),
+            Some("MEDIA_LOCAL_BODY_INVALID")
+        );
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn disabled_control_clears_a_pending_media_upload_failure() {
+        let directory = tempfile::tempdir().expect("create database fixture");
+        let database = DbActorHandle::open(&directory.path().join("agent.sqlite3"), "0.1.0")
+            .await
+            .expect("open database");
+        let identity = CommunicationIdentity {
+            workspace_id: Uuid::new_v4(),
+            device_id: Uuid::new_v4(),
+        };
+        database
+            .upsert_collector_state(&CollectorState {
+                collector_key: "communication.wechat".to_owned(),
+                collector_version: "test".to_owned(),
+                status: CollectorStatus::Degraded,
+                desired_config_revision: 1,
+                applied_config_revision: 1,
+                last_event_at_ms: Some(1),
+                last_health_at_ms: Some(1),
+                last_error_code: Some("COMMUNICATION_MEDIA_UPLOAD_FAILED".to_owned()),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .expect("seed media failure");
+
+        persist_collector_state(
+            &database,
+            CommunicationControl::paired(identity, 2, false).expect("valid disabled control"),
+            None,
+        )
+        .await
+        .expect("persist disabled state");
+        let state = database
+            .load_collector_states()
+            .await
+            .expect("load collector")
+            .into_iter()
+            .find(|state| state.collector_key == "communication.wechat")
+            .expect("collector exists");
+        assert_eq!(state.status, CollectorStatus::Disabled);
+        assert_eq!(state.last_error_code, None);
+        database.shutdown().await.expect("shutdown database");
     }
 }
