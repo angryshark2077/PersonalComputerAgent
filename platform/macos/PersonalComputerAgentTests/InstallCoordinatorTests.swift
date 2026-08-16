@@ -6,6 +6,20 @@ import XCTest
 
 @MainActor
 final class InstallCoordinatorTests: XCTestCase {
+    func testInstallerProcessInheritsParentEnvironmentByDefault() async throws {
+        let expectedHome = try XCTUnwrap(ProcessInfo.processInfo.environment["HOME"])
+        let result = try await runInstallerProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: [],
+            timeout: .seconds(3),
+            captureOutput: true
+        )
+
+        XCTAssertEqual(result.status, 0)
+        let output = String(decoding: result.output, as: UTF8.self)
+        XCTAssertTrue(output.split(separator: "\n").contains("HOME=\(expectedHome)"))
+    }
+
     func testInstallerProcessDrainsOutputBeforeWaitingForExit() async throws {
         let result = try await runInstallerProcess(
             executableURL: URL(fileURLWithPath: "/bin/dd"),

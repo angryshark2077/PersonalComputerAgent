@@ -566,7 +566,9 @@ func runInstallerProcess(
     let process = Process()
     process.executableURL = executableURL
     process.arguments = arguments
-    process.environment = environment
+    if let environment {
+        process.environment = environment
+    }
     let output = captureOutput ? Pipe() : nil
     process.standardOutput = output
     process.standardError = output
