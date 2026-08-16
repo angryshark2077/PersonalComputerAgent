@@ -285,6 +285,19 @@ async fn wait_for_owner_stop(owner_stopped: std_mpsc::Receiver<()>) {
     );
 }
 
+async fn wait_for_observation_channel_close(observations: &mut mpsc::Receiver<SystemObservation>) {
+    for _ in 0..10_000 {
+        match observations.try_recv() {
+            Ok(_) | Err(mpsc::error::TryRecvError::Empty) => {
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => return,
+        }
+    }
+    panic!("collector observation channel did not close after a fatal group error");
+}
+
 #[tokio::test(start_paused = true)]
 async fn emits_immediately_then_on_independent_periods() {
     let controls = FakeControls::always_succeeds();
@@ -403,11 +416,10 @@ async fn unsupported_error_stops_only_its_metric_group_until_shutdown() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn fatal_error_stops_only_its_metric_group_until_shutdown() {
+async fn fatal_error_stops_entire_collector_for_supervised_restart() {
     let controls = FakeControls::cpu_script([Err(terminal_error(SystemSampleErrorKind::Fatal))]);
     let (handle, mut observations) = test_runtime(&controls, 16);
-    let observation =
-        initial_observation_for_group(&mut observations, MetricGroup::CpuMemory).await;
+    let observation = next_for_group(&mut observations, MetricGroup::CpuMemory).await;
     assert!(matches!(
         observation,
         SystemObservation::Failed {
@@ -419,13 +431,16 @@ async fn fatal_error_stops_only_its_metric_group_until_shutdown() {
         }
     ));
 
-    tokio::time::advance(Duration::from_secs(900)).await;
-    wait_for_calls(&controls, 1, 2).await;
+    wait_for_observation_channel_close(&mut observations).await;
     assert_eq!(controls.cpu_calls(), 1);
-    let _ = next_for_group(&mut observations, MetricGroup::Disk).await;
-    assert!(drain_groups(&mut observations).is_empty());
+    assert!(controls.disk_calls() <= 1);
 
-    handle.shutdown().await.expect("collector shutdown");
+    let error = handle
+        .shutdown()
+        .await
+        .expect_err("fatal group error must stop the entire collector");
+    assert_eq!(error.kind, SystemSampleErrorKind::Fatal);
+    assert_eq!(error.code, "SYSTEM_TEST_TERMINAL");
 }
 
 #[tokio::test(start_paused = true)]

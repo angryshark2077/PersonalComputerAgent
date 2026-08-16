@@ -891,6 +891,8 @@ export const cloudSchema = {
   deviceCollectorHealth,
   deviceNetworkHistory,
   deviceMediaCleanupRequests,
+  deviceScreenshotRequests,
+  deviceScreenshots,
   networkLocationLibrary,
   deviceRevocationAudit,
   communicationEvents,

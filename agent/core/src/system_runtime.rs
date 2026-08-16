@@ -638,6 +638,7 @@ mod tests {
         cpu_calls: Arc<AtomicUsize>,
         disk_calls: Arc<AtomicUsize>,
         cpu_failures_remaining: Arc<AtomicUsize>,
+        cpu_fatal: Arc<AtomicBool>,
     }
 
     impl FakeControls {
@@ -646,6 +647,7 @@ mod tests {
                 cpu_calls: Arc::new(AtomicUsize::new(0)),
                 disk_calls: Arc::new(AtomicUsize::new(0)),
                 cpu_failures_remaining: Arc::new(AtomicUsize::new(0)),
+                cpu_fatal: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -654,6 +656,12 @@ mod tests {
             controls
                 .cpu_failures_remaining
                 .store(times, Ordering::SeqCst);
+            controls
+        }
+
+        fn with_cpu_fatal() -> Self {
+            let controls = Self::new();
+            controls.cpu_fatal.store(true, Ordering::SeqCst);
             controls
         }
 
@@ -679,6 +687,13 @@ mod tests {
     impl SystemMetricsSource for FakeSource {
         fn sample_cpu_memory(&mut self) -> Result<CpuMemorySample, SystemSampleError> {
             self.controls.cpu_calls.fetch_add(1, Ordering::SeqCst);
+            if self.controls.cpu_fatal.swap(false, Ordering::SeqCst) {
+                return Err(SystemSampleError {
+                    kind: pca_system_collector::SystemSampleErrorKind::Fatal,
+                    code: "SYSTEM_TEST_FATAL",
+                    message: "stop the deterministic system collector".to_owned(),
+                });
+            }
             if self
                 .controls
                 .cpu_failures_remaining
@@ -1209,6 +1224,31 @@ mod tests {
         assert!(matches!(
             runtime.shutdown().await,
             Err(SystemRuntimeError::Domain(error)) if !error.retryable
+        ));
+        close_database(database).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fatal_sample_error_finishes_runtime_for_supervised_restart() {
+        let (_directory, database) = open_database().await;
+        let controls = FakeControls::with_cpu_fatal();
+        let runtime = SystemRuntimeHandle::start_with_source_and_sink(
+            Arc::clone(&database),
+            Some(identity()),
+            controls.source(),
+            Arc::new(DirectDbSink {
+                database: Arc::clone(&database),
+            }),
+        )
+        .await
+        .expect("start paired runtime");
+
+        yield_until(|| runtime.is_finished()).await;
+        assert_eq!(controls.cpu_calls(), 1);
+        assert!(controls.disk_calls() <= 1);
+        assert!(matches!(
+            runtime.shutdown().await,
+            Err(SystemRuntimeError::Collector(error)) if error.code == "SYSTEM_TEST_FATAL"
         ));
         close_database(database).await;
     }

@@ -168,14 +168,14 @@ async fn supervise(
     control: watch::Receiver<ControlState>,
 ) -> Result<(), SystemSampleError> {
     let sampler = Arc::new(sampler);
-    let cpu_task = tokio::spawn(run_group(
+    let mut cpu_task = tokio::spawn(run_group(
         MetricGroup::CpuMemory,
         CPU_MEMORY_INTERVAL,
         Arc::clone(&sampler),
         observations.clone(),
         control.clone(),
     ));
-    let disk_task = tokio::spawn(run_group(
+    let mut disk_task = tokio::spawn(run_group(
         MetricGroup::Disk,
         DISK_INTERVAL,
         Arc::clone(&sampler),
@@ -183,14 +183,27 @@ async fn supervise(
         control,
     ));
 
-    let (cpu_result, disk_result) = tokio::join!(cpu_task, disk_task);
-    let task_error = cpu_result.err().or_else(|| disk_result.err()).map(|error| {
-        SystemSampleError::new(
-            SystemSampleErrorKind::Fatal,
-            "SYSTEM_COLLECTOR_TASK_FAILED",
-            error.to_string(),
-        )
-    });
+    let (first_result, cpu_finished_first) = tokio::select! {
+        result = &mut cpu_task => (result, true),
+        result = &mut disk_task => (result, false),
+    };
+    let mut task_error = group_task_error(first_result);
+    if task_error.is_some() {
+        if cpu_finished_first {
+            disk_task.abort();
+            let _ = disk_task.await;
+        } else {
+            cpu_task.abort();
+            let _ = cpu_task.await;
+        }
+    } else {
+        let remaining_result = if cpu_finished_first {
+            disk_task.await
+        } else {
+            cpu_task.await
+        };
+        task_error = group_task_error(remaining_result);
+    }
     let sampler = Arc::try_unwrap(sampler).map_err(|_| {
         SystemSampleError::new(
             SystemSampleErrorKind::Fatal,
@@ -207,13 +220,27 @@ async fn supervise(
     }
 }
 
+fn group_task_error(
+    result: Result<Result<(), SystemSampleError>, tokio::task::JoinError>,
+) -> Option<SystemSampleError> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(error) => Some(SystemSampleError::new(
+            SystemSampleErrorKind::Fatal,
+            "SYSTEM_COLLECTOR_TASK_FAILED",
+            error.to_string(),
+        )),
+    }
+}
+
 async fn run_group(
     group: MetricGroup,
     period: Duration,
     sampler: Arc<SamplerHandle>,
     observations: mpsc::Sender<SystemObservation>,
     mut control: watch::Receiver<ControlState>,
-) {
+) -> Result<(), SystemSampleError> {
     let mut schedule = normal_schedule(period);
     let mut retry_index = 0_usize;
     let mut retry_delay = None;
@@ -223,11 +250,11 @@ async fn run_group(
     loop {
         let mut current_control = *control.borrow_and_update();
         match current_control.mode {
-            ControlMode::Shutdown => return,
+            ControlMode::Shutdown => return Ok(()),
             ControlMode::Suppressed => {
                 let Some(running_control) = wait_until_running(&mut control, &observations).await
                 else {
-                    return;
+                    return Ok(());
                 };
                 current_control = running_control;
             }
@@ -250,7 +277,7 @@ async fn run_group(
             match outcome {
                 WaitOutcome::Ready => {}
                 WaitOutcome::ControlChanged => continue,
-                WaitOutcome::ReceiverClosed => return,
+                WaitOutcome::ReceiverClosed => return Ok(()),
             }
         }
 
@@ -258,11 +285,11 @@ async fn run_group(
             biased;
             changed = control.changed() => {
                 if changed.is_err() {
-                    return;
+                    return Ok(());
                 }
                 continue;
             }
-            () = observations.closed() => return,
+            () = observations.closed() => return Ok(()),
             result = time::timeout(SAMPLE_OPERATION_TIMEOUT, sampler.sample(group)) => {
                 result.unwrap_or_else(|_| Err(SystemSampleError::new(
                     SystemSampleErrorKind::Fatal,
@@ -275,7 +302,8 @@ async fn run_group(
             continue;
         }
 
-        let error_kind = result.as_ref().err().map(|error| error.kind);
+        let terminal_error = result.as_ref().err().cloned();
+        let error_kind = terminal_error.as_ref().map(|error| error.kind);
         let observation = match result {
             Ok(sample) => SystemObservation::Sampled {
                 sample,
@@ -293,9 +321,9 @@ async fn run_group(
         );
         match send_observation(observation, &observations, &mut control).await {
             WaitOutcome::Ready => {}
-            WaitOutcome::ControlChanged if terminal => return,
+            WaitOutcome::ControlChanged if terminal => return group_exit(terminal_error),
             WaitOutcome::ControlChanged => continue,
-            WaitOutcome::ReceiverClosed => return,
+            WaitOutcome::ReceiverClosed => return Ok(()),
         }
 
         match error_kind {
@@ -308,9 +336,18 @@ async fn run_group(
                 retry_delay = Some(RETRY_DELAYS[retry_index.min(RETRY_DELAYS.len() - 1)]);
                 retry_index = retry_index.saturating_add(1);
             }
-            Some(SystemSampleErrorKind::Unsupported | SystemSampleErrorKind::Fatal) => return,
+            Some(SystemSampleErrorKind::Unsupported | SystemSampleErrorKind::Fatal) => {
+                return group_exit(terminal_error);
+            }
         }
         sample_now = false;
+    }
+}
+
+fn group_exit(error: Option<SystemSampleError>) -> Result<(), SystemSampleError> {
+    match error {
+        Some(error) if error.kind == SystemSampleErrorKind::Fatal => Err(error),
+        Some(_) | None => Ok(()),
     }
 }
 
@@ -485,6 +522,10 @@ mod tests {
         ));
 
         release_sender.send(()).expect("release system sampler");
-        collector.shutdown().await.expect("shut down collector");
+        let error = collector
+            .shutdown()
+            .await
+            .expect_err("fatal timeout must stop the collector");
+        assert_eq!(error.code, "SYSTEM_SAMPLE_TIMEOUT");
     }
 }

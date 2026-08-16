@@ -55,7 +55,8 @@ pub struct PairingIpcServer {
 }
 
 struct PendingPairing {
-    service: AgentPairingService,
+    session_id: String,
+    service: Arc<AgentPairingService>,
     client: Arc<HttpControlClient>,
 }
 
@@ -341,11 +342,11 @@ impl PairingIpcServer {
                         return Err(());
                     };
                     let pairing_client: Arc<dyn PairingClient> = client.clone();
-                    let service = AgentPairingService::new(
+                    let service = Arc::new(AgentPairingService::new(
                         Arc::clone(&self.database),
                         Arc::clone(&self.store),
                         pairing_client,
-                    );
+                    ));
                     match service
                         .begin(PairingStartHandoff {
                             callback_uri: payload.callback_uri,
@@ -353,7 +354,11 @@ impl PairingIpcServer {
                         .await
                     {
                         Ok(session) => {
-                            *self.pending.lock().await = Some(PendingPairing { service, client });
+                            *self.pending.lock().await = Some(PendingPairing {
+                                session_id: session.session_id.clone(),
+                                service,
+                                client,
+                            });
                             json!({
                                 "session_id": session.session_id,
                                 "authorization_url": session.authorization_url,
@@ -366,17 +371,31 @@ impl PairingIpcServer {
             }
             PairingIpcOperation::Complete => {
                 let payload = request.complete_payload().map_err(|_| ())?;
-                match self.pending.lock().await.take() {
+                let pending = self
+                    .pending
+                    .lock()
+                    .await
+                    .as_ref()
+                    .filter(|pending| pending.session_id == payload.session_id)
+                    .map(|pending| (Arc::clone(&pending.service), Arc::clone(&pending.client)));
+                match pending {
                     None => error_response("PAIRING_UNAVAILABLE"),
-                    Some(pending) => match pending
-                        .service
+                    Some((service, client)) => match service
                         .complete(PairingCallbackHandoff {
-                            session_id: payload.session_id,
+                            session_id: payload.session_id.clone(),
                             authorization_code: payload.authorization_code,
                         })
                         .await
                     {
                         Ok(completion) => {
+                            let mut pending = self.pending.lock().await;
+                            if pending
+                                .as_ref()
+                                .is_some_and(|pending| pending.session_id == payload.session_id)
+                            {
+                                *pending = None;
+                            }
+                            drop(pending);
                             let credential =
                                 load_device_credential(self.store.as_ref()).ok().flatten();
                             match credential {
@@ -387,7 +406,7 @@ impl PairingIpcServer {
                                             credential,
                                             Arc::clone(&self.store),
                                         ),
-                                        pending.client.clone() as Arc<dyn ControlClient>,
+                                        client as Arc<dyn ControlClient>,
                                     )
                                     .await
                                 {
@@ -408,7 +427,18 @@ impl PairingIpcServer {
             }
             PairingIpcOperation::Cancel => {
                 let payload = request.cancel_payload().map_err(|_| ())?;
-                if let Some(pending) = self.pending.lock().await.take() {
+                let pending = {
+                    let mut pending = self.pending.lock().await;
+                    if pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.session_id == payload.session_id)
+                    {
+                        pending.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pending) = pending {
                     pending.service.cancel(&payload.session_id).await;
                 }
                 json!({ "cancelled": true })

@@ -630,7 +630,11 @@ impl RuntimeResources {
                     }
                 }
                 Some(command) = sleep_control_receiver.recv() => {
-                    let result = self.prepare_for_sleep().await;
+                    let result = self.prepare_for_sleep(
+                        config,
+                        &communication_authorization,
+                        *pairing_state_receiver.borrow(),
+                    ).await;
                     let _ = command.response().send(result.map_err(|_| ()));
                 }
             }
@@ -699,7 +703,10 @@ impl RuntimeResources {
             .await?
             .as_ref()
             .is_some_and(PairingState::is_paired);
-        self.restart_system_collector(config, paired).await
+        if let Some(runtime) = self.system_runtime.take() {
+            let _ = tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, runtime.shutdown()).await;
+        }
+        self.start_system_collector(config, paired).await
     }
 
     fn ensure_owner_workers_alive(&self) -> Result<(), FailureStage> {
@@ -763,7 +770,12 @@ impl RuntimeResources {
             .await
     }
 
-    async fn prepare_for_sleep(&mut self) -> Result<(), FailureStage> {
+    async fn prepare_for_sleep(
+        &mut self,
+        config: &RunConfig,
+        authorization: &CommunicationAuthorization,
+        paired: bool,
+    ) -> Result<(), FailureStage> {
         if self.collectors_suspended_for_sleep {
             return Ok(());
         }
@@ -810,6 +822,8 @@ impl RuntimeResources {
             Ok(()) => Ok(()),
             Err(stage) => {
                 lifecycle.abort_sleep_preparation().await;
+                self.resume_collectors_after_wake(config, authorization, paired)
+                    .await?;
                 Err(stage)
             }
         }

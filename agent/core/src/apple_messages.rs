@@ -158,21 +158,10 @@ async fn collect_once(
         let mut decoded = decoded.into_iter();
         for source_message in messages {
             let row_id = source_message.row_id;
-            let text = source_message
-                .text
-                .as_deref()
-                .and_then(normalize_text)
-                .map(str::to_owned)
-                .or_else(|| {
-                    source_message
-                        .attributed_body
-                        .as_ref()
-                        .and_then(|_| decoded.next().flatten())
-                });
+            let text = resolved_message_text(&source_message, &mut decoded)?;
             if let Some(text) = text {
-                if let Ok(commit) = message_commit(&source_message, text, workspace_id, device_id) {
-                    event_observed |= commit_message_or_accept_replay(database, &commit).await?;
-                }
+                let commit = message_commit(&source_message, text, workspace_id, device_id)?;
+                event_observed |= commit_message_or_accept_replay(database, &commit).await?;
             }
             persist_cursor(workspace_id, device_id, row_id).await?;
             cursor = Some(row_id);
@@ -415,6 +404,20 @@ fn normalize_text(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
 }
+
+fn resolved_message_text(
+    source: &SourceMessage,
+    decoded: &mut impl Iterator<Item = Option<String>>,
+) -> Result<Option<String>, ()> {
+    if let Some(text) = source.text.as_deref().and_then(normalize_text) {
+        return Ok(Some(text.to_owned()));
+    }
+    if source.attributed_body.is_none() {
+        return Ok(None);
+    }
+    let text = decoded.next().ok_or(())?.ok_or(())?;
+    normalize_text(&text).map(str::to_owned).map(Some).ok_or(())
+}
 fn messages_database_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -486,8 +489,8 @@ async fn persist_cursor(workspace_id: &str, device_id: &str, row_id: i64) -> Res
 mod tests {
     use super::{
         apple_date_to_rfc3339, commit_message_or_accept_replay, load_recent_messages,
-        message_commit, message_events, migrate_established_cursor, stable_uuid, SourceMessage,
-        MESSAGE_PAGE_SIZE,
+        message_commit, message_events, migrate_established_cursor, resolved_message_text,
+        stable_uuid, SourceMessage, MESSAGE_PAGE_SIZE,
     };
     use pca_db_local::DbActorHandle;
     use rusqlite::{params, Connection};
@@ -621,6 +624,46 @@ mod tests {
         };
 
         assert!(message_commit(&message, "hello".to_owned(), "workspace", "device").is_err());
+    }
+
+    #[test]
+    fn attributed_body_decode_failure_stops_before_cursor_advance() {
+        let message = SourceMessage {
+            row_id: 8,
+            guid: "message-guid".to_owned(),
+            chat_guid: "chat-guid".to_owned(),
+            display_name: "Chat".to_owned(),
+            sender_id: "sender".to_owned(),
+            sender_display_name: "Sender".to_owned(),
+            is_from_me: false,
+            apple_date: 0,
+            member_count: 1,
+            text: None,
+            attributed_body: Some(vec![1, 2, 3]),
+        };
+
+        assert!(resolved_message_text(&message, &mut [None].into_iter()).is_err());
+    }
+
+    #[test]
+    fn bodyless_message_remains_skippable_without_consuming_a_decode_result() {
+        let message = SourceMessage {
+            row_id: 9,
+            guid: "message-guid".to_owned(),
+            chat_guid: "chat-guid".to_owned(),
+            display_name: "Chat".to_owned(),
+            sender_id: "sender".to_owned(),
+            sender_display_name: "Sender".to_owned(),
+            is_from_me: false,
+            apple_date: 0,
+            member_count: 1,
+            text: None,
+            attributed_body: None,
+        };
+        let mut decoded = [Some("later".to_owned())].into_iter();
+
+        assert_eq!(resolved_message_text(&message, &mut decoded), Ok(None));
+        assert_eq!(decoded.next(), Some(Some("later".to_owned())));
     }
 
     #[test]

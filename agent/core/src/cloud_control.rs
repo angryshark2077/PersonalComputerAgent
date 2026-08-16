@@ -517,6 +517,7 @@ impl std::fmt::Debug for PairingExchangeRequest {
 struct PendingPairing {
     session_id: String,
     code_verifier: String,
+    credential: Option<DeviceCredential>,
 }
 
 /// In-memory owner of a single Setup pairing transaction.
@@ -593,6 +594,7 @@ impl AgentPairingService {
         *pending = Some(PendingPairing {
             session_id: response.session_id.clone(),
             code_verifier,
+            credential: None,
         });
         Ok(PairingSessionHandoff {
             session_id: response.session_id,
@@ -611,27 +613,46 @@ impl AgentPairingService {
         &self,
         handoff: PairingCallbackHandoff,
     ) -> Result<PairingCompletion, CloudControlRuntimeError> {
+        if handoff.authorization_code.is_empty() {
+            return Err(CloudControlRuntimeError::Pairing(ControlError::Contract));
+        }
         let pending = self
             .pending
             .lock()
             .await
-            .take()
+            .as_ref()
             .filter(|pending| pending.session_id == handoff.session_id)
+            .cloned()
             .ok_or(CloudControlRuntimeError::Pairing(ControlError::Contract))?;
-        if handoff.authorization_code.is_empty() {
-            return Err(CloudControlRuntimeError::Pairing(ControlError::Contract));
-        }
-        let credential = self
-            .client
-            .exchange_pairing_callback(&PairingExchangeRequest {
-                session_id: handoff.session_id,
-                authorization_code: handoff.authorization_code,
-                code_verifier: pending.code_verifier,
-            })
-            .await
-            .map_err(CloudControlRuntimeError::Pairing)?;
+        let credential = if let Some(credential) = pending.credential {
+            credential
+        } else {
+            let credential = self
+                .client
+                .exchange_pairing_callback(&PairingExchangeRequest {
+                    session_id: handoff.session_id.clone(),
+                    authorization_code: handoff.authorization_code,
+                    code_verifier: pending.code_verifier,
+                })
+                .await
+                .map_err(CloudControlRuntimeError::Pairing)?;
+            let mut current = self.pending.lock().await;
+            let current = current
+                .as_mut()
+                .filter(|pending| pending.session_id == handoff.session_id)
+                .ok_or(CloudControlRuntimeError::Pairing(ControlError::Contract))?;
+            current.credential = Some(credential.clone());
+            credential
+        };
         store_device_credential(self.store.as_ref(), &credential)?;
         ensure_pairing_state(&self.database, &credential).await?;
+        let mut current = self.pending.lock().await;
+        if current
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == handoff.session_id)
+        {
+            *current = None;
+        }
         Ok(PairingCompletion {
             device_id: credential.device_id().to_owned(),
             workspace_id: credential.workspace_id().to_owned(),
@@ -4957,6 +4978,10 @@ mod tests {
         request: Arc<StdMutex<Option<PairingSessionRequest>>>,
     }
 
+    struct RetryingPairingClient {
+        exchanges: Arc<AtomicUsize>,
+    }
+
     impl PairingClient for CapturingPairingClient {
         fn create_pairing_session<'a>(
             &'a self,
@@ -4978,6 +5003,38 @@ mod tests {
             _: &'a PairingExchangeRequest,
         ) -> ControlFuture<'a, DeviceCredential> {
             Box::pin(async { Err(ControlError::Contract) })
+        }
+    }
+
+    impl PairingClient for RetryingPairingClient {
+        fn create_pairing_session<'a>(
+            &'a self,
+            _: &'a PairingSessionRequest,
+        ) -> ControlFuture<'a, PairingSessionResponse> {
+            Box::pin(async {
+                Ok(PairingSessionResponse {
+                    session_id: "01981111-7111-8111-8111-111111111111".to_owned(),
+                    authorization_url: "https://dashboard.example.invalid/pair".to_owned(),
+                })
+            })
+        }
+
+        fn exchange_pairing_callback<'a>(
+            &'a self,
+            _: &'a PairingExchangeRequest,
+        ) -> ControlFuture<'a, DeviceCredential> {
+            Box::pin(async move {
+                if self.exchanges.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(ControlError::Transient);
+                }
+                DeviceCredential::new(
+                    "01982222-7222-8222-8222-222222222222".to_owned(),
+                    "01983333-7333-8333-8333-333333333333".to_owned(),
+                    "access",
+                    "refresh",
+                )
+                .map_err(|_| ControlError::Contract)
+            })
         }
     }
 
@@ -5025,6 +5082,60 @@ mod tests {
                 .and_then(|request| request.existing_device_id.as_deref()),
             Some(device_id),
         );
+        drop(service);
+        let Ok(database) = Arc::try_unwrap(database) else {
+            panic!("release database");
+        };
+        database.shutdown().await.expect("shutdown database");
+    }
+
+    #[tokio::test]
+    async fn pairing_completion_survives_wrong_session_and_transient_exchange_failure() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database = Arc::new(
+            DbActorHandle::open(&directory.path().join("agent.sqlite3"), "test")
+                .await
+                .expect("open database"),
+        );
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let service = AgentPairingService::new(
+            Arc::clone(&database),
+            Arc::new(EmptyCredentialStore),
+            Arc::new(RetryingPairingClient {
+                exchanges: Arc::clone(&exchanges),
+            }),
+        );
+        let session = service
+            .begin(PairingStartHandoff {
+                callback_uri: "http://127.0.0.1:43123/pca/pair/callback".to_owned(),
+            })
+            .await
+            .expect("begin pairing");
+
+        assert!(service
+            .complete(PairingCallbackHandoff {
+                session_id: "01984444-7444-8444-8444-444444444444".to_owned(),
+                authorization_code: "code".to_owned(),
+            })
+            .await
+            .is_err());
+        assert_eq!(exchanges.load(Ordering::SeqCst), 0);
+
+        let callback = PairingCallbackHandoff {
+            session_id: session.session_id,
+            authorization_code: "code".to_owned(),
+        };
+        assert!(service.complete(callback.clone()).await.is_err());
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        let completion = service
+            .complete(callback.clone())
+            .await
+            .expect("retry pairing completion");
+        assert_eq!(completion.device_id, "01982222-7222-8222-8222-222222222222");
+        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+        assert!(service.complete(callback).await.is_err());
+        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+
         drop(service);
         let Ok(database) = Arc::try_unwrap(database) else {
             panic!("release database");
