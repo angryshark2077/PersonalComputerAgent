@@ -424,6 +424,26 @@ export interface SystemMetricRecord {
   payload: SystemMetricPayload;
 }
 
+export interface LifecycleEventRecord {
+  eventId: string;
+  eventType: "agent.started" | "agent.stopped" | "agent.crash_recovered" | "system.sleep" | "system.wake";
+  occurredAt: Date;
+  payload: Record<string, unknown>;
+}
+
+export interface LifecycleEventPage {
+  events: LifecycleEventRecord[];
+  totalCount: number;
+}
+
+const lifecycleEventTypes: LifecycleEventRecord["eventType"][] = [
+  "agent.started",
+  "agent.stopped",
+  "agent.crash_recovered",
+  "system.sleep",
+  "system.wake",
+];
+
 export interface SystemEventAppendResult {
   acceptedEventIds: string[];
   duplicateEventIds: string[];
@@ -688,6 +708,13 @@ export interface ControlRepository {
     userId: string,
     limit: number,
   ): Promise<SystemMetricRecord[]>;
+  listOwnerLifecycleEvents(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+    offset: number,
+  ): Promise<LifecycleEventPage>;
   listOwnerCommunicationConversations(
     deviceId: string,
     workspaceId: string,
@@ -1939,6 +1966,32 @@ export class MemoryControlRepository implements ControlRepository {
         metricGroup: (event.payload as unknown as SystemMetricPayload).metric_group,
         payload: event.payload as unknown as SystemMetricPayload,
       }));
+  }
+
+  async listOwnerLifecycleEvents(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+    offset: number,
+  ): Promise<LifecycleEventPage> {
+    this.#requireOwnerMembership(workspaceId, userId);
+    this.#requireDevice(deviceId, workspaceId, true);
+    const events = [...this.#systemEvents.values()]
+      .filter((event) => event.workspaceId === workspaceId
+        && event.deviceId === deviceId
+        && lifecycleEventTypes.includes(event.eventType as LifecycleEventRecord["eventType"]))
+      .sort((left, right) => right.occurredAt.getTime() - left.occurredAt.getTime()
+        || right.eventId.localeCompare(left.eventId));
+    return {
+      events: events.slice(offset, offset + limit).map((event) => ({
+        eventId: event.eventId,
+        eventType: event.eventType as LifecycleEventRecord["eventType"],
+        occurredAt: event.occurredAt,
+        payload: { ...event.payload },
+      })),
+      totalCount: events.length,
+    };
   }
 
   #ownerDeviceSummary(device: DeviceRecord): OwnerDeviceSummary {
@@ -4131,6 +4184,50 @@ export class DrizzleControlRepository implements ControlRepository {
           payload,
         };
       });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
+  async listOwnerLifecycleEvents(
+    deviceId: string,
+    workspaceId: string,
+    userId: string,
+    limit: number,
+    offset: number,
+  ): Promise<LifecycleEventPage> {
+    try {
+      await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
+      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const where = and(
+        eq(systemEvents.workspaceId, workspaceId),
+        eq(systemEvents.deviceId, deviceId),
+        inArray(systemEvents.eventType, lifecycleEventTypes),
+      );
+      const [rows, totals] = await Promise.all([
+        this.database
+          .select({
+            eventId: systemEvents.eventId,
+            eventType: systemEvents.eventType,
+            occurredAt: systemEvents.occurredAt,
+            payload: systemEvents.payload,
+          })
+          .from(systemEvents)
+          .where(where)
+          .orderBy(desc(systemEvents.occurredAt), desc(systemEvents.eventId))
+          .limit(limit)
+          .offset(offset),
+        this.database.select({ count: count() }).from(systemEvents).where(where),
+      ]);
+      return {
+        events: rows.map((row) => ({
+          eventId: row.eventId,
+          eventType: row.eventType as LifecycleEventRecord["eventType"],
+          occurredAt: row.occurredAt,
+          payload: row.payload,
+        })),
+        totalCount: totals[0]?.count ?? 0,
+      };
     } catch (error) {
       throw repositoryError(error);
     }

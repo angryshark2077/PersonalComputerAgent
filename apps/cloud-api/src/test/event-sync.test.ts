@@ -1316,6 +1316,40 @@ test("paired device uploads strict agent and network lifecycle events", async ()
     "01986666-7666-8666-8666-66666666666b",
   ]);
 
+  const startedWithBootTime = agentStarted(credentials.device_id);
+  startedWithBootTime.event_id = "01986666-7666-8666-8666-66666666666c";
+  startedWithBootTime.idempotency_key = "lifecycle:01986666-7666-8666-8666-66666666666c";
+  startedWithBootTime.occurred_at = "2026-08-02T00:01:00Z";
+  startedWithBootTime.created_at = "2026-08-02T00:01:00Z";
+  startedWithBootTime.payload = { boot_time: "2026-08-01T23:59:00Z" };
+  const bootTimeResponse = await api.request("/v1/agent/sync/events", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credentials.device_access_token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      batch_id: "01987777-7777-8777-8777-777777777774",
+      device_id: credentials.device_id,
+      protocol_version: 1,
+      events: [startedWithBootTime],
+    }),
+  });
+  assert.equal(bootTimeResponse.status, 200);
+  assert.deepEqual((await bootTimeResponse.json() as { accepted: string[] }).accepted, [startedWithBootTime.event_id]);
+
+  const lifecycle = await api.request(`/v1/devices/${credentials.device_id}/lifecycle-events?limit=1&offset=0`);
+  assert.equal(lifecycle.status, 200);
+  assert.deepEqual(await lifecycle.json(), {
+    events: [{
+      event_id: startedWithBootTime.event_id,
+      event_type: "agent.started",
+      occurred_at: "2026-08-02T00:01:00.000Z",
+      boot_time: "2026-08-01T23:59:00Z",
+    }],
+    pagination: { limit: 1, offset: 0, total_count: 2 },
+  });
+
   const broadened = agentStarted(credentials.device_id);
   broadened.payload = { reason: "must remain local" };
   const mixed = await api.request("/v1/agent/sync/events", {

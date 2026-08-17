@@ -756,6 +756,36 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.get("/v1/devices/:deviceId/lifecycle-events", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const limit = parseMetricLimit(context.req.query("limit"));
+    const offset = parseListOffset(context.req.query("offset"));
+    if (limit === null || offset === null) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid lifecycle pagination.");
+    }
+    try {
+      const page = await options.repository.listOwnerLifecycleEvents(
+        context.req.param("deviceId"),
+        principal.workspaceId,
+        principal.userId,
+        limit,
+        offset,
+      );
+      return context.json({
+        events: page.events.map((event) => ({
+          event_id: event.eventId,
+          event_type: event.eventType,
+          occurred_at: event.occurredAt.toISOString(),
+          boot_time: typeof event.payload.boot_time === "string" ? event.payload.boot_time : null,
+        })),
+        pagination: { limit, offset, total_count: page.totalCount },
+      });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.get("/v1/devices/:deviceId/communication/conversations", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;
@@ -1093,6 +1123,12 @@ function parseMetricLimit(value: string | undefined): number | null {
   if (value === undefined) return 20;
   const limit = Number(value);
   return Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
+}
+
+function parseListOffset(value: string | undefined): number | null {
+  if (value === undefined) return 0;
+  const offset = Number(value);
+  return Number.isInteger(offset) && offset >= 0 && offset <= 100_000 ? offset : null;
 }
 
 function parseCommunicationLimit(value: string | undefined): number | null {

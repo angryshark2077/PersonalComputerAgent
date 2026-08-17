@@ -3,7 +3,8 @@ use std::{fmt, sync::Arc, time::Duration};
 use pca_bridge_client::PlatformLifecycleEvent;
 use pca_db_local::{DbActorHandle, DbError};
 use pca_domain::{EventEnvelope, Sensitivity};
-use serde_json::Map;
+use serde_json::{Map, Value};
+use sysinfo::System;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::{
     sync::{mpsc, oneshot, Mutex, RwLock},
@@ -137,7 +138,16 @@ impl LifecycleRuntime {
     }
 
     pub(crate) async fn record_startup(&self) -> Result<String, LifecycleError> {
-        self.persist("agent.started", false).await
+        let boot_time = OffsetDateTime::from_unix_timestamp(
+            i64::try_from(System::boot_time()).map_err(|_| LifecycleError::Clock)?,
+        )
+        .map_err(|_| LifecycleError::Clock)?
+        .format(&Rfc3339)
+        .map_err(|_| LifecycleError::Clock)?;
+        let mut payload = Map::new();
+        payload.insert("boot_time".to_owned(), Value::String(boot_time));
+        self.persist_with_payload("agent.started", payload, false)
+            .await
     }
 
     pub(crate) async fn record_crash_recovery(&self) -> Result<String, LifecycleError> {
@@ -335,12 +345,23 @@ impl LifecycleRuntime {
         event_type: &'static str,
         checkpoint: bool,
     ) -> Result<String, LifecycleError> {
+        self.persist_with_payload(event_type, Map::new(), checkpoint)
+            .await
+    }
+
+    async fn persist_with_payload(
+        &self,
+        event_type: &'static str,
+        payload: Map<String, Value>,
+        checkpoint: bool,
+    ) -> Result<String, LifecycleError> {
         let gate = self.gate.lock().await;
         if !gate.accepting || gate.sleep_preparing {
             return Err(LifecycleError::NotAccepting);
         }
         let identity = self.current_identity().await?;
-        let event = lifecycle_event(&identity, event_type)?;
+        let mut event = lifecycle_event(&identity, event_type)?;
+        event.payload = payload;
         let response = send_persist(&self.sender, event, checkpoint).await;
         drop(gate);
         response
@@ -545,6 +566,49 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn startup_records_the_current_system_boot_time() {
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let path = directory.path().join("agent.sqlite3");
+        let database = Arc::new(
+            DbActorHandle::open(&path, "0.0.0")
+                .await
+                .expect("open database"),
+        );
+        let runtime = LifecycleRuntime::start(
+            Arc::clone(&database),
+            Some(RuntimeIdentity::new("local-workspace", "local-device")),
+            2,
+            Arc::new(RecordingRefresher {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                database_path: None,
+                fail: false,
+            }),
+        );
+
+        runtime.record_startup().await.expect("record startup");
+        runtime.abort_and_drain().await.expect("drain lifecycle");
+
+        let connection = rusqlite::Connection::open(path).expect("inspect database");
+        let payload: String = connection
+            .query_row(
+                "SELECT payload_json FROM events_local WHERE event_type = 'agent.started'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("startup payload exists");
+        let boot_time = serde_json::from_str::<serde_json::Value>(&payload)
+            .expect("startup payload is json")["boot_time"]
+            .as_str()
+            .expect("boot time is present")
+            .to_owned();
+        assert!(time::OffsetDateTime::parse(
+            &boot_time,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok());
     }
 
     #[tokio::test]

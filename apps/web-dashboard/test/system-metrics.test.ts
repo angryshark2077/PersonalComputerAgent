@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { getSystemMetrics } from "../src/lib/api.ts";
+import { getLifecycleEvents, getSystemMetrics } from "../src/lib/api.ts";
 import { summarizeSystemMetrics } from "../src/lib/system-metrics.ts";
 
 test("loads device system metrics from the owner-scoped endpoint", async () => {
@@ -15,6 +15,23 @@ test("loads device system metrics from the owner-scoped endpoint", async () => {
   assert.equal(
     requested,
     "https://cloud.example/v1/devices/01982222-7222-8222-8222-222222222222/system-metrics",
+  );
+});
+
+test("loads paginated lifecycle history from the device endpoint", async () => {
+  let requested = "";
+  const page = await getLifecycleEvents(async (input) => {
+    requested = String(input);
+    return new Response(JSON.stringify({
+      events: [],
+      pagination: { limit: 20, offset: 20, total_count: 37 },
+    }), { status: 200 });
+  }, "https://cloud.example", "01982222-7222-8222-8222-222222222222", 20, 20);
+
+  assert.equal(page.pagination.total_count, 37);
+  assert.equal(
+    requested,
+    "https://cloud.example/v1/devices/01982222-7222-8222-8222-222222222222/lifecycle-events?limit=20&offset=20",
   );
 });
 

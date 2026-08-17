@@ -138,6 +138,18 @@ export interface DashboardDevice {
   collectors: CollectorConfig;
 }
 
+export interface DashboardLifecycleEvent {
+  event_id: string;
+  event_type: "agent.started" | "agent.stopped" | "agent.crash_recovered" | "system.sleep" | "system.wake";
+  occurred_at: string;
+  boot_time: string | null;
+}
+
+export interface DashboardLifecyclePage {
+  events: DashboardLifecycleEvent[];
+  pagination: { limit: number; offset: number; total_count: number };
+}
+
 export interface DashboardCollectorHealth {
   collector_key: string;
   collector_version: string;
@@ -312,6 +324,19 @@ export async function getDevice(
     apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}`),
   );
   return normalizeDashboardDevice(device);
+}
+
+export async function getLifecycleEvents(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  deviceId: string,
+  limit = 20,
+  offset = 0,
+): Promise<DashboardLifecyclePage> {
+  return jsonRequest<DashboardLifecyclePage>(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(deviceId)}/lifecycle-events?limit=${limit}&offset=${offset}`),
+  );
 }
 
 export async function getDevices(

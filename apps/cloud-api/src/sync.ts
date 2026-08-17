@@ -87,7 +87,7 @@ function parseSystemEvent(event: EventEnvelope): SystemEventRecord | null {
     if (
       event.source !== "runtime.lifecycle"
       || !isRecord(event.payload)
-      || Object.keys(event.payload).length !== 0
+      || !validLifecyclePayload(event.event_type, event.payload)
     ) return null;
   } else {
     return null;
@@ -108,6 +108,15 @@ function parseSystemEvent(event: EventEnvelope): SystemEventRecord | null {
     payload: event.payload as unknown as Record<string, unknown>,
     idempotencyKey: event.idempotency_key ?? null,
   };
+}
+
+function validLifecyclePayload(eventType: LifecycleEventType, payload: Record<string, unknown>): boolean {
+  const keys = Object.keys(payload);
+  if (keys.length === 0) return true;
+  return eventType === "agent.started"
+    && keys.length === 1
+    && typeof payload.boot_time === "string"
+    && !Number.isNaN(Date.parse(payload.boot_time));
 }
 
 function validPhotoAssetPayload(value: unknown): boolean {

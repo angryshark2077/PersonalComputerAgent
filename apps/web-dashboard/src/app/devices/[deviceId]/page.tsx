@@ -11,6 +11,7 @@ import {
   deleteNetworkLocation,
   getCollectorAudit,
   getDevice,
+  getLifecycleEvents,
   getNetworkLocations,
   getSystemMetrics,
   purgeDevice,
@@ -22,6 +23,7 @@ import {
   type CollectorConfigAudit,
   type DashboardCollectorHealth,
   type DashboardDevice,
+  type DashboardLifecycleEvent,
   type DashboardNetworkLocation,
   type DashboardSystemMetric,
 } from "../../../lib/api";
@@ -29,12 +31,15 @@ import { getBrowserSession, redirectToSignIn } from "../../../lib/auth";
 import { DashboardShell } from "../../../components/dashboard-shell";
 import { summarizeSystemMetrics } from "../../../lib/system-metrics";
 import { collectorHealthPresentation } from "../../../lib/collector-health";
+import { buildLifecycleTimeline } from "../../../lib/lifecycle-timeline";
 
 interface DeviceScreen {
   device: DashboardDevice;
   audit: CollectorConfigAudit[];
   metrics: DashboardSystemMetric[];
   locations: DashboardNetworkLocation[];
+  lifecycleEvents: DashboardLifecycleEvent[];
+  lifecycleTotalCount: number;
 }
 
 export default function DevicePage() {
@@ -49,14 +54,45 @@ export default function DevicePage() {
 
   async function refresh(): Promise<void> {
     const origin = cloudApiOrigin();
-    const [device, audit, metrics, locations] = await Promise.all([
+    const [device, audit, metrics, locations, lifecycle] = await Promise.all([
       getDevice(window.fetch, origin, deviceId),
       getCollectorAudit(window.fetch, origin, deviceId),
       getSystemMetrics(window.fetch, origin, deviceId),
       getNetworkLocations(window.fetch, origin),
+      getLifecycleEvents(window.fetch, origin, deviceId),
     ]);
-    setScreen({ device, audit, metrics, locations });
+    setScreen({
+      device,
+      audit,
+      metrics,
+      locations,
+      lifecycleEvents: lifecycle.events,
+      lifecycleTotalCount: lifecycle.pagination.total_count,
+    });
     setScreenDraft(device.collectors["screen.capture"]);
+  }
+
+  async function loadMoreLifecycle(): Promise<void> {
+    if (screen === null || busy) return;
+    setBusy(true);
+    try {
+      const page = await getLifecycleEvents(
+        window.fetch,
+        cloudApiOrigin(),
+        deviceId,
+        20,
+        screen.lifecycleEvents.length,
+      );
+      setScreen({
+        ...screen,
+        lifecycleEvents: [...screen.lifecycleEvents, ...page.events],
+        lifecycleTotalCount: page.pagination.total_count,
+      });
+    } catch (cause) {
+      setError(messageFor(cause));
+    } finally {
+      setBusy(false);
+    }
   }
 
   useEffect(() => {
@@ -222,6 +258,12 @@ export default function DevicePage() {
         health={screen.device.status?.collector_health ?? []}
         presence={screen.device.status?.presence}
         lastSuccessfulCheckIn={screen.device.status?.observed_at}
+      />
+      <LifecyclePanel
+        events={screen.lifecycleEvents}
+        hasMore={screen.lifecycleEvents.length < screen.lifecycleTotalCount}
+        busy={busy}
+        onLoadMore={() => void loadMoreLifecycle()}
       />
       <CollectorScopeCard
           name="Network"
@@ -475,6 +517,42 @@ export default function DevicePage() {
           )}
         </section>
     </DashboardShell>
+  );
+}
+
+function LifecyclePanel({
+  events,
+  hasMore,
+  busy,
+  onLoadMore,
+}: {
+  events: DashboardLifecycleEvent[];
+  hasMore: boolean;
+  busy: boolean;
+  onLoadMore: () => void;
+}) {
+  const timeline = buildLifecycleTimeline(events);
+  return (
+    <section className="dashboard-panel collector-card" aria-labelledby="lifecycle-heading">
+      <h2 id="lifecycle-heading">Device activity</h2>
+      <p>Sleep, wake, macOS boot, Agent restart, and crash recovery history.</p>
+      {timeline.length === 0 ? <p>No lifecycle records yet.</p> : (
+        <ol>
+          {timeline.map((item) => (
+            <li key={item.key}>
+              <strong>{item.title}</strong>
+              <p>{new Date(item.occurredAt).toLocaleString()}</p>
+              {item.detail === null ? null : <p>{item.detail}</p>}
+            </li>
+          ))}
+        </ol>
+      )}
+      {hasMore ? (
+        <button type="button" className="primary-button" disabled={busy} onClick={onLoadMore}>
+          {busy ? "Loading…" : "Load more activity"}
+        </button>
+      ) : null}
+    </section>
   );
 }
 
