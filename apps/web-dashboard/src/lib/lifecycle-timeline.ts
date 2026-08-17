@@ -16,8 +16,10 @@ export function buildLifecycleTimeline(events: DashboardLifecycleEvent[]): Lifec
 
   for (const event of ordered) {
     if (event.event_type === "system.sleep") {
-      if (pendingSleep !== null) items.push(singleItem(pendingSleep, "Entered sleep"));
-      pendingSleep = event;
+      // macOS dark wakes can emit a second sleep notification without an intervening
+      // user-visible wake. Merge consecutive sleeps into one period that starts at the
+      // first sleep and ends at the next real wake.
+      if (pendingSleep === null) pendingSleep = event;
       continue;
     }
     if (event.event_type === "system.wake") {

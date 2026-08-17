@@ -13,6 +13,29 @@ test("pairs sleep and wake events without displaying dark wakes", () => {
   assert.match(timeline[0]?.detail ?? "", /13h 43m/);
 });
 
+test("merges consecutive sleep events into one period ending at the next wake", () => {
+  const timeline = buildLifecycleTimeline([
+    event("wake", "system.wake", "2026-08-17T10:53:25Z"),
+    event("sleep-2", "system.sleep", "2026-08-16T21:10:25Z"),
+    event("sleep-1", "system.sleep", "2026-08-16T11:07:52Z"),
+  ]);
+  assert.equal(timeline.length, 1);
+  assert.equal(timeline[0]?.title, "Sleep");
+  // 23h45m proves the period starts at the FIRST sleep (21:10:25Z start would be 13h43m).
+  assert.match(timeline[0]?.detail ?? "", /23h 45m/);
+});
+
+test("keeps the first sleep visible when no matching wake has arrived", () => {
+  const timeline = buildLifecycleTimeline([
+    event("sleep-2", "system.sleep", "2026-08-17T21:10:25Z"),
+    event("sleep-1", "system.sleep", "2026-08-17T11:07:52Z"),
+  ]);
+  assert.equal(timeline.length, 1);
+  assert.equal(timeline[0]?.title, "Entered sleep");
+  assert.equal(timeline[0]?.detail, "No matching wake event yet");
+  assert.equal(timeline[0]?.occurredAt, "2026-08-17T11:07:52Z");
+});
+
 test("distinguishes an Agent restart from a macOS reboot when boot time is available", () => {
   const timeline = buildLifecycleTimeline([
     event("start-2", "agent.started", "2026-08-17T05:07:48Z", "2026-08-16T23:00:00Z"),
