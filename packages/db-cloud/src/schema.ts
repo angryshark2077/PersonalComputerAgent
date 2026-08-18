@@ -131,6 +131,9 @@ export const devices = pgTable(
     platform: text("platform").notNull(),
     createdAt: timestampColumn("created_at").notNull(),
     revokedAt: timestampColumn("revoked_at"),
+    mergedIntoDeviceId: uuid("merged_into_device_id"),
+    mergedAt: timestampColumn("merged_at"),
+    mergedByUserId: uuid("merged_by_user_id"),
   },
   (table) => [
     unique("devices_workspace_id_unique").on(table.workspaceId, table.id),
@@ -141,6 +144,23 @@ export const devices = pgTable(
     }).onDelete("restrict"),
     uniqueIndex("devices_public_key_hash_unique").on(table.devicePublicKeyHash),
     index("idx_devices_workspace").on(table.workspaceId, table.id),
+    index("idx_devices_merge_target").on(table.workspaceId, table.mergedIntoDeviceId).where(sql`${table.mergedIntoDeviceId} IS NOT NULL`),
+    foreignKey({
+      name: "devices_merge_target_fk",
+      columns: [table.workspaceId, table.mergedIntoDeviceId],
+      foreignColumns: [table.workspaceId, table.id],
+    }).onDelete("restrict"),
+    foreignKey({
+      name: "devices_merge_actor_fk",
+      columns: [table.mergedByUserId],
+      foreignColumns: [authUsers.id],
+    }).onDelete("restrict"),
+    check("devices_not_merged_into_self", sql`${table.mergedIntoDeviceId} IS NULL OR ${table.mergedIntoDeviceId} <> ${table.id}`),
+    check("devices_merge_fields_complete", sql`(
+      (${table.mergedIntoDeviceId} IS NULL AND ${table.mergedAt} IS NULL AND ${table.mergedByUserId} IS NULL)
+      OR
+      (${table.mergedIntoDeviceId} IS NOT NULL AND ${table.mergedAt} IS NOT NULL AND ${table.mergedByUserId} IS NOT NULL)
+    )`),
     check("devices_macos_only", sql`${table.platform} = 'macos'`),
     check(
       "devices_public_key_hash_hex",

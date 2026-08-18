@@ -191,6 +191,41 @@ test("owner config is scoped, strict, and reaches device control", async () => {
   assert.equal(badScope.status, 400);
 });
 
+test("owner can merge a duplicate device into an active device", async () => {
+  const { api, credentials } = await pairedApi();
+  const verifier = "verifier-merge-target";
+  const callbackState = "merge-target-callback-state-12345678901234567890";
+  const start = await api.request("/v1/device-pairing/sessions", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      device_public_key: "device-public-key-merge-target",
+      code_challenge: pkceChallenge(verifier),
+      callback_uri: "http://127.0.0.1:43123/pca/pair/callback",
+      callback_state: callbackState,
+    }),
+  });
+  const { session_id: sessionId } = await start.json() as { session_id: string };
+  const authorized = await api.request(`/v1/device-pairing/sessions/${sessionId}/authorize`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ callback_state: callbackState }),
+  });
+  const code = new URL(authorized.headers.get("location") ?? "").searchParams.get("code");
+  const exchange = await api.request("/v1/device-pairing/exchange", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, authorization_code: code, code_verifier: verifier }),
+  });
+  const target = await exchange.json() as { device_id: string };
+
+  const merged = await api.request(`/v1/devices/${credentials.device_id}/merge`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ target_device_id: target.device_id }),
+  });
+  assert.equal(merged.status, 200);
+  assert.deepEqual(await merged.json(), { merged: true, device_id: target.device_id });
+  const devices = await (await api.request("/v1/devices")).json() as { devices: Array<{ device_id: string }> };
+  assert.deepEqual(devices.devices.map((device) => device.device_id), [target.device_id]);
+});
+
 test("refresh safely replays after a lost response and a revoked device is rejected", async () => {
   const { api, credentials } = await pairedApi();
   const refresh = await api.request("/v1/devices/token/refresh", {

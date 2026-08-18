@@ -508,6 +508,19 @@ export async function revokeDevice(
   if (response.status !== 204) throw await apiError(response);
 }
 
+export async function mergeDevice(
+  fetcher: DashboardFetch,
+  cloudApiOrigin: string,
+  sourceDeviceId: string,
+  targetDeviceId: string,
+): Promise<void> {
+  await jsonRequest(
+    fetcher,
+    apiUrl(cloudApiOrigin, `/v1/devices/${encodeURIComponent(sourceDeviceId)}/merge`),
+    { method: "POST", body: JSON.stringify({ target_device_id: targetDeviceId }) },
+  );
+}
+
 export async function purgeDevice(
   fetcher: DashboardFetch,
   cloudApiOrigin: string,

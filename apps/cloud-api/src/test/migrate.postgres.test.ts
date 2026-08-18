@@ -40,6 +40,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertCredentialRotationReplay(pool);
     await assertCollectorHealthSchema(pool);
     await assertHeartbeatPrivacyCleanup(pool);
+    await assertDeviceMergePreservesHistory(pool);
     await assertRepairPairingReusesExistingDevice(pool);
     await assertRepairPairingReplacesMissingDevice(pool);
 
@@ -52,12 +53,41 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertDeviceLocationSchema(pool);
     await assertScreenshotSchema(pool);
     await assertCollectorHealthSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024", "0025", "0026", "0027", "0028", "0029"]);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024", "0025", "0026", "0027", "0028", "0029", "0030"]);
   } finally {
     await pool.end();
     await postgres.stop();
   }
 });
+
+async function assertDeviceMergePreservesHistory(pool: Pool) {
+  const workspaceId = "01982222-7222-8222-8222-222222222250";
+  const ownerUserId = "01983333-7333-8333-8333-333333333350";
+  const sourceDeviceId = "01981111-7111-8111-8111-111111111150";
+  const targetDeviceId = "01981111-7111-8111-8111-111111111151";
+  const mergedAt = new Date("2026-08-18T01:00:00.000Z");
+  await pool.query("INSERT INTO auth_users (id, name, email, created_at, updated_at) VALUES ($1, 'Merge', 'merge@example.invalid', $2, $2)", [ownerUserId, mergedAt]);
+  await pool.query("INSERT INTO workspaces (id, name, slug, created_at, updated_at) VALUES ($1, 'Merge', 'merge', $2, $2)", [workspaceId, mergedAt]);
+  await pool.query("INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES ($1, $2, 'owner', $3)", [workspaceId, ownerUserId, mergedAt]);
+  await pool.query(
+    "INSERT INTO devices (id, workspace_id, owner_user_id, device_public_key_hash, platform, created_at) VALUES ($1, $3, $4, $5, 'macos', $7), ($2, $3, $4, $6, 'macos', $7)",
+    [sourceDeviceId, targetDeviceId, workspaceId, ownerUserId, "01".repeat(32), "02".repeat(32), mergedAt],
+  );
+  await pool.query(
+    `INSERT INTO system_events (event_id, workspace_id, device_id, event_type, source, schema_version, occurred_at, created_at, sensitivity, payload)
+     VALUES ('01986666-7666-8666-8666-666666666680', $1, $2, 'system.sleep', 'runtime.lifecycle', 1, $4, $4, 'normal', '{}'::jsonb),
+            ('01986666-7666-8666-8666-666666666681', $1, $3, 'system.wake', 'runtime.lifecycle', 1, $4 + interval '1 minute', $4 + interval '1 minute', 'normal', '{}'::jsonb)`,
+    [workspaceId, sourceDeviceId, targetDeviceId, mergedAt],
+  );
+  const repository = new DrizzleControlRepository(drizzle(pool, { schema: cloudSchema }));
+  await repository.mergeOwnerDevice({ sourceDeviceId, targetDeviceId, workspaceId, actorUserId: ownerUserId, now: mergedAt });
+  assert.deepEqual((await repository.listOwnerDevices(workspaceId, ownerUserId)).map((device) => device.deviceId), [targetDeviceId]);
+  assert.equal((await repository.listOwnerLifecycleEvents(targetDeviceId, workspaceId, ownerUserId, 20, 0)).totalCount, 2);
+  await assert.rejects(
+    repository.mergeOwnerDevice({ sourceDeviceId: targetDeviceId, targetDeviceId, workspaceId, actorUserId: ownerUserId, now: mergedAt }),
+    (error) => error instanceof ControlRepositoryError && error.code === "CONFLICT",
+  );
+}
 
 async function assertHeartbeatPrivacyCleanup(pool: Pool) {
   const workspaceId = "01982222-7222-8222-8222-222222222230";

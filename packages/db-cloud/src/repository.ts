@@ -1,5 +1,5 @@
 import type { AgentControlSnapshot, SystemMetricPayload } from "@pca/contracts/src/types.js";
-import { and, count, countDistinct, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -383,6 +383,14 @@ export interface OwnerDeviceDetail extends OwnerDeviceSummary {
   localMediaCleanup: LocalMediaCleanupRecord | null;
 }
 
+export interface DeviceMergeInput {
+  sourceDeviceId: string;
+  targetDeviceId: string;
+  workspaceId: string;
+  actorUserId: string;
+  now: Date;
+}
+
 export interface CollectorConfigAuditRecord {
   actorUserId: string;
   configurationRevision: number;
@@ -676,6 +684,7 @@ export interface ControlRepository {
   deleteOwnerNetworkLocation(locationId: string, workspaceId: string, userId: string): Promise<void>;
   appendConfigAudit(input: ConfigAuditInput): Promise<number>;
   revokeDevice(input: DeviceRevocationInput): Promise<void>;
+  mergeOwnerDevice(input: DeviceMergeInput): Promise<void>;
   listOwnerDeviceObjectKeys(deviceId: string, workspaceId: string, userId: string): Promise<string[]>;
   deleteOwnerDevice(deviceId: string, workspaceId: string, userId: string): Promise<void>;
   resolveOwnerWorkspace(userId: string): Promise<string | null>;
@@ -776,6 +785,9 @@ interface DeviceRecord {
   platform: "macos";
   createdAt: Date;
   revokedAt: Date | null;
+  mergedIntoDeviceId: string | null;
+  mergedAt: Date | null;
+  mergedByUserId: string | null;
 }
 
 interface CredentialRecord extends DeviceCredentialGrant {
@@ -889,6 +901,9 @@ export class MemoryControlRepository implements ControlRepository {
     if (existing !== undefined && existing.workspaceId !== code.workspaceId) {
       throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
     }
+    if (existing?.mergedIntoDeviceId !== null && existing?.mergedIntoDeviceId !== undefined) {
+      throw new ControlRepositoryError("DEVICE_REVOKED");
+    }
     if (
       this.#devicePublicKeyHashes.has(session.devicePublicKeyHash)
       && existing?.devicePublicKeyHash !== session.devicePublicKeyHash
@@ -925,6 +940,9 @@ export class MemoryControlRepository implements ControlRepository {
         platform: "macos",
         createdAt: input.now,
         revokedAt: null,
+        mergedIntoDeviceId: null,
+        mergedAt: null,
+        mergedByUserId: null,
       });
     } else {
       this.#devicePublicKeyHashes.delete(existing.devicePublicKeyHash);
@@ -1313,10 +1331,10 @@ export class MemoryControlRepository implements ControlRepository {
     offset: number,
   ): Promise<ScreenshotPage> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     const screenshots = [...this.#screenshots.values()]
       .filter((record) => record.workspaceId === workspaceId
-        && record.deviceId === deviceId
+        && deviceIds.includes(record.deviceId)
         && record.state === "completed")
       .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime()
         || right.screenshotId.localeCompare(left.screenshotId))
@@ -1331,9 +1349,9 @@ export class MemoryControlRepository implements ControlRepository {
     screenshotId: string,
   ): Promise<ScreenshotRecord> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     const screenshot = this.#screenshots.get(screenshotId);
-    if (screenshot === undefined || screenshot.workspaceId !== workspaceId || screenshot.deviceId !== deviceId || screenshot.state !== "completed") {
+    if (screenshot === undefined || screenshot.workspaceId !== workspaceId || !deviceIds.includes(screenshot.deviceId) || screenshot.state !== "completed") {
       throw new ControlRepositoryError("DEVICE_NOT_FOUND");
     }
     return { ...screenshot };
@@ -1412,9 +1430,14 @@ export class MemoryControlRepository implements ControlRepository {
     offset: number,
   ): Promise<PhotoLibraryAssetPage> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
-    const photos = [...this.#photoLibraryAssets.values()]
-      .filter((record) => record.workspaceId === workspaceId && record.deviceId === deviceId && record.state === "completed")
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
+    const byAsset = new Map<string, PhotoLibraryAssetRecord>();
+    for (const record of this.#photoLibraryAssets.values()) {
+      if (record.workspaceId !== workspaceId || !deviceIds.includes(record.deviceId) || record.state !== "completed") continue;
+      const existing = byAsset.get(record.assetId);
+      if (existing === undefined || record.capturedAt > existing.capturedAt) byAsset.set(record.assetId, record);
+    }
+    const photos = [...byAsset.values()]
       .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime());
     return {
       photos: photos.slice(offset, offset + limit).map(clonePhotoLibraryAsset),
@@ -1424,9 +1447,9 @@ export class MemoryControlRepository implements ControlRepository {
 
   async loadOwnerCompletedPhotoLibraryAsset(workspaceId: string, userId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     const record = this.#photoLibraryAssets.get(photoId);
-    if (record === undefined || record.workspaceId !== workspaceId || record.deviceId !== deviceId || record.state !== "completed") {
+    if (record === undefined || record.workspaceId !== workspaceId || !deviceIds.includes(record.deviceId) || record.state !== "completed") {
       throw new ControlRepositoryError("DEVICE_NOT_FOUND");
     }
     return clonePhotoLibraryAsset(record);
@@ -1478,19 +1501,21 @@ export class MemoryControlRepository implements ControlRepository {
 
   async listOwnerDeviceObjectKeys(deviceId: string, workspaceId: string, userId: string): Promise<string[]> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     return [
-      ...[...this.#screenshots.values()].filter((record) => record.deviceId === deviceId).map((record) => record.objectKey),
-      ...[...this.#photoLibraryAssets.values()].filter((record) => record.deviceId === deviceId).map((record) => record.objectKey),
-      ...[...this.#communicationObjects.values()].filter((record) => record.deviceId === deviceId).map((record) => record.objectKey),
+      ...[...this.#screenshots.values()].filter((record) => deviceIds.includes(record.deviceId)).map((record) => record.objectKey),
+      ...[...this.#photoLibraryAssets.values()].filter((record) => deviceIds.includes(record.deviceId)).map((record) => record.objectKey),
+      ...[...this.#communicationObjects.values()].filter((record) => deviceIds.includes(record.deviceId)).map((record) => record.objectKey),
     ];
   }
 
   async deleteOwnerDevice(deviceId: string, workspaceId: string, userId: string): Promise<void> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
-    this.#devices.delete(deviceId);
-    this.#credentials.delete(deviceId);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
+    for (const scopedDeviceId of deviceIds) {
+      this.#devices.delete(scopedDeviceId);
+      this.#credentials.delete(scopedDeviceId);
+    }
   }
 
   async resolveOwnerWorkspace(userId: string): Promise<string | null> {
@@ -1537,7 +1562,7 @@ export class MemoryControlRepository implements ControlRepository {
   async listOwnerDevices(workspaceId: string, userId: string): Promise<OwnerDeviceSummary[]> {
     this.#requireOwnerMembership(workspaceId, userId);
     return [...this.#devices.values()]
-      .filter((device) => device.workspaceId === workspaceId)
+      .filter((device) => device.workspaceId === workspaceId && device.mergedIntoDeviceId === null)
       .map((device) => this.#ownerDeviceSummary(device));
   }
 
@@ -1548,6 +1573,7 @@ export class MemoryControlRepository implements ControlRepository {
   ): Promise<OwnerDeviceDetail> {
     this.#requireOwnerMembership(workspaceId, userId);
     const device = this.#requireDevice(deviceId, workspaceId, true);
+    if (device.mergedIntoDeviceId !== null) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
     const summary = this.#ownerDeviceSummary(device);
     return {
       ...summary,
@@ -1562,11 +1588,11 @@ export class MemoryControlRepository implements ControlRepository {
     userId: string,
   ): Promise<CollectorConfigAuditRecord[]> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     return this.#configAudit
-      .filter((record) => record.workspaceId === workspaceId && record.deviceId === deviceId)
+      .filter((record) => record.workspaceId === workspaceId && deviceIds.includes(record.deviceId))
       .map(({ workspaceId: _workspaceId, deviceId: _deviceId, ...record }) => ({ ...record }))
-      .reverse();
+      .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime());
   }
 
   async appendSystemEvents(
@@ -1734,17 +1760,21 @@ export class MemoryControlRepository implements ControlRepository {
     offset: number,
   ): Promise<CommunicationConversationPage> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     const conversations = new Map<string, CommunicationConversationRecord>();
+    const seenMessages = new Set<string>();
     for (const event of this.#communicationEvents.values()) {
       if (
         event.workspaceId !== workspaceId
-        || event.deviceId !== deviceId
+        || !deviceIds.includes(event.deviceId)
         || event.eventType !== "communication.message_recorded"
         || event.source !== source
       ) continue;
+      const deduplicationKey = `${event.message.conversationId}:${event.message.sourceKey}`;
+      if (seenMessages.has(deduplicationKey)) continue;
+      seenMessages.add(deduplicationKey);
       const metadata = this.#communicationConversations.get(
-        `${workspaceId}:${deviceId}:${event.message.conversationId}`,
+        `${workspaceId}:${event.deviceId}:${event.message.conversationId}`,
       );
       const existing = conversations.get(event.message.conversationId);
       if (existing === undefined) {
@@ -1781,11 +1811,11 @@ export class MemoryControlRepository implements ControlRepository {
     before: CommunicationMessageCursor | null,
   ): Promise<CommunicationMessageRecord[]> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
-    return [...this.#communicationEvents.values()]
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
+    const events = [...this.#communicationEvents.values()]
       .filter((event): event is CommunicationMessageEventRecord =>
         event.workspaceId === workspaceId
-        && event.deviceId === deviceId
+        && deviceIds.includes(event.deviceId)
         && event.eventType === "communication.message_recorded"
         && event.source === source
         && event.message.conversationId === conversationId
@@ -1797,7 +1827,13 @@ export class MemoryControlRepository implements ControlRepository {
       .sort((left, right) =>
         right.message.occurredAt.getTime() - left.message.occurredAt.getTime()
         || right.eventId.localeCompare(left.eventId),
-      )
+      );
+    const seenSourceKeys = new Set<string>();
+    return events.filter((event) => {
+      if (seenSourceKeys.has(event.message.sourceKey)) return false;
+      seenSourceKeys.add(event.message.sourceKey);
+      return true;
+    })
       .slice(0, limit)
       .map((event) => communicationMessageRecord(event, this.#communicationObjects));
   }
@@ -1872,12 +1908,12 @@ export class MemoryControlRepository implements ControlRepository {
     objectId: string,
   ): Promise<CommunicationObjectRecord> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     const object = this.#communicationObjects.get(objectId);
     if (
       object === undefined
       || object.workspaceId !== workspaceId
-      || object.deviceId !== deviceId
+      || !deviceIds.includes(object.deviceId)
       || object.state !== "completed"
     ) {
       throw new ControlRepositoryError("DEVICE_NOT_FOUND");
@@ -1955,9 +1991,9 @@ export class MemoryControlRepository implements ControlRepository {
     limit: number,
   ): Promise<SystemMetricRecord[]> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     return [...this.#systemEvents.values()]
-      .filter((event) => event.workspaceId === workspaceId && event.deviceId === deviceId && event.eventType === "system.metric_sampled")
+      .filter((event) => event.workspaceId === workspaceId && deviceIds.includes(event.deviceId) && event.eventType === "system.metric_sampled")
       .sort((left, right) => right.occurredAt.getTime() - left.occurredAt.getTime())
       .slice(0, limit)
       .map((event) => ({
@@ -1976,10 +2012,10 @@ export class MemoryControlRepository implements ControlRepository {
     offset: number,
   ): Promise<LifecycleEventPage> {
     this.#requireOwnerMembership(workspaceId, userId);
-    this.#requireDevice(deviceId, workspaceId, true);
+    const deviceIds = this.#deviceScopeIds(deviceId, workspaceId);
     const events = [...this.#systemEvents.values()]
       .filter((event) => event.workspaceId === workspaceId
-        && event.deviceId === deviceId
+        && deviceIds.includes(event.deviceId)
         && lifecycleEventTypes.includes(event.eventType as LifecycleEventRecord["eventType"]))
       .sort((left, right) => right.occurredAt.getTime() - left.occurredAt.getTime()
         || right.eventId.localeCompare(left.eventId));
@@ -2078,9 +2114,34 @@ export class MemoryControlRepository implements ControlRepository {
     return device;
   }
 
+  #deviceScopeIds(deviceId: string, workspaceId: string): string[] {
+    const target = this.#requireDevice(deviceId, workspaceId, true);
+    if (target.mergedIntoDeviceId !== null) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+    return [target.id, ...[...this.#devices.values()]
+      .filter((device) => device.workspaceId === workspaceId && device.mergedIntoDeviceId === target.id)
+      .map((device) => device.id)];
+  }
+
   #requireOwnerMembership(workspaceId: string, userId: string): void {
     if (!this.#ownerMemberships.has(membershipKey(workspaceId, userId))) {
       throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
+    }
+  }
+
+  async mergeOwnerDevice(input: DeviceMergeInput): Promise<void> {
+    this.#requireOwnerMembership(input.workspaceId, input.actorUserId);
+    if (input.sourceDeviceId === input.targetDeviceId) throw new ControlRepositoryError("CONFLICT");
+    const source = this.#requireDevice(input.sourceDeviceId, input.workspaceId, true);
+    const target = this.#requireDevice(input.targetDeviceId, input.workspaceId, false);
+    if (source.mergedIntoDeviceId !== null || target.mergedIntoDeviceId !== null) {
+      throw new ControlRepositoryError("CONFLICT");
+    }
+    source.revokedAt ??= input.now;
+    source.mergedIntoDeviceId = target.id;
+    source.mergedAt = input.now;
+    source.mergedByUserId = input.actorUserId;
+    for (const credential of this.#credentials.get(source.id) ?? []) {
+      credential.revokedAt ??= input.now;
     }
   }
 
@@ -2266,10 +2327,10 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<ScreenshotPage> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const where = and(
         eq(deviceScreenshots.workspaceId, workspaceId),
-        eq(deviceScreenshots.deviceId, deviceId),
+        inArray(deviceScreenshots.deviceId, deviceIds),
         eq(deviceScreenshots.state, "completed"),
       );
       const [rows, totals] = await Promise.all([
@@ -2293,11 +2354,11 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<ScreenshotRecord> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const [row] = await this.database.select().from(deviceScreenshots).where(and(
         eq(deviceScreenshots.id, screenshotId),
         eq(deviceScreenshots.workspaceId, workspaceId),
-        eq(deviceScreenshots.deviceId, deviceId),
+        inArray(deviceScreenshots.deviceId, deviceIds),
         eq(deviceScreenshots.state, "completed"),
       )).limit(1);
       if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
@@ -2387,27 +2448,25 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<PhotoLibraryAssetPage> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const where = and(
         eq(photoLibraryAssets.workspaceId, workspaceId),
-        eq(photoLibraryAssets.deviceId, deviceId),
+        inArray(photoLibraryAssets.deviceId, deviceIds),
         eq(photoLibraryAssets.state, "completed"),
       );
-      const [rows, totals] = await Promise.all([
-        this.database.select().from(photoLibraryAssets).where(where)
-          .orderBy(desc(photoLibraryAssets.capturedAt), desc(photoLibraryAssets.id))
-          .limit(limit).offset(offset),
-        this.database.select({ total: count() }).from(photoLibraryAssets).where(where),
-      ]);
-      return { photos: rows.map(photoLibraryAssetFromRow), total: totals[0]?.total ?? 0 };
+      const rows = await this.database.selectDistinctOn([photoLibraryAssets.assetId]).from(photoLibraryAssets).where(where)
+        .orderBy(photoLibraryAssets.assetId, desc(photoLibraryAssets.capturedAt), desc(photoLibraryAssets.id));
+      const photos = rows.map(photoLibraryAssetFromRow)
+        .sort((left, right) => right.capturedAt.getTime() - left.capturedAt.getTime());
+      return { photos: photos.slice(offset, offset + limit), total: photos.length };
     } catch (error) { throw repositoryError(error); }
   }
 
   async loadOwnerCompletedPhotoLibraryAsset(workspaceId: string, userId: string, deviceId: string, photoId: string): Promise<PhotoLibraryAssetRecord> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
-      const [row] = await this.database.select().from(photoLibraryAssets).where(and(eq(photoLibraryAssets.id, photoId), eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId), eq(photoLibraryAssets.state, "completed"))).limit(1);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
+      const [row] = await this.database.select().from(photoLibraryAssets).where(and(eq(photoLibraryAssets.id, photoId), eq(photoLibraryAssets.workspaceId, workspaceId), inArray(photoLibraryAssets.deviceId, deviceIds), eq(photoLibraryAssets.state, "completed"))).limit(1);
       if (row === undefined) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
       return photoLibraryAssetFromRow(row);
     } catch (error) { throw repositoryError(error); }
@@ -2515,6 +2574,7 @@ export class DrizzleControlRepository implements ControlRepository {
             .select({
               id: devices.id,
               workspaceId: devices.workspaceId,
+              mergedIntoDeviceId: devices.mergedIntoDeviceId,
             })
             .from(devices)
             .where(eq(devices.id, binding.requestedDeviceId))
@@ -2540,6 +2600,7 @@ export class DrizzleControlRepository implements ControlRepository {
           if (existing.workspaceId !== binding.workspaceId) {
             throw new ControlRepositoryError("WORKSPACE_FORBIDDEN");
           }
+          if (existing.mergedIntoDeviceId !== null) throw new ControlRepositoryError("DEVICE_REVOKED");
           deviceId = existing.id;
           const [latestCredential] = await transaction
             .select({ generation: deviceCredentialGenerations.generation })
@@ -3163,14 +3224,40 @@ export class DrizzleControlRepository implements ControlRepository {
     }
   }
 
+  async mergeOwnerDevice(input: DeviceMergeInput): Promise<void> {
+    try {
+      await this.database.transaction(async (transaction) => {
+        await requireDatabaseOwnerMembership(transaction, input.workspaceId, input.actorUserId);
+        if (input.sourceDeviceId === input.targetDeviceId) throw new ControlRepositoryError("CONFLICT");
+        const source = await requireDatabaseDevice(transaction, input.sourceDeviceId, input.workspaceId, true);
+        const target = await requireDatabaseDevice(transaction, input.targetDeviceId, input.workspaceId, false);
+        if (source.mergedIntoDeviceId !== null || target.mergedIntoDeviceId !== null) throw new ControlRepositoryError("CONFLICT");
+        const [merged] = await transaction.update(devices).set({
+          revokedAt: source.revokedAt ?? input.now,
+          mergedIntoDeviceId: target.id,
+          mergedAt: input.now,
+          mergedByUserId: input.actorUserId,
+        }).where(and(eq(devices.id, source.id), eq(devices.workspaceId, input.workspaceId), isNull(devices.mergedIntoDeviceId)))
+          .returning({ id: devices.id });
+        if (merged === undefined) throw new ControlRepositoryError("CONFLICT");
+        await transaction.update(deviceCredentialGenerations).set({ revokedAt: input.now }).where(and(
+          eq(deviceCredentialGenerations.deviceId, source.id),
+          isNull(deviceCredentialGenerations.revokedAt),
+        ));
+      });
+    } catch (error) {
+      throw repositoryError(error);
+    }
+  }
+
   async listOwnerDeviceObjectKeys(deviceId: string, workspaceId: string, userId: string): Promise<string[]> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const [screenshots, photos, communication] = await Promise.all([
-        this.database.select({ objectKey: deviceScreenshots.objectKey }).from(deviceScreenshots).where(and(eq(deviceScreenshots.workspaceId, workspaceId), eq(deviceScreenshots.deviceId, deviceId))),
-        this.database.select({ objectKey: photoLibraryAssets.objectKey }).from(photoLibraryAssets).where(and(eq(photoLibraryAssets.workspaceId, workspaceId), eq(photoLibraryAssets.deviceId, deviceId))),
-        this.database.select({ objectKey: communicationObjects.objectKey }).from(communicationObjects).where(and(eq(communicationObjects.workspaceId, workspaceId), eq(communicationObjects.deviceId, deviceId))),
+        this.database.select({ objectKey: deviceScreenshots.objectKey }).from(deviceScreenshots).where(and(eq(deviceScreenshots.workspaceId, workspaceId), inArray(deviceScreenshots.deviceId, deviceIds))),
+        this.database.select({ objectKey: photoLibraryAssets.objectKey }).from(photoLibraryAssets).where(and(eq(photoLibraryAssets.workspaceId, workspaceId), inArray(photoLibraryAssets.deviceId, deviceIds))),
+        this.database.select({ objectKey: communicationObjects.objectKey }).from(communicationObjects).where(and(eq(communicationObjects.workspaceId, workspaceId), inArray(communicationObjects.deviceId, deviceIds))),
       ]);
       return [...screenshots, ...photos, ...communication].map((row) => row.objectKey);
     } catch (error) {
@@ -3181,8 +3268,15 @@ export class DrizzleControlRepository implements ControlRepository {
   async deleteOwnerDevice(deviceId: string, workspaceId: string, userId: string): Promise<void> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      const deleted = await this.database.delete(devices).where(and(eq(devices.id, deviceId), eq(devices.workspaceId, workspaceId), eq(devices.ownerUserId, userId))).returning({ id: devices.id });
-      if (deleted.length !== 1) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
+      await this.database.transaction(async (transaction) => {
+        const sourceDeviceIds = deviceIds.slice(1);
+        if (sourceDeviceIds.length > 0) {
+          await transaction.delete(devices).where(and(inArray(devices.id, sourceDeviceIds), eq(devices.workspaceId, workspaceId), eq(devices.ownerUserId, userId)));
+        }
+        const deleted = await transaction.delete(devices).where(and(eq(devices.id, deviceId), eq(devices.workspaceId, workspaceId), eq(devices.ownerUserId, userId))).returning({ id: devices.id });
+        if (deleted.length !== 1) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      });
     } catch (error) {
       throw repositoryError(error);
     }
@@ -3258,7 +3352,7 @@ export class DrizzleControlRepository implements ControlRepository {
       const rows = await this.database
         .select({ deviceId: devices.id })
         .from(devices)
-        .where(eq(devices.workspaceId, workspaceId));
+        .where(and(eq(devices.workspaceId, workspaceId), isNull(devices.mergedIntoDeviceId)));
       return Promise.all(
         rows.map(async ({ deviceId }) => {
           const detail = await this.loadOwnerDevice(deviceId, workspaceId, userId);
@@ -3279,6 +3373,8 @@ export class DrizzleControlRepository implements ControlRepository {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
       const device = await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      if (device.mergedIntoDeviceId !== null) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const [config] = await this.database
         .select()
         .from(collectorConfigs)
@@ -3330,7 +3426,7 @@ export class DrizzleControlRepository implements ControlRepository {
         .from(deviceNetworkHistory)
         .where(and(
           eq(deviceNetworkHistory.workspaceId, workspaceId),
-          eq(deviceNetworkHistory.deviceId, deviceId),
+          inArray(deviceNetworkHistory.deviceId, deviceIds),
         ))
         .orderBy(desc(deviceNetworkHistory.observedAt))
         .limit(5);
@@ -3442,7 +3538,7 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<CollectorConfigAuditRecord[]> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const rows = await this.database
         .select({
           actorUserId: collectorConfigAudit.actorUserId,
@@ -3455,7 +3551,7 @@ export class DrizzleControlRepository implements ControlRepository {
         .where(
           and(
             eq(collectorConfigAudit.workspaceId, workspaceId),
-            eq(collectorConfigAudit.deviceId, deviceId),
+            inArray(collectorConfigAudit.deviceId, deviceIds),
           ),
         )
         .orderBy(desc(collectorConfigAudit.createdAt));
@@ -3736,14 +3832,23 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<CommunicationConversationPage> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const where = and(
-        eq(communicationConversations.workspaceId, workspaceId),
-        eq(communicationConversations.deviceId, deviceId),
+        eq(communicationMessages.workspaceId, workspaceId),
+        inArray(communicationMessages.deviceId, deviceIds),
         eq(communicationEvents.source, source),
       );
-      const [rows, totals] = await Promise.all([
-        this.database
+      const [aggregates, metadata] = await Promise.all([this.database
+        .select({
+          conversationId: communicationMessages.conversationId,
+          messageCount: sql<number>`count(DISTINCT ${communicationMessages.sourceKey})::integer`,
+          lastMessageAt: sql<Date>`max(${communicationMessages.occurredAt})`
+            .mapWith(communicationMessages.occurredAt),
+        })
+        .from(communicationMessages)
+        .innerJoin(communicationEvents, eq(communicationEvents.eventId, communicationMessages.eventId))
+        .where(where)
+        .groupBy(communicationMessages.conversationId), this.database
         .select({
           conversationId: communicationConversations.conversationId,
           displayName: communicationConversations.displayName,
@@ -3751,61 +3856,31 @@ export class DrizzleControlRepository implements ControlRepository {
           scope: communicationConversations.scope,
           memberCount: communicationConversations.memberCount,
           lastMessageAt: communicationConversations.lastMessageAt,
-          messageCount: sql<number>`count(${communicationMessages.eventId})::integer`,
-          sourceLastMessageAt: sql<Date>`max(${communicationMessages.occurredAt})`
-            .mapWith(communicationMessages.occurredAt),
         })
         .from(communicationConversations)
-        .innerJoin(
-          communicationMessages,
-          and(
-            eq(communicationMessages.workspaceId, communicationConversations.workspaceId),
-            eq(communicationMessages.deviceId, communicationConversations.deviceId),
-            eq(communicationMessages.conversationId, communicationConversations.conversationId),
-          ),
-        )
-        .innerJoin(
-          communicationEvents,
-          eq(communicationEvents.eventId, communicationMessages.eventId),
-        )
-        .where(where)
-        .groupBy(
-          communicationConversations.conversationId,
-          communicationConversations.displayName,
-          communicationConversations.avatarUrl,
-          communicationConversations.scope,
-          communicationConversations.memberCount,
-          communicationConversations.lastMessageAt,
-        )
-        .orderBy(
-          desc(sql`max(${communicationMessages.occurredAt})`),
-          desc(communicationConversations.conversationId),
-        )
-        .limit(limit)
-        .offset(offset),
-        this.database
-          .select({ total: countDistinct(communicationConversations.conversationId) })
-          .from(communicationConversations)
-          .innerJoin(
-            communicationMessages,
-            and(
-              eq(communicationMessages.workspaceId, communicationConversations.workspaceId),
-              eq(communicationMessages.deviceId, communicationConversations.deviceId),
-              eq(communicationMessages.conversationId, communicationConversations.conversationId),
-            ),
-          )
-          .innerJoin(communicationEvents, eq(communicationEvents.eventId, communicationMessages.eventId))
-          .where(where),
-      ]);
-      return { conversations: rows.map((row) => ({
-        conversationId: row.conversationId,
-        displayName: row.displayName || row.conversationId,
-        avatarUrl: row.avatarUrl,
-        scope: row.scope as "direct" | "group",
-        memberCount: row.memberCount,
-        messageCount: row.messageCount,
-        lastMessageAt: row.sourceLastMessageAt,
-      })), total: Number(totals[0]?.total ?? 0) };
+        .where(and(
+          eq(communicationConversations.workspaceId, workspaceId),
+          inArray(communicationConversations.deviceId, deviceIds),
+        ))]);
+      const latestMetadata = new Map<string, (typeof metadata)[number]>();
+      for (const row of metadata) {
+        const existing = latestMetadata.get(row.conversationId);
+        if (existing === undefined || row.lastMessageAt > existing.lastMessageAt) latestMetadata.set(row.conversationId, row);
+      }
+      const conversations = aggregates.map((row) => {
+        const projection = latestMetadata.get(row.conversationId);
+        return {
+          conversationId: row.conversationId,
+          displayName: projection?.displayName || row.conversationId,
+          avatarUrl: projection?.avatarUrl ?? null,
+          scope: (projection?.scope ?? "direct") as "direct" | "group",
+          memberCount: projection?.memberCount ?? null,
+          messageCount: row.messageCount,
+          lastMessageAt: row.lastMessageAt,
+        };
+      }).sort((left, right) => right.lastMessageAt.getTime() - left.lastMessageAt.getTime()
+        || right.conversationId.localeCompare(left.conversationId));
+      return { conversations: conversations.slice(offset, offset + limit), total: conversations.length };
     } catch (error) {
       throw repositoryError(error);
     }
@@ -3822,10 +3897,11 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<CommunicationMessageRecord[]> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const messages = await this.database
         .select({
           eventId: communicationMessages.eventId,
+          sourceKey: communicationMessages.sourceKey,
           messageId: communicationMessages.messageId,
           senderId: communicationMessages.senderId,
           senderDisplayName: communicationMessages.senderDisplayName,
@@ -3843,7 +3919,7 @@ export class DrizzleControlRepository implements ControlRepository {
         .where(
           and(
             eq(communicationMessages.workspaceId, workspaceId),
-            eq(communicationMessages.deviceId, deviceId),
+            inArray(communicationMessages.deviceId, deviceIds),
             eq(communicationMessages.conversationId, conversationId),
             eq(communicationEvents.source, source),
             before === null ? undefined : or(
@@ -3856,8 +3932,14 @@ export class DrizzleControlRepository implements ControlRepository {
           ),
         )
         .orderBy(desc(communicationMessages.occurredAt), desc(communicationMessages.eventId))
-        .limit(limit);
-      return Promise.all(messages.map(async (message) => {
+        .limit(limit * deviceIds.length);
+      const seenSourceKeys = new Set<string>();
+      const deduplicated = messages.filter((message) => {
+        if (seenSourceKeys.has(message.sourceKey)) return false;
+        seenSourceKeys.add(message.sourceKey);
+        return true;
+      }).slice(0, limit);
+      return Promise.all(deduplicated.map(async (message) => {
         const attachments = await this.database
           .select({
             attachmentId: communicationMessageAttachments.attachmentId,
@@ -4034,14 +4116,14 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<CommunicationObjectRecord> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const [object] = await this.database
         .select()
         .from(communicationObjects)
         .where(
           and(
             eq(communicationObjects.workspaceId, workspaceId),
-            eq(communicationObjects.deviceId, deviceId),
+            inArray(communicationObjects.deviceId, deviceIds),
             eq(communicationObjects.objectId, objectId),
             eq(communicationObjects.state, "completed"),
           ),
@@ -4158,7 +4240,7 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<SystemMetricRecord[]> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const rows = await this.database
         .select({
           eventId: systemEvents.eventId,
@@ -4169,7 +4251,7 @@ export class DrizzleControlRepository implements ControlRepository {
         .where(
           and(
             eq(systemEvents.workspaceId, workspaceId),
-            eq(systemEvents.deviceId, deviceId),
+            inArray(systemEvents.deviceId, deviceIds),
             eq(systemEvents.eventType, "system.metric_sampled"),
           ),
         )
@@ -4198,10 +4280,10 @@ export class DrizzleControlRepository implements ControlRepository {
   ): Promise<LifecycleEventPage> {
     try {
       await requireDatabaseOwnerMembership(this.database, workspaceId, userId);
-      await requireDatabaseDevice(this.database, deviceId, workspaceId, true);
+      const deviceIds = await loadDatabaseDeviceScopeIds(this.database, deviceId, workspaceId);
       const where = and(
         eq(systemEvents.workspaceId, workspaceId),
-        eq(systemEvents.deviceId, deviceId),
+        inArray(systemEvents.deviceId, deviceIds),
         inArray(systemEvents.eventType, lifecycleEventTypes),
       );
       const [rows, totals] = await Promise.all([
@@ -4313,6 +4395,9 @@ async function requireDatabaseDevice(
       platform: devices.platform,
       createdAt: devices.createdAt,
       revokedAt: devices.revokedAt,
+      mergedIntoDeviceId: devices.mergedIntoDeviceId,
+      mergedAt: devices.mergedAt,
+      mergedByUserId: devices.mergedByUserId,
     })
     .from(devices)
     .where(eq(devices.id, deviceId))
@@ -4327,6 +4412,20 @@ async function requireDatabaseDevice(
     throw new ControlRepositoryError("DEVICE_REVOKED");
   }
   return { ...device, platform: device.platform as "macos" };
+}
+
+async function loadDatabaseDeviceScopeIds(
+  database: NodePgDatabase<typeof cloudSchema>,
+  deviceId: string,
+  workspaceId: string,
+): Promise<string[]> {
+  const target = await requireDatabaseDevice(database, deviceId, workspaceId, true);
+  if (target.mergedIntoDeviceId !== null) throw new ControlRepositoryError("DEVICE_NOT_FOUND");
+  const sources = await database.select({ deviceId: devices.id }).from(devices).where(and(
+    eq(devices.workspaceId, workspaceId),
+    eq(devices.mergedIntoDeviceId, deviceId),
+  ));
+  return [deviceId, ...sources.map((source) => source.deviceId)];
 }
 
 async function requireDatabaseOwnerMembership(

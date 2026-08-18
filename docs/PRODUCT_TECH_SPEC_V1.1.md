@@ -716,6 +716,7 @@ AND extension_reports_active_tab</th>
 | 远程命令     | 立即截图、暂停/恢复、刷新健康、检查更新、导出诊断。    |
 | 撤销         | 撤销 Token；保留云端历史；本地进入重新配对。           |
 | 命名         | 用户可改显示名；device_key 不变。                      |
+| 合并重复设备 | Owner 将已重复创建的来源设备合并到同 Workspace 的当前设备；来源凭据立即撤销并从设备列表隐藏，历史 Event、消息与对象仍保留原 device_id，目标设备查询逻辑聚合这些来源 ID。禁止自合并、跨 Workspace、链式和循环合并。 |
 
 ## 10.5 Settings
 
@@ -1530,7 +1531,7 @@ Agent BrowserCollector<br />
 | Activity         | GET /v1/activity/summary; GET /v1/activity/sessions; GET /v1/applications                          |
 | Communication    | GET /v1/conversations; GET /v1/messages                                                            |
 | Photos            | POST /v1/agent/photos/prepare; POST /v1/agent/photos/complete; GET /v1/devices/:deviceId/photos; GET /v1/devices/:deviceId/photos/:photoId/read |
-| Devices/Commands | GET /v1/devices; GET /v1/devices/:id; POST /v1/devices/:id/commands                                |
+| Devices/Commands | GET /v1/devices; GET /v1/devices/:id; POST /v1/devices/:id/commands; POST /v1/devices/:id/merge       |
 | Settings         | GET/PUT collector-configs; retention-policies; exclusion-rules                                     |
 | Updates          | GET /v1/agent-update/policy; POST /v1/agent-update/events                                          |
 
@@ -2036,6 +2037,9 @@ rustfmt、clippy -D warnings、cargo nextest、Rust/Swift/TypeScript 编译、Br
 | last_heartbeat_at | timestamptz | NULL              | 最近心跳                              |
 | presence          | text        | DEFAULT 'offline' | online/stale/offline/sleeping/revoked |
 | revoked_at        | timestamptz | NULL              | 撤销时间                              |
+| merged_into_device_id | uuid    | NULL FK           | 重复设备的当前展示目标；历史事实不改写 |
+| merged_at         | timestamptz | NULL              | Owner 执行逻辑合并的时间               |
+| merged_by_user_id | uuid        | NULL FK           | 执行合并的 Owner                       |
 | public_key        | text        | NULL              | 设备公钥                              |
 
 **collector_instances · 公共字段：WORKSPACE_ENTITY**

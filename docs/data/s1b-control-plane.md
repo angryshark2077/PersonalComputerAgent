@@ -54,7 +54,7 @@ Migrations are ordered and immutable:
 |---|---|---|
 | `pairing_sessions` | SHA-256 session/device-public-key/callback-state hashes, PKCE challenge, callback URI, expiry/created/authorized timestamps | five-minute one-time pairing session; no plaintext code or credential |
 | `pairing_authorization_codes` | SHA-256 authorization-code and callback-state hashes, session, workspace/Owner, expiry/created/consumed timestamps | one-time code; server consumes it atomically; no plaintext authorization code |
-| `devices` | device/workspace/Owner IDs, public-key hash, fixed `macos` platform, created/revoked timestamps | device belongs to its composite Workspace/Owner membership |
+| `devices` | device/workspace/Owner IDs, public-key hash, fixed `macos` platform, created/revoked timestamps, optional merge target/actor/time | device belongs to its composite Workspace/Owner membership; a merged source remains immutable history under its original ID and points to one active same-Workspace target |
 | `device_credential_generations` | device/workspace, generation, SHA-256 access/refresh hashes, expiries, created/revoked timestamps | credentials rotate by generation; only hashes persist; revocation invalidates active generations |
 
 ### Desired configuration, audit, and presence
@@ -71,6 +71,7 @@ Migrations are ordered and immutable:
 
 - `idx_pairing_sessions_active_expiry` expires unauthorised pairing sessions.
 - `idx_devices_workspace` scopes device lookup to a Workspace.
+- `idx_devices_merge_target` resolves the historical source IDs logically attached to one visible device without rewriting append-only events or object keys.
 - `idx_collector_config_audit_chronology` and
   `idx_device_revocation_audit_chronology` support Owner audit timelines.
 - `idx_device_heartbeats_last` supports recent presence lookup.

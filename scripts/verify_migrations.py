@@ -66,6 +66,7 @@ EXPECTED_MIGRATIONS = {
         "0027_device_collector_health.sql",
         "0028_repair_existing_device_pairing.sql",
         "0029_heartbeat_privacy_retention.sql",
+        "0030_device_merges.sql",
     ],
 }
 

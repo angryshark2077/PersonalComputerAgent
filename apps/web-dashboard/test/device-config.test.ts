@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizeDashboardDevice, type DashboardDevice } from "../src/lib/api.ts";
+import { mergeDevice, normalizeDashboardDevice, type DashboardDevice } from "../src/lib/api.ts";
 import { renderDeviceConfiguration } from "../src/lib/device-configuration.ts";
 
 const snapshotWithWechatEnabled = () => ({
@@ -50,6 +50,17 @@ const snapshotWithWechatEnabled = () => ({
       cloud_retention: "permanent" as const,
     },
   },
+});
+
+test("device merge sends the selected active target without deleting history", async () => {
+  let request: { url: string; init?: RequestInit } | null = null;
+  await mergeDevice(async (url, init) => {
+    request = { url: String(url), init };
+    return new Response(JSON.stringify({ merged: true }), { status: 200, headers: { "content-type": "application/json" } });
+  }, "https://cloud.example", "source-device", "target-device");
+  assert.equal(request?.url, "https://cloud.example/v1/devices/source-device/merge");
+  assert.equal(request?.init?.method, "POST");
+  assert.deepEqual(JSON.parse(String(request?.init?.body)), { target_device_id: "target-device" });
 });
 
 test("device configuration exposes the approved WeChat scope", () => {

@@ -963,6 +963,28 @@ export function createApp(options: CreateAppOptions): Hono {
     }
   });
 
+  app.post("/v1/devices/:deviceId/merge", async (context) => {
+    const principal = await requireOwner(context, options.ownerAuthenticator);
+    if (principal instanceof Response) return principal;
+    const sourceDeviceId = context.req.param("deviceId");
+    const body = await context.req.json().catch(() => null) as { target_device_id?: unknown } | null;
+    if (!isUuid(sourceDeviceId) || typeof body?.target_device_id !== "string" || !isUuid(body.target_device_id)) {
+      return errorResponse(context, 400, "REQUEST_INVALID", "Invalid device merge request.");
+    }
+    try {
+      await options.repository.mergeOwnerDevice({
+        sourceDeviceId,
+        targetDeviceId: body.target_device_id,
+        workspaceId: principal.workspaceId,
+        actorUserId: principal.userId,
+        now: new Date(),
+      });
+      return context.json({ merged: true, device_id: body.target_device_id });
+    } catch (error) {
+      return repositoryErrorResponse(context, error);
+    }
+  });
+
   app.post("/v1/devices/:deviceId/purge", async (context) => {
     const principal = await requireOwner(context, options.ownerAuthenticator);
     if (principal instanceof Response) return principal;

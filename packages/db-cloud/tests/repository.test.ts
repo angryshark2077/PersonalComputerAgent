@@ -45,6 +45,78 @@ async function pairDevice(repository: MemoryControlRepository): Promise<void> {
   });
 }
 
+async function pairSecondDevice(repository: MemoryControlRepository): Promise<string> {
+  const deviceId = "01984444-7444-8444-8444-444444444444";
+  await repository.createPairingSession({
+    sessionIdHash: hash("7"), devicePublicKeyHash: hash("8"), codeChallenge: "challenge-b",
+    callbackUri: "http://127.0.0.1:43123/pca/pair/callback", callbackStateHash: hash("9"),
+    expiresAt: later, createdAt: now,
+  });
+  await repository.authorizePairingSession({
+    sessionIdHash: hash("7"), authorizationCodeHash: hash("a"), workspaceId, ownerUserId,
+    callbackStateHash: hash("9"), expiresAt: later, now,
+  });
+  await repository.consumeAuthorizationCode({
+    sessionIdHash: hash("7"), authorizationCodeHash: hash("a"), codeChallenge: "challenge-b",
+    deviceId, accessTokenHash: hash("b"), refreshTokenHash: hash("c"), accessExpiresAt: later,
+    refreshExpiresAt: new Date("2026-08-30T12:00:00.000Z"), now,
+  });
+  return deviceId;
+}
+
+test("merging a duplicate device hides it, revokes it, and preserves its lifecycle history under the target", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  const sourceDeviceId = "01981111-7111-8111-8111-111111111111";
+  await pairDevice(repository);
+  const targetDeviceId = await pairSecondDevice(repository);
+  await repository.appendSystemEvents(workspaceId, sourceDeviceId, [{
+    eventId: "01986666-7666-8666-8666-666666666661", workspaceId, deviceId: sourceDeviceId,
+    eventType: "system.sleep", source: "runtime.lifecycle", schemaVersion: 1,
+    occurredAt: now, createdAt: now, sensitivity: "normal", payload: {}, idempotencyKey: "sleep:source",
+  }]);
+  await repository.appendSystemEvents(workspaceId, targetDeviceId, [{
+    eventId: "01986666-7666-8666-8666-666666666662", workspaceId, deviceId: targetDeviceId,
+    eventType: "system.wake", source: "runtime.lifecycle", schemaVersion: 1,
+    occurredAt: later, createdAt: later, sensitivity: "normal", payload: {}, idempotencyKey: "wake:target",
+  }]);
+  const message = (eventId: string, deviceId: string, sourceKey: string, text: string) => ({
+    eventId, workspaceId, deviceId, eventType: "communication.message_recorded" as const,
+    source: "communication.wechat" as const, schemaVersion: 1 as const, occurredAt: now, createdAt: now,
+    sensitivity: "high" as const, payload: {}, attachmentRefs: [], idempotencyKey: sourceKey,
+    message: {
+      messageId: sourceKey, conversationId: "conversation-merge", senderId: "sender",
+      senderDisplayName: "Sender", senderAvatarUrl: null, sourceKey, occurredAt: now,
+      direction: "incoming" as const, kind: "text" as const,
+      conversation: { scope: "direct" as const, memberCount: null }, text, attachments: [],
+    },
+  });
+  await repository.appendCommunicationEvents(workspaceId, sourceDeviceId, [
+    message("01986666-7666-8666-8666-666666666663", sourceDeviceId, "shared-message", "old copy"),
+    message("01986666-7666-8666-8666-666666666664", sourceDeviceId, "old-only-message", "old only"),
+  ]);
+  await repository.appendCommunicationEvents(workspaceId, targetDeviceId, [
+    message("01986666-7666-8666-8666-666666666665", targetDeviceId, "shared-message", "new copy"),
+  ]);
+
+  await repository.mergeOwnerDevice({ sourceDeviceId, targetDeviceId, workspaceId, actorUserId: ownerUserId, now: later });
+
+  const devices = await repository.listOwnerDevices(workspaceId, ownerUserId);
+  assert.deepEqual(devices.map((device) => device.deviceId), [targetDeviceId]);
+  const lifecycle = await repository.listOwnerLifecycleEvents(targetDeviceId, workspaceId, ownerUserId, 20, 0);
+  assert.deepEqual(lifecycle.events.map((event) => event.eventId), [
+    "01986666-7666-8666-8666-666666666662",
+    "01986666-7666-8666-8666-666666666661",
+  ]);
+  const conversations = await repository.listOwnerCommunicationConversations(targetDeviceId, workspaceId, ownerUserId, "communication.wechat", 20, 0);
+  assert.equal(conversations.conversations[0]?.messageCount, 2);
+  const messages = await repository.listOwnerCommunicationMessages(targetDeviceId, "conversation-merge", workspaceId, ownerUserId, "communication.wechat", 20, null);
+  assert.deepEqual(messages.map((message) => message.messageId).sort(), ["old-only-message", "shared-message"]);
+  await assert.rejects(
+    repository.authenticateDeviceAccess(hash("5"), now),
+    (error) => error instanceof ControlRepositoryError && error.code === "DEVICE_REVOKED",
+  );
+});
+
 test("authorization codes are PKCE-bound and consumed only once", async () => {
   const repository = new MemoryControlRepository([membership]);
   await pairDevice(repository);

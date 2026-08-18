@@ -12,9 +12,11 @@ import {
   getCollectorAudit,
   getDevice,
   getLifecycleEvents,
+  getDevices,
   getNetworkLocations,
   getSystemMetrics,
   purgeDevice,
+  mergeDevice,
   revokeDevice,
   requestLocalMediaCleanup,
   requestScreenshot,
@@ -35,6 +37,7 @@ import { buildLifecycleTimeline } from "../../../lib/lifecycle-timeline";
 
 interface DeviceScreen {
   device: DashboardDevice;
+  mergeTargets: Omit<DashboardDevice, "collectors">[];
   audit: CollectorConfigAudit[];
   metrics: DashboardSystemMetric[];
   locations: DashboardNetworkLocation[];
@@ -51,11 +54,13 @@ export default function DevicePage() {
   const [locationName, setLocationName] = useState("");
   const [screenDraft, setScreenDraft] = useState<CollectorConfig["screen.capture"] | null>(null);
   const [captureQueued, setCaptureQueued] = useState(false);
+  const [mergeTargetId, setMergeTargetId] = useState("");
 
   async function refresh(): Promise<void> {
     const origin = cloudApiOrigin();
-    const [device, audit, metrics, locations, lifecycle] = await Promise.all([
+    const [device, devices, audit, metrics, locations, lifecycle] = await Promise.all([
       getDevice(window.fetch, origin, deviceId),
+      getDevices(window.fetch, origin),
       getCollectorAudit(window.fetch, origin, deviceId),
       getSystemMetrics(window.fetch, origin, deviceId),
       getNetworkLocations(window.fetch, origin),
@@ -63,6 +68,7 @@ export default function DevicePage() {
     ]);
     setScreen({
       device,
+      mergeTargets: devices.filter((candidate) => candidate.device_id !== deviceId && !candidate.revoked),
       audit,
       metrics,
       locations,
@@ -150,6 +156,20 @@ export default function DevicePage() {
     try {
       await purgeDevice(window.fetch, cloudApiOrigin(), deviceId);
       window.location.assign("/");
+    } catch (cause) {
+      setError(messageFor(cause));
+      setBusy(false);
+    }
+  }
+
+  async function mergeIntoSelectedDevice(): Promise<void> {
+    if (mergeTargetId === "") return;
+    if (!window.confirm(`Merge all history from device ${deviceId} into ${mergeTargetId}?\n\nThe source device will be revoked and hidden. Historical Cloud data will be preserved.`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await mergeDevice(window.fetch, cloudApiOrigin(), deviceId, mergeTargetId);
+      window.location.assign(`/devices/${encodeURIComponent(mergeTargetId)}`);
     } catch (cause) {
       setError(messageFor(cause));
       setBusy(false);
@@ -460,6 +480,24 @@ export default function DevicePage() {
             Permanently delete device
           </button>
         </div>
+        {screen.mergeTargets.length > 0 ? (
+          <section className="dashboard-panel collector-card" aria-labelledby="merge-device-heading">
+            <h2 id="merge-device-heading">Merge duplicate device</h2>
+            <p>Preserve this device&apos;s Cloud history under another active device, then revoke and hide this duplicate.</p>
+            <label>
+              Target device
+              <select value={mergeTargetId} disabled={busy} onChange={(event) => setMergeTargetId(event.target.value)}>
+                <option value="">Select an active device</option>
+                {screen.mergeTargets.map((device) => (
+                  <option key={device.device_id} value={device.device_id}>{device.device_id}</option>
+                ))}
+              </select>
+            </label>
+            <button className="danger-button" type="button" disabled={busy || mergeTargetId === ""} onClick={() => void mergeIntoSelectedDevice()}>
+              Merge this device
+            </button>
+          </section>
+        ) : null}
         <section className="dashboard-panel collector-card" aria-labelledby="metrics-heading">
           <h2 id="metrics-heading">System metrics</h2>
           {metrics.cpu === null && metrics.memory === null && metrics.disk === null ? (
