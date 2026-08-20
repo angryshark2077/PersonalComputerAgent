@@ -449,13 +449,12 @@ test("credential rotation revokes the prior refresh hash", async () => {
     deviceId: rotation.deviceId,
   });
   assert.deepEqual(await repository.rotateDeviceCredentials(rotation), grant);
-  await assert.rejects(
-    repository.rotateDeviceCredentials({
+  assert.deepEqual(
+    await repository.rotateDeviceCredentials({
       ...rotation,
       now: rotation.replayExpiresAt,
     }),
-    (error) =>
-      error instanceof ControlRepositoryError && error.code === "CREDENTIAL_INVALID",
+    grant,
   );
   assert.deepEqual(
     await repository.rotateDeviceCredentials({
@@ -466,9 +465,39 @@ test("credential rotation revokes the prior refresh hash", async () => {
     }),
     grant,
   );
+  assert.deepEqual(
+    await repository.authenticateDeviceRefresh(hash("6"), rotation.replayExpiresAt),
+    { workspaceId, deviceId: rotation.deviceId },
+  );
   await assert.rejects(
-    repository.authenticateDeviceRefresh(hash("6"), rotation.replayExpiresAt),
+    repository.authenticateDeviceRefresh(hash("6"), rotation.refreshExpiresAt),
     (error) => error instanceof ControlRepositoryError && error.code === "CREDENTIAL_INVALID",
+  );
+});
+
+test("credential rotation replay survives a twelve-hour device sleep", async () => {
+  const repository = new MemoryControlRepository([membership]);
+  await pairDevice(repository);
+  const replayExpiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const rotation = {
+    workspaceId,
+    deviceId: "01981111-7111-8111-8111-111111111111",
+    currentRefreshTokenHash: hash("6"),
+    newAccessTokenHash: hash("a"),
+    newRefreshTokenHash: hash("b"),
+    accessExpiresAt: later,
+    refreshExpiresAt: replayExpiresAt,
+    replayPayload: "sealed-rotation-result",
+    replayExpiresAt,
+    now,
+  };
+
+  const grant = await repository.rotateDeviceCredentials(rotation);
+  const afterTwelveHours = new Date(now.getTime() + 12 * 60 * 60 * 1000);
+
+  assert.deepEqual(
+    await repository.rotateDeviceCredentials({ ...rotation, now: afterTwelveHours }),
+    grant,
   );
 });
 

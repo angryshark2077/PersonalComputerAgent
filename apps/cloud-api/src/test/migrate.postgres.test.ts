@@ -245,8 +245,12 @@ async function assertCredentialRotationReplay(pool: Pool) {
     workspaceId,
     deviceId,
   });
+  assert.deepEqual(
+    await repository.authenticateDeviceRefresh("2".repeat(64), replayExpiresAt),
+    { workspaceId, deviceId },
+  );
   await assert.rejects(
-    repository.authenticateDeviceRefresh("2".repeat(64), replayExpiresAt),
+    repository.authenticateDeviceRefresh("2".repeat(64), rotation.refreshExpiresAt),
     (error) => error instanceof ControlRepositoryError && error.code === "CREDENTIAL_INVALID",
   );
 }

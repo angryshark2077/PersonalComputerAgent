@@ -998,9 +998,7 @@ export class MemoryControlRepository implements ControlRepository {
       );
       if (
         replay === undefined ||
-        current.rotationReplayPayload === null ||
-        current.rotationReplayExpiresAt === null ||
-        current.rotationReplayExpiresAt <= input.now
+        current.rotationReplayPayload === null
       ) {
         throw new ControlRepositoryError("CREDENTIAL_INVALID");
       }
@@ -2088,8 +2086,6 @@ export class MemoryControlRepository implements ControlRepository {
       if (credential.revokedAt !== null) {
         const replayable = allowRotationReplay
           && credential.rotationReplayPayload !== null
-          && credential.rotationReplayExpiresAt !== null
-          && credential.rotationReplayExpiresAt > now
           && credentials.some((record) =>
             record.credentialGeneration === credential.credentialGeneration + 1
               && record.revokedAt === null);
@@ -2670,7 +2666,6 @@ export class DrizzleControlRepository implements ControlRepository {
             generation: deviceCredentialGenerations.generation,
             revokedAt: deviceCredentialGenerations.revokedAt,
             rotationReplayPayload: deviceCredentialGenerations.rotationReplayPayload,
-            rotationReplayExpiresAt: deviceCredentialGenerations.rotationReplayExpiresAt,
           })
           .from(deviceCredentialGenerations)
           .where(
@@ -2689,7 +2684,6 @@ export class DrizzleControlRepository implements ControlRepository {
           const [source] = await transaction
             .select({
               replayPayload: deviceCredentialGenerations.rotationReplayPayload,
-              replayExpiresAt: deviceCredentialGenerations.rotationReplayExpiresAt,
             })
             .from(deviceCredentialGenerations)
             .where(and(
@@ -2700,9 +2694,7 @@ export class DrizzleControlRepository implements ControlRepository {
             .limit(1);
           if (
             source?.replayPayload === null ||
-            source?.replayPayload === undefined ||
-            source.replayExpiresAt === null ||
-            source.replayExpiresAt <= input.now
+            source?.replayPayload === undefined
           ) return null;
           const [replay] = await transaction
             .select({
@@ -4337,7 +4329,6 @@ export class DrizzleControlRepository implements ControlRepository {
           generation: deviceCredentialGenerations.generation,
           credentialRevokedAt: deviceCredentialGenerations.revokedAt,
           rotationReplayPayload: deviceCredentialGenerations.rotationReplayPayload,
-          rotationReplayExpiresAt: deviceCredentialGenerations.rotationReplayExpiresAt,
           deviceRevokedAt: devices.revokedAt,
         })
         .from(deviceCredentialGenerations)
@@ -4353,9 +4344,7 @@ export class DrizzleControlRepository implements ControlRepository {
       if (credential.credentialRevokedAt !== null) {
         if (
           !allowRotationReplay ||
-          credential.rotationReplayPayload === null ||
-          credential.rotationReplayExpiresAt === null ||
-          credential.rotationReplayExpiresAt <= now
+          credential.rotationReplayPayload === null
         ) {
           throw new ControlRepositoryError("CREDENTIAL_INVALID");
         }

@@ -16,6 +16,8 @@ import {
   hashSecret,
   openRotatedCredentials,
   pkceChallenge,
+  refreshCredentialLifetimeMs,
+  refreshCredentialReplayLifetimeMs,
   sealRotatedCredentials,
 } from "../pairing.js";
 
@@ -50,6 +52,10 @@ test("rotated credentials can only be replayed with the prior refresh token", ()
   assert.deepEqual(openRotatedCredentials(prior, sealed), { accessToken, refreshToken });
   assert.equal(openRotatedCredentials("x".repeat(43), sealed), null);
   assert.equal(openRotatedCredentials(prior, tampered.toString("base64url")), null);
+});
+
+test("credential rotation replay remains available for the refresh credential lifetime", () => {
+  assert.equal(refreshCredentialReplayLifetimeMs, refreshCredentialLifetimeMs);
 });
 
 test("pairing session returns the fixed Dashboard authorization URL", async () => {

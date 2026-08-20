@@ -14,7 +14,7 @@ import type { DevicePairingExchange, DevicePairingStart } from "@pca/contracts/s
 export const pairingSessionLifetimeMs = 5 * 60 * 1000;
 export const accessCredentialLifetimeMs = 60 * 60 * 1000;
 export const refreshCredentialLifetimeMs = 30 * 24 * 60 * 60 * 1000;
-export const refreshCredentialReplayLifetimeMs = 5 * 60 * 1000;
+export const refreshCredentialReplayLifetimeMs = refreshCredentialLifetimeMs;
 export const pairingRateWindowMs = 60 * 1000;
 export const pairingRateMaxPerIp = 10;
 export const pairingRateMaxPerDeviceKey = 3;
