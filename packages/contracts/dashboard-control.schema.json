@@ -52,6 +52,10 @@
           ],
           "properties": {
             "enabled": { "type": "boolean" },
+            "selected_account_id": {
+              "type": ["string", "null"],
+              "pattern": "^[0-9a-f]{64}$"
+            },
             "directions": {
               "type": "array",
               "prefixItems": [{ "const": "incoming" }, { "const": "outgoing" }],
@@ -110,7 +114,7 @@
     "DeviceStatus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "network_history", "collector_health", "observed_at"],
+      "required": ["presence", "agent_version", "outbox_depth", "local_media", "network", "network_history", "wechat_accounts", "collector_health", "observed_at"],
       "properties": {
         "presence": { "enum": ["online", "stale", "offline", "sleeping"] },
         "agent_version": { "type": "string", "minLength": 1 },
@@ -118,8 +122,22 @@
         "local_media": { "$ref": "#/$defs/LocalMedia" },
         "network": { "anyOf": [{ "$ref": "#/$defs/NetworkStatus" }, { "type": "null" }] },
         "network_history": { "type": "array", "maxItems": 5, "items": { "$ref": "#/$defs/PreviousNetworkStatus" } },
+        "wechat_accounts": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/WechatAccount" }
+        },
         "collector_health": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/CollectorHealth" } },
         "observed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "WechatAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 64 }
       }
     },
     "CollectorHealth": {

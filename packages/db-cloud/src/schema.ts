@@ -22,6 +22,7 @@ import {
 export interface StoredCollectorConfig {
   networkEnabled: boolean;
   wechatEnabled: boolean;
+  wechatAccountId?: string | null;
   messagesEnabled: boolean;
   photosEnabled: boolean;
   screenCaptureEnabled: boolean;
@@ -134,6 +135,10 @@ export const devices = pgTable(
     mergedIntoDeviceId: uuid("merged_into_device_id"),
     mergedAt: timestampColumn("merged_at"),
     mergedByUserId: uuid("merged_by_user_id"),
+    wechatAccounts: jsonb("wechat_accounts")
+      .$type<Array<{ id: string; label: string }>>()
+      .notNull()
+      .default([]),
   },
   (table) => [
     unique("devices_workspace_id_unique").on(table.workspaceId, table.id),
@@ -288,6 +293,7 @@ export const collectorConfigs = pgTable(
       .default(0),
     networkEnabled: boolean("network_enabled").notNull().default(false),
     wechatEnabled: boolean("wechat_enabled").notNull().default(false),
+    wechatAccountId: text("wechat_account_id"),
     messagesEnabled: boolean("messages_enabled").notNull().default(false),
     photosEnabled: boolean("photos_enabled").notNull().default(false),
     screenCaptureEnabled: boolean("screen_capture_enabled").notNull().default(false),

@@ -50,7 +50,7 @@ async fn pairing_state_is_absent_until_validated_credentials_are_saved() {
     assert!(db.save_control_revision(1).await.is_err());
     assert_eq!(
         db.health().await.expect("database health").schema_version,
-        18
+        19
     );
 }
 
@@ -146,6 +146,7 @@ async fn control_revision_is_monotonic_and_manual_unpair_preserves_the_record() 
         workspace_id: workspace_id().to_owned(),
         configuration_revision: 10,
         communication_wechat_enabled: true,
+        communication_wechat_account_id: Some("a".repeat(64)),
         screen_capture_enabled: true,
         screen_capture_scheduled_enabled: true,
         screen_capture_interval_seconds: 300,
@@ -202,6 +203,7 @@ async fn applied_control_rejects_a_different_identity_and_stale_replacement() {
         workspace_id: workspace_id().to_owned(),
         configuration_revision: 8,
         communication_wechat_enabled: true,
+        communication_wechat_account_id: None,
         screen_capture_enabled: true,
         screen_capture_scheduled_enabled: true,
         screen_capture_interval_seconds: 300,

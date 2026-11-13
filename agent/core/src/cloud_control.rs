@@ -891,6 +891,7 @@ pub struct AppliedControl {
     pub configuration_revision: u64,
     pub network_enabled: bool,
     pub communication_wechat_enabled: bool,
+    pub communication_wechat_account_id: Option<String>,
     pub communication_messages_enabled: bool,
     pub photos_library_enabled: bool,
     pub screen_capture: ScreenCaptureControl,
@@ -903,6 +904,7 @@ impl AppliedControl {
             configuration_revision,
             network_enabled: false,
             communication_wechat_enabled: control.communication_wechat_enabled,
+            communication_wechat_account_id: control.communication_wechat_account_id,
             communication_messages_enabled: false,
             photos_library_enabled: false,
             screen_capture: ScreenCaptureControl {
@@ -923,6 +925,7 @@ impl AppliedControl {
             workspace_id: credentials.workspace_id().to_owned(),
             configuration_revision: self.configuration_revision,
             communication_wechat_enabled: self.communication_wechat_enabled,
+            communication_wechat_account_id: self.communication_wechat_account_id.clone(),
             screen_capture_enabled: self.screen_capture.enabled,
             screen_capture_scheduled_enabled: self.screen_capture.scheduled_enabled,
             screen_capture_interval_seconds: self.screen_capture.interval_seconds,
@@ -957,6 +960,11 @@ pub fn apply_snapshot(
         configuration_revision: snapshot.configuration_revision,
         network_enabled: snapshot.collectors.network.enabled,
         communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+        communication_wechat_account_id: snapshot
+            .collectors
+            .communication_wechat
+            .selected_account_id()
+            .map(str::to_owned),
         communication_messages_enabled: snapshot.collectors.communication_messages.enabled,
         photos_library_enabled: snapshot.collectors.photos_library.enabled,
         screen_capture: snapshot.collectors.screen_capture.clone(),
@@ -2245,6 +2253,11 @@ async fn apply_control_snapshot(
         configuration_revision: snapshot.configuration_revision,
         network_enabled: snapshot.collectors.network.enabled,
         communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
+        communication_wechat_account_id: snapshot
+            .collectors
+            .communication_wechat
+            .selected_account_id()
+            .map(str::to_owned),
         communication_messages_enabled: snapshot.collectors.communication_messages.enabled,
         photos_library_enabled: snapshot.collectors.photos_library.enabled,
         screen_capture: snapshot.collectors.screen_capture.clone(),
@@ -2265,18 +2278,7 @@ async fn apply_control_snapshot(
     }
     let applied = if snapshot.configuration_revision == current && !hydrated {
         snapshot.validate_exact_scopes()?;
-        Some(AppliedControl {
-            configuration_revision: snapshot.configuration_revision,
-            network_enabled: snapshot.collectors.network.enabled,
-            communication_wechat_enabled: snapshot.collectors.communication_wechat.enabled(),
-            communication_messages_enabled: snapshot.collectors.communication_messages.enabled,
-            photos_library_enabled: snapshot.collectors.photos_library.enabled,
-            screen_capture: snapshot.collectors.screen_capture.clone(),
-            screenshot_request_id: snapshot
-                .screenshot_request
-                .as_ref()
-                .map(|request| request.request_id.clone()),
-        })
+        Some(observed_control.clone())
     } else {
         apply_snapshot(current, &snapshot)?
     };
@@ -3995,16 +3997,56 @@ async fn apply_communication_authorization(
     let identity =
         CommunicationIdentity::try_new(credentials.workspace_id(), credentials.device_id())
             .map_err(|_| ControlError::Contract)?;
-    let control = CommunicationControl::paired(
+    let selected_account = applied
+        .communication_wechat_account_id
+        .as_deref()
+        .map(decode_account_selector)
+        .transpose()?;
+    let control = CommunicationControl::paired_with_account(
         identity,
         applied.configuration_revision,
         applied.communication_wechat_enabled,
+        selected_account,
     )
     .map_err(|_| ControlError::Contract)?;
     authorization
         .apply_persisted_for_owner(owner_epoch, control)
         .await
         .map_err(|_| ControlError::Contract)
+}
+
+/// Decodes the fixed lowercase hexadecimal account selector.
+///
+/// # Errors
+///
+/// Returns a contract error when the selector is not exactly 32 encoded bytes.
+pub fn decode_account_selector(value: &str) -> Result<[u8; 32], ControlError> {
+    if value.len() != 64 {
+        return Err(ControlError::Contract);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).map_err(|_| ControlError::Contract)?;
+        decoded[index] = u8::from_str_radix(text, 16).map_err(|_| ControlError::Contract)?;
+    }
+    Ok(decoded)
+}
+
+fn local_wechat_accounts() -> Vec<WechatAccountWire> {
+    #[cfg(all(target_os = "macos", not(feature = "process-test-hooks")))]
+    {
+        pca_wechat_provider::discover_wechat_accounts()
+            .into_iter()
+            .map(|account| WechatAccountWire {
+                id: account.id,
+                label: account.label,
+            })
+            .collect()
+    }
+    #[cfg(any(not(target_os = "macos"), feature = "process-test-hooks"))]
+    {
+        Vec::new()
+    }
 }
 
 async fn mark_manually_unpaired(
@@ -4404,6 +4446,7 @@ impl ControlClient for HttpControlClient {
                 },
                 network: self.network_observations.current_if_enabled(),
                 cleanup_result,
+                wechat_accounts: local_wechat_accounts(),
             };
             let response = client
                 .post(self.endpoint("v1/agent/control")?)
@@ -4826,6 +4869,13 @@ struct HeartbeatRequest {
     local_media: LocalMediaHeartbeat,
     network: Option<NetworkObservation>,
     cleanup_result: Option<LocalMediaCleanupResult>,
+    wechat_accounts: Vec<WechatAccountWire>,
+}
+
+#[derive(Serialize)]
+struct WechatAccountWire {
+    id: String,
+    label: String,
 }
 
 #[derive(Serialize)]
@@ -5156,6 +5206,7 @@ mod tests {
             workspace_id: credential.workspace_id().to_owned(),
             configuration_revision: 0,
             communication_wechat_enabled: true,
+            communication_wechat_account_id: None,
             screen_capture_enabled: false,
             screen_capture_scheduled_enabled: false,
             screen_capture_interval_seconds: 300,
@@ -6020,6 +6071,7 @@ mod tests {
             configuration_revision: 1,
             network_enabled: true,
             communication_wechat_enabled: false,
+            communication_wechat_account_id: None,
             communication_messages_enabled: false,
             photos_library_enabled: false,
             screen_capture: ScreenCaptureControl::default(),

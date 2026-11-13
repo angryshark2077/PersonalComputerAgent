@@ -32,6 +32,7 @@ export interface HeartbeatRequest {
       observedAt: Date;
     } | null;
   } | null;
+  wechatAccounts: Array<{ id: string; label: string }>;
 }
 
 export interface CollectorHealthRequest {
@@ -124,6 +125,7 @@ export function parseHeartbeat(value: unknown): HeartbeatRequest | null {
     "local_media",
     "cleanup_result",
     "network",
+    "wechat_accounts",
   ])) {
     return null;
   }
@@ -134,6 +136,7 @@ export function parseHeartbeat(value: unknown): HeartbeatRequest | null {
   const localMedia = parseLocalMedia(value.local_media);
   const cleanupResult = parseCleanupResult(value.cleanup_result);
   const network = value.network === undefined ? null : parseNetwork(value.network);
+  const wechatAccounts = parseWechatAccounts(value.wechat_accounts);
   if (
     typeof heartbeatId !== "string" ||
     typeof agentVersion !== "string" ||
@@ -144,10 +147,24 @@ export function parseHeartbeat(value: unknown): HeartbeatRequest | null {
     || localMedia === null
     || cleanupResult === undefined
     || network === undefined
+    || wechatAccounts === null
   ) {
     return null;
   }
-  return { heartbeatId, agentVersion, presence, outboxDepth, localMedia, cleanupResult, network };
+  return { heartbeatId, agentVersion, presence, outboxDepth, localMedia, cleanupResult, network, wechatAccounts };
+}
+
+function parseWechatAccounts(value: unknown): HeartbeatRequest["wechatAccounts"] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 16) return null;
+  const accounts: HeartbeatRequest["wechatAccounts"] = [];
+  for (const item of value) {
+    if (!isRecord(item) || !hasOnly(item, ["id", "label"])) return null;
+    if (typeof item.id !== "string" || !/^[0-9a-f]{64}$/.test(item.id)) return null;
+    if (typeof item.label !== "string" || item.label.length === 0 || item.label.length > 64 || /[\u0000-\u001f\u007f]/.test(item.label)) return null;
+    accounts.push({ id: item.id, label: item.label });
+  }
+  return new Set(accounts.map((account) => account.id)).size === accounts.length ? accounts : null;
 }
 
 function parseNetwork(value: unknown): HeartbeatRequest["network"] | undefined {
@@ -316,6 +333,7 @@ export function parseCollectorConfig(value: unknown): StoredCollectorConfig | nu
     !isRecord(wechat) ||
     !hasOnly(wechat, [
       "enabled",
+      "selected_account_id",
       "directions",
       "message_types",
       "conversation_scope",
@@ -324,6 +342,7 @@ export function parseCollectorConfig(value: unknown): StoredCollectorConfig | nu
       "retention_days",
     ]) ||
     typeof wechat.enabled !== "boolean" ||
+    !(wechat.selected_account_id === undefined || wechat.selected_account_id === null || (typeof wechat.selected_account_id === "string" && /^[0-9a-f]{64}$/.test(wechat.selected_account_id))) ||
     !isExact(wechat.directions, ["incoming", "outgoing"]) ||
     !isExact(wechat.message_types, ["text", "audio", "image", "video"]) ||
     wechat.conversation_scope !== "direct_and_group_at_most_fifteen_members" ||
@@ -364,6 +383,7 @@ export function parseCollectorConfig(value: unknown): StoredCollectorConfig | nu
   return {
     networkEnabled: network.enabled,
     wechatEnabled: wechat.enabled,
+    wechatAccountId: typeof wechat.selected_account_id === "string" ? wechat.selected_account_id : null,
     messagesEnabled: messages.enabled,
     photosEnabled: photos.enabled,
     screenCaptureEnabled: screen.enabled,

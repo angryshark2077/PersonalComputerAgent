@@ -123,6 +123,12 @@ export interface HeartbeatInput {
   localMedia: LocalMediaStorageStatus;
   cleanupResult: LocalMediaCleanupResult | null;
   network: NetworkHeartbeat | null;
+  wechatAccounts?: WechatAccountCandidate[];
+}
+
+export interface WechatAccountCandidate {
+  id: string;
+  label: string;
 }
 
 export type CollectorHealthStatus = "disabled" | "permission_required" | "initializing" | "running" | "paused" | "degraded" | "unsupported" | "error";
@@ -366,6 +372,7 @@ export interface DeviceStatus {
   }>;
   observedAt: Date;
   collectorHealth: CollectorHealthRecord[];
+  wechatAccounts: WechatAccountCandidate[];
 }
 
 export interface OwnerDeviceSummary {
@@ -788,6 +795,7 @@ interface DeviceRecord {
   mergedIntoDeviceId: string | null;
   mergedAt: Date | null;
   mergedByUserId: string | null;
+  wechatAccounts: WechatAccountCandidate[];
 }
 
 interface CredentialRecord extends DeviceCredentialGrant {
@@ -943,6 +951,7 @@ export class MemoryControlRepository implements ControlRepository {
         mergedIntoDeviceId: null,
         mergedAt: null,
         mergedByUserId: null,
+        wechatAccounts: [],
       });
     } else {
       this.#devicePublicKeyHashes.delete(existing.devicePublicKeyHash);
@@ -1113,6 +1122,7 @@ export class MemoryControlRepository implements ControlRepository {
       networkHistory: [],
       observedAt: input.receivedAt,
       collectorHealth: [...(this.#collectorHealth.get(input.deviceId)?.values() ?? [])],
+      wechatAccounts: [...(input.wechatAccounts ?? [])],
     });
   }
 
@@ -2033,6 +2043,7 @@ export class MemoryControlRepository implements ControlRepository {
       configurationRevision: 0,
       networkEnabled: false,
       wechatEnabled: false,
+      wechatAccountId: null,
       messagesEnabled: false,
       photosEnabled: false,
     };
@@ -2885,6 +2896,16 @@ export class DrizzleControlRepository implements ControlRepository {
           networkLocationHorizontalAccuracyMeters: input.network?.location?.horizontalAccuracyMeters ?? null,
           networkLocationObservedAt: input.network?.location?.observedAt ?? null,
         });
+        const wechatAccounts = input.wechatAccounts ?? [];
+        const serializedWechatAccounts = JSON.stringify(wechatAccounts);
+        await transaction
+          .update(devices)
+          .set({ wechatAccounts })
+          .where(and(
+            eq(devices.id, input.deviceId),
+            eq(devices.workspaceId, input.workspaceId),
+            sql`${devices.wechatAccounts} IS DISTINCT FROM ${serializedWechatAccounts}::jsonb`,
+          ));
         if (input.network !== null) {
           const [latest] = await transaction
             .select()
@@ -3514,6 +3535,7 @@ export class DrizzleControlRepository implements ControlRepository {
                   reportedAt: record.reportedAt,
                   agentVersion: record.agentVersion,
                 })),
+                wechatAccounts: device.wechatAccounts,
               },
         snapshot: await this.loadControlSnapshot(deviceId, workspaceId),
         localMediaCleanup: await this.loadLatestOwnerLocalMediaCleanup(deviceId, workspaceId, userId),
@@ -4387,6 +4409,7 @@ async function requireDatabaseDevice(
       mergedIntoDeviceId: devices.mergedIntoDeviceId,
       mergedAt: devices.mergedAt,
       mergedByUserId: devices.mergedByUserId,
+      wechatAccounts: devices.wechatAccounts,
     })
     .from(devices)
     .where(eq(devices.id, deviceId))
@@ -4694,6 +4717,9 @@ function snapshot(
       },
       "communication.wechat": {
         enabled: config.wechatEnabled,
+        ...(config.wechatAccountId === null || config.wechatAccountId === undefined
+          ? {}
+          : { selected_account_id: config.wechatAccountId }),
         directions: ["incoming", "outgoing"],
         message_types: ["text", "audio", "image", "video"],
         conversation_scope: "direct_and_group_at_most_fifteen_members",
@@ -4727,6 +4753,7 @@ function defaultCollectorConfig(): StoredCollectorConfig {
   return {
     networkEnabled: false,
     wechatEnabled: false,
+    wechatAccountId: null,
     messagesEnabled: false,
     photosEnabled: false,
     screenCaptureEnabled: false,
@@ -4743,6 +4770,7 @@ function storedConfig(config: Partial<StoredCollectorConfig>): StoredCollectorCo
   return {
     networkEnabled: config.networkEnabled ?? defaults.networkEnabled,
     wechatEnabled: config.wechatEnabled ?? defaults.wechatEnabled,
+    wechatAccountId: config.wechatAccountId ?? defaults.wechatAccountId ?? null,
     messagesEnabled: config.messagesEnabled ?? defaults.messagesEnabled,
     photosEnabled: config.photosEnabled ?? defaults.photosEnabled,
     screenCaptureEnabled: config.screenCaptureEnabled ?? defaults.screenCaptureEnabled,

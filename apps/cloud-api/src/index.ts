@@ -1696,6 +1696,7 @@ function ownerDeviceSummaryResponse(device: {
       reportedAt: Date;
       agentVersion: string;
     }>;
+    wechatAccounts: Array<{ id: string; label: string }>;
     observedAt: Date;
   } | null;
 }) {
@@ -1768,6 +1769,7 @@ function ownerDeviceSummaryResponse(device: {
               reported_at: collector.reportedAt.toISOString(),
               agent_version: collector.agentVersion,
             })),
+            wechat_accounts: device.status.wechatAccounts,
             observed_at: device.status.observedAt.toISOString(),
           },
   };
@@ -1830,6 +1832,7 @@ function collectorConfigResponse(config: StoredCollectorConfig) {
     },
     "communication.wechat": {
       enabled: config.wechatEnabled,
+      selected_account_id: config.wechatAccountId ?? null,
       directions: ["incoming", "outgoing"] as const,
       message_types: ["text", "audio", "image", "video"] as const,
       conversation_scope: "direct_and_group_at_most_fifteen_members" as const,

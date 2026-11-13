@@ -250,6 +250,10 @@ export default function DevicePage() {
   if (screen === null) return <DashboardShell><p className="status-note">Loading device…</p></DashboardShell>;
 
   const disabled = busy || screen.device.revoked;
+  const wechatAccounts = screen.device.status?.wechat_accounts ?? [];
+  const selectedWechatAccount = screen.device.collectors["communication.wechat"].selected_account_id ?? null;
+  const selectedWechatAccountAvailable = selectedWechatAccount !== null
+    && wechatAccounts.some((account) => account.id === selectedWechatAccount);
   const screenSettingsValid = screenDraft !== null
     && Number.isInteger(screenDraft.interval_seconds)
     && screenDraft.interval_seconds >= 60
@@ -304,10 +308,38 @@ export default function DevicePage() {
             ...screen.device.collectors,
             "communication.wechat": {
               ...screen.device.collectors["communication.wechat"],
-            enabled: !screen.device.collectors["communication.wechat"].enabled,
+              enabled: !screen.device.collectors["communication.wechat"].enabled,
             },
           })}
         />
+        <section className="dashboard-panel collector-card" aria-labelledby="wechat-account-heading">
+          <h2 id="wechat-account-heading">WeChat account</h2>
+          <p>Select the local WeChat account this device is allowed to collect.</p>
+          {wechatAccounts.length > 0 || selectedWechatAccount !== null ? (
+            <label>
+              Account
+              <select
+                disabled={disabled}
+                value={selectedWechatAccount ?? ""}
+                onChange={(event) => void save({
+                  ...screen.device.collectors,
+                  "communication.wechat": {
+                    ...screen.device.collectors["communication.wechat"],
+                    selected_account_id: event.target.value === "" ? null : event.target.value,
+                  },
+                })}
+              >
+                <option value="">Select an account</option>
+                {selectedWechatAccount !== null && !selectedWechatAccountAvailable ? (
+                  <option value={selectedWechatAccount} disabled>Previously selected account (unavailable)</option>
+                ) : null}
+                {wechatAccounts.map((account) => (
+                  <option key={account.id} value={account.id}>{account.label}</option>
+                ))}
+              </select>
+            </label>
+          ) : <p>No local WeChat accounts have been reported by this Agent.</p>}
+        </section>
         <CollectorScopeCard
           name="Messages"
           detail="All iMessage and SMS conversations; text only; initial 7-day history and future messages"

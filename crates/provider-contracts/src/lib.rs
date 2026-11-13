@@ -243,7 +243,10 @@ pub trait CommunicationProviderFactory: Send + Sync {
     /// # Errors
     ///
     /// Returns a domain error when no verified provider can be constructed.
-    fn create(&self) -> Result<Box<dyn CommunicationProvider>, DomainError>;
+    fn create(
+        &self,
+        selected_account_fingerprint: Option<[u8; 32]>,
+    ) -> Result<Box<dyn CommunicationProvider>, DomainError>;
 }
 
 pub trait CommunicationProvider: Send {

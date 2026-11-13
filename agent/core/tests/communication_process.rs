@@ -59,7 +59,10 @@ struct RecordingFactory {
 }
 
 impl CommunicationProviderFactory for RecordingFactory {
-    fn create(&self) -> Result<Box<dyn CommunicationProvider>, DomainError> {
+    fn create(
+        &self,
+        _selected_account_fingerprint: Option<[u8; 32]>,
+    ) -> Result<Box<dyn CommunicationProvider>, DomainError> {
         self.state.factory_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(RecordingProvider {
             state: Arc::clone(&self.state),

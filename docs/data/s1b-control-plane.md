@@ -26,6 +26,15 @@ through `DbActorHandle`.
 The table deliberately has no access credential, refresh credential,
 authorization code, device key material, message body, or Event payload.
 
+## Local SQLite: `applied_collector_control`
+
+Migration `0019_wechat_account_selection.sql` adds
+`communication_wechat_account_id`, an optional 64-character lowercase SHA-256
+fingerprint of the selected local WeChat account identifier. The fingerprint is
+not a credential and does not expose the local account directory or full wxid.
+It is persisted with the applied configuration revision so an Agent restart
+uses the same account before the next Cloud control poll.
+
 ## Cloud PostgreSQL
 
 Migrations are ordered and immutable:
@@ -54,16 +63,16 @@ Migrations are ordered and immutable:
 |---|---|---|
 | `pairing_sessions` | SHA-256 session/device-public-key/callback-state hashes, PKCE challenge, callback URI, expiry/created/authorized timestamps | five-minute one-time pairing session; no plaintext code or credential |
 | `pairing_authorization_codes` | SHA-256 authorization-code and callback-state hashes, session, workspace/Owner, expiry/created/consumed timestamps | one-time code; server consumes it atomically; no plaintext authorization code |
-| `devices` | device/workspace/Owner IDs, public-key hash, fixed `macos` platform, created/revoked timestamps, optional merge target/actor/time | device belongs to its composite Workspace/Owner membership; a merged source remains immutable history under its original ID and points to one active same-Workspace target |
+| `devices` | device/workspace/Owner IDs, public-key hash, fixed `macos` platform, created/revoked timestamps, optional merge target/actor/time, latest bounded `wechat_accounts` candidate list | device belongs to its composite Workspace/Owner membership; candidates contain only hashed IDs and locally masked labels; a merged source remains immutable history under its original ID and points to one active same-Workspace target |
 | `device_credential_generations` | device/workspace, generation, SHA-256 access/refresh hashes, expiries, created/revoked timestamps | credentials rotate by generation; only hashes persist; revocation invalidates active generations |
 
 ### Desired configuration, audit, and presence
 
 | Table | Fields | Scope and retention |
 |---|---|---|
-| `collector_configs` | workspace/device, non-negative revision, `network_enabled`, `wechat_enabled`, update time | one complete desired configuration per device; S1B transports it but starts neither source |
+| `collector_configs` | workspace/device, non-negative revision, `network_enabled`, `wechat_enabled`, optional `wechat_account_id`, update time | one complete desired configuration per device; the account ID is the Agent-reported SHA-256 selector, not a wxid or credential |
 | `collector_config_audit` | ID, workspace/device, actor, positive revision, old/new JSON configuration, time | append-only Owner audit; records only the two approved boolean scope settings |
-| `device_heartbeats` | ID, workspace/device, received time, Agent version, presence, non-negative Outbox depth | authenticated presence history; S1B has no Event upload |
+| `device_heartbeats` | ID, workspace/device, received time, Agent version, presence, non-negative Outbox depth | authenticated presence history; account candidates are kept once on the device row rather than repeated in append-only heartbeats; S1B has no Event upload |
 | `device_network_history` | ID, workspace/device, observation time, network identity, exit-IP city projection and optional Core Location estimate | only a changed network identity is recorded; each device retains its five newest records; no GPS source is assumed |
 | `device_revocation_audit` | ID, workspace/device, Owner actor, revoked time | append-only device revocation audit |
 

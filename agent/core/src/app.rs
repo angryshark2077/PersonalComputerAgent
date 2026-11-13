@@ -11,8 +11,8 @@ use pca_agent_runtime::{
 use pca_agentd::communication::UnavailableCommunicationProviderFactory;
 use pca_agentd::{
     cloud_control::{
-        CloudControlCommands, CloudControlOwner, ControlClient, HttpControlClient,
-        PRODUCTION_CLOUD_API_ORIGIN,
+        decode_account_selector, CloudControlCommands, CloudControlOwner, ControlClient,
+        HttpControlClient, PRODUCTION_CLOUD_API_ORIGIN,
     },
     communication::{
         CommunicationAuthorization, CommunicationControl, CommunicationIdentity,
@@ -1358,10 +1358,17 @@ async fn restore_persisted_communication_authorization(
     };
     let identity = CommunicationIdentity::try_new(&pairing.workspace_id, &pairing.device_id)
         .map_err(|_| FailureStage::CommunicationCollector)?;
-    let control = CommunicationControl::paired(
+    let selected_account = control
+        .communication_wechat_account_id
+        .as_deref()
+        .map(decode_account_selector)
+        .transpose()
+        .map_err(|_| FailureStage::CommunicationCollector)?;
+    let control = CommunicationControl::paired_with_account(
         identity,
         pairing.applied_control_revision,
         control.communication_wechat_enabled,
+        selected_account,
     )
     .map_err(|_| FailureStage::CommunicationCollector)?;
     authorization

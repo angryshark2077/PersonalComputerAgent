@@ -173,6 +173,7 @@ export interface AgentControlSnapshot {
     };
     "communication.wechat": {
       enabled: boolean;
+      selected_account_id?: string;
       directions: ["incoming", "outgoing"];
       message_types: ["text", "audio", "image", "video"];
       conversation_scope: "direct_and_group_at_most_fifteen_members";

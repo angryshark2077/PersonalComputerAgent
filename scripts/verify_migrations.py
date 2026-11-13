@@ -34,6 +34,7 @@ EXPECTED_MIGRATIONS = {
         "0016_applied_collector_control.sql",
         "0017_communication_cursor_checkpoint.sql",
         "0018_screenshot_request_history.sql",
+        "0019_wechat_account_selection.sql",
     ],
     MIGRATION_ROOTS[1]: [
         "0000_baseline.sql",
@@ -67,6 +68,7 @@ EXPECTED_MIGRATIONS = {
         "0028_repair_existing_device_pairing.sql",
         "0029_heartbeat_privacy_retention.sql",
         "0030_device_merges.sql",
+        "0031_wechat_account_selection.sql",
     ],
 }
 
@@ -175,6 +177,7 @@ def replay_local_chain(files: list[Path]) -> str | None:
             "screen_capture_activity_min_interval_seconds",
             "screen_capture_excluded_bundle_ids_json",
             "updated_at_ms",
+            "communication_wechat_account_id",
         ]:
             return f"unexpected applied_collector_control columns: {applied_control_columns}"
     except (OSError, sqlite3.Error, UnicodeDecodeError) as error:

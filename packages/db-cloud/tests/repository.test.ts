@@ -396,6 +396,7 @@ test("control state is Workspace-scoped, monotonic, and audited", async () => {
     config: {
       networkEnabled: true,
       wechatEnabled: false,
+      wechatAccountId: "a".repeat(64),
       messagesEnabled: false,
       photosEnabled: false,
       screenCaptureEnabled: false,
@@ -416,6 +417,7 @@ test("control state is Workspace-scoped, monotonic, and audited", async () => {
   assert.deepEqual(snapshot.collectors.network, { enabled: true });
   assert.deepEqual(snapshot.collectors["communication.wechat"], {
     enabled: false,
+    selected_account_id: "a".repeat(64),
     directions: ["incoming", "outgoing"],
     message_types: ["text", "audio", "image", "video"],
     conversation_scope: "direct_and_group_at_most_fifteen_members",

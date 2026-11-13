@@ -572,6 +572,8 @@ enum CommunicationSyncMode {
 #[serde(try_from = "RawCommunicationScopeV2")]
 pub struct CommunicationScopeV2 {
     enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_account_id: Option<String>,
     directions: Vec<Direction>,
     message_types: Vec<MessageKind>,
     conversation_scope: ConversationScopePolicy,
@@ -585,6 +587,11 @@ impl CommunicationScopeV2 {
     #[must_use]
     pub const fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    #[must_use]
+    pub fn selected_account_id(&self) -> Option<&str> {
+        self.selected_account_id.as_deref()
     }
 
     #[must_use]
@@ -621,7 +628,12 @@ impl CommunicationScopeV2 {
             MessageKind::Video,
             MessageKind::File,
         ];
-        if raw.directions.as_slice() != [Direction::Incoming, Direction::Outgoing]
+        if raw.selected_account_id.as_deref().is_some_and(|value| {
+            value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        }) || raw.directions.as_slice() != [Direction::Incoming, Direction::Outgoing]
             || (raw.message_types.as_slice() != legacy_message_types
                 && raw.message_types.as_slice() != current_message_types)
             || raw.max_group_members != 15
@@ -632,6 +644,7 @@ impl CommunicationScopeV2 {
 
         Ok(Self {
             enabled: raw.enabled,
+            selected_account_id: raw.selected_account_id,
             directions: raw.directions,
             message_types: raw.message_types,
             conversation_scope: raw.conversation_scope,
@@ -646,6 +659,8 @@ impl CommunicationScopeV2 {
 #[serde(deny_unknown_fields)]
 struct RawCommunicationScopeV2 {
     enabled: bool,
+    #[serde(default)]
+    selected_account_id: Option<String>,
     directions: Vec<Direction>,
     message_types: Vec<MessageKind>,
     conversation_scope: ConversationScopePolicy,

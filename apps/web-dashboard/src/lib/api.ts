@@ -10,6 +10,7 @@ export interface CollectorConfig {
   };
   "communication.wechat": {
     enabled: boolean;
+    selected_account_id?: string | null;
     directions: ["incoming", "outgoing"];
     message_types: ["text", "audio", "image", "video"] | ["text", "audio", "image", "video", "file"];
     conversation_scope: "direct_and_group_at_most_fifteen_members";
@@ -124,6 +125,7 @@ export interface DashboardDevice {
     network: DashboardNetworkObservation | null;
     network_history?: Array<DashboardNetworkObservation & { observed_at: string }>;
     collector_health: DashboardCollectorHealth[];
+    wechat_accounts?: Array<{ id: string; label: string }>;
     observed_at: string;
   } | null;
   local_media_cleanup: {
@@ -304,7 +306,11 @@ export function normalizeDashboardDevice(device: DashboardDevice): DashboardDevi
     ...device,
     status: device.status === null
       ? null
-      : { ...device.status, collector_health: device.status.collector_health ?? [] },
+      : {
+          ...device.status,
+          collector_health: device.status.collector_health ?? [],
+          wechat_accounts: device.status.wechat_accounts ?? [],
+        },
     collectors: {
       ...device.collectors,
       "screen.capture": collectors["screen.capture"] ?? defaultScreenCaptureConfig,

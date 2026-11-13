@@ -103,7 +103,8 @@ test("collector health reports are strict and visible to the owner", async () =>
   assert.equal(body.status.collector_health[0]?.collector_key, "communication.wechat");
   assert.equal(body.status.collector_health[0]?.error_code, "WECHAT_KEY_REJECTED");
   assert.equal(body.status.collector_health[0]?.last_event_at, "2026-08-11T18:11:53.000Z");
-  assert.equal(validateContract("dashboard-control", body).valid, true);
+  const validation = validateContract("dashboard-control", body);
+  assert.equal(validation.valid, true, validation.errors.join("\n"));
 
   const invalid = await api.request("/v1/agent/collector-health", {
     method: "POST",
@@ -119,6 +120,7 @@ test("collector health reports are strict and visible to the owner", async () =>
 
 test("owner config is scoped, strict, and reaches device control", async () => {
   const { api, credentials } = await pairedApi();
+  const selectedAccountId = "a".repeat(64);
   const config = await api.request(
     `/v1/devices/${credentials.device_id}/collector-config`,
     {
@@ -136,6 +138,7 @@ test("owner config is scoped, strict, and reaches device control", async () => {
         },
         "communication.wechat": {
           enabled: true,
+          selected_account_id: selectedAccountId,
           directions: ["incoming", "outgoing"],
           message_types: ["text", "audio", "image", "video"],
           conversation_scope: "direct_and_group_at_most_fifteen_members",
@@ -169,16 +172,37 @@ test("owner config is scoped, strict, and reaches device control", async () => {
         protected_bytes: 512,
       },
       cleanup_result: null,
+      wechat_accounts: [
+        { id: selectedAccountId, label: "WeChat account …1234" },
+      ],
     }),
   });
   assert.equal(control.status, 200);
   const result = (await control.json()) as {
-    snapshot: { configuration_revision: number; collectors: { network: { enabled: boolean } } };
+    snapshot: {
+      configuration_revision: number;
+      collectors: {
+        network: { enabled: boolean };
+        "communication.wechat": { selected_account_id?: string };
+      };
+    };
     server_time: string;
   };
   assert.equal(result.snapshot.configuration_revision, 1);
   assert.equal(result.snapshot.collectors.network.enabled, true);
+  assert.equal(result.snapshot.collectors["communication.wechat"].selected_account_id, selectedAccountId);
   assert.notEqual(Number.isNaN(Date.parse(result.server_time)), true);
+
+  const detail = await api.request(`/v1/devices/${credentials.device_id}`);
+  const device = await detail.json() as {
+    collectors: { "communication.wechat": { selected_account_id: string | null } };
+    status: { wechat_accounts: Array<{ id: string; label: string }> };
+  };
+  assert.equal(detail.status, 200);
+  assert.equal(device.collectors["communication.wechat"].selected_account_id, selectedAccountId);
+  assert.deepEqual(device.status.wechat_accounts, [
+    { id: selectedAccountId, label: "WeChat account …1234" },
+  ]);
 
   const badScope = await api.request(
     `/v1/devices/${credentials.device_id}/collector-config`,
@@ -488,6 +512,7 @@ test("Owner reads only its device control state and configuration audit", async 
     },
     "communication.wechat": {
       enabled: true,
+      selected_account_id: null,
       directions: ["incoming", "outgoing"],
       message_types: ["text", "audio", "image", "video"],
       conversation_scope: "direct_and_group_at_most_fifteen_members",
@@ -556,7 +581,8 @@ test("Owner reads only its device control state and configuration audit", async 
   const detail = await api.request(`/v1/devices/${credentials.device_id}`);
   assert.equal(detail.status, 200);
   const deviceBody = await detail.json();
-  assert.equal(validateContract("dashboard-control", deviceBody).valid, true);
+  const deviceValidation = validateContract("dashboard-control", deviceBody);
+  assert.equal(deviceValidation.valid, true, deviceValidation.errors.join("\n"));
   const snapshot = deviceBody as {
     collectors: { network: { enabled: boolean } };
     configuration_revision: number;

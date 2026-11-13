@@ -38,6 +38,12 @@
       "matched_location": null
     },
     "network_history": [],
+    "wechat_accounts": [
+      {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "label": "WeChat account …1234"
+      }
+    ],
     "collector_health": [
       {
         "collector_key": "communication.wechat",
@@ -67,6 +73,7 @@
     },
     "communication.wechat": {
       "enabled": true,
+      "selected_account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "directions": ["incoming", "outgoing"],
       "message_types": ["text", "audio", "image", "video"],
       "conversation_scope": "direct_and_group_at_most_fifteen_members",

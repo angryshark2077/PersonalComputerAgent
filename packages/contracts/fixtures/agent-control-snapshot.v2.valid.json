@@ -17,6 +17,7 @@
     },
     "communication.wechat": {
       "enabled": true,
+      "selected_account_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "directions": ["incoming", "outgoing"],
       "message_types": ["text", "audio", "image", "video"],
       "conversation_scope": "direct_and_group_at_most_fifteen_members",

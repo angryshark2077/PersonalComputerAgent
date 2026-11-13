@@ -130,11 +130,46 @@ impl MacOSWechatProviderFactory {
 }
 
 impl CommunicationProviderFactory for MacOSWechatProviderFactory {
-    fn create(&self) -> Result<Box<dyn CommunicationProvider>, DomainError> {
+    fn create(
+        &self,
+        selected_account_fingerprint: Option<[u8; 32]>,
+    ) -> Result<Box<dyn CommunicationProvider>, DomainError> {
         Ok(Box::new(WechatProvider::new(MacOSWechatSource::discover(
             self.local_database.as_deref(),
+            selected_account_fingerprint,
         )?)))
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WechatAccountCandidate {
+    pub id: String,
+    pub label: String,
+}
+
+/// Lists validated local `WeChat` account identifiers without opening message content.
+#[must_use]
+pub fn discover_wechat_accounts() -> Vec<WechatAccountCandidate> {
+    let Some(home) = env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let mut candidates = BTreeMap::new();
+    for path in discover_account_roots(&PathBuf::from(home).join(SOURCE_ROOT)).unwrap_or_default() {
+        if let Some(account) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(clean_account_directory_name)
+        {
+            let id = account_selector_id(&account);
+            candidates
+                .entry(id.clone())
+                .or_insert(WechatAccountCandidate {
+                    id,
+                    label: masked_account_label(&account),
+                });
+        }
+    }
+    candidates.into_values().collect()
 }
 
 struct SourcePaths {
@@ -166,9 +201,12 @@ struct MacOSWechatSource {
 }
 
 impl MacOSWechatSource {
-    fn discover(local_database: Option<&Path>) -> Result<Self, DomainError> {
+    fn discover(
+        local_database: Option<&Path>,
+        selected_account_fingerprint: Option<[u8; 32]>,
+    ) -> Result<Self, DomainError> {
         cleanup_staged_media();
-        let paths = discover_source_paths()?;
+        let paths = discover_source_paths(selected_account_fingerprint)?;
         let cursors = local_database.map_or_else(BTreeMap::new, |database| {
             bootstrap_source_cursors(database, &paths.account_id, &paths.message_databases)
         });
@@ -184,9 +222,7 @@ impl MacOSWechatSource {
     }
 }
 
-fn discover_source_paths() -> Result<SourcePaths, DomainError> {
-    let home = env::var_os("HOME").ok_or_else(source_unavailable)?;
-    let root = PathBuf::from(home).join(SOURCE_ROOT);
+fn discover_account_roots(root: &Path) -> Result<Vec<PathBuf>, DomainError> {
     let mut accounts = fs::read_dir(root)
         .map_err(|error| source_access_error(&error))?
         .filter_map(Result::ok)
@@ -196,20 +232,71 @@ fn discover_source_paths() -> Result<SourcePaths, DomainError> {
             path.join(SESSION_DATABASE).is_file()
                 && path.join(CONTACT_DATABASE).is_file()
                 && path.join(MESSAGE_DIRECTORY).is_dir()
-        });
-    let account_root = accounts.next().ok_or_else(source_unavailable)?;
-    if accounts.next().is_some() {
-        return Err(DomainError::new(
-            "WECHAT_MULTIPLE_ACCOUNTS",
-            "multiple local WeChat accounts require explicit selection",
-            true,
-        ));
-    }
+                && fs::read_dir(path.join(MESSAGE_DIRECTORY)).is_ok_and(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .any(|entry| is_message_database(&entry.path()))
+                })
+        })
+        .collect::<Vec<_>>();
+    accounts.sort();
+    Ok(accounts)
+}
+
+fn discover_source_paths(
+    selected_account_fingerprint: Option<[u8; 32]>,
+) -> Result<SourcePaths, DomainError> {
+    let home = env::var_os("HOME").ok_or_else(source_unavailable)?;
+    let root = PathBuf::from(home).join(SOURCE_ROOT);
+    let accounts = discover_account_roots(&root)?;
+    let account_root = select_account_root(accounts, selected_account_fingerprint)?;
     let local_username = account_root
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(clean_account_directory_name)
         .ok_or_else(source_unavailable)?;
+    build_source_paths(account_root, local_username)
+}
+
+fn select_account_root(
+    accounts: Vec<PathBuf>,
+    selected_account_fingerprint: Option<[u8; 32]>,
+) -> Result<PathBuf, DomainError> {
+    Ok(if let Some(selected) = selected_account_fingerprint {
+        accounts
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(clean_account_directory_name)
+                    .is_some_and(|account| {
+                        let fingerprint: [u8; 32] = Sha256::digest(account.as_bytes()).into();
+                        fingerprint == selected
+                    })
+            })
+            .cloned()
+            .ok_or_else(|| {
+                DomainError::new(
+                    "WECHAT_SELECTED_ACCOUNT_UNAVAILABLE",
+                    "the selected local WeChat account is unavailable",
+                    true,
+                )
+            })?
+    } else if accounts.len() > 1 {
+        return Err(DomainError::new(
+            "WECHAT_MULTIPLE_ACCOUNTS",
+            "multiple local WeChat accounts require explicit selection",
+            true,
+        ));
+    } else {
+        accounts.into_iter().next().ok_or_else(source_unavailable)?
+    })
+}
+
+fn build_source_paths(
+    account_root: PathBuf,
+    local_username: String,
+) -> Result<SourcePaths, DomainError> {
     let mut message_databases = fs::read_dir(account_root.join(MESSAGE_DIRECTORY))
         .map_err(|error| source_access_error(&error))?
         .filter_map(Result::ok)
@@ -233,7 +320,6 @@ fn discover_source_paths() -> Result<SourcePaths, DomainError> {
     let source_instance_id =
         source_instance_id(&account_root, &session_database, &contact_database)?;
     Ok(SourcePaths {
-        account_root: account_root.clone(),
         session_database,
         contact_database,
         emoticon_database: account_root
@@ -245,6 +331,7 @@ fn discover_source_paths() -> Result<SourcePaths, DomainError> {
         local_username,
         account_id,
         source_instance_id,
+        account_root,
     })
 }
 
@@ -279,7 +366,8 @@ impl WechatSource for MacOSWechatSource {
             };
             run_source_thread(move || {
                 cleanup_staged_media();
-                let refreshed_paths = discover_source_paths()?;
+                let selected = Sha256::digest(paths.local_username.as_bytes()).into();
+                let refreshed_paths = discover_source_paths(Some(selected))?;
                 if refreshed_paths.account_id != paths.account_id
                     || refreshed_paths.source_instance_id != paths.source_instance_id
                 {
@@ -5841,6 +5929,18 @@ fn account_id_for_root(root: &Path) -> String {
     format!("wechat-db-v1:{fingerprint:x}")
 }
 
+fn account_selector_id(account: &str) -> String {
+    format!("{:x}", Sha256::digest(account.as_bytes()))
+}
+
+fn masked_account_label(account: &str) -> String {
+    let suffix = account.chars().rev().take(4).collect::<Vec<_>>();
+    format!(
+        "WeChat account …{}",
+        suffix.into_iter().rev().collect::<String>()
+    )
+}
+
 fn source_instance_id(
     account_root: &Path,
     session_database: &Path,
@@ -6101,24 +6201,87 @@ mod tests {
         bootstrap_source_cursors, claim_pending_media_retry, clean_account_directory_name,
         cleanup_staged_media_in, decode_value, decode_voice_attachment, decode_zstd_text,
         decoded_image_attachment, decrypt_emoticon, decrypt_v4_image, derive_image_keys,
-        display_text_message, extend_message_database_routes, extract_hevc_nalu_units,
-        file_attachment, image_attachment_id, image_mime_type, index_decoded_images,
-        index_message_files, index_video_files, is_direct_conversation, is_message_database,
-        kvcomm_codes_from_filename, message_table_name, normalize_decrypted_image,
-        parse_group_nicknames, parse_image_dat_name, parse_image_md5_candidates,
-        parse_video_file_key, parse_video_length, parse_video_md5_candidates,
-        probe_wechat_app_data_root, read_contact_cards, read_conversation_metadata,
-        read_database_audio, read_database_emoticons, read_database_files, read_database_images,
-        read_database_text, read_database_videos, read_voice_blob,
-        remember_message_snapshot_after_scan, replace_with_durable_cursors,
+        discover_account_roots, display_text_message, extend_message_database_routes,
+        extract_hevc_nalu_units, file_attachment, image_attachment_id, image_mime_type,
+        index_decoded_images, index_message_files, index_video_files, is_direct_conversation,
+        is_message_database, kvcomm_codes_from_filename, message_table_name,
+        normalize_decrypted_image, parse_group_nicknames, parse_image_dat_name,
+        parse_image_md5_candidates, parse_video_file_key, parse_video_length,
+        parse_video_md5_candidates, probe_wechat_app_data_root, read_contact_cards,
+        read_conversation_metadata, read_database_audio, read_database_emoticons,
+        read_database_files, read_database_images, read_database_text, read_database_videos,
+        read_voice_blob, remember_message_snapshot_after_scan, replace_with_durable_cursors,
         resolve_full_image_dat_path, resolve_group_sender, resolve_image_dat_path,
-        resolve_message_file, resolve_video_path, retention_cutoff_from, select_image_candidate,
-        should_retire_failed_full_image_retry, should_scan_message_source, source_access_error,
-        source_instance_id, stage_decrypted_image, start_source_worker, video_attachment,
-        voice_same_time_index, ContactCardProfile, ConversationMetadata, ImageKeys,
-        MessageSourceSnapshot, Session, SourceFileStamp, SourcePaths, SourcePayload, SourceWorker,
-        TextReadContext, WechatAppDataAccess, MAX_TEXT_BYTES, SESSION_DATABASE,
+        resolve_message_file, resolve_video_path, retention_cutoff_from, select_account_root,
+        select_image_candidate, should_retire_failed_full_image_retry, should_scan_message_source,
+        source_access_error, source_instance_id, stage_decrypted_image, start_source_worker,
+        video_attachment, voice_same_time_index, ContactCardProfile, ConversationMetadata,
+        ImageKeys, MessageSourceSnapshot, Session, SourceFileStamp, SourcePaths, SourcePayload,
+        SourceWorker, TextReadContext, WechatAppDataAccess, CONTACT_DATABASE, MAX_TEXT_BYTES,
+        MESSAGE_DIRECTORY, SESSION_DATABASE,
     };
+
+    #[test]
+    fn account_discovery_ignores_stale_roots_without_message_databases() {
+        let root = tempfile::tempdir().expect("create WeChat root fixture");
+        for account in ["wxid_current", "wxid_stale"] {
+            let account_root = root.path().join(account);
+            std::fs::create_dir_all(account_root.join(MESSAGE_DIRECTORY))
+                .expect("create message directory");
+            std::fs::create_dir_all(account_root.join("db_storage/session"))
+                .expect("create session directory");
+            std::fs::create_dir_all(account_root.join("db_storage/contact"))
+                .expect("create contact directory");
+            std::fs::write(account_root.join(SESSION_DATABASE), [])
+                .expect("write session database");
+            std::fs::write(account_root.join(CONTACT_DATABASE), [])
+                .expect("write contact database");
+        }
+        std::fs::write(
+            root.path()
+                .join("wxid_current")
+                .join(MESSAGE_DIRECTORY)
+                .join("message_0.db"),
+            [],
+        )
+        .expect("write message database");
+
+        let accounts = discover_account_roots(root.path()).expect("discover accounts");
+
+        assert_eq!(accounts, vec![root.path().join("wxid_current")]);
+    }
+
+    #[test]
+    fn multiple_accounts_require_explicit_selection() {
+        let error = select_account_root(
+            vec!["/tmp/wxid_first".into(), "/tmp/wxid_second".into()],
+            None,
+        )
+        .expect_err("multiple accounts must not be selected implicitly");
+
+        assert_eq!(error.code, "WECHAT_MULTIPLE_ACCOUNTS");
+    }
+
+    #[test]
+    fn selected_account_is_matched_by_fingerprint() {
+        let selected: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(b"wxid_second").into();
+        let account = select_account_root(
+            vec!["/tmp/wxid_first".into(), "/tmp/wxid_second".into()],
+            Some(selected),
+        )
+        .expect("select matching account");
+
+        assert_eq!(account, std::path::PathBuf::from("/tmp/wxid_second"));
+    }
+
+    #[test]
+    fn unavailable_selected_account_is_reported() {
+        let selected: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(b"wxid_missing").into();
+        let error = select_account_root(vec!["/tmp/wxid_first".into()], Some(selected))
+            .expect_err("missing selected account must be reported");
+
+        assert_eq!(error.code, "WECHAT_SELECTED_ACCOUNT_UNAVAILABLE");
+    }
 
     #[test]
     fn source_instance_changes_when_account_databases_are_replaced() {

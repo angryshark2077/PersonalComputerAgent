@@ -102,3 +102,27 @@ test("device page normalizes an old Cloud response without screenshot settings",
     excluded_bundle_ids: [],
   });
 });
+
+test("device page normalizes an old Cloud response without WeChat account candidates", () => {
+  const current = snapshotWithWechatEnabled();
+  const legacy = {
+    ...current,
+    status: {
+      presence: "online" as const,
+      agent_version: "0.2.5",
+      outbox_depth: 0,
+      local_media: {
+        completed_file_count: 0,
+        completed_bytes: 0,
+        protected_file_count: 0,
+        protected_bytes: 0,
+      },
+      network: null,
+      network_history: [],
+      collector_health: [],
+      observed_at: "2026-11-13T08:00:00.000Z",
+    },
+  } as unknown as DashboardDevice;
+
+  assert.deepEqual(normalizeDashboardDevice(legacy).status?.wechat_accounts, []);
+});

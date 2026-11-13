@@ -81,6 +81,10 @@
           ],
           "properties": {
             "enabled": { "type": "boolean" },
+            "selected_account_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
             "directions": {
               "type": "array",
               "prefixItems": [{ "const": "incoming" }, { "const": "outgoing" }],

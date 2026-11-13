@@ -53,7 +53,7 @@ test("PostgreSQL migrations replay safely and create private communication proje
     await assertDeviceLocationSchema(pool);
     await assertScreenshotSchema(pool);
     await assertCollectorHealthSchema(pool);
-    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024", "0025", "0026", "0027", "0028", "0029", "0030"]);
+    assert.deepEqual(await migrationIds(pool), ["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022", "0023", "0024", "0025", "0026", "0027", "0028", "0029", "0030", "0031"]);
   } finally {
     await pool.end();
     await postgres.stop();
@@ -145,6 +145,10 @@ async function assertHeartbeatPrivacyCleanup(pool: Pool) {
     localMedia: { completedFileCount: 0, completedBytes: 0, protectedFileCount: 0, protectedBytes: 0 },
     cleanupResult: null,
     network: null,
+    wechatAccounts: [{
+      id: "a".repeat(64),
+      label: "WeChat account …1234",
+    }],
   });
   await repository.redactExpiredHeartbeatNetworkData(
     new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
@@ -165,6 +169,14 @@ async function assertHeartbeatPrivacyCleanup(pool: Pool) {
     [scrubbedHeartbeatId],
   );
   assert.equal(after.rows[0]?.xmin, before.rows[0]?.xmin);
+  const deviceAccounts = await pool.query<{ wechat_accounts: Array<{ id: string; label: string }> }>(
+    "SELECT wechat_accounts FROM devices WHERE id = $1",
+    [deviceId],
+  );
+  assert.deepEqual(deviceAccounts.rows[0]?.wechat_accounts, [{
+    id: "a".repeat(64),
+    label: "WeChat account …1234",
+  }]);
   const index = await pool.query<{ indexdef: string }>(
     "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_device_heartbeats_privacy_retention'",
   );

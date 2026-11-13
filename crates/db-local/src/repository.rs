@@ -1529,7 +1529,8 @@ pub(crate) fn load_applied_collector_control(
                     screen_capture_scheduled_enabled, screen_capture_interval_seconds,
                     screen_capture_activity_enabled,
                     screen_capture_activity_min_interval_seconds,
-                    screen_capture_excluded_bundle_ids_json, updated_at_ms
+                    screen_capture_excluded_bundle_ids_json,
+                    communication_wechat_account_id, updated_at_ms
              FROM applied_collector_control WHERE singleton_id = 1",
             [],
             |row| {
@@ -1553,7 +1554,8 @@ pub(crate) fn load_applied_collector_control(
                     screen_capture_activity_enabled: row.get(7)?,
                     screen_capture_activity_min_interval_seconds: row.get(8)?,
                     screen_capture_excluded_bundle_ids: excluded,
-                    updated_at_ms: row.get(10)?,
+                    communication_wechat_account_id: row.get(10)?,
+                    updated_at_ms: row.get(11)?,
                 })
             },
         )
@@ -1606,8 +1608,9 @@ pub(crate) fn save_applied_collector_control(
                 screen_capture_scheduled_enabled, screen_capture_interval_seconds,
                 screen_capture_activity_enabled,
                 screen_capture_activity_min_interval_seconds,
-                screen_capture_excluded_bundle_ids_json, updated_at_ms
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                screen_capture_excluded_bundle_ids_json,
+                communication_wechat_account_id, updated_at_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(singleton_id) DO UPDATE SET
                 device_id = excluded.device_id,
                 workspace_id = excluded.workspace_id,
@@ -1621,6 +1624,8 @@ pub(crate) fn save_applied_collector_control(
                     excluded.screen_capture_activity_min_interval_seconds,
                 screen_capture_excluded_bundle_ids_json =
                     excluded.screen_capture_excluded_bundle_ids_json,
+                communication_wechat_account_id =
+                    excluded.communication_wechat_account_id,
                 updated_at_ms = excluded.updated_at_ms
              WHERE excluded.device_id = applied_collector_control.device_id
                AND excluded.workspace_id = applied_collector_control.workspace_id
@@ -1637,6 +1642,7 @@ pub(crate) fn save_applied_collector_control(
                 control.screen_capture_activity_enabled,
                 control.screen_capture_activity_min_interval_seconds,
                 excluded_bundle_ids,
+                control.communication_wechat_account_id,
                 control.updated_at_ms,
             ],
         )
@@ -1666,6 +1672,15 @@ fn validate_applied_collector_control(control: &AppliedCollectorControl) -> Resu
         || !(60..=86_400).contains(&control.screen_capture_interval_seconds)
         || !(10..=3_600).contains(&control.screen_capture_activity_min_interval_seconds)
         || control.screen_capture_excluded_bundle_ids.len() > 100
+        || control
+            .communication_wechat_account_id
+            .as_deref()
+            .is_some_and(|value| {
+                value.len() != 64
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
         || control
             .screen_capture_excluded_bundle_ids
             .iter()

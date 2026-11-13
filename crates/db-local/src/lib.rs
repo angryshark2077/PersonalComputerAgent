@@ -84,6 +84,8 @@ pub const COMMUNICATION_CURSOR_CHECKPOINT_MIGRATION: &str =
 /// Remembers completed manual Screenshot requests across Agent restarts.
 pub const SCREENSHOT_REQUEST_HISTORY_MIGRATION: &str =
     include_str!("../migrations/0018_screenshot_request_history.sql");
+pub const WECHAT_ACCOUNT_SELECTION_MIGRATION: &str =
+    include_str!("../migrations/0019_wechat_account_selection.sql");
 
 /// Non-secret local Collector control that remains authoritative while Cloud is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,7 @@ pub struct AppliedCollectorControl {
     pub workspace_id: String,
     pub configuration_revision: u64,
     pub communication_wechat_enabled: bool,
+    pub communication_wechat_account_id: Option<String>,
     pub screen_capture_enabled: bool,
     pub screen_capture_scheduled_enabled: bool,
     pub screen_capture_interval_seconds: u64,

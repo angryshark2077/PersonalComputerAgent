@@ -84,6 +84,7 @@ pub struct CommunicationControl {
     identity: Option<CommunicationIdentity>,
     configuration_revision: u64,
     enabled: bool,
+    selected_account_fingerprint: Option<[u8; 32]>,
 }
 
 impl CommunicationControl {
@@ -93,6 +94,7 @@ impl CommunicationControl {
             identity: None,
             configuration_revision: 0,
             enabled: false,
+            selected_account_fingerprint: None,
         }
     }
 
@@ -113,6 +115,29 @@ impl CommunicationControl {
             identity: Some(identity),
             configuration_revision,
             enabled,
+            selected_account_fingerprint: None,
+        })
+    }
+
+    /// Creates paired control with an optional locally discovered account selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-control error when the configuration revision is zero.
+    pub const fn paired_with_account(
+        identity: CommunicationIdentity,
+        configuration_revision: u64,
+        enabled: bool,
+        selected_account_fingerprint: Option<[u8; 32]>,
+    ) -> Result<Self, CommunicationRuntimeError> {
+        if configuration_revision == 0 {
+            return Err(CommunicationRuntimeError::InvalidControl);
+        }
+        Ok(Self {
+            identity: Some(identity),
+            configuration_revision,
+            enabled,
+            selected_account_fingerprint,
         })
     }
 
@@ -608,7 +633,7 @@ async fn run_supervisor(
             let Some(_permit) = authorization_gate.commit_permit(control).await else {
                 continue;
             };
-            factory.create()
+            factory.create(control.selected_account_fingerprint)
         };
         let mut provider = match provider_result {
             Ok(provider) => provider,
@@ -2271,7 +2296,10 @@ async fn persist_collector_event(
 pub struct UnavailableCommunicationProviderFactory;
 
 impl CommunicationProviderFactory for UnavailableCommunicationProviderFactory {
-    fn create(&self) -> Result<Box<dyn CommunicationProvider>, DomainError> {
+    fn create(
+        &self,
+        _selected_account_fingerprint: Option<[u8; 32]>,
+    ) -> Result<Box<dyn CommunicationProvider>, DomainError> {
         Err(DomainError::new(
             "WECHAT_CAPABILITY_UNAVAILABLE",
             "verified WeChat source capability is unavailable",
