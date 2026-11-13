@@ -81,7 +81,7 @@ fn main() -> std::process::ExitCode {
 
 fn probe_messages() -> Result<(), RepairError> {
     let mut provider = MacOSWechatProviderFactory::default()
-        .create()
+        .create(None)
         .map_err(|_| RepairError::MessageProbeFailed)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
