@@ -47,7 +47,7 @@ case "$input" in
     attached_device=$(python3 -c '
 import os, plistlib, sys
 requested = os.path.realpath(sys.argv[1])
-document = plistlib.load(sys.stdin.buffer)
+document = plistlib.loads(sys.stdin.buffer.read())
 matches = [
     item.get("dev-entry")
     for item in document.get("system-entities", [])
@@ -107,11 +107,12 @@ version=$(plutil -extract CFBundleShortVersionString raw -o - "$info")
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "bundle version must be three numeric components"
 
 for permission_target in "$app" "$bridge_app"; do
-  permission_entitlements=$(codesign -d --entitlements :- "$permission_target" 2>/dev/null) \
+  permission_entitlements=$(codesign -d --entitlements :- "$permission_target" 2>&1 \
+    | sed -n '/^<?xml/,$p') \
     || fail "could not inspect signature privacy entitlements for $(basename "$permission_target")"
   permissions_allowed=$(python3 -c '
 import plistlib, sys
-values = plistlib.load(sys.stdin.buffer)
+values = plistlib.loads(sys.stdin.buffer.read())
 for key in (
     "com.apple.security.personal-information.location",
     "com.apple.security.personal-information.photos-library",
